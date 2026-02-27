@@ -1,0 +1,28 @@
+# IAR 编译和工程产生的中间垃圾文件
+settings/
+Debug/
+Release/
+*.dep
+*.pbi
+*.pbd
+*.pbw
+*.o
+*.out
+*.map
+*.hex
+*.bin
+*.sim
+*.dni
+*.jlink
+*.xcl
+*.cspy.bat
+*.cspy.ps1
+BrowseInfo/
+
+# VS Code 产生的临时文件
+.vscode/ipch/
+*.code-workspace
+
+# 其他系统垃圾
+.DS_Store
+Thumbs.db
