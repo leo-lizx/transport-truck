@@ -1,0 +1,18 @@
+{
+  "workspace": {
+    "path": "${workspaceFolder}\\project\\iar\\rt1064.eww"
+  },
+  "workspaces": {
+    "${workspaceFolder}\\project\\iar\\rt1064.eww": {
+      "configs": {
+        "${workspaceFolder}\\project\\iar\\program\\rt1064.ewp": "nor_sdram_zf_dtcm"
+      },
+      "selected": {
+        "path": "${workspaceFolder}\\project\\iar\\program\\rt1064.ewp"
+      }
+    }
+  },
+  "workbench": {
+    "path": "C:\\Program Files\\IAR Systems\\Embedded Workbench 9.2"
+  }
+}
