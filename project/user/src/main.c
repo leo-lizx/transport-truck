@@ -35,22 +35,24 @@
 
 #include "zf_common_headfile.h"
 
-// 打开新的工程或者工程移动了位置务必执行以下操作
-// 第一步 关闭上面所有打开的文件
-// 第二步 project->clean  等待下方进度条走完
+void system_init(void) {
+    // ... 其他硬件初始化代码 ...
 
-// 本例程是开源库移植用空工程
+    // 1. 初始化串口1: 波特率设为115200(需与OpenART Python脚本中的波特率保持一致)
+    // 使用 B12 作为 TX，B13 作为 RX
+    uart_init(UART_1, 115200, UART1_TX_B12, UART1_RX_B13);
 
+    // 2. 开启串口1的接收中断
+    uart_rx_interrupt(UART_1, 1);
 
+    // ... 其他代码 ...
+}
 
 int main(void)
 {
     clock_init(SYSTEM_CLOCK_600M);  // 不可删除
     debug_init();                   // 调试端口初始化
 
-    // 此处编写用户代码 例如外设初始化代码等
-    
-    // 此处编写用户代码 例如外设初始化代码等
     while(1)
     {
         // 此处编写需要循环执行的代码
