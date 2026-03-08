@@ -23,6 +23,26 @@ BrowseInfo/
 .vscode/ipch/
 *.code-workspace
 
+# VS Code 自动生成的本地调试配置
+.vscode/c_cpp_properties.json
+.vscode/launch.json
+.vscode/tasks.json
+
+# IAR/Eclipse 工作区元数据（本机相关）
+project/iar/.metadata/
+
+# IAR 构建产物目录（按配置名区分）
+project/iar/program/*/BrowseInfo/
+project/iar/program/*/Exe/
+project/iar/program/*/List/
+project/iar/program/*/Obj/
+project/iar/program/*/.ninja_deps
+project/iar/program/*/.ninja_log
+project/iar/program/*/.rt1064_build_cache
+
+# Office 临时锁文件
+project/~$*.xlsx
+
 # 其他系统垃圾
 .DS_Store
 Thumbs.db
