@@ -26,3 +26,18 @@ BrowseInfo/
 # 其他系统垃圾
 .DS_Store
 Thumbs.db
+# 编译构建工具 (Ninja/VS Code 插件) 产生的缓存文件
+.ninja_deps
+.ninja_log
+.rt1064_build_cache
+.vs/
+# Office 临时文件
+~$*
+
+# IAR/Eclipse 产生的本地工作空间元数据
+.metadata/
+
+# 确保过滤所有层级的构建缓存（加星号适配多级目录）
+*.ninja_deps
+*.ninja_log
+*.rt1064_build_cache
