@@ -1,65 +1,99 @@
 #include "app_game_logic.h"
 
-/**
- * @brief  根据视觉统计信息识别当前游戏阶段
- * @param  stats: 视觉串口解析模块传递过来的地图宏观统计信息
- * @return GameStage_e: 返回当前判定的游戏阶段
- */
-GameStage_e Game_Identify_Stage(VisionStats_t *stats) {
-    if (stats == NULL) return STAGE_UNKNOWN;
+uint8 g_game_map[MAP_ROWS][MAP_COLS];
+Point_t g_player_pos = {0, 0}; // 车模实时坐标
 
-    // 逻辑1：如果地图中存在炸弹，必定是第三阶段（策略模式）
-    if (stats->bomb_count > 0) {
-        return STAGE_3_STRATEGY;
-    }
-    // 逻辑2：如果没有炸弹，但视觉系统提示需要进行图像与数字分类匹配，则是第二阶段
-    else if (stats->need_classification > 0) {
-        return STAGE_2_CLASS;
-    }
-    // 逻辑3：既没有炸弹也不需要分类，且场上有箱子，则是第一阶段基础模式
-    else if (stats->box_count > 0) {
-        return STAGE_1_BASIC;
-    }
-
-    return STAGE_UNKNOWN;
-}
+// 状态机内部使用的静态变量
+static GameStage_e current_stage = STAGE_PENDING_SCOUT;
+static uint8 is_navigating = 0;       // 是否正在移动的标志位
+static ObservePoint_t current_target; // 当前需要前往的观察点
 
 /**
- * @brief  执行对应阶段的顶层策略调度 (状态机分支)
- * @param  stage: 当前识别出的游戏阶段
+ * @brief 游戏主逻辑任务 (需放在 main 函数的 while(1) 中循环调用)
  */
-void Game_Execute_Strategy(GameStage_e stage) {
-    switch (stage) {
-        case STAGE_1_BASIC:
-            /* * 策略一流程：
-             * 1. 将地图降维分解为单箱地图
-             * 2. 调用 BFS 算法解算 推箱路径
-             * 3. (暂不编写) 驱动底盘执行路径
-             */
-            // Algo_Sokoban_Solve(...); // 留作后续调用推箱子算法
+void Game_Logic_Task_Run(void) {
+    
+    switch (current_stage) {
+        // -----------------------------------------------------------------
+        // 【状态 1】：去最近的箱子看一眼，确定到底是第一阶段还是后面阶段
+        // -----------------------------------------------------------------
+        case STAGE_PENDING_SCOUT: {
+            if (!is_navigating) {
+                // 1. 找最近的箱子观察点
+                Point_t target_box;
+                current_target = Algo_Find_Nearest_Box_Observe_Point(g_game_map, g_player_pos, &target_box);
+                
+                if (current_target.is_valid) {
+                    // 下发移动指令给底盘
+                    HAL_CHASSIS_MOVE_TO(current_target.pos.x, current_target.pos.y);
+                    is_navigating = 1;
+                } else {
+                    // 异常：地图上没有合法箱子，保持待机
+                }
+            } else {
+                // 2. 检查是否已经开到观察点
+                if (HAL_CHASSIS_IS_ARRIVED()) {
+                    is_navigating = 0;
+                    
+                    // 3. 到了！抬头看前向摄像头(主镜头)的识别结果
+                    uint8 class_id = HAL_VISION_GET_BOX_CLASS_ID();
+                    
+                    if (class_id == 0) {
+                        // 没贴图，是基础模式，直接开推！
+                        current_stage = STAGE_1_BASIC_EXEC;
+                    } else {
+                        // 有贴图！是第二或第三阶段。
+                        // 规则要求：需要观察完所有的箱子建立映射。跳转到遍历状态！
+                        current_stage = STAGE_OBSERVE_ALL;
+                        // TODO: 将当前看过的这个箱子的 ID 记录到字典数组中
+                    }
+                }
+            }
             break;
+        }
 
-        case STAGE_2_CLASS:
-            /* * 策略二流程：
-             * 1. 寻找箱子与目标点的侧面观察点
-             * 2. (暂不编写) 驱动车模前往观察点，等待 OpenART#2 识别结果
-             * 3. 建立箱子与目标的正确映射关系
-             * 4. 再次调用第一阶段的推箱逻辑
-             */
+        // -----------------------------------------------------------------
+        // 【状态 2】：由于是二/三阶段，必须遍历全场尚未识别的箱子
+        // -----------------------------------------------------------------
+        case STAGE_OBSERVE_ALL: {
+            if (!is_navigating) {
+                /*
+                 * 步骤 1: 扫描全局地图，寻找下一个“还没被看过的箱子”。
+                 * 步骤 2: 调用 BFS 导航至其观察点。
+                 * 步骤 3: 如果所有箱子都看完了，检查地图有无炸弹：
+                 * 无炸弹 -> current_stage = STAGE_2_CLASS_EXEC;
+                 * 有炸弹 -> current_stage = STAGE_3_STRATEGY_EXEC;
+                 */
+                 // (此处省略遍历字典的具体登记代码)
+            } else {
+                if (HAL_CHASSIS_IS_ARRIVED()) {
+                    is_navigating = 0;
+                    // 记录摄像头看到的 class_id，标记该箱子为已观察。
+                }
+            }
             break;
+        }
 
-        case STAGE_3_STRATEGY:
-            /* * 策略三流程：
-             * 1. 遍历地图内部墙体，进行炸点评估解算
-             * 2. 调用 BFS 解算推炸弹的最优路径
-             * 3. (暂不编写) 驱动底盘引爆炸弹更新地图
-             * 4. 再次调用第二阶段/第一阶段推箱逻辑
-             */
+        // -----------------------------------------------------------------
+        // 【状态 3】：执行第一阶段（基础推箱）
+        // -----------------------------------------------------------------
+        case STAGE_1_BASIC_EXEC: {
+            // 在此调用您之前的推箱子 BFS 解算算法
+            // 按照路径输出的 ACT_UP, ACT_DOWN 逐格控制底盘
             break;
+        }
 
-        case STAGE_UNKNOWN:
+        // -----------------------------------------------------------------
+        // 【状态 4 & 5】：执行第二/第三阶段（分类/策略推箱）
+        // -----------------------------------------------------------------
+        case STAGE_2_CLASS_EXEC:
+        case STAGE_3_STRATEGY_EXEC: {
+            // 利用刚才在 STAGE_OBSERVE_ALL 中建立好的“图片-数字”字典
+            // 严格匹配目标后，调用推箱子/炸毁墙体逻辑
+            break;
+        }
+
         default:
-            // 地图尚未加载或异常，保持原地等待
             break;
     }
 }
