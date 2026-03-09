@@ -46,6 +46,9 @@ project/~$*.xlsx
 # 其他系统垃圾
 .DS_Store
 Thumbs.db
+
+project/code/plan.md
+
 # 编译构建工具 (Ninja/VS Code 插件) 产生的缓存文件
 .ninja_deps
 .ninja_log
