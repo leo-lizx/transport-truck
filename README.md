@@ -70,10 +70,9 @@ if (app_control_pipeline_is_arrived()) {
 
 // 视觉重定位校正（可选）
 app_control_pipeline_correct_pose(0.6f, 1.0f, 90.0f);
-
-// 陀螺零偏标定（可选，开机静止采样后写入）
-app_control_pipeline_set_gyro_bias(0.15f);
 ```
+
+> IMU 零偏在 `chassis_imu_init()` 启动阶段自动静止标定，无需额外调用手动写入接口。
 
 ## 模块说明
 
@@ -87,6 +86,13 @@ app_control_pipeline_set_gyro_bias(0.15f);
 | **麦轮运动学** | `chassis_mecanum.c/.h` | 正运动学（车体速度→四轮速度）、逆运动学（四轮→车体）、等比例限速。 |
 | **顶层控制** | `chassis_ctrl.c/.h` | 整合以上模块：5ms 姿态采样 + 20ms 闭环控制 + 网格定点移动 + 航向保持。 |
 | **调用层** | `chassis_pose_ctrl_call_example.c/.h` | `app_control_pipeline_*` 封装，隔离底盘实现，供 main/isr/上层业务调用。 |
+
+### IMU 全局变量说明
+
+- `car_angle` 是 IMU 模块导出的全局姿态变量（类型 `EulerAngle_t`，字段为 `roll/pitch/yaw`）。
+- 定义位置：`project/code/chassis_imu.c`。
+- 外部声明：`project/code/chassis_imu.h` 中 `extern EulerAngle_t car_angle;`。
+- 推荐用法：控制层优先通过 `chassis_imu_get_yaw_deg()` 获取航向角，`car_angle` 主要用于调试和可视化查看，避免在业务层直接写入。
 
 ## 引脚分配一览
 

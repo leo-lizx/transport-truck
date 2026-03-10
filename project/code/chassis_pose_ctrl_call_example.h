@@ -19,6 +19,5 @@ void app_control_pipeline_move_to_grid(uint8 target_x_grid, uint8 target_y_grid)
 uint8 app_control_pipeline_is_arrived(void);
 
 void app_control_pipeline_correct_pose(float x_m, float y_m, float yaw_deg);
-void app_control_pipeline_set_gyro_bias(float gyro_z_bias_dps);
 
 #endif /* CHASSIS_POSE_CTRL_CALL_EXAMPLE_H */

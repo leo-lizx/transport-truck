@@ -4,7 +4,6 @@
 #include <math.h>
 
 // 算法常量定义
-#define SAMPLE_FREQ     200.0f      // 采样频率 200Hz (对应 5ms 周期)
 #define DT              0.005f      // 积分步长 5ms
 #define GYRO_DEADZONE   0.15f       // 陀螺仪死区 (度/秒)，滤除静止时的微小噪声
 
@@ -37,10 +36,10 @@ static float invSqrt(float x) {
 }
 
 //-------------------------------------------------------------------------
-// 函数简介：IMU 算法初始化（包含静态零偏采集）
+// 函数简介：IMU 初始化（包含静态零偏采集）
 // 备注：调用此函数时，务必保证车模放在平地上且【绝对静止】！
 //-------------------------------------------------------------------------
-void IMU_Process_Init(void) {
+void chassis_imu_init(void) {
     float sum_gyro_z = 0.0f;
     int sample_count = 1000;  // 采集1000次求平均
 
@@ -63,18 +62,21 @@ void IMU_Process_Init(void) {
 }
 
 //-------------------------------------------------------------------------
-// 函数简介：重置或视觉校准 Yaw 角
-// 参数：new_yaw - 视觉识别到的绝对角度
+// 函数简介：设置/校准 Yaw 角（度）
 //-------------------------------------------------------------------------
-void IMU_Reset_Yaw(float new_yaw) {
-    car_angle.yaw = new_yaw;
+void chassis_imu_set_yaw_deg(float yaw_deg) {
+    car_angle.yaw = yaw_deg;
+}
+
+float chassis_imu_get_yaw_deg(void) {
+    return car_angle.yaw;
 }
 
 //-------------------------------------------------------------------------
-// 函数简介：IMU数据更新与姿态解算 (高频调用)
+// 函数简介：IMU数据更新与姿态解算 (5ms 高频调用)
 // 备注：必须放在严谨的 5ms 定时器中断中执行！
 //-------------------------------------------------------------------------
-void IMU_Process_Update(void) {
+void chassis_imu_update_5ms(void) {
     float ax, ay, az;
     float gx, gy, gz;
     float norm;

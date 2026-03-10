@@ -36,6 +36,7 @@
 #include "zf_common_headfile.h"
 #include "zf_common_debug.h"
 #include "isr.h"
+#include "chassis_imu.h"
 
 
 
@@ -52,7 +53,7 @@ void PIT_IRQHandler(void)
     {
         pit_flag_clear(PIT_CH0);
 
-        IMU_Process_Update(); // <--- 【新增】5ms 周期执行一次高频姿态解算
+        chassis_imu_update_5ms(); // 5ms 周期执行一次 IMU 高频姿态解算
     }
     
     if(pit_flag_get(PIT_CH1))

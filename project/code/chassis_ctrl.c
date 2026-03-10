@@ -410,8 +410,3 @@ void chassis_ctrl_set_pose(float x_m, float y_m, float yaw_deg)
     /* 同步航向角到 IMU 模块，避免下一次 5ms 更新覆盖校正值 */
     chassis_imu_set_yaw_deg(yaw_deg);
 }
-
-void chassis_ctrl_set_gyro_bias(float gyro_z_bias_dps)
-{
-    chassis_imu_set_gyro_bias(gyro_z_bias_dps);
-}

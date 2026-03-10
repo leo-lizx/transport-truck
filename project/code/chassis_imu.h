@@ -13,9 +13,10 @@ typedef struct {
 // 外部引用的姿态角变量
 extern EulerAngle_t car_angle;
 
-// 函数声明
-void IMU_Process_Init(void);         // IMU算法初始化（包含零偏采集，调用前需确保车模静止）
-void IMU_Process_Update(void);       // IMU数据更新与姿态解算（放入 5ms 定时器中断中调用）
-void IMU_Reset_Yaw(float new_yaw);   // 重置/校准 Yaw 角（用于视觉定期校正绝对角度）
+/* 底盘稳定调用接口（统一命名） */
+void chassis_imu_init(void);
+void chassis_imu_update_5ms(void);
+float chassis_imu_get_yaw_deg(void);
+void chassis_imu_set_yaw_deg(float yaw_deg);
 
 #endif

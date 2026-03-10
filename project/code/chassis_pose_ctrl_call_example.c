@@ -39,9 +39,3 @@ void app_control_pipeline_correct_pose(float x_m, float y_m, float yaw_deg)
     /* 预留给视觉重定位：矫正里程计累积误差 */
     chassis_ctrl_set_pose(x_m, y_m, yaw_deg);
 }
-
-void app_control_pipeline_set_gyro_bias(float gyro_z_bias_dps)
-{
-    /* 预留给上层静止标定：写入陀螺零偏 */
-    chassis_ctrl_set_gyro_bias(gyro_z_bias_dps);
-}

@@ -120,10 +120,4 @@ void chassis_ctrl_stop(void);
  */
 void chassis_ctrl_set_pose(float x_m, float y_m, float yaw_deg);
 
-/**
- * @brief  设置陀螺仪零偏补偿值
- * @param  gyro_z_bias_dps  Z 轴零偏（°/s）
- */
-void chassis_ctrl_set_gyro_bias(float gyro_z_bias_dps);
-
 #endif /* CHASSIS_CTRL_H */

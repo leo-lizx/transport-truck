@@ -30,6 +30,5 @@
 #define chassis_pose_ctrl_get_last_cmd  chassis_ctrl_get_last_cmd
 #define chassis_pose_ctrl_stop          chassis_ctrl_stop
 #define chassis_pose_ctrl_set_pose      chassis_ctrl_set_pose
-#define chassis_pose_ctrl_set_gyro_bias chassis_ctrl_set_gyro_bias
 
 #endif /* CHASSIS_POSE_CTRL_H */
