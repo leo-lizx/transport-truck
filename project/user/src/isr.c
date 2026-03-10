@@ -51,6 +51,8 @@ void PIT_IRQHandler(void)
     if(pit_flag_get(PIT_CH0))
     {
         pit_flag_clear(PIT_CH0);
+
+        IMU_Process_Update(); // <--- 【新增】5ms 周期执行一次高频姿态解算
     }
     
     if(pit_flag_get(PIT_CH1))
