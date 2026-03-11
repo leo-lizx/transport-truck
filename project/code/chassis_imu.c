@@ -1,15 +1,16 @@
 #include "chassis_imu.h"
+#include "chassis_config.h"
 #include "zf_device_imu660rb.h"
 #include "zf_driver_delay.h"
 #include <math.h>
 
-// 算法常量定义
-#define DT              0.005f      // 积分步长 5ms
-#define GYRO_DEADZONE   0.15f       // 陀螺仪死区 (度/秒)，滤除静止时的微小噪声
+// 算法常量定义 —— 使用 chassis_config.h 中的统一宏
+#define IMU_DT              CHASSIS_TASK_DT_5MS_S   // 积分步长 5ms
+#define IMU_GYRO_DEADZONE   0.15f                   // 陀螞仪死区 (°/s)
 
-// Mahony 滤波参数
-#define Kp 2.0f   // 比例增益，控制加速度计收敛到重力方向的速度
-#define Ki 0.005f // 积分增益，控制陀螺仪零偏漂移的收敛
+// Mahony 滤波参数 —— 加 IMU_ 前缀避免与 PID 的 Kp/Ki 冲突
+#define IMU_MAHONY_KP   2.0f    // 比例增益
+#define IMU_MAHONY_KI   0.005f  // 积分增益
 
 // 姿态输出
 EulerAngle_t car_angle = {0};
@@ -23,16 +24,10 @@ static float q0 = 1.0f, q1 = 0.0f, q2 = 0.0f, q3 = 0.0f;
 static float exInt = 0.0f, eyInt = 0.0f, ezInt = 0.0f;
 
 //-------------------------------------------------------------------------
-// 函数简介：快速计算平方根的倒数 (RT1064有硬件FPU，直接用1.0f/sqrtf也可，这里保留经典算法)
+// 函数简介：平方根倒数 (RT1064 自带硬件 FPU，直接使用标准库)
 //-------------------------------------------------------------------------
 static float invSqrt(float x) {
-    float halfx = 0.5f * x;
-    float y = x;
-    long i = *(long*)&y;
-    i = 0x5f3759df - (i >> 1);
-    y = *(float*)&i;
-    y = y * (1.5f - (halfx * y * y));
-    return y;
+    return 1.0f / sqrtf(x);
 }
 
 //-------------------------------------------------------------------------
@@ -101,12 +96,12 @@ void chassis_imu_update_5ms(void) {
     float current_gz = gz - gyro_z_bias; // 消除静态零偏
     
     // 剔除静止死区噪声
-    if(fabs(current_gz) < GYRO_DEADZONE) {
+    if(fabsf(current_gz) < IMU_GYRO_DEADZONE) {
         current_gz = 0.0f;
     }
     
     // 梯形积分求偏航角：Yaw += (上一次角速度 + 本次角速度) * dt / 2
-    car_angle.yaw += (last_gyro_z + current_gz) * DT / 2.0f;
+    car_angle.yaw += (last_gyro_z + current_gz) * IMU_DT / 2.0f;
     last_gyro_z = current_gz; // 更新历史值
 
     // 限制 Yaw 在 0~360 或 -180~180 之间 (根据个人习惯，这里做 -180~180 限制)
@@ -118,9 +113,9 @@ void chassis_imu_update_5ms(void) {
     // 第二部分：Mahony 算法解算 Pitch 和 Roll (加速度计与陀螺仪融合)
     // ==========================================================
     // 将陀螺仪数据转换为 弧度/秒，供四元数运算使用
-    gx = gx * 0.0174533f; 
-    gy = gy * 0.0174533f;
-    gz = gz * 0.0174533f;
+    gx = gx * CHASSIS_DEG_TO_RAD_F;
+    gy = gy * CHASSIS_DEG_TO_RAD_F;
+    gz = gz * CHASSIS_DEG_TO_RAD_F;
 
     // 只在加速度计数据有效时进行修正
     if(!((ax == 0.0f) && (ay == 0.0f) && (az == 0.0f))) {
@@ -141,22 +136,22 @@ void chassis_imu_update_5ms(void) {
         ez = (ax * vy - ay * vx);
 
         // 误差积分
-        exInt += ex * Ki;
-        eyInt += ey * Ki;
-        ezInt += ez * Ki;
+        exInt += ex * IMU_MAHONY_KI;
+        eyInt += ey * IMU_MAHONY_KI;
+        ezInt += ez * IMU_MAHONY_KI;
 
-        // 调整陀螺仪的测量值
-        gx += Kp * ex + exInt;
-        gy += Kp * ey + eyInt;
-        gz += Kp * ez + ezInt;
+        // 调整陀螞仪的测量值
+        gx += IMU_MAHONY_KP * ex + exInt;
+        gy += IMU_MAHONY_KP * ey + eyInt;
+        gz += IMU_MAHONY_KP * ez + ezInt;
     }
 
     // 整合四元数变化率并归一化 (一阶龙格库塔法)
     float q0_last = q0, q1_last = q1, q2_last = q2, q3_last = q3;
-    q0 += (-q1_last * gx - q2_last * gy - q3_last * gz) * (0.5f * DT);
-    q1 += ( q0_last * gx + q2_last * gz - q3_last * gy) * (0.5f * DT);
-    q2 += ( q0_last * gy - q1_last * gz + q3_last * gx) * (0.5f * DT);
-    q3 += ( q0_last * gz + q1_last * gy - q2_last * gx) * (0.5f * DT);
+    q0 += (-q1_last * gx - q2_last * gy - q3_last * gz) * (0.5f * IMU_DT);
+    q1 += ( q0_last * gx + q2_last * gz - q3_last * gy) * (0.5f * IMU_DT);
+    q2 += ( q0_last * gy - q1_last * gz + q3_last * gx) * (0.5f * IMU_DT);
+    q3 += ( q0_last * gz + q1_last * gy - q2_last * gx) * (0.5f * IMU_DT);
 
     // 四元数归一化
     norm = invSqrt(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3);
@@ -166,6 +161,6 @@ void chassis_imu_update_5ms(void) {
     q3 *= norm;
 
     // 将四元数转换为欧拉角 (仅计算 Pitch 和 Roll)
-    car_angle.pitch = asinf(-2.0f * q1 * q3 + 2.0f * q0 * q2) * 57.29578f;
-    car_angle.roll  = atan2f(2.0f * q2 * q3 + 2.0f * q0 * q1, -2.0f * q1 * q1 - 2.0f * q2 * q2 + 1.0f) * 57.29578f;
+    car_angle.pitch = asinf(-2.0f * q1 * q3 + 2.0f * q0 * q2) * CHASSIS_RAD_TO_DEG_F;
+    car_angle.roll  = atan2f(2.0f * q2 * q3 + 2.0f * q0 * q1, -2.0f * q1 * q1 - 2.0f * q2 * q2 + 1.0f) * CHASSIS_RAD_TO_DEG_F;
 }

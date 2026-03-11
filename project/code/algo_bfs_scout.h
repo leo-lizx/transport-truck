@@ -3,8 +3,8 @@
 
 #include "zf_common_headfile.h"
 
-#define MAP_ROWS    16
-#define MAP_COLS    12
+#define MAP_ROWS    12      // 12 行（Y 方向，对应 2.4m / 0.20m）
+#define MAP_COLS    16      // 16 列（X 方向，对应 3.2m / 0.20m）
 
 // 地图元素定义
 typedef enum {
