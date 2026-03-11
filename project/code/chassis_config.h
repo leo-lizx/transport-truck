@@ -116,17 +116,17 @@
 #define CHASSIS_ODOM_SCALE_Y            (1.00f)
 
 /* ======================================================================
- *  车模物理尺寸 — 必须根据实车精确测量后填入
+ *  车模物理尺寸 — 已经填入实际测量数据
  * ====================================================================== */
 
 /** 麦克纳姆轮半径（米），测量轮子外径 ÷ 2 */
-#define CHASSIS_WHEEL_RADIUS_M          (0.030f)
+#define CHASSIS_WHEEL_RADIUS_M          (0.0315f)
 
 /** 前后轴距的 1/2（米），前轮轴心到车体几何中心距离 */
-#define CHASSIS_HALF_WHEEL_BASE_M       (0.080f)
+#define CHASSIS_HALF_WHEEL_BASE_M       (0.100f)
 
 /** 左右轮距的 1/2（米），左轮中心到车体几何中心距离 */
-#define CHASSIS_HALF_TRACK_WIDTH_M      (0.070f)
+#define CHASSIS_HALF_TRACK_WIDTH_M      (0.090f)
 
 /** 麦轮运动学常数 K = 半轴距 + 半轮距，用于正/逆运动学解算 */
 #define CHASSIS_MECANUM_K_M             (CHASSIS_HALF_WHEEL_BASE_M + CHASSIS_HALF_TRACK_WIDTH_M)

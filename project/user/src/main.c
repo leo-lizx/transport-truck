@@ -34,6 +34,8 @@
 ********************************************************************************************************************/
 
 #include "zf_common_headfile.h"
+#include "chassis_pose_ctrl_call_example.h"
+#include "chassis_menu.h"
 
 void system_init(void) {
     // ... 其他硬件初始化代码 ...
@@ -53,12 +55,24 @@ int main(void)
     clock_init(SYSTEM_CLOCK_600M);  // 不可删除
     debug_init();                   // 调试端口初始化
 
+    ips200_set_dir(IPS200_CROSSWISE);
+    ips200_init(IPS200_TYPE_SPI);
+    ips200_set_font(IPS200_8X16_FONT);
+    ips200_set_color(RGB565_WHITE, RGB565_BLACK);
+
+    key_init(10);
+
+    app_control_pipeline_init();
+    chassis_menu_init();
+
+    pit_ms_init(PIT_CH0, 5);
+    pit_ms_init(PIT_CH1, 20);
+
     while(1)
     {
-        // 此处编写需要循环执行的代码
-        
-        
-        // 此处编写需要循环执行的代码
+        system_delay_ms(10);
+        chassis_menu_task_10ms();
+        chassis_menu_render_100ms();
     }
 }
 

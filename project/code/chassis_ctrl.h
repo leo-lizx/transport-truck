@@ -53,6 +53,23 @@ typedef struct
     float wz_dps;        /**< 转向角速度（°/s），逆时针为正 */
 } chassis_body_speed_cmd_t;
 
+/** 运行时可调参数（用于按键菜单在线调参） */
+typedef struct
+{
+    float wheel_pid_kp;
+    float wheel_pid_ki;
+    float wheel_pid_kd;
+
+    float pos_kp;
+    float yaw_kp;
+
+    float max_linear_speed_mps;
+    float max_yaw_speed_dps;
+
+    float cmd_accel_limit_mps2;
+    float cmd_accel_limit_dps2;
+} chassis_tune_params_t;
+
 /* ========================== 公共 API ========================== */
 
 /**
@@ -119,5 +136,17 @@ void chassis_ctrl_stop(void);
  * @param  yaw_deg  校正后航向角（度）
  */
 void chassis_ctrl_set_pose(float x_m, float y_m, float yaw_deg);
+
+/**
+ * @brief  获取当前运行时调参参数
+ * @param  out_params  输出参数结构体指针
+ */
+void chassis_ctrl_get_tune_params(chassis_tune_params_t *out_params);
+
+/**
+ * @brief  设置运行时调参参数（将自动限幅并立即生效）
+ * @param  in_params  输入参数结构体指针
+ */
+void chassis_ctrl_set_tune_params(const chassis_tune_params_t *in_params);
 
 #endif /* CHASSIS_CTRL_H */

@@ -56,6 +56,20 @@ static chassis_encoder_t s_encoders[CHASSIS_WHEEL_COUNT] =
 /** 四路轮速 PID 控制器（chassis_ctrl_init 中初始化增益） */
 static chassis_pid_t s_pids[CHASSIS_WHEEL_COUNT];
 
+/** 运行时可调参数（默认值来自 chassis_config.h） */
+static volatile chassis_tune_params_t s_tune_params =
+{
+    CHASSIS_WHEEL_PID_KP,
+    CHASSIS_WHEEL_PID_KI,
+    CHASSIS_WHEEL_PID_KD,
+    CHASSIS_POS_KP,
+    CHASSIS_YAW_KP,
+    CHASSIS_MAX_LINEAR_SPEED_MPS,
+    CHASSIS_MAX_YAW_SPEED_DPS,
+    CHASSIS_CMD_ACCEL_LIMIT_MPS2,
+    CHASSIS_CMD_ACCEL_LIMIT_DPS2,
+};
+
 /* ======================================================================
  *  全局位姿与导航状态变量
  * ====================================================================== */
@@ -86,6 +100,20 @@ static volatile uint8 s_arrived_flag = 1U;
 static volatile float s_body_vx_mps_feedback = 0.0f;
 static volatile float s_body_vy_mps_feedback = 0.0f;
 
+static chassis_tune_params_t ctrl_sanitize_tune_params(chassis_tune_params_t in)
+{
+    in.wheel_pid_kp          = chassis_clamp_f(in.wheel_pid_kp,          0.0f, 400.0f);
+    in.wheel_pid_ki          = chassis_clamp_f(in.wheel_pid_ki,          0.0f, 80.0f);
+    in.wheel_pid_kd          = chassis_clamp_f(in.wheel_pid_kd,          0.0f, 40.0f);
+    in.pos_kp                = chassis_clamp_f(in.pos_kp,                0.0f, 5.0f);
+    in.yaw_kp                = chassis_clamp_f(in.yaw_kp,                0.0f, 10.0f);
+    in.max_linear_speed_mps  = chassis_clamp_f(in.max_linear_speed_mps,  0.05f, 1.50f);
+    in.max_yaw_speed_dps     = chassis_clamp_f(in.max_yaw_speed_dps,     10.0f, 360.0f);
+    in.cmd_accel_limit_mps2  = chassis_clamp_f(in.cmd_accel_limit_mps2,  0.10f, 5.00f);
+    in.cmd_accel_limit_dps2  = chassis_clamp_f(in.cmd_accel_limit_dps2, 20.0f, 1000.0f);
+    return in;
+}
+
 /* ======================================================================
  *  内部辅助函数
  * ====================================================================== */
@@ -99,18 +127,20 @@ static void ctrl_limit_body_speed(chassis_body_speed_cmd_t *cmd)
 {
     float linear_norm;
     float linear_scale;
+    float max_yaw_speed_dps = s_tune_params.max_yaw_speed_dps;
+    float max_linear_speed_mps = s_tune_params.max_linear_speed_mps;
 
     /* 角速度独立限幅 */
     cmd->wz_dps = chassis_clamp_f(cmd->wz_dps,
-                                  -CHASSIS_MAX_YAW_SPEED_DPS,
-                                   CHASSIS_MAX_YAW_SPEED_DPS);
+                                  -max_yaw_speed_dps,
+                                   max_yaw_speed_dps);
 
     /* 线速度矢量模长限幅 */
     linear_norm = sqrtf(cmd->vx_body_mps * cmd->vx_body_mps
                       + cmd->vy_body_mps * cmd->vy_body_mps);
-    if (linear_norm > CHASSIS_MAX_LINEAR_SPEED_MPS && linear_norm > 1e-6f)
+    if (linear_norm > max_linear_speed_mps && linear_norm > 1e-6f)
     {
-        linear_scale = CHASSIS_MAX_LINEAR_SPEED_MPS / linear_norm;
+        linear_scale = max_linear_speed_mps / linear_norm;
         cmd->vx_body_mps *= linear_scale;
         cmd->vy_body_mps *= linear_scale;
     }
@@ -123,8 +153,8 @@ static void ctrl_limit_body_speed(chassis_body_speed_cmd_t *cmd)
  */
 static chassis_body_speed_cmd_t ctrl_filter_body_speed(chassis_body_speed_cmd_t target_cmd)
 {
-    float delta_linear_max = CHASSIS_CMD_ACCEL_LIMIT_MPS2 * CHASSIS_TASK_DT_20MS_S;
-    float delta_yaw_max    = CHASSIS_CMD_ACCEL_LIMIT_DPS2 * CHASSIS_TASK_DT_20MS_S;
+    float delta_linear_max = s_tune_params.cmd_accel_limit_mps2 * CHASSIS_TASK_DT_20MS_S;
+    float delta_yaw_max    = s_tune_params.cmd_accel_limit_dps2 * CHASSIS_TASK_DT_20MS_S;
     chassis_body_speed_cmd_t filtered;
 
     /* 先对目标做矢量限幅 */
@@ -228,9 +258,9 @@ void chassis_ctrl_init(void)
         chassis_motor_init(&s_motors[i]);
         chassis_encoder_init(&s_encoders[i]);
         chassis_pid_init(&s_pids[i],
-                         CHASSIS_WHEEL_PID_KP,
-                         CHASSIS_WHEEL_PID_KI,
-                         CHASSIS_WHEEL_PID_KD,
+                         s_tune_params.wheel_pid_kp,
+                         s_tune_params.wheel_pid_ki,
+                         s_tune_params.wheel_pid_kd,
                          CHASSIS_MOTOR_PWM_MAX);
     }
 
@@ -311,12 +341,12 @@ void chassis_ctrl_task_20ms(void)
 
         {
             /* 位置 P 控制器：误差 × Kp → 全局坐标系速度指令 */
-            float vx_global_cmd = CHASSIS_POS_KP * dx;
-            float vy_global_cmd = CHASSIS_POS_KP * dy;
+            float vx_global_cmd = s_tune_params.pos_kp * dx;
+            float vy_global_cmd = s_tune_params.pos_kp * dy;
             float linear_norm = sqrtf(vx_global_cmd * vx_global_cmd + vy_global_cmd * vy_global_cmd);
-            if (linear_norm > CHASSIS_MAX_LINEAR_SPEED_MPS && linear_norm > 1e-6f)
+            if (linear_norm > s_tune_params.max_linear_speed_mps && linear_norm > 1e-6f)
             {
-                float scale = CHASSIS_MAX_LINEAR_SPEED_MPS / linear_norm;
+                float scale = s_tune_params.max_linear_speed_mps / linear_norm;
                 vx_global_cmd *= scale;
                 vy_global_cmd *= scale;
             }
@@ -325,9 +355,9 @@ void chassis_ctrl_task_20ms(void)
             {
                 float target_yaw = atan2f(dy, dx) * CHASSIS_RAD_TO_DEG_F;
                 float yaw_err = chassis_normalize_angle_deg(target_yaw - s_pose.yaw_deg);
-                float wz_cmd = chassis_clamp_f(CHASSIS_YAW_KP * yaw_err,
-                                               -CHASSIS_MAX_YAW_SPEED_DPS,
-                                                CHASSIS_MAX_YAW_SPEED_DPS);
+                float wz_cmd = chassis_clamp_f(s_tune_params.yaw_kp * yaw_err,
+                                               -s_tune_params.max_yaw_speed_dps,
+                                                s_tune_params.max_yaw_speed_dps);
 
                 /* 全局速度 → 车体速度（逆旋转变换） */
                 chassis_body_speed_cmd_t cmd;
@@ -343,9 +373,9 @@ void chassis_ctrl_task_20ms(void)
     {
         /* ---- 航向保持模式：原地转向，不平移 ---- */
         float yaw_err = chassis_normalize_angle_deg(s_target_yaw_deg - s_pose.yaw_deg);
-        float wz_cmd = chassis_clamp_f(CHASSIS_YAW_KP * yaw_err,
-                                       -CHASSIS_MAX_YAW_SPEED_DPS,
-                                        CHASSIS_MAX_YAW_SPEED_DPS);
+        float wz_cmd = chassis_clamp_f(s_tune_params.yaw_kp * yaw_err,
+                           -s_tune_params.max_yaw_speed_dps,
+                        s_tune_params.max_yaw_speed_dps);
 
         ctrl_apply_body_speed((chassis_body_speed_cmd_t){ 0.0f, 0.0f, wz_cmd });
     }
@@ -409,4 +439,34 @@ void chassis_ctrl_set_pose(float x_m, float y_m, float yaw_deg)
 
     /* 同步航向角到 IMU 模块，避免下一次 5ms 更新覆盖校正值 */
     chassis_imu_set_yaw_deg(yaw_deg);
+}
+
+void chassis_ctrl_get_tune_params(chassis_tune_params_t *out_params)
+{
+    if (0 == out_params)
+    {
+        return;
+    }
+    *out_params = s_tune_params;
+}
+
+void chassis_ctrl_set_tune_params(const chassis_tune_params_t *in_params)
+{
+    uint8 i;
+    chassis_tune_params_t sanitized;
+
+    if (0 == in_params)
+    {
+        return;
+    }
+
+    sanitized = ctrl_sanitize_tune_params(*in_params);
+    s_tune_params = sanitized;
+
+    for (i = 0U; i < (uint8)CHASSIS_WHEEL_COUNT; ++i)
+    {
+        s_pids[i].kp = sanitized.wheel_pid_kp;
+        s_pids[i].ki = sanitized.wheel_pid_ki;
+        s_pids[i].kd = sanitized.wheel_pid_kd;
+    }
 }

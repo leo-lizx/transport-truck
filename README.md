@@ -20,6 +20,7 @@ project/
 │   ├── chassis_ctrl.c/.h          ← ★ 底盘顶层控制（对外唯一入口）
 │   ├── chassis_pose_ctrl_call_example.c/.h  ← 调用层封装（供 main/isr 使用）
 │   ├── chassis_pose_ctrl.c/.h     ← 旧文件兼容层（已清空/宏映射）
+│   ├── chassis_menu.c/.h          ← 2寸 IPS 参数菜单（按键在线调参）
 │   ├── algo_bfs_scout.c/.h        ← BFS 路径搜索算法
 │   └── app_game_logic.c/.h        ← 推箱子游戏状态机
 ├── user/
@@ -55,6 +56,10 @@ app_control_pipeline_on_pit_5ms();   // IMU 姿态采样 + 航向角积分
 
 // 在 20ms PIT 中断中调用：
 app_control_pipeline_on_pit_20ms();  // 编码器 → 里程计 → 导航 → PID → 电机
+
+// 在 main 主循环中每 10ms 调用：
+chassis_menu_task_10ms();            // 按键扫描 + 菜单处理
+chassis_menu_render_100ms();         // IPS 菜单刷新（100ms）
 ```
 
 ### 3. 业务层调用
@@ -73,6 +78,42 @@ app_control_pipeline_correct_pose(0.6f, 1.0f, 90.0f);
 ```
 
 > IMU 零偏在 `chassis_imu_init()` 启动阶段自动静止标定，无需额外调用手动写入接口。
+
+### 4. 2寸 IPS 二级调参菜单（新增）
+
+在 `main` 主循环中周期调用：
+
+```c
+chassis_menu_task_10ms();
+chassis_menu_render_100ms();
+```
+
+按键逻辑：
+
+- 四个物理按键固定映射：
+  - `KEY_1` = `C15`
+  - `KEY_2` = `C14`
+  - `KEY_3` = `C13`
+  - `KEY_4` = `C12`
+
+- 一级菜单（页面选择，按优先级排序）：`LIMIT -> NAV -> PID`
+  - `K1` 上一页
+  - `K2` 下一页
+  - `K3` 进入二级参数页
+  - `K4` 长按保存当前参数到 Flash
+- 二级菜单（参数调节）：
+  - `K1` 上一项
+  - `K2` 下一项
+  - `K3` 增大参数
+  - `K4` 减小参数
+  - `K1` 长按返回一级菜单
+  - `K4` 长按保存当前参数到 Flash
+
+Flash 持久化说明：
+
+- 启动时自动从 Flash 读取参数并校验（magic/version/checksum）。
+- 校验通过则覆盖当前调参值；失败则使用默认参数。
+- 当前实现使用 `sector=127, page=7` 存储菜单参数，请确保该区域未被你的其他业务占用。
 
 ## 模块说明
 
@@ -112,9 +153,9 @@ app_control_pipeline_correct_pose(0.6f, 1.0f, 90.0f);
 
 ```c
 // 车模物理尺寸（必须精确测量）
-#define CHASSIS_WHEEL_RADIUS_M          (0.030f)   // 轮半径 (m)
-#define CHASSIS_HALF_WHEEL_BASE_M       (0.080f)   // 半轴距 (m)
-#define CHASSIS_HALF_TRACK_WIDTH_M      (0.070f)   // 半轮距 (m)
+#define CHASSIS_WHEEL_RADIUS_M          (0.0315f)   // 轮半径 (m)
+#define CHASSIS_HALF_WHEEL_BASE_M       (0.100f)   // 半轴距 (m)
+#define CHASSIS_HALF_TRACK_WIDTH_M      (0.090f)   // 半轮距 (m)
 
 // 编码器（根据型号和倍频方式确认）
 #define CHASSIS_ENCODER_COUNTS_PER_REV  (1024.0f)  // 每转脉冲数
@@ -162,6 +203,7 @@ app_control_pipeline_correct_pose(0.6f, 1.0f, 90.0f);
 - `chassis_mecanum.c`
 - `chassis_pid.c`
 - `chassis_pose_ctrl_call_example.c`
+- `chassis_menu.c`
 - `algo_bfs_scout.c`
 - `app_game_logic.c`
 
