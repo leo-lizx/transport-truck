@@ -3,8 +3,15 @@
 
 #include "zf_common_headfile.h"
 #include "algo_bfs_scout.h"
-#include "algo_sokoban_solver.h"
 #include "chassis_pose_ctrl_call_example.h"
+
+#ifndef MAP_ROWS
+#define MAP_ROWS 12
+#endif
+
+#ifndef MAP_COLS
+#define MAP_COLS 16
+#endif
 
 // ==========================================
 // 底盘硬件调用层（已对接到 code/chassis_pose_ctrl_call_example.*）

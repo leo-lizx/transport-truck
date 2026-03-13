@@ -471,3 +471,56 @@ STAGE_PENDING_SCOUT ─→ 到最近箱子旁 ─→ 看有无贴图？
 2. **实车标定**：编码器脉冲数、轮径、PID 参数、方向极性、里程计比例（参数全在 `chassis_config.h`）
 3. **对接 OpenART 视觉串口**：替换 `HAL_VISION_GET_BOX_CLASS_ID()` 占位宏
 4. **分类映射表填充**：在 `STAGE_OBSERVE_ALL` 阶段由 OpenART 识别结果写入 `g_box_to_target[]`
+
+## 联调排障指南（2026-03 代码审查版）
+
+本节基于 `project/code` 与 `project/user` 全量 C/H 审查，给出当前最容易导致“跑不通流程”的逻辑点与调试顺序。
+
+### 已确认的高优先级逻辑风险
+
+1. **视觉链路未接入，状态机只能走第一阶段**
+    - `HAL_VISION_GET_BOX_CLASS_ID()` 固定返回 0：见 `project/code/app_game_logic.h`
+    - UART1 中断解析函数未启用：`Vision_Parse_Byte(dat)` 仍为注释：见 `project/user/src/isr.c`
+    - 影响：`STAGE_OBSERVE_ALL` / `STAGE_2_CLASS_EXEC` / `STAGE_3_STRATEGY_EXEC` 不会真实触发。
+
+2. **`STAGE_OBSERVE_ALL` 仍是框架代码，未实现遍历与映射填充**
+    - 关键 TODO 仍在：见 `project/code/app_game_logic.c`
+    - 影响：一旦进入 `STAGE_OBSERVE_ALL`，流程会卡住，无法切到阶段 2/3。
+
+3. **已修复（2026-03-13）：阶段 2/3 的 `box_count` 参数来源错误**
+    - 修复方式：改为实时统计地图箱子数后传入 `Sokoban_Solve_Stage2`。
+    - 修复效果：避免首次进入阶段 2/3 时 `box_count=0` 导致直接失败。
+
+4. **已修复（2026-03-13）：阶段 1/2 推箱完成后状态不迁移**
+    - 修复方式：阶段 1/2 复用 `exec_push_waypoints()` 返回值，完成后切到 `STAGE_DONE`。
+    - 修复效果：执行完毕后状态机会正确收尾，不再停留在执行态。
+
+### 推荐断点与观测变量（按顺序）
+
+1. **先验证控制时序**
+    - 断点：`app_control_pipeline_on_pit_5ms`、`app_control_pipeline_on_pit_20ms`
+    - 目标：确认 PIT 5ms/20ms 任务持续触发，无掉中断。
+
+2. **验证状态机主循环是否在推进**
+    - 断点：`Game_Logic_Task_Run` 的 `switch (current_stage)`
+    - 观察：`current_stage`, `is_navigating`, `g_soko_exec_init`
+
+3. **验证视觉入口**
+    - 断点：`LPUART1_IRQHandler`
+    - 观察：串口收包后是否进入解析，`class_id` 是否不再恒为 0。
+
+4. **验证阶段 2/3 求解入口参数**
+    - 断点：`Sokoban_Solve_Stage2(...)` 调用前
+    - 观察：`box_count`、`g_box_to_target[]`、地图中实际箱子数是否一致（当前版本已改为实时统计）。
+
+5. **验证执行收尾状态迁移**
+    - 断点：`exec_push_waypoints()` 返回 1 的分支
+    - 目标：确保阶段 1/2/3 都能进入 `STAGE_DONE`（当前版本已修复 1/2 收尾）。
+
+### 最小可复现调试思路（建议当天联调按此执行）
+
+1. 先让车只跑底盘闭环，不跑视觉分阶段：确认 `move_to_grid` 到点稳定。
+2. 打开 UART1 解析并替换 `HAL_VISION_GET_BOX_CLASS_ID` 占位实现，先跑“能切到 `STAGE_OBSERVE_ALL`”。
+3. 实现 `STAGE_OBSERVE_ALL` 的箱子遍历与 `g_box_to_target[]` 填充，确认可稳定进入阶段 2。
+4. 回归验证阶段 2/3 的 `box_count` 与实际箱子数一致，再测 `Sokoban_Solve_Stage2` 成功率。
+5. 回归验证阶段 1/2/3 完成后都能进入 `STAGE_DONE`，做整场流程回归。

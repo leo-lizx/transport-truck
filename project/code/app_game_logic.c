@@ -27,6 +27,22 @@ static SokoWaypointPath_t g_bomb_waypoints;     // 推炸弹路点
 static uint16          g_bomb_wp_idx = 0;       // 当前路点索引
 
 /**
+ * @brief 统计当前地图中的箱子数量
+ */
+static uint8 get_map_box_count(void)
+{
+    uint8 count = 0;
+    for (int8 r = 0; r < MAP_ROWS; r++) {
+        for (int8 c = 0; c < MAP_COLS; c++) {
+            if (g_game_map[r][c] == MAP_BOX) {
+                count++;
+            }
+        }
+    }
+    return count;
+}
+
+/**
  * @brief 从底盘里程计同步当前网格坐标到 g_player_pos
  */
 static void sync_player_pos(void)
@@ -181,7 +197,9 @@ void Game_Logic_Task_Run(void) {
                 g_soko_exec_init = 1;
             }
             if (g_soko_solution.is_solved) {
-                exec_push_waypoints();
+                if (exec_push_waypoints()) {
+                    current_stage = STAGE_DONE;
+                }
             }
             break;
         }
@@ -191,9 +209,16 @@ void Game_Logic_Task_Run(void) {
         // -----------------------------------------------------------------
         case STAGE_2_CLASS_EXEC: {
             if (!g_soko_exec_init) {
+                uint8 box_count = get_map_box_count();
+                if (box_count == 0) {
+                    current_stage = STAGE_DONE;
+                    g_soko_exec_init = 1;
+                    break;
+                }
+
                 if (Sokoban_Solve_Stage2(g_game_map, g_player_pos,
                                           g_box_to_target,
-                                          g_soko_solution.total_boxes,
+                                          box_count,
                                           &g_soko_solution)) {
                     g_soko_sub_idx = 0;
                     Sokoban_Actions_To_Waypoints(
@@ -205,7 +230,9 @@ void Game_Logic_Task_Run(void) {
                 g_soko_exec_init = 1;
             }
             if (g_soko_solution.is_solved) {
-                exec_push_waypoints();
+                if (exec_push_waypoints()) {
+                    current_stage = STAGE_DONE;
+                }
             }
             break;
         }
@@ -224,9 +251,16 @@ void Game_Logic_Task_Run(void) {
         // -----------------------------------------------------------------
         case STAGE_3_STRATEGY_EXEC: {
             if (!g_soko_exec_init) {
+                uint8 box_count = get_map_box_count();
+                if (box_count == 0) {
+                    current_stage = STAGE_DONE;
+                    g_soko_exec_init = 1;
+                    break;
+                }
+
                 uint8 ok = Sokoban_Solve_Stage2(g_game_map, g_player_pos,
                                                  g_box_to_target,
-                                                 g_soko_solution.total_boxes,
+                                                 box_count,
                                                  &g_soko_solution);
                 if (!ok) {
                     /* ---- 无解：需要炸弹清障 ---- */

@@ -33,6 +33,145 @@ static uint16 sb_queue[SB_STATE_COUNT];
 static uint8  sb_sub_map[MAP_ROWS][MAP_COLS];
 
 /*===========================================================================
+ *  原 algo_bfs_scout.c 实现（合并到本文件）
+ *===========================================================================*/
+
+/** 移动方向偏移：上、下、左、右 */
+static const int8 s_bfs_dx[4] = {0, 0, -1, 1};
+static const int8 s_bfs_dy[4] = {-1, 1, 0, 0};
+
+/**
+ * 定义静态大数组防止单片机栈溢出
+ * (16x12 = 192个节点，内存占用极小)
+ */
+static Point_t bfs_queue[MAP_ROWS * MAP_COLS];
+static Point_t parent_map[MAP_ROWS][MAP_COLS];
+static uint8   bfs_visited[MAP_ROWS][MAP_COLS];
+
+/** 判断坐标是否可通行（空地/目标可通过，箱子/炸弹/墙不可通过） */
+static uint8 algo_is_nav_passable(const uint8 map[MAP_ROWS][MAP_COLS], int8 y, int8 x)
+{
+    if (x < 0 || x >= MAP_COLS || y < 0 || y >= MAP_ROWS) return 0;
+    if (map[y][x] == MAP_EMPTY || map[y][x] == MAP_TARGET) return 1;
+    return 0;
+}
+
+ObservePoint_t Algo_Find_Nearest_Box_Observe_Point(const uint8 map[MAP_ROWS][MAP_COLS],
+                                                   Point_t player_pos,
+                                                   Point_t *target_box_pos)
+{
+    ObservePoint_t result = {{0, 0}, 0};
+    int16 head = 0, tail = 0;
+
+    memset(bfs_visited, 0, sizeof(bfs_visited));
+
+    /* 玩家起点入队 */
+    bfs_queue[tail++] = player_pos;
+    bfs_visited[player_pos.y][player_pos.x] = 1;
+
+    while (head < tail) {
+        Point_t current = bfs_queue[head++];
+
+        /* 1. 检查当前网格四周是否有箱子 */
+        for (int i = 0; i < 4; i++) {
+            int8 ny = current.y + s_bfs_dy[i];
+            int8 nx = current.x + s_bfs_dx[i];
+
+            if (nx >= 0 && nx < MAP_COLS && ny >= 0 && ny < MAP_ROWS) {
+                if (map[ny][nx] == MAP_BOX) {
+                    result.pos = current;
+                    result.is_valid = 1;
+                    target_box_pos->x = nx;
+                    target_box_pos->y = ny;
+                    return result;
+                }
+            }
+        }
+
+        /* 2. 没看到箱子，继续向四周可通行区域扩散 */
+        for (int i = 0; i < 4; i++) {
+            int8 ny = current.y + s_bfs_dy[i];
+            int8 nx = current.x + s_bfs_dx[i];
+
+            if (algo_is_nav_passable(map, ny, nx) && !bfs_visited[ny][nx]) {
+                bfs_visited[ny][nx] = 1;
+                bfs_queue[tail].x = nx;
+                bfs_queue[tail].y = ny;
+                tail++;
+            }
+        }
+    }
+    return result;
+}
+
+uint8 Algo_Nav_BFS(const uint8 map[MAP_ROWS][MAP_COLS],
+                   Point_t start,
+                   Point_t end,
+                   NavPath_t *result_path)
+{
+    int16 head = 0, tail = 0;
+    uint8 found = 0;
+
+    result_path->step_count = 0;
+    if (start.x == end.x && start.y == end.y) {
+        return 1;
+    }
+
+    memset(bfs_visited, 0, sizeof(bfs_visited));
+    for (int i = 0; i < MAP_ROWS; i++) {
+        for (int j = 0; j < MAP_COLS; j++) {
+            parent_map[i][j].x = -1;
+            parent_map[i][j].y = -1;
+        }
+    }
+
+    bfs_queue[tail++] = start;
+    bfs_visited[start.y][start.x] = 1;
+
+    while (head < tail) {
+        Point_t current = bfs_queue[head++];
+
+        if (current.x == end.x && current.y == end.y) {
+            found = 1;
+            break;
+        }
+
+        for (int i = 0; i < 4; i++) {
+            int8 ny = current.y + s_bfs_dy[i];
+            int8 nx = current.x + s_bfs_dx[i];
+
+            if (algo_is_nav_passable(map, ny, nx) && !bfs_visited[ny][nx]) {
+                bfs_visited[ny][nx] = 1;
+                parent_map[ny][nx] = current;
+
+                bfs_queue[tail].x = nx;
+                bfs_queue[tail].y = ny;
+                tail++;
+            }
+        }
+    }
+
+    if (found) {
+        Point_t temp_path[200];
+        uint16 step = 0;
+        Point_t curr = end;
+
+        while (curr.x != start.x || curr.y != start.y) {
+            temp_path[step++] = curr;
+            curr = parent_map[curr.y][curr.x];
+        }
+
+        result_path->step_count = step;
+        for (int i = 0; i < step; i++) {
+            result_path->path[i] = temp_path[step - 1 - i];
+        }
+        return 1;
+    }
+
+    return 0;
+}
+
+/*===========================================================================
  *  内联辅助函数
  *===========================================================================*/
 

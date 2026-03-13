@@ -21,7 +21,39 @@
  *===========================================================================*/
 
 #include "zf_common_headfile.h"
-#include "algo_bfs_scout.h"
+
+/* ======================================================================
+ *  地图基础定义（原 algo_bfs_scout.h）
+ * ====================================================================== */
+
+#define MAP_ROWS    12      // 12 行（Y 方向，对应 2.4m / 0.20m）
+#define MAP_COLS    16      // 16 列（X 方向，对应 3.2m / 0.20m）
+
+// 地图元素定义
+typedef enum {
+    MAP_EMPTY   = 0, // 空地
+    MAP_WALL    = 1, // 墙体
+    MAP_TARGET  = 2, // 目的地 (数字点，侦查阶段可直接穿过)
+    MAP_BOX     = 3, // 箱子 (图片点)
+    MAP_BOMB    = 4  // 炸弹
+} MapElement_e;
+
+typedef struct {
+    int8 x;
+    int8 y;
+} Point_t;
+
+// 观察点结构体（包含坐标和需要车头朝向的方向）
+typedef struct {
+    Point_t pos;        // 观察点的网格坐标
+    uint8   is_valid;   // 是否有效
+} ObservePoint_t;
+
+// 导航路径结果
+typedef struct {
+    Point_t path[200];  // 存放沿途经过的坐标点队列
+    uint16  step_count; // 路径总步数
+} NavPath_t;
 
 /* ======================================================================
  *  常量
@@ -67,6 +99,30 @@ typedef struct {
 /* ======================================================================
  *  API 函数
  * ====================================================================== */
+
+/**
+ * @brief 寻找距离车模最近的箱子的"侧面观察点" (使用BFS曼哈顿扩散)
+ * @param map 地图矩阵
+ * @param player_pos 车模当前坐标
+ * @param target_box_pos (输出参数) 记录最终选定的箱子坐标
+ * @return ObservePoint_t 最佳的空地观察坐标
+ */
+ObservePoint_t Algo_Find_Nearest_Box_Observe_Point(const uint8 map[MAP_ROWS][MAP_COLS],
+                                                   Point_t player_pos,
+                                                   Point_t *target_box_pos);
+
+/**
+ * @brief 点到点纯寻路算法 (不推箱，专用于侦查阶段的快速跑位)
+ * @param map 地图矩阵
+ * @param start 起点坐标
+ * @param end 终点坐标
+ * @param result_path 结构体指针，用于接收解算出的路径队列
+ * @return uint8 1: 成功找到路径, 0: 无法到达目标点
+ */
+uint8 Algo_Nav_BFS(const uint8 map[MAP_ROWS][MAP_COLS],
+                   Point_t start,
+                   Point_t end,
+                   NavPath_t *result_path);
 
 /**
  * @brief  第一阶段求解 — 任意箱→任意目标（基础模式）
