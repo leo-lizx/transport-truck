@@ -53,14 +53,14 @@ void PIT_IRQHandler(void)
     {
         pit_flag_clear(PIT_CH0);
 
-        app_control_pipeline_on_pit_5ms();
+        app_control_pipeline_on_pit_5ms();   // 5ms: IMU 姿态采样 + 航向角积分
     }
     
     if(pit_flag_get(PIT_CH1))
     {
         pit_flag_clear(PIT_CH1);
 
-        app_control_pipeline_on_pit_20ms();
+        app_control_pipeline_on_pit_20ms();  // 20ms: 编码器 + 里程计 + PID + 导航
     }
     
     if(pit_flag_get(PIT_CH2))

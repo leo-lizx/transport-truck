@@ -5,6 +5,14 @@
 #include "algo_bfs_scout.h"
 #include "chassis_pose_ctrl_call_example.h"
 
+#ifndef MAP_ROWS
+#define MAP_ROWS 12
+#endif
+
+#ifndef MAP_COLS
+#define MAP_COLS 16
+#endif
+
 // ==========================================
 // 底盘硬件调用层（已对接到 code/chassis_pose_ctrl_call_example.*）
 // 说明：
@@ -67,7 +75,9 @@ typedef enum {
     STAGE_OBSERVE_ALL,        // 2. 遍历侦查模式（若判定为二/三阶段，需看遍所有箱子）
     STAGE_1_BASIC_EXEC,       // 3. 第一阶段：基础推箱执行
     STAGE_2_CLASS_EXEC,       // 4. 第二阶段：分类推箱执行
-    STAGE_3_STRATEGY_EXEC     // 5. 第三阶段：含炸弹推箱执行
+    STAGE_3_STRATEGY_EXEC,    // 5. 第三阶段：含炸弹推箱执行
+    STAGE_3_BOMB_PUSH,        // 6. 第三阶段子状态：推炸弹到墙体
+    STAGE_DONE                // 7. 全部完成
 } GameStage_e;
 
 // 地图全局变量 (由副镜头串口解析后写入此数组)
