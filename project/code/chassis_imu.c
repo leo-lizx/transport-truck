@@ -6,7 +6,10 @@
 
 // 算法常量定义 —— 使用 chassis_config.h 中的统一宏
 #define IMU_DT              CHASSIS_TASK_DT_5MS_S   // 积分步长 5ms
-#define IMU_GYRO_DEADZONE   0.15f                   // 陀螞仪死区 (°/s)
+#define IMU_GYRO_DEADZONE   CHASSIS_IMU_GYRO_DEADZONE_DPS
+#define IMU_GYRO_LPF_ALPHA  CHASSIS_IMU_GYRO_LPF_ALPHA
+#define IMU_BIAS_ADAPT_ALPHA CHASSIS_IMU_BIAS_ADAPT_ALPHA
+#define IMU_YAW_SIGN        CHASSIS_IMU_YAW_SIGN
 
 // Mahony 滤波参数 —— 加 IMU_ 前缀避免与 PID 的 Kp/Ki 冲突
 #define IMU_MAHONY_KP   2.0f    // 比例增益
@@ -17,7 +20,7 @@ EulerAngle_t car_angle = {0};
 
 // 内部状态变量
 static float gyro_z_bias = 0.0f;    // Z轴陀螺仪静态零偏
-static float last_gyro_z = 0.0f;    // 上一次的 Z 轴角速度（用于梯形积分）
+static float yaw_rate_lpf = 0.0f;   // Yaw 角速度低通状态 (°/s)
 
 // Mahony 四元数与积分误差
 static float q0 = 1.0f, q1 = 0.0f, q2 = 0.0f, q3 = 0.0f;
@@ -53,7 +56,7 @@ void chassis_imu_init(void) {
     
     // 4. 初始化状态
     car_angle.yaw = 0.0f;
-    last_gyro_z = 0.0f;
+    yaw_rate_lpf = 0.0f;
 }
 
 //-------------------------------------------------------------------------
@@ -91,22 +94,28 @@ void chassis_imu_update_5ms(void) {
     gz = imu660rb_gyro_transition(imu660rb_gyro_z);
 
     // ==========================================================
-    // 第一部分：高精度 Yaw 角解算 (死区 + 梯形积分)
+    // 第一部分：Yaw 角积分（零偏补偿 + 死区 + 低通 + 欧拉积分）
     // ==========================================================
-    float current_gz = gz - gyro_z_bias; // 消除静态零偏
+    float current_gz = (gz - gyro_z_bias) * IMU_YAW_SIGN;
     
     // 剔除静止死区噪声
     if(fabsf(current_gz) < IMU_GYRO_DEADZONE) {
         current_gz = 0.0f;
     }
-    
-    // 梯形积分求偏航角：Yaw += (上一次角速度 + 本次角速度) * dt / 2
-    car_angle.yaw += (last_gyro_z + current_gz) * IMU_DT / 2.0f;
-    last_gyro_z = current_gz; // 更新历史值
 
-    // 限制 Yaw 在 0~360 或 -180~180 之间 (根据个人习惯，这里做 -180~180 限制)
-    if(car_angle.yaw > 180.0f)  car_angle.yaw -= 360.0f;
-    if(car_angle.yaw < -180.0f) car_angle.yaw += 360.0f;
+    // 静止时缓慢跟踪零偏，减小长期漂移
+    if(0.0f == current_gz) {
+        gyro_z_bias += IMU_BIAS_ADAPT_ALPHA * (gz - gyro_z_bias);
+    }
+
+    // 一阶低通，抑制角速度噪声
+    yaw_rate_lpf += IMU_GYRO_LPF_ALPHA * (current_gz - yaw_rate_lpf);
+    
+    // 简单欧拉积分：Yaw += 角速度 * dt
+    car_angle.yaw += yaw_rate_lpf * IMU_DT;
+
+    // 统一限制到 [-180, 180]
+    car_angle.yaw = chassis_normalize_angle_deg(car_angle.yaw);
 
 
     // ==========================================================

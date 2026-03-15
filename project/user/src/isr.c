@@ -78,26 +78,17 @@ void PIT_IRQHandler(void)
 
 void LPUART1_IRQHandler(void)
 {
-    // 判断是否是接收寄存器满中断
-    if(kLPUART_RxDataRegFullFlag & LPUART_GetStatusFlags(LPUART1))
+   if(kLPUART_RxDataRegFullFlag & LPUART_GetStatusFlags(LPUART1))
     {
-        // 1. 立即读取数据寄存器中的这个字节 (注意：调用 ReadByte 会自动清除中断标志位)
-        uint8 dat = LPUART_ReadByte(LPUART1);
-        
-        // 2. 将收到的数据送入我们的视觉解析状态机
-        // Vision_Parse_Byte(dat);  // ?等我们写好解析协议后，把这句注释打开
-        
-        /* * 注意：原有库代码中有 debug_interrupr_handler()。
-         * 既然您已经把 UART1 专门给 OpenART 视觉用了，
-         * 建议不要把 UART1 再当成 debug 打印口，所以我将下面这段注释掉了，防止冲突。
-         */
-    #if DEBUG_UART_USE_INTERRUPT                        
-        // debug_interrupr_handler();                      
-    #endif                                              
+        // 接收中断
+    #if DEBUG_UART_USE_INTERRUPT                        // 如果开启 debug 串口中断
+        debug_interrupr_handler();                      // 调用 debug 串口接收处理函数 数据会被 debug 环形缓冲区读取
+    #endif                                              // 如果修改了 DEBUG_UART_INDEX 那这段代码需要放到对应的串口中断去
     }
         
-    LPUART_ClearStatusFlags(LPUART1, kLPUART_RxOverrunFlag);    // 清除溢出标志位，不允许删除
+    LPUART_ClearStatusFlags(LPUART1, kLPUART_RxOverrunFlag);    // 不允许删除
 }
+
 
 void LPUART2_IRQHandler(void)
 {

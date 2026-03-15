@@ -64,3 +64,5 @@ project/code/plan.md
 *.ninja_deps
 *.ninja_log
 *.rt1064_build_cache
+
+.vscode
