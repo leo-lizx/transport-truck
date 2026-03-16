@@ -3,7 +3,7 @@
 
 #include "zf_common_headfile.h"
 #include "algo_sokoban_solver.h"
-#include "chassis_pose_ctrl_call_example.h"
+#include "chassis_ctrl.h"
 
 #ifndef MAP_ROWS
 #define MAP_ROWS 12
@@ -14,7 +14,7 @@
 #endif
 
 // ==========================================
-// 底盘硬件调用层（已对接到 code/chassis_pose_ctrl_call_example.*）
+// 底盘硬件调用层（直接对接 chassis_ctrl.*）
 // 说明：
 // 1. HAL_CHASSIS_MOVE_TO: 下发网格坐标目标点。
 // 2. HAL_CHASSIS_IS_ARRIVED: 查询是否已到达目标点。
@@ -35,7 +35,7 @@
  * 1) 调用一次后，配合 HAL_CHASSIS_IS_ARRIVED() 轮询到点状态。
  * 2) 若中途重复调用，会覆盖上一目标点，属于预期行为。
  */
-#define HAL_CHASSIS_MOVE_TO(x, y)      app_control_pipeline_move_to_grid((uint8)(x), (uint8)(y))
+#define HAL_CHASSIS_MOVE_TO(x, y)      chassis_ctrl_move_to_grid((uint8)(x), (uint8)(y))
 
 /*
  * 宏名称: HAL_CHASSIS_IS_ARRIVED()
@@ -50,7 +50,7 @@
  * 使用建议:
  * 1) 建议在任务调度循环中周期调用，避免在中断中做复杂状态判断。
  */
-#define HAL_CHASSIS_IS_ARRIVED()       (app_control_pipeline_is_arrived())
+#define HAL_CHASSIS_IS_ARRIVED()       (chassis_ctrl_is_arrived())
 
 /*
  * 宏名称: HAL_VISION_GET_BOX_CLASS_ID()
