@@ -17,7 +17,6 @@ static uint8  g_soko_exec_init = 0;      // 推箱执行阶段是否已初始化
 
 // 第二阶段分类映射表 (box_id → target_id, 由 OpenART 识别后填入)
 static uint8  g_box_to_target[SOKOBAN_MAX_BOXES] = {0};
-static uint8  g_observe_count = 0;  // 已观察箱子数
 
 // 第三阶段炸弹推送用变量
 static Point_t         g_bomb_pos;              // 当前选中的炸弹坐标

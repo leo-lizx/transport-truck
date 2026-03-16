@@ -36,10 +36,6 @@ static uint8  sb_sub_map[MAP_ROWS][MAP_COLS];
  *  原 algo_bfs_scout.c 实现（合并到本文件）
  *===========================================================================*/
 
-/** 移动方向偏移：上、下、左、右 */
-static const int8 s_bfs_dx[4] = {0, 0, -1, 1};
-static const int8 s_bfs_dy[4] = {-1, 1, 0, 0};
-
 /**
  * 定义静态大数组防止单片机栈溢出
  * (16x12 = 192个节点，内存占用极小)
@@ -74,8 +70,8 @@ ObservePoint_t Algo_Find_Nearest_Box_Observe_Point(const uint8 map[MAP_ROWS][MAP
 
         /* 1. 检查当前网格四周是否有箱子 */
         for (int i = 0; i < 4; i++) {
-            int8 ny = current.y + s_bfs_dy[i];
-            int8 nx = current.x + s_bfs_dx[i];
+            int8 ny = current.y + s_dr[i];
+            int8 nx = current.x + s_dc[i];
 
             if (nx >= 0 && nx < MAP_COLS && ny >= 0 && ny < MAP_ROWS) {
                 if (map[ny][nx] == MAP_BOX) {
@@ -90,8 +86,8 @@ ObservePoint_t Algo_Find_Nearest_Box_Observe_Point(const uint8 map[MAP_ROWS][MAP
 
         /* 2. 没看到箱子，继续向四周可通行区域扩散 */
         for (int i = 0; i < 4; i++) {
-            int8 ny = current.y + s_bfs_dy[i];
-            int8 nx = current.x + s_bfs_dx[i];
+            int8 ny = current.y + s_dr[i];
+            int8 nx = current.x + s_dc[i];
 
             if (algo_is_nav_passable(map, ny, nx) && !bfs_visited[ny][nx]) {
                 bfs_visited[ny][nx] = 1;
@@ -137,8 +133,8 @@ uint8 Algo_Nav_BFS(const uint8 map[MAP_ROWS][MAP_COLS],
         }
 
         for (int i = 0; i < 4; i++) {
-            int8 ny = current.y + s_bfs_dy[i];
-            int8 nx = current.x + s_bfs_dx[i];
+            int8 ny = current.y + s_dr[i];
+            int8 nx = current.x + s_dc[i];
 
             if (algo_is_nav_passable(map, ny, nx) && !bfs_visited[ny][nx]) {
                 bfs_visited[ny][nx] = 1;

@@ -37,6 +37,7 @@
 #include "zf_common_debug.h"
 #include "isr.h"
 #include "chassis_pose_ctrl_call_example.h"
+#include "chassis_menu.h"
 
 
 
@@ -66,6 +67,9 @@ void PIT_IRQHandler(void)
     if(pit_flag_get(PIT_CH2))
     {
         pit_flag_clear(PIT_CH2);
+
+        chassis_menu_task_10ms();
+        chassis_menu_render_100ms();
     }
     
     if(pit_flag_get(PIT_CH3))

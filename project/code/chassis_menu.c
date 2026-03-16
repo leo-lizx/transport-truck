@@ -1,8 +1,22 @@
 #include "chassis_menu.h"
 
 #include "chassis_ctrl.h"
+#include "chassis_imu.h"
 #include "zf_common_headfile.h"
 #include "zf_driver_flash.h"
+
+/*===========================================================================
+ * [chassis_menu.c] 底盘参数菜单（两级）
+ *
+ * 作用：
+ * 1) 提供 LIMIT/NAV/PID 三组参数的在线调参与显示。
+ * 2) 支持一级/二级菜单切换与参数实时下发。
+ * 3) 支持参数掉电保存与上电加载（Flash 校验）。
+ *
+ * 调度约定：
+ * - chassis_menu_task_10ms() 按 10ms 节拍调用。
+ * - chassis_menu_render_100ms() 与 10ms 调度配合，内部按计数约 100ms 刷新。
+ *===========================================================================*/
 
 /*
  * 二级菜单说明：
@@ -75,6 +89,9 @@ static uint8 s_need_redraw = 1U;
 static uint8 s_render_ticks = 0U;
 static char s_status_text[24] = "STATUS: READY";
 static uint8 s_flash_ready = 0U;
+static uint8 s_full_refresh_done = 0U;
+
+static const char s_clear_line_40[] = "                                        ";
 
 static const menu_param_meta_t s_param_meta[MENU_PARAM_COUNT] =
 {
@@ -102,21 +119,39 @@ static const menu_page_meta_t s_pages[] =
 
 #define MENU_PAGE_COUNT ((uint8)(sizeof(s_pages) / sizeof(s_pages[0])))
 
-/* 根据参数ID返回当前参数指针，便于统一读写与显示。 */
-static float *menu_get_param_ptr(menu_param_id_enum id)
+/* 根据参数ID读取当前参数值。 */
+static float menu_get_param_value(menu_param_id_enum id)
 {
     switch (id)
     {
-        case MENU_PARAM_WHEEL_KP: return &s_menu_params.wheel_pid_kp;
-        case MENU_PARAM_WHEEL_KI: return &s_menu_params.wheel_pid_ki;
-        case MENU_PARAM_WHEEL_KD: return &s_menu_params.wheel_pid_kd;
-        case MENU_PARAM_POS_KP:   return &s_menu_params.pos_kp;
-        case MENU_PARAM_YAW_KP:   return &s_menu_params.yaw_kp;
-        case MENU_PARAM_MAX_V:    return &s_menu_params.max_linear_speed_mps;
-        case MENU_PARAM_MAX_W:    return &s_menu_params.max_yaw_speed_dps;
-        case MENU_PARAM_ACC_V:    return &s_menu_params.cmd_accel_limit_mps2;
-        case MENU_PARAM_ACC_W:    return &s_menu_params.cmd_accel_limit_dps2;
-        default:                  return &s_menu_params.wheel_pid_kp;
+        case MENU_PARAM_WHEEL_KP: return s_menu_params.wheel_pid_kp;
+        case MENU_PARAM_WHEEL_KI: return s_menu_params.wheel_pid_ki;
+        case MENU_PARAM_WHEEL_KD: return s_menu_params.wheel_pid_kd;
+        case MENU_PARAM_POS_KP:   return s_menu_params.pos_kp;
+        case MENU_PARAM_YAW_KP:   return s_menu_params.yaw_kp;
+        case MENU_PARAM_MAX_V:    return s_menu_params.max_linear_speed_mps;
+        case MENU_PARAM_MAX_W:    return s_menu_params.max_yaw_speed_dps;
+        case MENU_PARAM_ACC_V:    return s_menu_params.cmd_accel_limit_mps2;
+        case MENU_PARAM_ACC_W:    return s_menu_params.cmd_accel_limit_dps2;
+        default:                  return s_menu_params.wheel_pid_kp;
+    }
+}
+
+/* 根据参数ID写入当前参数值。 */
+static void menu_set_param_value(menu_param_id_enum id, float value)
+{
+    switch (id)
+    {
+        case MENU_PARAM_WHEEL_KP: s_menu_params.wheel_pid_kp = value; break;
+        case MENU_PARAM_WHEEL_KI: s_menu_params.wheel_pid_ki = value; break;
+        case MENU_PARAM_WHEEL_KD: s_menu_params.wheel_pid_kd = value; break;
+        case MENU_PARAM_POS_KP:   s_menu_params.pos_kp = value; break;
+        case MENU_PARAM_YAW_KP:   s_menu_params.yaw_kp = value; break;
+        case MENU_PARAM_MAX_V:    s_menu_params.max_linear_speed_mps = value; break;
+        case MENU_PARAM_MAX_W:    s_menu_params.max_yaw_speed_dps = value; break;
+        case MENU_PARAM_ACC_V:    s_menu_params.cmd_accel_limit_mps2 = value; break;
+        case MENU_PARAM_ACC_W:    s_menu_params.cmd_accel_limit_dps2 = value; break;
+        default: break;
     }
 }
 
@@ -234,10 +269,11 @@ static menu_param_id_enum menu_get_current_param_id(void)
 static void menu_apply_current_param_delta(float delta)
 {
     menu_param_id_enum id = menu_get_current_param_id();
-    float *value_ptr = menu_get_param_ptr(id);
     const menu_param_meta_t *meta = &s_param_meta[id];
+    float value = menu_get_param_value(id);
 
-    *value_ptr = chassis_clamp_f(*value_ptr + delta, meta->min_val, meta->max_val);
+    value = chassis_clamp_f(value + delta, meta->min_val, meta->max_val);
+    menu_set_param_value(id, value);
     chassis_ctrl_set_tune_params(&s_menu_params);
     s_need_redraw = 1U;
 }
@@ -387,7 +423,7 @@ static void menu_draw_param_list(void)
         ips200_set_color((i == s_param_index) ? RGB565_YELLOW : RGB565_WHITE, RGB565_BLACK);
         ips200_show_string(0, y, (i == s_param_index) ? ">" : " ");
         ips200_show_string(12, y, meta->name);
-        ips200_show_float(200, y, *menu_get_param_ptr(id), 6, meta->decimal);
+        ips200_show_float(200, y, menu_get_param_value(id), 6, meta->decimal);
     }
 }
 
@@ -395,18 +431,33 @@ static void menu_draw_param_list(void)
 static void menu_draw_pose(void)
 {
     chassis_pose_t pose = chassis_ctrl_get_pose();
+    float imu_yaw_deg = chassis_imu_get_yaw_deg();
+
+    /* 先按行清屏，避免数字位数变化时残影。 */
+    ips200_set_color(RGB565_WHITE, RGB565_BLACK);
+    ips200_show_string(0, 206, s_clear_line_40);
+    ips200_show_string(0, 224, s_clear_line_40);
 
     ips200_set_color(RGB565_GREEN, RGB565_BLACK);
-    ips200_show_string(0, 188, "Pose X / Y / Yaw");
+    ips200_show_string(0, 188, "Pose X / Y / IMU Yaw");
 
     ips200_set_color(RGB565_WHITE, RGB565_BLACK);
     ips200_show_float(0,   206, pose.x_m, 4, 2U);
     ips200_show_float(100, 206, pose.y_m, 4, 2U);
-    ips200_show_float(200, 206, pose.yaw_deg, 5, 1U);
+    ips200_show_float(200, 206, imu_yaw_deg, 5, 1U);
 
     ips200_set_color(RGB565_CYAN, RGB565_BLACK);
     ips200_show_string(0, 224, s_status_text);
 }
+
+//-------------------------------------------------------------------------
+// 函数简介：菜单模块初始化
+// 参数说明：无
+// 返回参数：无
+// 使用示例：系统启动后调用一次
+//          chassis_menu_init();
+// 备注信息：会尝试从 Flash 加载参数，校验失败则回退默认参数
+//-------------------------------------------------------------------------
 
 void chassis_menu_init(void)
 {
@@ -418,7 +469,17 @@ void chassis_menu_init(void)
     s_param_index = 0U;
     s_need_redraw = 1U;
     s_render_ticks = 0U;
+    s_full_refresh_done = 0U;
 }
+
+//-------------------------------------------------------------------------
+// 函数简介：菜单 10ms 周期任务
+// 参数说明：无
+// 返回参数：无
+// 使用示例：主循环以 10ms 节拍调用
+//          chassis_menu_task_10ms();
+// 备注信息：负责按键扫描、菜单状态切换与参数修改处理
+//-------------------------------------------------------------------------
 
 void chassis_menu_task_10ms(void)
 {
@@ -436,6 +497,15 @@ void chassis_menu_task_10ms(void)
     menu_clear_long_press_flags();
 }
 
+//-------------------------------------------------------------------------
+// 函数简介：菜单渲染任务（约 100ms 刷新）
+// 参数说明：无
+// 返回参数：无
+// 使用示例：与 10ms 调度配合调用
+//          chassis_menu_render_100ms();
+// 备注信息：无参数变化时会降频刷新，减少屏幕闪烁
+//-------------------------------------------------------------------------
+
 void chassis_menu_render_100ms(void)
 {
     s_render_ticks++;
@@ -445,19 +515,24 @@ void chassis_menu_render_100ms(void)
     }
 
     s_render_ticks = 0U;
-    s_need_redraw = 0U;
-
-    ips200_full(RGB565_BLACK);
-    menu_draw_header();
-
-    if (MENU_LEVEL_ROOT == s_menu_level)
+    if ((0U == s_full_refresh_done) || (0U != s_need_redraw))
     {
-        menu_draw_root_list();
-    }
-    else
-    {
-        menu_draw_param_list();
+        s_need_redraw = 0U;
+        s_full_refresh_done = 1U;
+
+        ips200_full(RGB565_BLACK);
+        menu_draw_header();
+
+        if (MENU_LEVEL_ROOT == s_menu_level)
+        {
+            menu_draw_root_list();
+        }
+        else
+        {
+            menu_draw_param_list();
+        }
     }
 
+    /* 常态仅更新位姿区，避免整屏反复刷导致闪烁。 */
     menu_draw_pose();
 }

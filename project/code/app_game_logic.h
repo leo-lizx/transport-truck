@@ -2,7 +2,7 @@
 #define _APP_GAME_LOGIC_H_
 
 #include "zf_common_headfile.h"
-#include "algo_bfs_scout.h"
+#include "algo_sokoban_solver.h"
 #include "chassis_pose_ctrl_call_example.h"
 
 #ifndef MAP_ROWS

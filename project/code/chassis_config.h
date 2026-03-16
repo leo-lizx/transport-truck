@@ -111,7 +111,7 @@
  * Yaw 角速度一阶低通系数，范围 (0, 1]。
  * 越小越平滑，响应也更慢。
  */
-#define CHASSIS_IMU_GYRO_LPF_ALPHA       (0.4f)
+#define CHASSIS_IMU_GYRO_LPF_ALPHA       (0.25f)
 
 /**
  * 静止时在线零偏修正系数，范围 (0, 1]。
