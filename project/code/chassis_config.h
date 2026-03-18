@@ -217,6 +217,54 @@
  *    ENCODER4_SIGN = +1 (左前轮 LF)
  * ====================================================================== */
 
+/* ==================== 四轮编码器-电机-引脚对应表（实车标定版） ====================
+ * 平台：RT1064 学习主板（四轮差速/麦轮底盘）
+ * 标定方法：手动拨轮 + 串口读取 ENCODER1~4 最大响应通道
+ * 车头方向约定：以当前整车安装方向为准（本表按实测结果确认）
+ *
+ * 一、编码器接口定义（主板引脚）
+ * ENCODER_1 = QTIMER1_ENCODER1, A:C0  B:C1
+ * ENCODER_2 = QTIMER1_ENCODER2, A:C2  B:C24
+ * ENCODER_3 = QTIMER2_ENCODER1, A:C3  B:C4
+ * ENCODER_4 = QTIMER2_ENCODER2, A:C5  B:C25
+ *
+ * 二、轮子与编码器对应关系（实测）
+ * 左前轮 -> ENCODER_4
+ * 右前轮 -> ENCODER_3
+ * 左后轮 -> ENCODER_1
+ * 右后轮 -> ENCODER_2
+ *
+ * 三、编码器反查轮子（用于里程计/运动学）
+ * ENCODER_1 -> 左后轮
+ * ENCODER_2 -> 右后轮
+ * ENCODER_3 -> 右前轮
+ * ENCODER_4 -> 左前轮
+ *
+ * 四、电机驱动引脚（当前工程）
+ * MOTOR1: DIR=C9,  PWM=C8   -> 右前轮 RF
+ * MOTOR2: DIR=C7,  PWM=C6   -> 右后轮 RB
+ * MOTOR3: DIR=D2,  PWM=D3   -> 左后轮 LB
+ * MOTOR4: DIR=C10, PWM=C11  -> 左前轮 LF
+ *
+ * 五、使用注意
+ * 1) 本对应关系仅对当前机械安装、线序、轮位有效。
+ * 2) 若更换电机、编码器线序、减速箱或轮子安装位置，必须重新标定。
+ * 3) 建议在速度环、里程计、底盘运动学中统一使用本表，避免前后/左右混用。
+ * ================================================================================
+ */
+
+/** 编码器统一方向修正系数（前进为正） */
+#define CHASSIS_ENCODER1_SIGN          (1.0f)   /**< ENCODER1 -> 左后轮 LB */
+#define CHASSIS_ENCODER2_SIGN          (-1.0f)  /**< ENCODER2 -> 右后轮 RB */
+#define CHASSIS_ENCODER3_SIGN          (-1.0f)  /**< ENCODER3 -> 右前轮 RF */
+#define CHASSIS_ENCODER4_SIGN          (1.0f)   /**< ENCODER4 -> 左前轮 LF */
+
+/** 轮子到编码器符号映射（便于四轮统一引用） */
+#define CHASSIS_LF_ENC_SIGN            CHASSIS_ENCODER4_SIGN
+#define CHASSIS_RF_ENC_SIGN            CHASSIS_ENCODER3_SIGN
+#define CHASSIS_LB_ENC_SIGN            CHASSIS_ENCODER1_SIGN
+#define CHASSIS_RB_ENC_SIGN            CHASSIS_ENCODER2_SIGN
+
 /* ---------- 左前轮 (LF) ---------- */
 #define CHASSIS_LF_PWM_CHANNEL      PWM2_MODULE2_CHB_C11        /**< PWM 输出: C11 引脚 */
 #define CHASSIS_LF_DIR_PIN          C10                          /**< 方向控制: C10 引脚 */
