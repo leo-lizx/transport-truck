@@ -107,8 +107,8 @@ static chassis_tune_params_t ctrl_sanitize_tune_params(chassis_tune_params_t in)
     in.wheel_pid_kd          = chassis_clamp_f(in.wheel_pid_kd,          0.0f, 40.0f);
     in.pos_kp                = chassis_clamp_f(in.pos_kp,                0.0f, 5.0f);
     in.yaw_kp                = chassis_clamp_f(in.yaw_kp,                0.0f, 10.0f);
-    in.max_linear_speed_mps  = chassis_clamp_f(in.max_linear_speed_mps,  0.05f, 1.50f);
-    in.max_yaw_speed_dps     = chassis_clamp_f(in.max_yaw_speed_dps,     10.0f, 360.0f);
+    in.max_linear_speed_mps  = chassis_clamp_f(in.max_linear_speed_mps,  0.05f, CHASSIS_TUNE_MAX_LINEAR_SPEED_LIMIT_MPS);
+    in.max_yaw_speed_dps     = chassis_clamp_f(in.max_yaw_speed_dps,     10.0f, CHASSIS_TUNE_MAX_YAW_SPEED_LIMIT_DPS);
     in.cmd_accel_limit_mps2  = chassis_clamp_f(in.cmd_accel_limit_mps2,  0.10f, 5.00f);
     in.cmd_accel_limit_dps2  = chassis_clamp_f(in.cmd_accel_limit_dps2, 20.0f, 1000.0f);
     return in;
@@ -248,6 +248,9 @@ static void ctrl_apply_body_speed(chassis_body_speed_cmd_t cmd)
 void chassis_ctrl_init(void)
 {
     uint8 i;
+
+    /* 上电时先应用一次安全限幅，防止默认参数过大。 */
+    s_tune_params = ctrl_sanitize_tune_params(s_tune_params);
 
     /* 初始化 IMU（若失败，5ms 任务会自动跳过 IMU 读取） */
     chassis_imu_init();

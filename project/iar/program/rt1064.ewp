@@ -1132,12 +1132,6 @@
     <group>
         <name>code</name>
         <file>
-            <name>$PROJ_DIR$\..\..\code\algo_bfs_scout.c</name>
-        </file>
-        <file>
-            <name>$PROJ_DIR$\..\..\code\algo_bfs_scout.h</name>
-        </file>
-        <file>
             <name>$PROJ_DIR$\..\..\code\algo_sokoban_solver.c</name>
         </file>
         <file>
@@ -1187,15 +1181,6 @@
         </file>
         <file>
             <name>$PROJ_DIR$\..\..\code\chassis_pid.h</name>
-        </file>
-        <file>
-            <name>$PROJ_DIR$\..\..\code\chassis_pose_ctrl.h</name>
-        </file>
-        <file>
-            <name>$PROJ_DIR$\..\..\code\chassis_pose_ctrl_call_example.c</name>
-        </file>
-        <file>
-            <name>$PROJ_DIR$\..\..\code\chassis_pose_ctrl_call_example.h</name>
         </file>
         <file>
             <name>$PROJ_DIR$\..\..\code\chassis_menu.c</name>
