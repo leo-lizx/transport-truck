@@ -16,7 +16,7 @@
 #define IMU_MAHONY_KI   0.005f  // 积分增益
 
 // 姿态输出
-EulerAngle_t car_angle = {0};
+volatile EulerAngle_t car_angle = {0};
 
 // 内部状态变量
 static float gyro_z_bias = 0.0f;    // Z轴陀螺仪静态零偏
@@ -63,7 +63,7 @@ void chassis_imu_init(void) {
 // 函数简介：设置/校准 Yaw 角（度）
 //-------------------------------------------------------------------------
 void chassis_imu_set_yaw_deg(float yaw_deg) {
-    car_angle.yaw = yaw_deg;
+    car_angle.yaw = chassis_normalize_angle_deg(yaw_deg);
 }
 
 float chassis_imu_get_yaw_deg(void) {

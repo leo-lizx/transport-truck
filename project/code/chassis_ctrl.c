@@ -20,6 +20,8 @@
 
 #include <math.h>
 
+#define CHASSIS_YAW_HOLD_DEADZONE_DEG   (0.30f)
+
 /* ======================================================================
  *  四轮硬件实例（按 LF / RF / LB / RB 顺序排列）
  *
@@ -376,9 +378,19 @@ void chassis_ctrl_task_20ms(void)
     {
         /* ---- 航向保持模式：原地转向，不平移 ---- */
         float yaw_err = chassis_normalize_angle_deg(s_target_yaw_deg - s_pose.yaw_deg);
-        float wz_cmd = chassis_clamp_f(s_tune_params.yaw_kp * yaw_err,
-                           -s_tune_params.max_yaw_speed_dps,
-                        s_tune_params.max_yaw_speed_dps);
+        float wz_cmd;
+
+        /* 在零点附近增加小死区，避免静止时高频抖动。 */
+        if (fabsf(yaw_err) <= CHASSIS_YAW_HOLD_DEADZONE_DEG)
+        {
+            wz_cmd = 0.0f;
+        }
+        else
+        {
+            wz_cmd = chassis_clamp_f(s_tune_params.yaw_kp * yaw_err,
+                                     -s_tune_params.max_yaw_speed_dps,
+                                      s_tune_params.max_yaw_speed_dps);
+        }
 
         ctrl_apply_body_speed((chassis_body_speed_cmd_t){ 0.0f, 0.0f, wz_cmd });
     }
@@ -402,6 +414,47 @@ void chassis_ctrl_hold_yaw(float target_yaw_deg)
 {
     s_target_yaw_deg = chassis_normalize_angle_deg(target_yaw_deg);
     s_move_mode_enabled = 0U;
+    s_arrived_flag = 1U;
+}
+
+void chassis_ctrl_attitude_debug_start_zero(void)
+{
+    /* 清理历史速度与 PID 状态，避免从运动态切换到锁角时出现残余冲击。 */
+    ctrl_force_stop();
+    chassis_ctrl_hold_yaw(0.0f);
+}
+
+void chassis_ctrl_attitude_debug_get_state(chassis_attitude_debug_info_t *out_info)
+{
+    if (0 == out_info)
+    {
+        return;
+    }
+
+    out_info->target_yaw_deg  = s_target_yaw_deg;
+    out_info->current_yaw_deg = s_pose.yaw_deg;
+    out_info->yaw_err_deg     = chassis_normalize_angle_deg(s_target_yaw_deg - s_pose.yaw_deg);
+    out_info->wz_cmd_dps      = s_last_cmd.wz_dps;
+}
+
+void chassis_ctrl_attitude_debug_task_5ms(void)
+{
+    static uint8 s_print_div = 0U;
+    chassis_attitude_debug_info_t info;
+
+    s_print_div++;
+    if (s_print_div < 20U)
+    {
+        return;
+    }
+    s_print_div = 0U;
+
+    chassis_ctrl_attitude_debug_get_state(&info);
+    printf("[YawHold] target=%.2f yaw=%.2f err=%.2f wz_cmd=%.2f\r\n",
+           info.target_yaw_deg,
+           info.current_yaw_deg,
+           info.yaw_err_deg,
+           info.wz_cmd_dps);
 }
 
 uint8 chassis_ctrl_is_arrived(void)

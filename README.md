@@ -77,10 +77,10 @@ int main(void)
 
 ### 1.1 姿态闭环调试（仅保留底盘 + 菜单，不跑游戏逻辑）
 
-调试 IMU 航向角保持和轮速 PID 时，可以把主循环改为只跑菜单，不调用 `Game_Logic_Task_Run()`，然后用 `move_to_grid` 手动下发目标点：
+当前工程已提供专用接口，将姿态闭环调试逻辑从 `main` 中卸载到 `chassis_ctrl`，可直接锁定 **0 度航向闭环**：
 
 ```c
-#include "chassis_pose_ctrl_call_example.h"
+#include "chassis_ctrl.h"
 #include "chassis_menu.h"
 
 int main(void)
@@ -96,47 +96,42 @@ int main(void)
     key_init(10);
 
     // 底盘 + 菜单
-    app_control_pipeline_init();
+    chassis_ctrl_init();
     chassis_menu_init();
 
     pit_ms_init(PIT_CH0, 5);
     pit_ms_init(PIT_CH1, 20);
+    pit_ms_init(PIT_CH2, 10);
 
-    // ★ 调试: 下发一个固定目标网格点 (3, 5)，观察车模是否走直线到达
-    app_control_pipeline_move_to_grid(3, 5);
+    // ★ 姿态闭环调试入口：固定 0 度
+    chassis_ctrl_set_pose(0.0f, 0.0f, 0.0f);
+    chassis_ctrl_attitude_debug_start_zero();
 
     while (1) {
-        chassis_menu_task_10ms();        // 按键调参保持可用
-        chassis_menu_render_100ms();     // 屏幕实时显示位姿
+        // 100ms 自动打印一次: target/yaw/error/wz_cmd
+        chassis_ctrl_attitude_debug_task_5ms();
+        system_delay_ms(5);
     }
 }
 ```
 
 调试要点：
 
-- **航向角保持**：下发目标后观察屏幕 `Yaw` 值，车模应沿直线行进而非画弧，若偏航说明 `Yaw Kp` 需要调大或 IMU 零偏未收敛（启动时确保车模静止 2 秒）。
-- **定点精度**：到达后观察 `Pose X / Y` 与目标网格坐标 × 0.20m 的偏差，若偏差 > 2cm 可调 `Pos Kp`。
-- **轮速 PID**：在菜单 PID 页面调节 `Wheel Kp/Ki/Kd`，改完即时生效，长按 K4 保存到 Flash。
-- **多点移动测试**：到达后再手动改目标点，或写一个简单的序列：
+- **第一步先看 0 度锁定是否成立**：串口打印中 `err` 应快速收敛到 0 附近，`wz_cmd` 在稳态应接近 0。
+- **若出现零点附近来回抖动**：工程已在航向保持中加入小死区（0.30°），优先确认车体静止时误差是否进入死区。
+- **若偏航持续单边漂移**：检查上电静止标定环境，必要时调小 `CHASSIS_IMU_GYRO_DEADZONE_DPS` 或调大 `CHASSIS_IMU_BIAS_ADAPT_ALPHA`。
+- **若响应太慢/太肉**：适当增大 `Yaw Kp`；若过冲明显则回调 `Yaw Kp` 并检查机械摩擦与电机方向符号。
+- **若闭环时偶发抖动**：可临时关闭 `PIT_CH2` 菜单刷新中断，仅保留 5ms/20ms 控制任务进行纯姿态调试。
+- **并发安全建议**：调试读取优先使用 `chassis_ctrl_attitude_debug_get_state()` 或 `chassis_imu_get_yaw_deg()`，避免业务层直接写 `car_angle`。
+
+常见排查顺序（推荐按此执行）：
 
 ```c
-    // 多点移动调试示例
-    app_control_pipeline_move_to_grid(3, 0);  // 先走到 (3,0)
-    while (!app_control_pipeline_is_arrived()) {
-        chassis_menu_task_10ms();
-        chassis_menu_render_100ms();
-    }
-    app_control_pipeline_move_to_grid(3, 5);  // 再走到 (3,5)
-    while (!app_control_pipeline_is_arrived()) {
-        chassis_menu_task_10ms();
-        chassis_menu_render_100ms();
-    }
-    // 到达后停车，可在此加断点观察最终位姿
-    chassis_ctrl_stop();
-    while (1) {
-        chassis_menu_task_10ms();
-        chassis_menu_render_100ms();
-    }
+1) 上电后静止 1~2 秒，等待 IMU 零偏稳定
+2) 进入 0 度锁定（chassis_ctrl_attitude_debug_start_zero）
+3) 观察 10 秒打印日志：err 均值、峰值、是否持续单边
+4) 调 Yaw Kp，让收敛速度和超调折中
+5) 再启用业务逻辑（Game_Logic_Task_Run）做联调
 ```
 
 ### 1.2 里程计与视觉校正调试

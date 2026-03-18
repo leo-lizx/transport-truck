@@ -53,6 +53,15 @@ typedef struct
     float wz_dps;        /**< 转向角速度（°/s），逆时针为正 */
 } chassis_body_speed_cmd_t;
 
+/** 姿态闭环调试信息（用于 0 度航向保持调试打印） */
+typedef struct
+{
+    float target_yaw_deg;   /**< 目标航向角（度） */
+    float current_yaw_deg;  /**< 当前航向角（度） */
+    float yaw_err_deg;      /**< 航向误差（度） */
+    float wz_cmd_dps;       /**< 当前角速度指令（°/s） */
+} chassis_attitude_debug_info_t;
+
 /** 运行时可调参数（用于按键菜单在线调参） */
 typedef struct
 {
@@ -105,6 +114,24 @@ void chassis_ctrl_move_to_grid(uint8 target_x_grid, uint8 target_y_grid);
  * @param  target_yaw_deg  目标航向角（度）
  */
 void chassis_ctrl_hold_yaw(float target_yaw_deg);
+
+/**
+ * @brief  进入姿态调试模式：固定 0 度航向保持，停止平移
+ *         推荐在 main 初始化完成后调用一次。
+ */
+void chassis_ctrl_attitude_debug_start_zero(void);
+
+/**
+ * @brief  读取姿态闭环调试信息（线程安全的结构体拷贝）
+ * @param  out_info  输出信息结构体指针，传空则忽略
+ */
+void chassis_ctrl_attitude_debug_get_state(chassis_attitude_debug_info_t *out_info);
+
+/**
+ * @brief  姿态闭环调试任务（建议主循环每 5ms 调用一次）
+ *         内部 100ms 打印一次目标角/当前角/误差/角速度指令。
+ */
+void chassis_ctrl_attitude_debug_task_5ms(void);
 
 /**
  * @brief  查询是否已到达目标点

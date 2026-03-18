@@ -34,7 +34,7 @@
 ********************************************************************************************************************/
 
 #include "zf_common_headfile.h"
-#include "chassis_imu.h"
+#include "chassis_ctrl.h"
 #include "chassis_menu.h"
 #include "app_game_logic.h"
 
@@ -83,8 +83,6 @@
  *    PIT_CH1  20ms → chassis_ctrl_task_20ms()  底盘闭环控制
  *    UART_1         → OpenART 串口帧解析, 更新 g_game_map
  *==========================================================================*/
-extern EulerAngle_t car_angle;
-
 int main(void)
 {
     clock_init(SYSTEM_CLOCK_600M);  // 不可删除
@@ -116,7 +114,9 @@ int main(void)
 
     // 姿态与位置清零，保持里程计与 IMU 航向基准一致。
     chassis_ctrl_set_pose(0.0f, 0.0f, 0.0f);
-    chassis_imu_set_yaw_deg(0.0f);
+
+    // 进入姿态闭环调试模式：固定 0 度航向保持。
+    chassis_ctrl_attitude_debug_start_zero();
 
     // ------------------------------------------------------------------
     // 4. PIT 定时中断初始化
@@ -135,7 +135,8 @@ int main(void)
 
     while (1)
     {
-        printf("Current Yaw: %.2f \n", car_angle.yaw);  // 实时打印当前航向角
+        // 姿态闭环调试任务：100ms 打印一次目标角/当前角/误差/角速度指令。
+        chassis_ctrl_attitude_debug_task_5ms();
         // Game_Logic_Task_Run();                         // 运行推箱子游戏状态机 (非阻塞)
         system_delay_ms(5);                               // 主循环节拍
     }

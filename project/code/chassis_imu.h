@@ -11,7 +11,7 @@ typedef struct {
 } EulerAngle_t;
 
 // 外部引用的姿态角变量
-extern EulerAngle_t car_angle;
+extern volatile EulerAngle_t car_angle;
 
 /* 底盘稳定调用接口（统一命名） */
 void chassis_imu_init(void);
