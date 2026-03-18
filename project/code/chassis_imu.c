@@ -23,15 +23,15 @@ static float gyro_z_bias = 0.0f;    // Z轴陀螺仪静态零偏
 static float yaw_rate_lpf = 0.0f;   // Yaw 角速度低通状态 (°/s)
 
 // Mahony 四元数与积分误差
-static float q0 = 1.0f, q1 = 0.0f, q2 = 0.0f, q3 = 0.0f;
-static float exInt = 0.0f, eyInt = 0.0f, ezInt = 0.0f;
+// static float q0 = 1.0f, q1 = 0.0f, q2 = 0.0f, q3 = 0.0f;
+// static float exInt = 0.0f, eyInt = 0.0f, ezInt = 0.0f;
 
 //-------------------------------------------------------------------------
 // 函数简介：平方根倒数 (RT1064 自带硬件 FPU，直接使用标准库)
 //-------------------------------------------------------------------------
-static float invSqrt(float x) {
-    return 1.0f / sqrtf(x);
-}
+// static float invSqrt(float x) {
+//     return 1.0f / sqrtf(x);
+// }
 
 //-------------------------------------------------------------------------
 // 函数简介：IMU 初始化（包含静态零偏采集）
@@ -75,22 +75,23 @@ float chassis_imu_get_yaw_deg(void) {
 // 备注：必须放在严谨的 5ms 定时器中断中执行！
 //-------------------------------------------------------------------------
 void chassis_imu_update_5ms(void) {
-    float ax, ay, az;
-    float gx, gy, gz;
-    float norm;
-    float vx, vy, vz;
-    float ex, ey, ez;
+    // float ax, ay, az;
+    // float gx, gy, gz;
+    float gz;
+    // float norm;
+    // float vx, vy, vz;
+    // float ex, ey, ez;
 
     // 1. 获取底层原始数据并转换为物理单位
     imu660rb_get_acc();
     imu660rb_get_gyro();
     
-    ax = imu660rb_acc_transition(imu660rb_acc_x); // 单位: g
-    ay = imu660rb_acc_transition(imu660rb_acc_y);
-    az = imu660rb_acc_transition(imu660rb_acc_z);
+    // ax = imu660rb_acc_transition(imu660rb_acc_x); // 单位: g
+    // ay = imu660rb_acc_transition(imu660rb_acc_y);
+    // az = imu660rb_acc_transition(imu660rb_acc_z);
     
-    gx = imu660rb_gyro_transition(imu660rb_gyro_x); // 单位: °/s
-    gy = imu660rb_gyro_transition(imu660rb_gyro_y);
+    // gx = imu660rb_gyro_transition(imu660rb_gyro_x); // 单位: °/s
+    // gy = imu660rb_gyro_transition(imu660rb_gyro_y);
     gz = imu660rb_gyro_transition(imu660rb_gyro_z);
 
     // ==========================================================
@@ -122,54 +123,54 @@ void chassis_imu_update_5ms(void) {
     // 第二部分：Mahony 算法解算 Pitch 和 Roll (加速度计与陀螺仪融合)
     // ==========================================================
     // 将陀螺仪数据转换为 弧度/秒，供四元数运算使用
-    gx = gx * CHASSIS_DEG_TO_RAD_F;
-    gy = gy * CHASSIS_DEG_TO_RAD_F;
-    gz = gz * CHASSIS_DEG_TO_RAD_F;
+    // gx = gx * CHASSIS_DEG_TO_RAD_F;
+    // gy = gy * CHASSIS_DEG_TO_RAD_F;
+    // gz = gz * CHASSIS_DEG_TO_RAD_F;
 
-    // 只在加速度计数据有效时进行修正
-    if(!((ax == 0.0f) && (ay == 0.0f) && (az == 0.0f))) {
-        // 归一化加速度计数据
-        norm = invSqrt(ax * ax + ay * ay + az * az);
-        ax *= norm;
-        ay *= norm;
-        az *= norm;
+    // // 只在加速度计数据有效时进行修正
+    // if(!((ax == 0.0f) && (ay == 0.0f) && (az == 0.0f))) {
+    //     // 归一化加速度计数据
+    //     norm = invSqrt(ax * ax + ay * ay + az * az);
+    //     ax *= norm;
+    //     ay *= norm;
+    //     az *= norm;
 
-        // 根据四元数计算出的当前重力在三个轴上的估计投影
-        vx = 2.0f * (q1 * q3 - q0 * q2);
-        vy = 2.0f * (q0 * q1 + q2 * q3);
-        vz = q0 * q0 - q1 * q1 - q2 * q2 + q3 * q3;
+    //     // 根据四元数计算出的当前重力在三个轴上的估计投影
+    //     vx = 2.0f * (q1 * q3 - q0 * q2);
+    //     vy = 2.0f * (q0 * q1 + q2 * q3);
+    //     vz = q0 * q0 - q1 * q1 - q2 * q2 + q3 * q3;
 
-        // 测量得到的重力向量与估计的重力向量之间的误差 (叉乘)
-        ex = (ay * vz - az * vy);
-        ey = (az * vx - ax * vz);
-        ez = (ax * vy - ay * vx);
+    //     // 测量得到的重力向量与估计的重力向量之间的误差 (叉乘)
+    //     ex = (ay * vz - az * vy);
+    //     ey = (az * vx - ax * vz);
+    //     ez = (ax * vy - ay * vx);
 
-        // 误差积分
-        exInt += ex * IMU_MAHONY_KI;
-        eyInt += ey * IMU_MAHONY_KI;
-        ezInt += ez * IMU_MAHONY_KI;
+    //     // 误差积分
+    //     exInt += ex * IMU_MAHONY_KI;
+    //     eyInt += ey * IMU_MAHONY_KI;
+    //     ezInt += ez * IMU_MAHONY_KI;
 
-        // 调整陀螞仪的测量值
-        gx += IMU_MAHONY_KP * ex + exInt;
-        gy += IMU_MAHONY_KP * ey + eyInt;
-        gz += IMU_MAHONY_KP * ez + ezInt;
-    }
+    //     // 调整陀螞仪的测量值
+    //     gx += IMU_MAHONY_KP * ex + exInt;
+    //     gy += IMU_MAHONY_KP * ey + eyInt;
+    //     gz += IMU_MAHONY_KP * ez + ezInt;
+    // }
 
-    // 整合四元数变化率并归一化 (一阶龙格库塔法)
-    float q0_last = q0, q1_last = q1, q2_last = q2, q3_last = q3;
-    q0 += (-q1_last * gx - q2_last * gy - q3_last * gz) * (0.5f * IMU_DT);
-    q1 += ( q0_last * gx + q2_last * gz - q3_last * gy) * (0.5f * IMU_DT);
-    q2 += ( q0_last * gy - q1_last * gz + q3_last * gx) * (0.5f * IMU_DT);
-    q3 += ( q0_last * gz + q1_last * gy - q2_last * gx) * (0.5f * IMU_DT);
+    // // 整合四元数变化率并归一化 (一阶龙格库塔法)
+    // float q0_last = q0, q1_last = q1, q2_last = q2, q3_last = q3;
+    // q0 += (-q1_last * gx - q2_last * gy - q3_last * gz) * (0.5f * IMU_DT);
+    // q1 += ( q0_last * gx + q2_last * gz - q3_last * gy) * (0.5f * IMU_DT);
+    // q2 += ( q0_last * gy - q1_last * gz + q3_last * gx) * (0.5f * IMU_DT);
+    // q3 += ( q0_last * gz + q1_last * gy - q2_last * gx) * (0.5f * IMU_DT);
 
-    // 四元数归一化
-    norm = invSqrt(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3);
-    q0 *= norm;
-    q1 *= norm;
-    q2 *= norm;
-    q3 *= norm;
+    // // 四元数归一化
+    // norm = invSqrt(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3);
+    // q0 *= norm;
+    // q1 *= norm;
+    // q2 *= norm;
+    // q3 *= norm;
 
-    // 将四元数转换为欧拉角 (仅计算 Pitch 和 Roll)
-    car_angle.pitch = asinf(-2.0f * q1 * q3 + 2.0f * q0 * q2) * CHASSIS_RAD_TO_DEG_F;
-    car_angle.roll  = atan2f(2.0f * q2 * q3 + 2.0f * q0 * q1, -2.0f * q1 * q1 - 2.0f * q2 * q2 + 1.0f) * CHASSIS_RAD_TO_DEG_F;
+    // // 将四元数转换为欧拉角 (仅计算 Pitch 和 Roll)
+    // car_angle.pitch = asinf(-2.0f * q1 * q3 + 2.0f * q0 * q2) * CHASSIS_RAD_TO_DEG_F;
+    // car_angle.roll  = atan2f(2.0f * q2 * q3 + 2.0f * q0 * q1, -2.0f * q1 * q1 - 2.0f * q2 * q2 + 1.0f) * CHASSIS_RAD_TO_DEG_F;
 }

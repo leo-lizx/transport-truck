@@ -88,10 +88,9 @@ static uint8 s_param_index = 0U;
 static uint8 s_need_redraw = 1U;
 static uint8 s_render_ticks = 0U;
 static char s_status_text[24] = "STATUS: READY";
+static char s_status_text_prev[24] = "";
 static uint8 s_flash_ready = 0U;
 static uint8 s_full_refresh_done = 0U;
-
-static const char s_clear_line_40[] = "                                        ";
 
 static const menu_param_meta_t s_param_meta[MENU_PARAM_COUNT] =
 {
@@ -428,26 +427,40 @@ static void menu_draw_param_list(void)
 }
 
 /* 底部调试信息绘制：统一显示当前位姿。 */
-static void menu_draw_pose(void)
+static void menu_draw_pose(uint8 force_refresh)
 {
     chassis_pose_t pose = chassis_ctrl_get_pose();
     float imu_yaw_deg = chassis_imu_get_yaw_deg();
+    char status_line[41];
+    uint8 i;
 
-    /* 先按行清屏，避免数字位数变化时残影。 */
-    ips200_set_color(RGB565_WHITE, RGB565_BLACK);
-    ips200_show_string(0, 206, s_clear_line_40);
-    ips200_show_string(0, 224, s_clear_line_40);
-
-    ips200_set_color(RGB565_GREEN, RGB565_BLACK);
-    ips200_show_string(0, 188, "Pose X / Y / IMU Yaw");
+    if (0U != force_refresh)
+    {
+        ips200_set_color(RGB565_GREEN, RGB565_BLACK);
+        ips200_show_string(0, 188, "Pose X / Y / IMU Yaw");
+    }
 
     ips200_set_color(RGB565_WHITE, RGB565_BLACK);
     ips200_show_float(0,   206, pose.x_m, 4, 2U);
     ips200_show_float(100, 206, pose.y_m, 4, 2U);
     ips200_show_float(200, 206, imu_yaw_deg, 5, 1U);
 
-    ips200_set_color(RGB565_CYAN, RGB565_BLACK);
-    ips200_show_string(0, 224, s_status_text);
+    if ((0U != force_refresh) || (0 != strcmp(s_status_text_prev, s_status_text)))
+    {
+        for (i = 0U; i < 40U; ++i)
+        {
+            status_line[i] = ' ';
+        }
+        for (i = 0U; (i < 40U) && ('\0' != s_status_text[i]); ++i)
+        {
+            status_line[i] = s_status_text[i];
+        }
+        status_line[40] = '\0';
+
+        ips200_set_color(RGB565_CYAN, RGB565_BLACK);
+        ips200_show_string(0, 224, status_line);
+        strcpy(s_status_text_prev, s_status_text);
+    }
 }
 
 //-------------------------------------------------------------------------
@@ -464,6 +477,7 @@ void chassis_menu_init(void)
     chassis_ctrl_get_tune_params(&s_menu_params);
     s_flash_ready = (0U == flash_init()) ? 1U : 0U;
     menu_load_params_from_flash();
+    strcpy(s_status_text_prev, "");
     s_menu_level = MENU_LEVEL_ROOT;
     s_root_index = 0U;
     s_param_index = 0U;
@@ -508,6 +522,8 @@ void chassis_menu_task_10ms(void)
 
 void chassis_menu_render_100ms(void)
 {
+    uint8 do_full_refresh = 0U;
+
     s_render_ticks++;
     if ((0U == s_need_redraw) && (s_render_ticks < 10U))
     {
@@ -517,6 +533,7 @@ void chassis_menu_render_100ms(void)
     s_render_ticks = 0U;
     if ((0U == s_full_refresh_done) || (0U != s_need_redraw))
     {
+        do_full_refresh = 1U;
         s_need_redraw = 0U;
         s_full_refresh_done = 1U;
 
@@ -534,5 +551,5 @@ void chassis_menu_render_100ms(void)
     }
 
     /* 常态仅更新位姿区，避免整屏反复刷导致闪烁。 */
-    menu_draw_pose();
+    menu_draw_pose(do_full_refresh);
 }
