@@ -155,7 +155,7 @@
  * Yaw 角速度死区（°/s）。
  * 抑制静止抖动，过大将导致小角速度被吞掉。
  */
-#define CHASSIS_IMU_GYRO_DEADZONE_DPS    (1.8f)
+#define CHASSIS_IMU_GYRO_DEADZONE_DPS    (0.8f)
 
 /**
  * Yaw 角速度一阶低通系数，范围 (0, 1]。

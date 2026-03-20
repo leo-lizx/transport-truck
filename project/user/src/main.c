@@ -38,6 +38,16 @@
 #include "chassis_menu.h"
 #include "app_game_logic.h"
 
+/*
+ * main 运行模式：
+ * 1 = 航向保持测试模式（默认）：进入后保持目标航向角
+ * 0 = 游戏状态机模式
+ */
+#define MAIN_YAW_HOLD_TEST_MODE   (1)
+
+/* 航向保持测试目标角（单位：度，可按需修改） */
+#define MAIN_HOLD_YAW_TARGET_DEG  (0.0f)
+
 /*==========================================================================
  *  推箱子智能车完整调用流程 (第二十一届全国智能车竞赛 AI视觉组)
  *
@@ -92,8 +102,10 @@ int main(void)
     // 1. 通信外设初始化
     // ------------------------------------------------------------------
     // 串口1: 与 OpenART 视觉模块通信 (波特率需与 OpenART 一致)
-    // uart_init(UART_1, 115200, UART1_TX_B12, UART1_RX_B13);
-    // uart_rx_interrupt(UART_1, 1);
+#if (0 == MAIN_YAW_HOLD_TEST_MODE)
+    uart_init(UART_1, 115200, UART1_TX_B12, UART1_RX_B13);
+    uart_rx_interrupt(UART_1, 1);
+#endif
 
     // ------------------------------------------------------------------
     // 2. IPS200 屏幕 + 按键初始化 (调参菜单)
@@ -117,8 +129,14 @@ int main(void)
                           chassis_grid_y_to_m(CHASSIS_START_GRID_Y),
                           0.0f);
 
-    // 进入姿态闭环调试模式：固定 0 度航向保持。
-    chassis_ctrl_attitude_debug_start_zero();
+#if (1 == MAIN_YAW_HOLD_TEST_MODE)
+    // 航向保持测试模式：仅设置一次目标航向，不运行推箱状态机。
+    // 持续闭环由 PIT_CH1 的 chassis_ctrl_task_20ms() 执行。
+    chassis_ctrl_hold_yaw(MAIN_HOLD_YAW_TARGET_DEG);
+#else
+    // 游戏模式：仅设置初始航向基准。
+    chassis_ctrl_hold_yaw(0.0f);
+#endif
 
     // ------------------------------------------------------------------
     // 4. PIT 定时中断初始化
@@ -137,9 +155,19 @@ int main(void)
 
     while (1)
     {
-        // 姿态闭环调试任务：100ms 打印一次目标角/当前角/误差/角速度指令。
+        // 航向闭环调试任务：100ms 打印一次目标角/当前角/误差/角速度指令。
         chassis_ctrl_attitude_debug_task_5ms();
-        // Game_Logic_Task_Run();                         // 运行推箱子游戏状态机 (非阻塞)
+
+    #if (1 == MAIN_YAW_HOLD_TEST_MODE)
+        /*
+         * 航向保持测试模式：
+         * 目标角已在初始化阶段设置，20ms 中断中持续执行闭环。
+         * 这里不重复调用 hold_yaw，避免反复清空积分项影响闭环效果。
+         */
+    #else
+        Game_Logic_Task_Run();                         // 运行推箱子游戏状态机 (非阻塞)
+    #endif
+
         system_delay_ms(5);                               // 主循环节拍
     }
 }
