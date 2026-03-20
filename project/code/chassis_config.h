@@ -65,6 +65,12 @@
 /** 网格 Y 方向最大索引（0 ~ 11，共 12 行） */
 #define CHASSIS_GRID_MAX_Y              (11U)
 
+/** 网格总列数（X 方向） */
+#define CHASSIS_GRID_COLS               (CHASSIS_GRID_MAX_X + 1U)
+
+/** 网格总行数（Y 方向） */
+#define CHASSIS_GRID_ROWS               (CHASSIS_GRID_MAX_Y + 1U)
+
 /** 到达目标点判定阈值（米），距目标小于此值即认为"已到达" */
 #define CHASSIS_TARGET_REACHED_EPSILON_M (0.03f)
 
@@ -80,13 +86,6 @@
 
 /** 单个轮子允许的最大线速度（m/s），超出时四轮按比例缩放 */
 #define CHASSIS_MAX_WHEEL_SPEED_MPS     (0.60f)
-
-/**
- * 调参硬上限（安全限制）：
- * 菜单里即使设得更大，控制层也会被钳位到以下上限。
- */
-#define CHASSIS_TUNE_MAX_LINEAR_SPEED_LIMIT_MPS   (0.20f)
-#define CHASSIS_TUNE_MAX_YAW_SPEED_LIMIT_DPS      (30.0f)
 
 /* ======================================================================
  *  导航控制增益（P 控制器参数）
@@ -145,10 +144,10 @@
  * ====================================================================== */
 
 /** X 方向里程计缩放系数 */
-#define CHASSIS_ODOM_SCALE_X            (0.619849f)
+#define CHASSIS_ODOM_SCALE_X            (1.00f)
 
 /** Y 方向里程计缩放系数 */
-#define CHASSIS_ODOM_SCALE_Y            (0.380710f)
+#define CHASSIS_ODOM_SCALE_Y            (1.00f)
 
 /* ======================================================================
  *  车模物理尺寸 — 已经填入实际测量数据

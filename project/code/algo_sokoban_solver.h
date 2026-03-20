@@ -21,13 +21,14 @@
  *===========================================================================*/
 
 #include "zf_common_headfile.h"
+#include "chassis_config.h"
 
 /* ======================================================================
  *  地图基础定义（原 algo_bfs_scout.h）
  * ====================================================================== */
 
-#define MAP_ROWS    12      // 12 行（Y 方向，对应 2.4m / 0.20m）
-#define MAP_COLS    16      // 16 列（X 方向，对应 3.2m / 0.20m）
+#define MAP_ROWS    ((int)CHASSIS_GRID_ROWS)   // 12 行（Y 方向，对应 2.4m / 0.20m）
+#define MAP_COLS    ((int)CHASSIS_GRID_COLS)   // 16 列（X 方向，对应 3.2m / 0.20m）
 
 // 地图元素定义
 typedef enum {

@@ -2,15 +2,16 @@
 #define _APP_GAME_LOGIC_H_
 
 #include "zf_common_headfile.h"
+#include "chassis_config.h"
 #include "algo_sokoban_solver.h"
 #include "chassis_ctrl.h"
 
 #ifndef MAP_ROWS
-#define MAP_ROWS 12
+#define MAP_ROWS ((int)CHASSIS_GRID_ROWS)
 #endif
 
 #ifndef MAP_COLS
-#define MAP_COLS 16
+#define MAP_COLS ((int)CHASSIS_GRID_COLS)
 #endif
 
 // ==========================================
