@@ -4,6 +4,11 @@
 
 #include "chassis_encoder.h"
 
+/**
+ * @brief  初始化单路编码器
+ * @param  enc 编码器对象指针
+ * @note   初始化后会清零计数器，首帧速度输出为 0。
+ */
 void chassis_encoder_init(chassis_encoder_t *enc)
 {
     /* 初始化正交编码器硬件计数器 */
@@ -15,13 +20,18 @@ void chassis_encoder_init(chassis_encoder_t *enc)
     enc->speed_mps = 0.0f;
 }
 
+/**
+ * @brief  按固定周期更新编码器速度
+ * @param  enc  编码器对象指针
+ * @param  dt_s 采样周期（秒）
+ */
 void chassis_encoder_update(chassis_encoder_t *enc, float dt_s)
 {
-    int16 count_delta;
-    float meter_per_count;
+    int16 pulse_delta_count;      /* 本周期脉冲增量（计数器差分值） */
+    float wheel_meter_per_count;  /* 每个脉冲对应的轮线位移（米） */
 
     /* 读取自上次清零以来的脉冲增量 */
-    count_delta = encoder_get_count(enc->index);
+    pulse_delta_count = encoder_get_count(enc->index);
 
     /* 立即清零计数器，为下一个采样周期做准备 */
     encoder_clear_count(enc->index);
@@ -32,12 +42,17 @@ void chassis_encoder_update(chassis_encoder_t *enc, float dt_s)
      *                   = (2 × π × R) / N
      *   speed = count_delta × meter_per_count / dt × dir_sign
      */
-    meter_per_count = (2.0f * CHASSIS_PI_F * CHASSIS_WHEEL_RADIUS_M)
-                    / CHASSIS_ENCODER_COUNTS_PER_REV;
+    wheel_meter_per_count = (2.0f * CHASSIS_PI_F * CHASSIS_WHEEL_RADIUS_M)
+                          / CHASSIS_ENCODER_COUNTS_PER_REV;
 
-    enc->speed_mps = (float)count_delta * meter_per_count / dt_s * enc->dir_sign;
+    enc->speed_mps = (float)pulse_delta_count * wheel_meter_per_count / dt_s * enc->dir_sign;
 }
 
+/**
+ * @brief  读取最近一次更新后的轮速
+ * @param  enc 编码器对象指针
+ * @return 轮速（m/s）
+ */
 float chassis_encoder_get_speed(const chassis_encoder_t *enc)
 {
     return enc->speed_mps;

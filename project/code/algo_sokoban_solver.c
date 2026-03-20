@@ -44,10 +44,18 @@ static Point_t bfs_queue[MAP_ROWS * MAP_COLS];
 static Point_t parent_map[MAP_ROWS][MAP_COLS];
 static uint8   bfs_visited[MAP_ROWS][MAP_COLS];
 
+/** 判断坐标是否位于可通行内场（最外圈边界不可进入） */
+static inline uint8 map_is_inner_cell(int8 y, int8 x)
+{
+    if (x < (int8)CHASSIS_GRID_INNER_MIN_X || x > (int8)CHASSIS_GRID_INNER_MAX_X) return 0;
+    if (y < (int8)CHASSIS_GRID_INNER_MIN_Y || y > (int8)CHASSIS_GRID_INNER_MAX_Y) return 0;
+    return 1;
+}
+
 /** 判断坐标是否可通行（空地/目标可通过，箱子/炸弹/墙不可通过） */
 static uint8 algo_is_nav_passable(const uint8 map[MAP_ROWS][MAP_COLS], int8 y, int8 x)
 {
-    if (x < 0 || x >= MAP_COLS || y < 0 || y >= MAP_ROWS) return 0;
+    if (!map_is_inner_cell(y, x)) return 0;
     if (map[y][x] == MAP_EMPTY || map[y][x] == MAP_TARGET) return 1;
     return 0;
 }
@@ -58,6 +66,16 @@ ObservePoint_t Algo_Find_Nearest_Box_Observe_Point(const uint8 map[MAP_ROWS][MAP
 {
     ObservePoint_t result = {{0, 0}, 0};
     int16 head = 0, tail = 0;
+
+    if (0 == target_box_pos) {
+        return result;
+    }
+
+    /* 起点异常时先钳位到内场，避免访问边界或越界下标。 */
+    if (player_pos.x < (int8)CHASSIS_GRID_INNER_MIN_X) player_pos.x = (int8)CHASSIS_GRID_INNER_MIN_X;
+    if (player_pos.x > (int8)CHASSIS_GRID_INNER_MAX_X) player_pos.x = (int8)CHASSIS_GRID_INNER_MAX_X;
+    if (player_pos.y < (int8)CHASSIS_GRID_INNER_MIN_Y) player_pos.y = (int8)CHASSIS_GRID_INNER_MIN_Y;
+    if (player_pos.y > (int8)CHASSIS_GRID_INNER_MAX_Y) player_pos.y = (int8)CHASSIS_GRID_INNER_MAX_Y;
 
     memset(bfs_visited, 0, sizeof(bfs_visited));
 
@@ -73,7 +91,7 @@ ObservePoint_t Algo_Find_Nearest_Box_Observe_Point(const uint8 map[MAP_ROWS][MAP
             int8 ny = current.y + s_dr[i];
             int8 nx = current.x + s_dc[i];
 
-            if (nx >= 0 && nx < MAP_COLS && ny >= 0 && ny < MAP_ROWS) {
+            if (map_is_inner_cell(ny, nx)) {
                 if (map[ny][nx] == MAP_BOX) {
                     result.pos = current;
                     result.is_valid = 1;
@@ -107,6 +125,18 @@ uint8 Algo_Nav_BFS(const uint8 map[MAP_ROWS][MAP_COLS],
 {
     int16 head = 0, tail = 0;
     uint8 found = 0;
+
+    if (0 == result_path) {
+        return 0;
+    }
+
+    /* 起终点必须在内场且可通行。 */
+    if (!map_is_inner_cell(start.y, start.x) || !map_is_inner_cell(end.y, end.x)) {
+        return 0;
+    }
+    if (!algo_is_nav_passable(map, start.y, start.x) || !algo_is_nav_passable(map, end.y, end.x)) {
+        return 0;
+    }
 
     result_path->step_count = 0;
     if (start.x == end.x && start.y == end.y) {
@@ -192,7 +222,7 @@ static inline void sb_decode(uint16 idx, int8 *pr, int8 *pc, int8 *br, int8 *bc)
 /** 检查 (r, c) 是否在地图内且可通行（空地 / 目标点） */
 static inline uint8 sb_is_free(const uint8 map[MAP_ROWS][MAP_COLS], int8 r, int8 c)
 {
-    if (r < 0 || r >= MAP_ROWS || c < 0 || c >= MAP_COLS) return 0;
+    if (!map_is_inner_cell(r, c)) return 0;
     return (map[r][c] == MAP_EMPTY || map[r][c] == MAP_TARGET) ? 1 : 0;
 }
 
@@ -211,6 +241,13 @@ static uint8 sokoban_bfs_single(const uint8 sub_map[MAP_ROWS][MAP_COLS],
 {
     uint32 head = 0, tail = 0;
     uint16 start_idx, goal_idx = 0;
+
+    if (0 == sol) return 0;
+    if (!map_is_inner_cell(player.y, player.x) ||
+        !map_is_inner_cell(box.y, box.x) ||
+        !map_is_inner_cell(target.y, target.x)) {
+        return 0;
+    }
 
     sol->count = 0;
     memset(sb_came_from, 0, SB_STATE_COUNT);
@@ -312,8 +349,8 @@ static uint8 extract_elements(const uint8 map[MAP_ROWS][MAP_COLS],
                               Point_t out[], uint8 max_count)
 {
     uint8 n = 0;
-    for (int8 r = 0; r < MAP_ROWS; r++) {
-        for (int8 c = 0; c < MAP_COLS; c++) {
+    for (int8 r = (int8)CHASSIS_GRID_INNER_MIN_Y; r <= (int8)CHASSIS_GRID_INNER_MAX_Y; r++) {
+        for (int8 c = (int8)CHASSIS_GRID_INNER_MIN_X; c <= (int8)CHASSIS_GRID_INNER_MAX_X; c++) {
             if (map[r][c] == (uint8)type && n < max_count) {
                 out[n].y = r;
                 out[n].x = c;

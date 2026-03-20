@@ -4,7 +4,7 @@
 /*===========================================================================
  * [chassis_ctrl.h] 底盘顶层控制模块
  *
- *   整合 IMU 姿态、编码器测速、麦轮运动学、PID 轮控、里程计定位、
+ *   整合 IMU 航向、编码器测速、麦轮运动学、PID 轮控、里程计定位、
  *   定点移动导航等功能，对外提供简洁统一的 API。
  *
  *   本模块是底盘子系统的唯一对外入口，上层代码（如 app_game_logic）
@@ -15,6 +15,7 @@
  *     5ms PIT 中断:  chassis_ctrl_task_5ms()
  *     20ms PIT 中断: chassis_ctrl_task_20ms()
  *     业务层:        chassis_ctrl_move_to_grid(x, y)
+ *                    chassis_ctrl_set_move_yaw_cmd(vx, vy, yaw)
  *                    while (!chassis_ctrl_is_arrived()) { ... }
  *
  *   内部控制流程（20ms 周期内依次执行）：
@@ -26,7 +27,7 @@
  *
  * [模块依赖]:
  *   chassis_config.h  — 所有引脚和参数配置
- *   chassis_imu.h     — IMU 姿态采样
+ *   chassis_imu.h     — IMU 航向采样
  *   chassis_encoder.h — 编码器测速
  *   chassis_motor.h   — 电机驱动
  *   chassis_pid.h     — PID 控制器
@@ -53,7 +54,7 @@ typedef struct
     float wz_dps;        /**< 转向角速度（°/s），逆时针为正 */
 } chassis_body_speed_cmd_t;
 
-/** 姿态闭环调试信息（用于 0 度航向保持调试打印） */
+/** 航向闭环调试信息（用于 0 度航向保持调试打印） */
 typedef struct
 {
     float target_yaw_deg;   /**< 目标航向角（度） */
@@ -102,12 +103,23 @@ void chassis_ctrl_task_20ms(void);
 
 /**
  * @brief  下发网格坐标目标，底盘自动移动到该位置
- *         网格索引范围: x=[0, CHASSIS_GRID_MAX_X], y=[0, CHASSIS_GRID_MAX_Y]
- *         超出范围自动钳位到边界
+ *         竞赛地图采用 12×16，总外框边界不可进入。
+ *         可通行索引范围: x=[CHASSIS_GRID_INNER_MIN_X, CHASSIS_GRID_INNER_MAX_X]
+ *                       y=[CHASSIS_GRID_INNER_MIN_Y, CHASSIS_GRID_INNER_MAX_Y]
+ *         超出范围自动钳位到可通行内场
  * @param  target_x_grid  目标 X 网格索引
  * @param  target_y_grid  目标 Y 网格索引
  */
 void chassis_ctrl_move_to_grid(uint8 target_x_grid, uint8 target_y_grid);
+
+/**
+ * @brief  下发“移动 + 航向”指令（车体系速度 + 航向闭环目标角）
+ *         该模式下不走点位导航，直接按速度指令运动，同时执行航向闭环。
+ * @param  vx_body_mps     车体系 X 方向速度（m/s，向右为正）
+ * @param  vy_body_mps     车体系 Y 方向速度（m/s，向前为正）
+ * @param  target_yaw_deg  目标航向角（度）
+ */
+void chassis_ctrl_set_move_yaw_cmd(float vx_body_mps, float vy_body_mps, float target_yaw_deg);
 
 /**
  * @brief  切换到航向保持模式：停止位置移动，仅保持指定航向角
@@ -116,19 +128,19 @@ void chassis_ctrl_move_to_grid(uint8 target_x_grid, uint8 target_y_grid);
 void chassis_ctrl_hold_yaw(float target_yaw_deg);
 
 /**
- * @brief  进入姿态调试模式：固定 0 度航向保持，停止平移
+ * @brief  进入航向调试模式：固定 0 度航向保持，停止平移
  *         推荐在 main 初始化完成后调用一次。
  */
 void chassis_ctrl_attitude_debug_start_zero(void);
 
 /**
- * @brief  读取姿态闭环调试信息（线程安全的结构体拷贝）
+ * @brief  读取航向闭环调试信息（线程安全的结构体拷贝）
  * @param  out_info  输出信息结构体指针，传空则忽略
  */
 void chassis_ctrl_attitude_debug_get_state(chassis_attitude_debug_info_t *out_info);
 
 /**
- * @brief  姿态闭环调试任务（建议主循环每 5ms 调用一次）
+ * @brief  航向闭环调试任务（建议主循环每 5ms 调用一次）
  *         内部 100ms 打印一次目标角/当前角/误差/角速度指令。
  */
 void chassis_ctrl_attitude_debug_task_5ms(void);

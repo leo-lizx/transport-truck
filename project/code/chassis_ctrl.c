@@ -20,7 +20,10 @@
 
 #include <math.h>
 
+/* 航向闭环参数：用于原地锁角和“移动+航向指令”模式。 */
 #define CHASSIS_YAW_HOLD_DEADZONE_DEG   (0.30f)
+#define CHASSIS_YAW_HOLD_KI              (0.030f)
+#define CHASSIS_YAW_I_LIMIT_DEG_S        (120.0f)
 
 /* ======================================================================
  *  四轮硬件实例（按 LF / RF / LB / RB 顺序排列）
@@ -95,7 +98,7 @@ static volatile float s_target_yaw_deg = 0.0f;
 /** 运动模式: 1 = 定点移动模式, 0 = 航向保持模式 */
 static volatile uint8 s_move_mode_enabled = 0U;
 
-/** 姿态调试强制模式: 1 = 20ms 周期强制走姿态闭环, 0 = 正常模式 */
+/** 航向闭环调试强制模式: 1 = 20ms 周期强制走原地航向闭环, 0 = 正常模式 */
 static volatile uint8 s_attitude_debug_force_enabled = 0U;
 
 /** 到达标志: 1 = 已到达（或空闲）, 0 = 移动中 */
@@ -105,6 +108,22 @@ static volatile uint8 s_arrived_flag = 1U;
 static volatile float s_body_vx_mps_feedback = 0.0f;
 static volatile float s_body_vy_mps_feedback = 0.0f;
 
+/** 外部“移动+航向”指令模式开关: 1=启用, 0=关闭 */
+static volatile uint8 s_move_yaw_cmd_mode_enabled = 0U;
+
+/** 外部“移动+航向”指令中的车体系速度目标 */
+static volatile float s_cmd_vx_body_mps = 0.0f;
+static volatile float s_cmd_vy_body_mps = 0.0f;
+
+/** 航向误差积分（单位：度*秒），用于航向闭环时消除小稳态误差 */
+static volatile float s_yaw_err_i_accum = 0.0f;
+
+/**
+ * @brief  运行时调参参数安全限幅
+ * @param  in  输入参数副本
+ * @return 限幅后的参数副本
+ * @note   所有外部/菜单写入参数都要先经过本函数，避免失稳参数进入控制链。
+ */
 static chassis_tune_params_t ctrl_sanitize_tune_params(chassis_tune_params_t in)
 {
     /* 对每个可调参数做安全限幅，防止异常参数导致控制失稳。 */
@@ -199,6 +218,7 @@ static void ctrl_force_stop(void)
 
     s_cmd_filtered = (chassis_body_speed_cmd_t){ 0.0f, 0.0f, 0.0f }; /* 清空滤波状态 */
     s_last_cmd     = (chassis_body_speed_cmd_t){ 0.0f, 0.0f, 0.0f }; /* 清空最近输出 */
+    s_yaw_err_i_accum = 0.0f; /* 清空航向积分项，避免模式切换后残余积分冲击 */
 
     for (i = 0U; i < (uint8)CHASSIS_WHEEL_COUNT; ++i)
     {
@@ -251,6 +271,14 @@ static void ctrl_apply_body_speed(chassis_body_speed_cmd_t cmd)
 
 /* ========================== 公共 API 实现 ========================== */
 
+/**
+ * @brief  底盘控制模块初始化
+ * @note   初始化顺序：
+ *         1) 对默认调参做安全限幅
+ *         2) 初始化 IMU/电机/编码器/PID
+ *         3) 清零位姿、目标、滤波器与模式状态
+ *         4) 强制停机，确保上电后无误动作
+ */
 void chassis_ctrl_init(void)
 {
     uint8 i; /* 轮序号：初始化四路硬件 */
@@ -279,31 +307,43 @@ void chassis_ctrl_init(void)
     s_target_y_m       = 0.0f; /* 清零目标 Y */
     s_target_yaw_deg   = 0.0f; /* 清零目标航向 */
     s_move_mode_enabled = 0U; /* 默认进入航向保持模式 */
-    s_attitude_debug_force_enabled = 0U; /* 默认关闭姿态调试强制模式 */
+    s_attitude_debug_force_enabled = 0U; /* 默认关闭航向调试强制模式 */
+    s_move_yaw_cmd_mode_enabled = 0U; /* 默认关闭外部移动+航向指令模式 */
     s_arrived_flag      = 1U; /* 默认处于空闲/到达状态 */
     s_body_vx_mps_feedback = 0.0f; /* 清零反馈 vx */
     s_body_vy_mps_feedback = 0.0f; /* 清零反馈 vy */
-    s_cmd_filtered = (chassis_body_speed_cmd_t){ 0.0f, 0.0f, 0.0f }; /* 清零滤波器 */
-    s_last_cmd     = (chassis_body_speed_cmd_t){ 0.0f, 0.0f, 0.0f }; /* 清零最近指令 */
-
+    s_cmd_vx_body_mps = 0.0f; /* 清零外部速度指令 vx */
+    s_cmd_vy_body_mps = 0.0f; /* 清零外部速度指令 vy */
     /* 确保全部电机停止 */
     ctrl_force_stop(); /* 最终强制停机，确保上电无误动作 */
 }
 
+/**
+ * @brief  5ms 快速任务
+ * @note   仅负责 IMU 更新和航向角同步，不做导航/驱动输出。
+ */
 void chassis_ctrl_task_5ms(void)
 {
-    /* IMU 姿态采样与航向角积分 */
+    /* IMU 角速度采样与航向角积分 */
     chassis_imu_update_5ms(); /* 更新 IMU 角速度并积分航向角 */
 
     /* 同步航向角到位姿结构体，保证 get_pose() 实时性 */
     s_pose.yaw_deg = chassis_imu_get_yaw_deg(); /* 将 IMU 航向同步到位姿结构 */
 }
 
+/**
+ * @brief  20ms 主控制任务
+ * @note   本函数统一完成：
+ *         1) 轮速采样与里程计积分（全局定位）
+ *         2) 点位导航/移动航向指令/原地航向闭环 三种控制分支
+ *         3) 速度指令下发到底盘执行链路
+ */
 void chassis_ctrl_task_20ms(void)
 {
     float yaw_rad, cos_yaw, sin_yaw;              /* 当前航向角及其三角函数 */
     float wheel_speeds[CHASSIS_WHEEL_COUNT];      /* 四轮实时速度反馈 */
     float vx_body_raw, vy_body_raw;               /* 麦轮逆解得到的车体速度原始值 */
+    chassis_body_speed_cmd_t cmd = {0.0f, 0.0f, 0.0f}; /* 本周期最终下发的车体速度指令 */
     uint8 i;                                      /* 轮序号 */
 
     /* --- 步骤 1: 读取全部编码器，更新四轮速度 --- */
@@ -332,8 +372,9 @@ void chassis_ctrl_task_20ms(void)
         s_pose.y_m += vy_global * CHASSIS_TASK_DT_20MS_S; /* 对全局 vy 积分得到 y */
     }
 
-    /* --- 步骤 4: 导航控制 → 输出车体速度指令 --- */
-    /* 调试强制模式打开时，20ms 控制周期始终执行姿态闭环分支。 */
+    /* --- 步骤 4: 导航控制（含航向闭环） → 输出车体速度指令 --- */
+    /* 分支优先级：点位导航 > 外部移动+航向指令 > 原地航向闭环。 */
+    /* 航向调试强制模式打开时，统一走原地航向闭环分支。 */
     if ((0U != s_move_mode_enabled) && (0U == s_attitude_debug_force_enabled))
     {
         /* ---- 定点移动模式：同时控制位置和航向 ---- */
@@ -355,6 +396,10 @@ void chassis_ctrl_task_20ms(void)
             float vx_global_cmd = s_tune_params.pos_kp * dx; /* 全局 X 方向速度指令 */
             float vy_global_cmd = s_tune_params.pos_kp * dy; /* 全局 Y 方向速度指令 */
             float linear_norm = sqrtf(vx_global_cmd * vx_global_cmd + vy_global_cmd * vy_global_cmd); /* 全局线速度模长 */
+            float target_yaw; /* 朝向目标点的期望航向 */
+            float yaw_err;    /* 航向误差（度） */
+            float wz_cmd;     /* 航向闭环输出角速度 */
+
             if (linear_norm > s_tune_params.max_linear_speed_mps && linear_norm > 1e-6f)
             {
                 float scale = s_tune_params.max_linear_speed_mps / linear_norm; /* 限速缩放系数 */
@@ -362,76 +407,144 @@ void chassis_ctrl_task_20ms(void)
                 vy_global_cmd *= scale; /* 缩放全局 vy 指令 */
             }
 
-            /* 航向 P 控制器：对准前进方向 */
-            {
-                float target_yaw = atan2f(dy, dx) * CHASSIS_RAD_TO_DEG_F; /* 朝向目标点的期望航向 */
-                float yaw_err = chassis_normalize_angle_deg(target_yaw - s_pose.yaw_deg); /* 航向误差（归一化到 -180~180） */
-                float wz_cmd = chassis_clamp_f(s_tune_params.yaw_kp * yaw_err, /* 角速度 P 控制输出并限幅 */
-                                               -s_tune_params.max_yaw_speed_dps,
-                                                s_tune_params.max_yaw_speed_dps);
+            /* 航向闭环（点位导航模式）：目标朝向 = 指向目标点，不启用死区。 */
+            target_yaw = atan2f(dy, dx) * CHASSIS_RAD_TO_DEG_F;
+            yaw_err = chassis_normalize_angle_deg(target_yaw - s_pose.yaw_deg);
 
-                /* 全局速度 → 车体速度（逆旋转变换） */
-                chassis_body_speed_cmd_t cmd; /* 待下发的车体速度指令 */
-                cmd.vx_body_mps =  cos_yaw * vx_global_cmd + sin_yaw * vy_global_cmd; /* 全局速度旋回车体系 vx */
-                cmd.vy_body_mps = -sin_yaw * vx_global_cmd + cos_yaw * vy_global_cmd; /* 全局速度旋回车体系 vy */
-                cmd.wz_dps = wz_cmd; /* 写入角速度指令 */
+            /* 移动态仅使用 P，且清空积分避免拖拽转向响应。 */
+            s_yaw_err_i_accum = 0.0f;
+            wz_cmd = chassis_clamp_f(s_tune_params.yaw_kp * yaw_err,
+                                     -s_tune_params.max_yaw_speed_dps,
+                                      s_tune_params.max_yaw_speed_dps);
 
-                ctrl_apply_body_speed(cmd); /* 下发到执行层 */
-            }
+            /* 全局速度 → 车体速度（逆旋转变换） */
+            cmd.vx_body_mps =  cos_yaw * vx_global_cmd + sin_yaw * vy_global_cmd;
+            cmd.vy_body_mps = -sin_yaw * vx_global_cmd + cos_yaw * vy_global_cmd;
+            cmd.wz_dps = wz_cmd;
         }
     }
     else
     {
-        /* ---- 航向保持模式：原地转向，不平移 ---- */
+        /* ---- 非点位导航分支：统一走航向闭环（可选平移） ---- */
+        uint8 move_with_yaw_cmd = ((0U != s_move_yaw_cmd_mode_enabled) && (0U == s_attitude_debug_force_enabled)); /* 1=移动+航向指令, 0=原地航向闭环 */
         float yaw_err = chassis_normalize_angle_deg(s_target_yaw_deg - s_pose.yaw_deg); /* 目标航向与当前航向误差 */
-        float wz_cmd; /* 航向保持输出角速度 */
+        float wz_cmd; /* 航向闭环输出角速度 */
 
-        /* 在零点附近增加小死区，避免静止时高频抖动。 */
+        /* 航向闭环：零点死区 + PI 控制。 */
         if (fabsf(yaw_err) <= CHASSIS_YAW_HOLD_DEADZONE_DEG)
         {
-            wz_cmd = 0.0f; /* 误差很小：输出 0 抑制抖动 */
+            /* 误差很小时让积分缓慢回零，抑制长期残余输出。 */
+            s_yaw_err_i_accum *= 0.80f;
+            wz_cmd = 0.0f;
         }
         else
         {
-            wz_cmd = chassis_clamp_f(s_tune_params.yaw_kp * yaw_err,
+            s_yaw_err_i_accum += yaw_err * CHASSIS_TASK_DT_20MS_S; /* 误差积分 */
+            s_yaw_err_i_accum = chassis_clamp_f(s_yaw_err_i_accum,
+                                                -CHASSIS_YAW_I_LIMIT_DEG_S,
+                                                 CHASSIS_YAW_I_LIMIT_DEG_S); /* 积分限幅防 wind-up */
+
+            wz_cmd = s_tune_params.yaw_kp * yaw_err + CHASSIS_YAW_HOLD_KI * s_yaw_err_i_accum; /* PI 输出 */
+            wz_cmd = chassis_clamp_f(wz_cmd,
                                      -s_tune_params.max_yaw_speed_dps,
-                                      s_tune_params.max_yaw_speed_dps); /* 超出死区：按 P 控制计算角速度 */
+                                      s_tune_params.max_yaw_speed_dps); /* 输出限幅 */
         }
 
-        ctrl_apply_body_speed((chassis_body_speed_cmd_t){ 0.0f, 0.0f, wz_cmd }); /* 原地转向：vx/vy=0，仅输出 wz */
+        if (move_with_yaw_cmd)
+        {
+            /* 外部移动+航向指令模式：使用外部下发的平移速度。 */
+            cmd.vx_body_mps = s_cmd_vx_body_mps;
+            cmd.vy_body_mps = s_cmd_vy_body_mps;
+        }
+        else
+        {
+            /* 原地航向闭环模式：平移速度固定为 0。 */
+            cmd.vx_body_mps = 0.0f;
+            cmd.vy_body_mps = 0.0f;
+        }
+        cmd.wz_dps      = wz_cmd;
     }
+
+    /* 航向闭环与导航目标统一汇总后，集中下发到底层执行链路。 */
+    ctrl_apply_body_speed(cmd);
 }
 
+/**
+ * @brief  下发网格目标点并启动点位导航
+ * @param  target_x_grid 目标网格 X（含边界输入会被自动钳位）
+ * @param  target_y_grid 目标网格 Y（含边界输入会被自动钳位）
+ * @note   本函数会关闭“移动+航向指令模式”，并清除到达标志。
+ */
 void chassis_ctrl_move_to_grid(uint8 target_x_grid, uint8 target_y_grid)
 {
-    /* 边界保护：超出网格范围自动钳位 */
-    uint8 x = (target_x_grid > CHASSIS_GRID_MAX_X) ? (uint8)CHASSIS_GRID_MAX_X : target_x_grid; /* 限幅后的 X 网格索引 */
-    uint8 y = (target_y_grid > CHASSIS_GRID_MAX_Y) ? (uint8)CHASSIS_GRID_MAX_Y : target_y_grid; /* 限幅后的 Y 网格索引 */
+    /* 边界保护：外圈边界不可进入，目标钳位到可通行内场。 */
+    uint8 x = chassis_clamp_grid_x_inner(target_x_grid); /* 限幅后的 X 网格索引（1~14） */
+    uint8 y = chassis_clamp_grid_y_inner(target_y_grid); /* 限幅后的 Y 网格索引（1~10） */
 
-    /* 网格坐标 → 物理坐标：以左上角为原点，每格 20cm */
-    s_target_x_m = (float)x * CHASSIS_GRID_CELL_SIZE_M; /* 网格 X 转米 */
-    s_target_y_m = (float)y * CHASSIS_GRID_CELL_SIZE_M; /* 网格 Y 转米 */
+    /* 网格坐标 → 物理坐标：按 X/Y 独立步长换算。 */
+    s_target_x_m = chassis_grid_x_to_m(x); /* 网格 X 转米 */
+    s_target_y_m = chassis_grid_y_to_m(y); /* 网格 Y 转米 */
+    s_yaw_err_i_accum = 0.0f; /* 模式切换时清空航向积分，避免历史积分残留 */
 
-    s_attitude_debug_force_enabled = 0U; /* 进入路径移动前关闭姿态调试强制模式 */
+    s_move_yaw_cmd_mode_enabled = 0U; /* 点位导航模式会覆盖外部移动+航向指令模式 */
+    s_attitude_debug_force_enabled = 0U; /* 进入路径移动前关闭航向调试强制模式 */
     s_move_mode_enabled = 1U; /* 启动移动模式 */
     s_arrived_flag = 0U;      /* 清除到达标志 */
 }
 
+/**
+ * @brief  下发“移动+航向”复合控制指令
+ * @param  vx_body_mps    车体系 X 方向速度目标（m/s）
+ * @param  vy_body_mps    车体系 Y 方向速度目标（m/s）
+ * @param  target_yaw_deg 目标航向角（度，内部会归一化）
+ * @note   本函数会退出点位导航，转入“平移+航向闭环”模式。
+ */
+void chassis_ctrl_set_move_yaw_cmd(float vx_body_mps, float vy_body_mps, float target_yaw_deg)
+{
+    /* 写入外部下发的车体系速度与目标航向角。 */
+    s_cmd_vx_body_mps = vx_body_mps;
+    s_cmd_vy_body_mps = vy_body_mps;
+    s_target_yaw_deg = chassis_normalize_angle_deg(target_yaw_deg);
+    s_yaw_err_i_accum = 0.0f; /* 模式切换时清空航向积分，避免切入瞬态冲击 */
+
+    /* 切换到“移动+航向指令”模式，并关闭点位导航。 */
+    s_move_mode_enabled = 0U;
+    s_attitude_debug_force_enabled = 0U;
+    s_move_yaw_cmd_mode_enabled = 1U;
+    s_arrived_flag = 1U; /* 非点位导航模式不使用到达判定，视为空闲态 */
+}
+
+/**
+ * @brief  进入原地航向闭环模式
+ * @param  target_yaw_deg 目标航向角（度，内部会归一化）
+ * @note   平移速度会被置零，仅保留角速度闭环输出。
+ */
 void chassis_ctrl_hold_yaw(float target_yaw_deg)
 {
     s_target_yaw_deg = chassis_normalize_angle_deg(target_yaw_deg); /* 写入并归一化目标角 */
+    s_yaw_err_i_accum = 0.0f; /* 切入原地航向闭环前清空积分状态 */
+    s_move_yaw_cmd_mode_enabled = 0U; /* 进入原地航向闭环时关闭外部移动+航向指令模式 */
     s_move_mode_enabled = 0U; /* 关闭移动模式，进入航向保持 */
     s_arrived_flag = 1U;      /* 航向保持模式视为空闲 */
 }
 
+/**
+ * @brief  航向调试入口：清状态并以 0 度为目标启动闭环
+ * @note   主要用于串口观察航向误差收敛过程，不参与点位导航。
+ */
 void chassis_ctrl_attitude_debug_start_zero(void)
 {
-    /* 清理历史速度与 PID 状态，避免从运动态切换到锁角时出现残余冲击。 */
-    s_attitude_debug_force_enabled = 1U; /* 打开姿态调试强制模式，20ms 只走姿态闭环 */
+    /* 清理历史速度与 PID 状态，避免从运动态切换到原地航向闭环时出现残余冲击。 */
     ctrl_force_stop();          /* 清零执行器和 PID 状态 */
     chassis_ctrl_hold_yaw(0.0f); /* 将目标航向固定到 0 度 */
+    s_attitude_debug_force_enabled = 1U; /* 打开航向调试强制模式，20ms 仅走原地航向闭环 */
 }
 
+/**
+ * @brief  获取当前航向调试状态快照
+ * @param  out_info 输出结构体指针（不可为空）
+ * @note   提供目标角、当前角、误差与最近角速度指令，供调试打印使用。
+ */
 void chassis_ctrl_attitude_debug_get_state(chassis_attitude_debug_info_t *out_info)
 {
     if (0 == out_info)
@@ -445,6 +558,10 @@ void chassis_ctrl_attitude_debug_get_state(chassis_attitude_debug_info_t *out_in
     out_info->wz_cmd_dps      = s_last_cmd.wz_dps; /* 最近一次输出角速度 */
 }
 
+/**
+ * @brief  航向调试周期打印任务（5ms 调用）
+ * @note   内部按 100ms 分频打印一次，避免串口刷屏影响实时性。
+ */
 void chassis_ctrl_attitude_debug_task_5ms(void)
 {
     static uint8 s_print_div = 0U;      /* 打印分频计数：20 * 5ms = 100ms */
@@ -459,18 +576,26 @@ void chassis_ctrl_attitude_debug_task_5ms(void)
     s_print_div = 0U; /* 达到打印周期后清零分频计数 */
 
     chassis_ctrl_attitude_debug_get_state(&info); /* 获取本次打印快照 */
-    printf("[YawHold] target=%.2f yaw=%.2f err=%.2f wz_cmd=%.2f\r\n",
+    printf("[YawClosedLoop] target=%.2f yaw=%.2f err=%.2f wz=%.2f\r\n",
            info.target_yaw_deg,
-           info.current_yaw_deg,
-           info.yaw_err_deg,
-           info.wz_cmd_dps); /* 打印姿态闭环核心观测量 */
+            info.current_yaw_deg,
+            info.yaw_err_deg,
+            info.wz_cmd_dps); /* 打印航向闭环核心观测量 */
 }
 
+/**
+ * @brief  查询点位导航到达标志
+ * @return 1=已到达或空闲，0=移动中
+ */
 uint8 chassis_ctrl_is_arrived(void)
 {
     return s_arrived_flag; /* 返回当前到达标志 */
 }
 
+/**
+ * @brief  获取当前位姿快照
+ * @return 当前位姿（x/y/yaw）副本
+ */
 chassis_pose_t chassis_ctrl_get_pose(void)
 {
     chassis_pose_t copy; /* 位姿副本，避免直接暴露全局变量 */
@@ -480,6 +605,10 @@ chassis_pose_t chassis_ctrl_get_pose(void)
     return copy;                   /* 返回位姿副本 */
 }
 
+/**
+ * @brief  获取最近一次下发到底层的速度命令
+ * @return 车体速度命令副本（vx/vy/wz）
+ */
 chassis_body_speed_cmd_t chassis_ctrl_get_last_cmd(void)
 {
     chassis_body_speed_cmd_t copy; /* 指令副本，避免直接暴露全局变量 */
@@ -489,13 +618,25 @@ chassis_body_speed_cmd_t chassis_ctrl_get_last_cmd(void)
     return copy;                               /* 返回指令副本 */
 }
 
+/**
+ * @brief  底盘停止接口
+ * @note   会退出所有运动模式并清零执行链路状态。
+ */
 void chassis_ctrl_stop(void)
 {
+    s_move_yaw_cmd_mode_enabled = 0U; /* 停车时关闭外部移动+航向指令模式 */
     s_move_mode_enabled = 0U; /* 关闭移动模式 */
     s_arrived_flag = 1U;      /* 置位空闲状态 */
     ctrl_force_stop();        /* 强制停机 */
 }
 
+/**
+ * @brief  手动设置位姿（外部校正接口）
+ * @param  x_m      校正后的全局 X 坐标（米）
+ * @param  y_m      校正后的全局 Y 坐标（米）
+ * @param  yaw_deg  校正后的航向角（度）
+ * @note   同时同步 IMU 航向，防止下一周期被旧值覆盖。
+ */
 void chassis_ctrl_set_pose(float x_m, float y_m, float yaw_deg)
 {
     s_pose.x_m     = x_m;                               /* 写入校正后的 x */
@@ -503,9 +644,13 @@ void chassis_ctrl_set_pose(float x_m, float y_m, float yaw_deg)
     s_pose.yaw_deg = chassis_normalize_angle_deg(yaw_deg); /* 写入并归一化校正后的 yaw */
 
     /* 同步航向角到 IMU 模块，避免下一次 5ms 更新覆盖校正值 */
-    chassis_imu_set_yaw_deg(yaw_deg); /* 同步 IMU 内部航向状态 */
+    chassis_imu_set_yaw_deg(s_pose.yaw_deg); /* 同步 IMU 内部航向状态 */
 }
 
+/**
+ * @brief  读取当前运行时调参
+ * @param  out_params 输出参数结构体（不可为空）
+ */
 void chassis_ctrl_get_tune_params(chassis_tune_params_t *out_params)
 {
     if (0 == out_params)
@@ -515,6 +660,11 @@ void chassis_ctrl_get_tune_params(chassis_tune_params_t *out_params)
     *out_params = s_tune_params; /* 返回当前生效参数快照 */
 }
 
+/**
+ * @brief  写入并生效运行时调参
+ * @param  in_params 输入参数结构体（不可为空）
+ * @note   写入前会统一做安全限幅，随后同步更新四轮 PID 增益。
+ */
 void chassis_ctrl_set_tune_params(const chassis_tune_params_t *in_params)
 {
     uint8 i;                       /* 轮序号：同步更新四路 PID 增益 */

@@ -27,8 +27,15 @@
  *  地图基础定义（原 algo_bfs_scout.h）
  * ====================================================================== */
 
-#define MAP_ROWS    ((int)CHASSIS_GRID_ROWS)   // 12 行（Y 方向，对应 2.4m / 0.20m）
-#define MAP_COLS    ((int)CHASSIS_GRID_COLS)   // 16 列（X 方向，对应 3.2m / 0.20m）
+#ifdef MAP_ROWS
+#undef MAP_ROWS
+#endif
+#define MAP_ROWS    (12)   // 12 行总地图（含上下边界）
+
+#ifdef MAP_COLS
+#undef MAP_COLS
+#endif
+#define MAP_COLS    (16)   // 16 列总地图（含左右边界）
 
 // 地图元素定义
 typedef enum {

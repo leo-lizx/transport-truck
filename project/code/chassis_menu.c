@@ -458,10 +458,16 @@ static void menu_draw_pose(uint8 force_refresh)
     {
         /* 全刷时补画标题，增量刷新时不重复绘制。 */
         ips200_set_color(RGB565_GREEN, RGB565_BLACK);
+        ips200_show_string(0, 152, "Map 12x16 | Inner 10x14");
+        ips200_show_string(0, 170, "SX:0.000 SY:0.000 ST:00,00");
         ips200_show_string(0, 188, "Pose X / Y / IMU Yaw");
     }
 
     ips200_set_color(RGB565_WHITE, RGB565_BLACK);      /* 数据区使用白字 */
+    ips200_show_float(24,  170, CHASSIS_GRID_STEP_X_M, 5, 3U); /* 绘制 X 方向步长 */
+    ips200_show_float(96,  170, CHASSIS_GRID_STEP_Y_M, 5, 3U); /* 绘制 Y 方向步长 */
+    ips200_show_uint(168,  170, CHASSIS_START_GRID_X,  2U);    /* 对齐到 "ST:00,00" 中第一个 "00" */
+    ips200_show_uint(192,  170, CHASSIS_START_GRID_Y,  2U);    /* 对齐到 "ST:00,00" 中第二个 "00" */
     ips200_show_float(0,   206, pose.x_m, 4, 2U);      /* 绘制 X 坐标 */
     ips200_show_float(100, 206, pose.y_m, 4, 2U);      /* 绘制 Y 坐标 */
     ips200_show_float(200, 206, imu_yaw_deg, 5, 1U);   /* 绘制 IMU 航向角 */

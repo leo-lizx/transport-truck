@@ -112,8 +112,10 @@ int main(void)
     chassis_ctrl_init();
     chassis_menu_init();
 
-    // 姿态与位置清零，保持里程计与 IMU 航向基准一致。
-    chassis_ctrl_set_pose(0.0f, 0.0f, 0.0f);
+    // 发车位修正：第一列，距最底边界约 1m（折算到网格后为 G(1,7)）。
+    chassis_ctrl_set_pose(chassis_grid_x_to_m(CHASSIS_START_GRID_X),
+                          chassis_grid_y_to_m(CHASSIS_START_GRID_Y),
+                          0.0f);
 
     // 进入姿态闭环调试模式：固定 0 度航向保持。
     chassis_ctrl_attitude_debug_start_zero();

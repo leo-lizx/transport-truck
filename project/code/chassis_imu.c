@@ -1,176 +1,111 @@
+/*===========================================================================
+ * [chassis_imu.c] IMU 航向采样与积分模块实现
+ *===========================================================================*/
+
 #include "chassis_imu.h"
 #include "chassis_config.h"
 #include "zf_device_imu660rb.h"
 #include "zf_driver_delay.h"
 #include <math.h>
 
-// 算法常量定义 —— 使用 chassis_config.h 中的统一宏
-#define IMU_DT              CHASSIS_TASK_DT_5MS_S   // 积分步长 5ms
-#define IMU_GYRO_DEADZONE   CHASSIS_IMU_GYRO_DEADZONE_DPS
-#define IMU_GYRO_LPF_ALPHA  CHASSIS_IMU_GYRO_LPF_ALPHA
-#define IMU_BIAS_ADAPT_ALPHA CHASSIS_IMU_BIAS_ADAPT_ALPHA
-#define IMU_YAW_SIGN        CHASSIS_IMU_YAW_SIGN
+/* IMU 积分与滤波参数（统一使用配置头中的宏） */
+#define IMU_DT_S                 CHASSIS_TASK_DT_5MS_S
+#define IMU_GYRO_DEADZONE_DPS    CHASSIS_IMU_GYRO_DEADZONE_DPS
+#define IMU_GYRO_LPF_ALPHA       CHASSIS_IMU_GYRO_LPF_ALPHA
+#define IMU_BIAS_ADAPT_ALPHA     CHASSIS_IMU_BIAS_ADAPT_ALPHA
+#define IMU_YAW_SIGN             CHASSIS_IMU_YAW_SIGN
 
-// Mahony 滤波参数 —— 加 IMU_ 前缀避免与 PID 的 Kp/Ki 冲突
-#define IMU_MAHONY_KP   2.0f    // 比例增益
-#define IMU_MAHONY_KI   0.005f  // 积分增益
+/** 全局欧拉角输出（当前控制链只使用 yaw） */
+volatile EulerAngle_t car_angle = {0.0f, 0.0f, 0.0f};
 
-// 姿态输出
-volatile EulerAngle_t car_angle = {0};
+/** Z 轴陀螺仪静态零偏（单位：度/秒） */
+static float s_gyro_z_bias_dps = 0.0f;
 
-// 内部状态变量
-static float gyro_z_bias = 0.0f;    // Z轴陀螺仪静态零偏
-static float yaw_rate_lpf = 0.0f;   // Yaw 角速度低通状态 (°/s)
+/** Z 轴角速度一阶低通状态（单位：度/秒） */
+static float s_yaw_rate_lpf_dps = 0.0f;
 
-// Mahony 四元数与积分误差
-// static float q0 = 1.0f, q1 = 0.0f, q2 = 0.0f, q3 = 0.0f;
-// static float exInt = 0.0f, eyInt = 0.0f, ezInt = 0.0f;
+/**
+ * @brief  初始化 IMU 硬件并执行静态零偏标定
+ * @note   标定期间车体必须静止，否则会把运动角速度误认为零偏。
+ */
+void chassis_imu_init(void)
+{
+    float gyro_z_sum_dps = 0.0f; /* 标定窗口内角速度累计值 */
+    uint16 sample_count = 1000U; /* 标定采样次数 */
+    uint16 i;                    /* 采样循环计数 */
 
-//-------------------------------------------------------------------------
-// 函数简介：平方根倒数 (RT1064 自带硬件 FPU，直接使用标准库)
-//-------------------------------------------------------------------------
-// static float invSqrt(float x) {
-//     return 1.0f / sqrtf(x);
-// }
-
-//-------------------------------------------------------------------------
-// 函数简介：IMU 初始化（包含静态零偏采集）
-// 备注：调用此函数时，务必保证车模放在平地上且【绝对静止】！
-//-------------------------------------------------------------------------
-void chassis_imu_init(void) {
-    float sum_gyro_z = 0.0f;
-    int sample_count = 1000;  // 采集1000次求平均
-
-    // 1. 底层硬件初始化
+    /* 步骤 1: 初始化底层 IMU 设备。 */
     imu660rb_init();
-    
-    // 2. 静态零偏标定
-    for(int i = 0; i < sample_count; i++) {
-        imu660rb_get_gyro(); // 底层读取
-        sum_gyro_z += imu660rb_gyro_transition(imu660rb_gyro_z); // 转换为 °/s 并累加
-        system_delay_ms(1);  // 短暂延时
+
+    /* 步骤 2: 在静止状态采样 Z 轴角速度，估计零偏。 */
+    for (i = 0U; i < sample_count; ++i)
+    {
+        imu660rb_get_gyro();
+        gyro_z_sum_dps += imu660rb_gyro_transition(imu660rb_gyro_z);
+        system_delay_ms(1);
     }
-    
-    // 3. 计算 Z 轴零偏
-    gyro_z_bias = sum_gyro_z / (float)sample_count;
-    
-    // 4. 初始化状态
+
+    /* 步骤 3: 计算并保存平均零偏。 */
+    s_gyro_z_bias_dps = gyro_z_sum_dps / (float)sample_count;
+
+    /* 步骤 4: 复位航向积分状态。 */
+    car_angle.roll = 0.0f;
+    car_angle.pitch = 0.0f;
     car_angle.yaw = 0.0f;
-    yaw_rate_lpf = 0.0f;
+    s_yaw_rate_lpf_dps = 0.0f;
 }
 
-//-------------------------------------------------------------------------
-// 函数简介：设置/校准 Yaw 角（度）
-//-------------------------------------------------------------------------
-void chassis_imu_set_yaw_deg(float yaw_deg) {
+/**
+ * @brief  外部设置航向角（用于重定位校正）
+ * @param  yaw_deg 目标航向角（度）
+ */
+void chassis_imu_set_yaw_deg(float yaw_deg)
+{
     car_angle.yaw = chassis_normalize_angle_deg(yaw_deg);
 }
 
-float chassis_imu_get_yaw_deg(void) {
+/**
+ * @brief  读取当前航向角
+ * @return 航向角（度，范围 [-180, 180]）
+ */
+float chassis_imu_get_yaw_deg(void)
+{
     return car_angle.yaw;
 }
 
-//-------------------------------------------------------------------------
-// 函数简介：IMU数据更新与姿态解算 (5ms 高频调用)
-// 备注：必须放在严谨的 5ms 定时器中断中执行！
-//-------------------------------------------------------------------------
-void chassis_imu_update_5ms(void) {
-    // float ax, ay, az;
-    // float gx, gy, gz;
-    float gz;
-    // float norm;
-    // float vx, vy, vz;
-    // float ex, ey, ez;
+/**
+ * @brief  5ms 周期更新航向角
+ * @note   处理链路：零偏补偿 -> 死区抑噪 -> 零偏自适应 -> 低通 -> 欧拉积分。
+ */
+void chassis_imu_update_5ms(void)
+{
+    float gyro_z_raw_dps;  /* 原始 Z 轴角速度（度/秒） */
+    float yaw_rate_dps;    /* 零偏补偿与符号修正后的角速度（度/秒） */
 
-    // 1. 获取底层原始数据并转换为物理单位
+    /* 步骤 1: 采样底层传感器数据。 */
     imu660rb_get_acc();
     imu660rb_get_gyro();
-    
-    // ax = imu660rb_acc_transition(imu660rb_acc_x); // 单位: g
-    // ay = imu660rb_acc_transition(imu660rb_acc_y);
-    // az = imu660rb_acc_transition(imu660rb_acc_z);
-    
-    // gx = imu660rb_gyro_transition(imu660rb_gyro_x); // 单位: °/s
-    // gy = imu660rb_gyro_transition(imu660rb_gyro_y);
-    gz = imu660rb_gyro_transition(imu660rb_gyro_z);
+    gyro_z_raw_dps = imu660rb_gyro_transition(imu660rb_gyro_z);
 
-    // ==========================================================
-    // 第一部分：Yaw 角积分（零偏补偿 + 死区 + 低通 + 欧拉积分）
-    // ==========================================================
-    float current_gz = (gz - gyro_z_bias) * IMU_YAW_SIGN;
-    
-    // 剔除静止死区噪声
-    if(fabsf(current_gz) < IMU_GYRO_DEADZONE) {
-        current_gz = 0.0f;
+    /* 步骤 2: 做零偏补偿与安装方向修正。 */
+    yaw_rate_dps = (gyro_z_raw_dps - s_gyro_z_bias_dps) * IMU_YAW_SIGN;
+
+    /* 步骤 3: 小角速度死区抑噪。 */
+    if (fabsf(yaw_rate_dps) < IMU_GYRO_DEADZONE_DPS)
+    {
+        yaw_rate_dps = 0.0f;
     }
 
-    // 静止时缓慢跟踪零偏，减小长期漂移
-    if(0.0f == current_gz) {
-        gyro_z_bias += IMU_BIAS_ADAPT_ALPHA * (gz - gyro_z_bias);
+    /* 步骤 4: 静止时缓慢更新零偏，抑制长期漂移。 */
+    if (0.0f == yaw_rate_dps)
+    {
+        s_gyro_z_bias_dps += IMU_BIAS_ADAPT_ALPHA * (gyro_z_raw_dps - s_gyro_z_bias_dps);
     }
 
-    // 一阶低通，抑制角速度噪声
-    yaw_rate_lpf += IMU_GYRO_LPF_ALPHA * (current_gz - yaw_rate_lpf);
-    
-    // 简单欧拉积分：Yaw += 角速度 * dt
-    car_angle.yaw += yaw_rate_lpf * IMU_DT;
+    /* 步骤 5: 一阶低通滤波，降低角速度噪声。 */
+    s_yaw_rate_lpf_dps += IMU_GYRO_LPF_ALPHA * (yaw_rate_dps - s_yaw_rate_lpf_dps);
 
-    // 统一限制到 [-180, 180]
+    /* 步骤 6: 欧拉积分并归一化到 [-180, 180]。 */
+    car_angle.yaw += s_yaw_rate_lpf_dps * IMU_DT_S;
     car_angle.yaw = chassis_normalize_angle_deg(car_angle.yaw);
-
-
-    // ==========================================================
-    // 第二部分：Mahony 算法解算 Pitch 和 Roll (加速度计与陀螺仪融合)
-    // ==========================================================
-    // 将陀螺仪数据转换为 弧度/秒，供四元数运算使用
-    // gx = gx * CHASSIS_DEG_TO_RAD_F;
-    // gy = gy * CHASSIS_DEG_TO_RAD_F;
-    // gz = gz * CHASSIS_DEG_TO_RAD_F;
-
-    // // 只在加速度计数据有效时进行修正
-    // if(!((ax == 0.0f) && (ay == 0.0f) && (az == 0.0f))) {
-    //     // 归一化加速度计数据
-    //     norm = invSqrt(ax * ax + ay * ay + az * az);
-    //     ax *= norm;
-    //     ay *= norm;
-    //     az *= norm;
-
-    //     // 根据四元数计算出的当前重力在三个轴上的估计投影
-    //     vx = 2.0f * (q1 * q3 - q0 * q2);
-    //     vy = 2.0f * (q0 * q1 + q2 * q3);
-    //     vz = q0 * q0 - q1 * q1 - q2 * q2 + q3 * q3;
-
-    //     // 测量得到的重力向量与估计的重力向量之间的误差 (叉乘)
-    //     ex = (ay * vz - az * vy);
-    //     ey = (az * vx - ax * vz);
-    //     ez = (ax * vy - ay * vx);
-
-    //     // 误差积分
-    //     exInt += ex * IMU_MAHONY_KI;
-    //     eyInt += ey * IMU_MAHONY_KI;
-    //     ezInt += ez * IMU_MAHONY_KI;
-
-    //     // 调整陀螞仪的测量值
-    //     gx += IMU_MAHONY_KP * ex + exInt;
-    //     gy += IMU_MAHONY_KP * ey + eyInt;
-    //     gz += IMU_MAHONY_KP * ez + ezInt;
-    // }
-
-    // // 整合四元数变化率并归一化 (一阶龙格库塔法)
-    // float q0_last = q0, q1_last = q1, q2_last = q2, q3_last = q3;
-    // q0 += (-q1_last * gx - q2_last * gy - q3_last * gz) * (0.5f * IMU_DT);
-    // q1 += ( q0_last * gx + q2_last * gz - q3_last * gy) * (0.5f * IMU_DT);
-    // q2 += ( q0_last * gy - q1_last * gz + q3_last * gx) * (0.5f * IMU_DT);
-    // q3 += ( q0_last * gz + q1_last * gy - q2_last * gx) * (0.5f * IMU_DT);
-
-    // // 四元数归一化
-    // norm = invSqrt(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3);
-    // q0 *= norm;
-    // q1 *= norm;
-    // q2 *= norm;
-    // q3 *= norm;
-
-    // // 将四元数转换为欧拉角 (仅计算 Pitch 和 Roll)
-    // car_angle.pitch = asinf(-2.0f * q1 * q3 + 2.0f * q0 * q2) * CHASSIS_RAD_TO_DEG_F;
-    // car_angle.roll  = atan2f(2.0f * q2 * q3 + 2.0f * q0 * q1, -2.0f * q1 * q1 - 2.0f * q2 * q2 + 1.0f) * CHASSIS_RAD_TO_DEG_F;
 }

@@ -5,6 +5,9 @@
 #include "chassis_mecanum.h"
 #include <math.h>
 
+/**
+ * @brief  正运动学：车体速度映射到四轮线速度
+ */
 void chassis_mecanum_forward(float vx_body_mps,
                              float vy_body_mps,
                              float wz_radps,
@@ -29,6 +32,9 @@ void chassis_mecanum_forward(float vx_body_mps,
     out_wheel_mps[CHASSIS_WHEEL_RB] = vy_body_mps + vx_body_mps + CHASSIS_MECANUM_K_M * wz_radps;
 }
 
+/**
+ * @brief  逆运动学：四轮线速度反解车体平移速度
+ */
 void chassis_mecanum_inverse(const float wheel_mps[CHASSIS_WHEEL_COUNT],
                              float *out_vx_mps,
                              float *out_vy_mps)
@@ -46,30 +52,33 @@ void chassis_mecanum_inverse(const float wheel_mps[CHASSIS_WHEEL_COUNT],
                  + wheel_mps[CHASSIS_WHEEL_LB] + wheel_mps[CHASSIS_WHEEL_RB]) * 0.25f;
 }
 
+/**
+ * @brief  四轮等比例限速（保持速度方向不变）
+ */
 void chassis_mecanum_clamp_wheels(float wheel_mps[CHASSIS_WHEEL_COUNT],
                                   float max_speed)
 {
-    float abs_max = 0.0f;
-    float scale;
-    uint8 i;
+    float max_abs_wheel_speed = 0.0f; /* 四轮中绝对值最大的速度 */
+    float speed_scale;                /* 超限时统一缩放系数 */
+    uint8 i;                          /* 轮序号 */
 
     /* 找出四轮中绝对值最大的速度 */
     for (i = 0U; i < (uint8)CHASSIS_WHEEL_COUNT; ++i)
     {
         float abs_val = fabsf(wheel_mps[i]);
-        if (abs_val > abs_max)
+        if (abs_val > max_abs_wheel_speed)
         {
-            abs_max = abs_val;
+            max_abs_wheel_speed = abs_val;
         }
     }
 
     /* 若超限：所有轮乘以同一缩放系数，保持运动方向不变 */
-    if (abs_max > max_speed && abs_max > 1e-6f)
+    if (max_abs_wheel_speed > max_speed && max_abs_wheel_speed > 1e-6f)
     {
-        scale = max_speed / abs_max;
+        speed_scale = max_speed / max_abs_wheel_speed;
         for (i = 0U; i < (uint8)CHASSIS_WHEEL_COUNT; ++i)
         {
-            wheel_mps[i] *= scale;
+            wheel_mps[i] *= speed_scale;
         }
     }
 }

@@ -6,13 +6,15 @@
 #include "algo_sokoban_solver.h"
 #include "chassis_ctrl.h"
 
-#ifndef MAP_ROWS
-#define MAP_ROWS ((int)CHASSIS_GRID_ROWS)
+#ifdef MAP_ROWS
+#undef MAP_ROWS
 #endif
+#define MAP_ROWS (12)
 
-#ifndef MAP_COLS
-#define MAP_COLS ((int)CHASSIS_GRID_COLS)
+#ifdef MAP_COLS
+#undef MAP_COLS
 #endif
+#define MAP_COLS (16)
 
 // ==========================================
 // 底盘硬件调用层（直接对接 chassis_ctrl.*）
@@ -28,8 +30,8 @@
  * 1) 向底盘控制链路下发“网格坐标目标点”。
  * 2) 该宏不会阻塞等待底盘到达，仅负责触发目标更新。
  * 参数说明:
- * 1) x: 目标网格 X 坐标（建议范围 0~15）。
- * 2) y: 目标网格 Y 坐标（建议范围 0~11）。
+ * 1) x: 目标网格 X 坐标（建议范围 1~14，最外圈边界不可进）。
+ * 2) y: 目标网格 Y 坐标（建议范围 1~10，最外圈边界不可进）。
  * 返回值:
  * 1) 无返回值。
  * 使用建议:

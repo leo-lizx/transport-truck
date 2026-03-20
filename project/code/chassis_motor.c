@@ -4,6 +4,10 @@
 
 #include "chassis_motor.h"
 
+/**
+ * @brief  初始化单路电机驱动
+ * @param  motor 电机对象指针
+ */
 void chassis_motor_init(chassis_motor_t *motor)
 {
     /* 初始化 PWM 输出引脚，初始占空比为 0（电机不转） */
@@ -16,18 +20,23 @@ void chassis_motor_init(chassis_motor_t *motor)
     pwm_set_duty(motor->pwm_channel, 0U);
 }
 
+/**
+ * @brief  设置单路电机有符号 PWM
+ * @param  motor      电机对象指针
+ * @param  pwm_signed 有符号 PWM：正值正转，负值反转
+ */
 void chassis_motor_set_pwm(chassis_motor_t *motor, float pwm_signed)
 {
-    float pwm_abs;
-    uint32 duty;
+    float pwm_abs_value; /* 绝对值后的 PWM 幅值 */
+    uint32 pwm_duty;     /* 下发到硬件的占空比 */
 
     /* 取绝对值并限幅到 PWM 最大值 */
-    pwm_abs = (pwm_signed >= 0.0f) ? pwm_signed : (-pwm_signed);
-    if (pwm_abs > CHASSIS_MOTOR_PWM_MAX)
+    pwm_abs_value = (pwm_signed >= 0.0f) ? pwm_signed : (-pwm_signed);
+    if (pwm_abs_value > CHASSIS_MOTOR_PWM_MAX)
     {
-        pwm_abs = CHASSIS_MOTOR_PWM_MAX;
+        pwm_abs_value = CHASSIS_MOTOR_PWM_MAX;
     }
-    duty = (uint32)pwm_abs;
+    pwm_duty = (uint32)pwm_abs_value;
 
     /*
      * 方向控制逻辑：
@@ -46,9 +55,13 @@ void chassis_motor_set_pwm(chassis_motor_t *motor, float pwm_signed)
         gpio_low(motor->dir_pin);
     }
 
-    pwm_set_duty(motor->pwm_channel, duty);
+    pwm_set_duty(motor->pwm_channel, pwm_duty);
 }
 
+/**
+ * @brief  立即停止单路电机
+ * @param  motor 电机对象指针
+ */
 void chassis_motor_stop(chassis_motor_t *motor)
 {
     pwm_set_duty(motor->pwm_channel, 0U);

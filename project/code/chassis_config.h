@@ -53,11 +53,10 @@
 
 /* ======================================================================
  *  比赛场地 & 网格参数
- *  场地物理尺寸 3.2m × 2.4m，映射为 16 列 × 12 行的网格
+ *  比赛地图总尺寸 16 列 × 12 行：
+ *    - 最外圈边界（首行/末行/首列/末列）不可进入
+ *    - 实际可通行区域为 14 列 × 10 行，对应 3.2m × 2.4m
  * ====================================================================== */
-
-/** 每格物理边长（米），即 20cm = 0.20m */
-#define CHASSIS_GRID_CELL_SIZE_M        (0.20f)
 
 /** 网格 X 方向最大索引（0 ~ 15，共 16 列） */
 #define CHASSIS_GRID_MAX_X              (15U)
@@ -70,6 +69,45 @@
 
 /** 网格总行数（Y 方向） */
 #define CHASSIS_GRID_ROWS               (CHASSIS_GRID_MAX_Y + 1U)
+
+/** 可通行区域最小 X 索引（首列边界不可进） */
+#define CHASSIS_GRID_INNER_MIN_X        (1U)
+
+/** 可通行区域最大 X 索引（末列边界不可进） */
+#define CHASSIS_GRID_INNER_MAX_X        (CHASSIS_GRID_MAX_X - 1U)
+
+/** 可通行区域最小 Y 索引（首行边界不可进） */
+#define CHASSIS_GRID_INNER_MIN_Y        (1U)
+
+/** 可通行区域最大 Y 索引（末行边界不可进） */
+#define CHASSIS_GRID_INNER_MAX_Y        (CHASSIS_GRID_MAX_Y - 1U)
+
+/** 可通行区域列数（14 列） */
+#define CHASSIS_GRID_INNER_COLS         (CHASSIS_GRID_INNER_MAX_X - CHASSIS_GRID_INNER_MIN_X + 1U)
+
+/** 可通行区域行数（10 行） */
+#define CHASSIS_GRID_INNER_ROWS         (CHASSIS_GRID_INNER_MAX_Y - CHASSIS_GRID_INNER_MIN_Y + 1U)
+
+/** 可通行区域物理宽度（米） */
+#define CHASSIS_MAP_WIDTH_M             (3.20f)
+
+/** 可通行区域物理高度（米） */
+#define CHASSIS_MAP_HEIGHT_M            (2.40f)
+
+/** X 方向单步步长（米）= 3.2 / 14 */
+#define CHASSIS_GRID_STEP_X_M           (CHASSIS_MAP_WIDTH_M / (float)CHASSIS_GRID_INNER_COLS)
+
+/** Y 方向单步步长（米）= 2.4 / 10 */
+#define CHASSIS_GRID_STEP_Y_M           (CHASSIS_MAP_HEIGHT_M / (float)CHASSIS_GRID_INNER_ROWS)
+
+/** 兼容旧代码：等同于 X 方向步长（不建议新代码继续使用） */
+#define CHASSIS_GRID_CELL_SIZE_M        (CHASSIS_GRID_STEP_X_M)
+
+/** 发车区：第一列（可通行区域首列） */
+#define CHASSIS_START_GRID_X            (CHASSIS_GRID_INNER_MIN_X)
+
+/** 发车区：距离最底边界约 1m（按 Y 步长折算后取最近网格） */
+#define CHASSIS_START_GRID_Y            (7U)
 
 /** 到达目标点判定阈值（米），距目标小于此值即认为"已到达" */
 #define CHASSIS_TARGET_REACHED_EPSILON_M (0.03f)
@@ -86,6 +124,12 @@
 
 /** 单个轮子允许的最大线速度（m/s），超出时四轮按比例缩放 */
 #define CHASSIS_MAX_WHEEL_SPEED_MPS     (0.60f)
+
+/** 在线调参时允许的线速度上限硬限制（m/s） */
+#define CHASSIS_TUNE_MAX_LINEAR_SPEED_LIMIT_MPS  (1.50f)
+
+/** 在线调参时允许的角速度上限硬限制（°/s） */
+#define CHASSIS_TUNE_MAX_YAW_SPEED_LIMIT_DPS     (360.0f)
 
 /* ======================================================================
  *  导航控制增益（P 控制器参数）
@@ -144,10 +188,10 @@
  * ====================================================================== */
 
 /** X 方向里程计缩放系数 */
-#define CHASSIS_ODOM_SCALE_X            (1.00f)
+#define CHASSIS_ODOM_SCALE_X            (0.463768f)
 
 /** Y 方向里程计缩放系数 */
-#define CHASSIS_ODOM_SCALE_Y            (1.00f)
+#define CHASSIS_ODOM_SCALE_Y            (0.489795f)
 
 /* ======================================================================
  *  车模物理尺寸 — 已经填入实际测量数据
@@ -332,6 +376,68 @@ static inline float chassis_clamp_f(float value, float min_val, float max_val)
     if (value < min_val) return min_val;
     if (value > max_val) return max_val;
     return value;
+}
+
+/**
+ * @brief  将 X 网格索引钳位到可通行内场范围 [1, 14]
+ */
+static inline uint8 chassis_clamp_grid_x_inner(uint8 grid_x)
+{
+    if (grid_x < CHASSIS_GRID_INNER_MIN_X) return CHASSIS_GRID_INNER_MIN_X;
+    if (grid_x > CHASSIS_GRID_INNER_MAX_X) return CHASSIS_GRID_INNER_MAX_X;
+    return grid_x;
+}
+
+/**
+ * @brief  将 Y 网格索引钳位到可通行内场范围 [1, 10]
+ */
+static inline uint8 chassis_clamp_grid_y_inner(uint8 grid_y)
+{
+    if (grid_y < CHASSIS_GRID_INNER_MIN_Y) return CHASSIS_GRID_INNER_MIN_Y;
+    if (grid_y > CHASSIS_GRID_INNER_MAX_Y) return CHASSIS_GRID_INNER_MAX_Y;
+    return grid_y;
+}
+
+/**
+ * @brief  可通行网格 X 索引 -> 物理坐标 X（米）
+ *         以可通行区域左边界为 0m。
+ */
+static inline float chassis_grid_x_to_m(uint8 grid_x)
+{
+    int32 inner_x = (int32)chassis_clamp_grid_x_inner(grid_x) - (int32)CHASSIS_GRID_INNER_MIN_X;
+    return ((float)inner_x * CHASSIS_GRID_STEP_X_M);
+}
+
+/**
+ * @brief  可通行网格 Y 索引 -> 物理坐标 Y（米）
+ *         以可通行区域上边界为 0m。
+ */
+static inline float chassis_grid_y_to_m(uint8 grid_y)
+{
+    int32 inner_y = (int32)chassis_clamp_grid_y_inner(grid_y) - (int32)CHASSIS_GRID_INNER_MIN_Y;
+    return ((float)inner_y * CHASSIS_GRID_STEP_Y_M);
+}
+
+/**
+ * @brief  物理坐标 X（米）-> 可通行网格 X 索引（四舍五入）
+ */
+static inline uint8 chassis_m_to_grid_x(float x_m)
+{
+    int32 grid_x = (int32)(x_m / CHASSIS_GRID_STEP_X_M + 0.5f) + (int32)CHASSIS_GRID_INNER_MIN_X;
+    if (grid_x < (int32)CHASSIS_GRID_INNER_MIN_X) grid_x = (int32)CHASSIS_GRID_INNER_MIN_X;
+    if (grid_x > (int32)CHASSIS_GRID_INNER_MAX_X) grid_x = (int32)CHASSIS_GRID_INNER_MAX_X;
+    return (uint8)grid_x;
+}
+
+/**
+ * @brief  物理坐标 Y（米）-> 可通行网格 Y 索引（四舍五入）
+ */
+static inline uint8 chassis_m_to_grid_y(float y_m)
+{
+    int32 grid_y = (int32)(y_m / CHASSIS_GRID_STEP_Y_M + 0.5f) + (int32)CHASSIS_GRID_INNER_MIN_Y;
+    if (grid_y < (int32)CHASSIS_GRID_INNER_MIN_Y) grid_y = (int32)CHASSIS_GRID_INNER_MIN_Y;
+    if (grid_y > (int32)CHASSIS_GRID_INNER_MAX_Y) grid_y = (int32)CHASSIS_GRID_INNER_MAX_Y;
+    return (uint8)grid_y;
 }
 
 /**

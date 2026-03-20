@@ -1,7 +1,7 @@
 #include "app_game_logic.h"
 
 uint8 g_game_map[MAP_ROWS][MAP_COLS];
-Point_t g_player_pos = {0, 0}; // 车模实时坐标
+Point_t g_player_pos = {(int8)CHASSIS_START_GRID_X, (int8)CHASSIS_START_GRID_Y}; // 车模实时坐标
 
 // 状态机内部使用的静态变量
 static GameStage_e current_stage = STAGE_PENDING_SCOUT;
@@ -31,8 +31,8 @@ static uint16          g_bomb_wp_idx = 0;       // 当前路点索引
 static uint8 get_map_box_count(void)
 {
     uint8 count = 0;
-    for (int8 r = 0; r < MAP_ROWS; r++) {
-        for (int8 c = 0; c < MAP_COLS; c++) {
+    for (int8 r = (int8)CHASSIS_GRID_INNER_MIN_Y; r <= (int8)CHASSIS_GRID_INNER_MAX_Y; r++) {
+        for (int8 c = (int8)CHASSIS_GRID_INNER_MIN_X; c <= (int8)CHASSIS_GRID_INNER_MAX_X; c++) {
             if (g_game_map[r][c] == MAP_BOX) {
                 count++;
             }
@@ -47,14 +47,8 @@ static uint8 get_map_box_count(void)
 static void sync_player_pos(void)
 {
     chassis_pose_t pose = chassis_ctrl_get_pose();
-    int8 gx = (int8)(pose.x_m / CHASSIS_GRID_CELL_SIZE_M + 0.5f);
-    int8 gy = (int8)(pose.y_m / CHASSIS_GRID_CELL_SIZE_M + 0.5f);
-
-    // 钳位到合法网格范围
-    if (gx < 0)                     gx = 0;
-    if (gx > (int8)CHASSIS_GRID_MAX_X) gx = (int8)CHASSIS_GRID_MAX_X;
-    if (gy < 0)                     gy = 0;
-    if (gy > (int8)CHASSIS_GRID_MAX_Y) gy = (int8)CHASSIS_GRID_MAX_Y;
+    int8 gx = (int8)chassis_m_to_grid_x(pose.x_m);
+    int8 gy = (int8)chassis_m_to_grid_y(pose.y_m);
 
     g_player_pos.x = gx;
     g_player_pos.y = gy;
@@ -268,8 +262,8 @@ void Game_Logic_Task_Run(void) {
                     Point_t blocked_target = {-1, -1};
                     {
                         NavPath_t nav_tmp;
-                        for (int8 r = 0; r < MAP_ROWS; r++) {
-                            for (int8 c = 0; c < MAP_COLS; c++) {
+                        for (int8 r = (int8)CHASSIS_GRID_INNER_MIN_Y; r <= (int8)CHASSIS_GRID_INNER_MAX_Y; r++) {
+                            for (int8 c = (int8)CHASSIS_GRID_INNER_MIN_X; c <= (int8)CHASSIS_GRID_INNER_MAX_X; c++) {
                                 if (g_game_map[r][c] == MAP_TARGET) {
                                     Point_t tp = {c, r};
                                     if (!Algo_Nav_BFS(g_game_map, g_player_pos, tp, &nav_tmp)) {
@@ -288,8 +282,8 @@ void Game_Logic_Task_Run(void) {
                                                     blocked_target, &g_bomb_wall_pos)) {
                             /* 3. 在地图中找炸弹 */
                             g_bomb_pos.x = -1;
-                            for (int8 r = 0; r < MAP_ROWS && g_bomb_pos.x < 0; r++) {
-                                for (int8 c = 0; c < MAP_COLS; c++) {
+                            for (int8 r = (int8)CHASSIS_GRID_INNER_MIN_Y; r <= (int8)CHASSIS_GRID_INNER_MAX_Y && g_bomb_pos.x < 0; r++) {
+                                for (int8 c = (int8)CHASSIS_GRID_INNER_MIN_X; c <= (int8)CHASSIS_GRID_INNER_MAX_X; c++) {
                                     if (g_game_map[r][c] == MAP_BOMB) {
                                         g_bomb_pos.x = c;
                                         g_bomb_pos.y = r;
