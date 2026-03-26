@@ -15,15 +15,15 @@
  *     输入：4 个轮子的实际线速度
  *     输出：vx_body, vy_body
  *
- *   正运动学公式（标准 X 型布局）：
- *     v_LF = vy + vx - K × wz
- *     v_RF = vy - vx + K × wz
- *     v_LB = vy - vx - K × wz
- *     v_RB = vy + vx + K × wz
+ *   正运动学公式（标准 O 型布局）：
+ *     v_LF = vy - vx - K × wz
+ *     v_RF = vy + vx + K × wz
+ *     v_LB = vy + vx - K × wz
+ *     v_RB = vy - vx + K × wz
  *   其中 K = CHASSIS_MECANUM_K_M = 半轴距 + 半轮距
  *
  *   逆运动学公式：
- *     vx_body = (v_LF - v_RF - v_LB + v_RB) / 4
+ *     vx_body = (-v_LF + v_RF + v_LB - v_RB) / 4
  *     vy_body = (v_LF + v_RF + v_LB + v_RB) / 4
  *===========================================================================*/
 
