@@ -160,7 +160,8 @@ static void force_stop(void)
 }
 
 /** 完整执行链路: 滤波 → 运动学 → PID → 电机 */
-static void apply_speed(chassis_body_speed_cmd_t cmd)
+static void apply_speed(chassis_body_speed_cmd_t cmd,
+                        const float wheel_fb_mps[CHASSIS_WHEEL_COUNT])
 {
     chassis_body_speed_cmd_t f;
     float targets[CHASSIS_WHEEL_COUNT];
@@ -177,7 +178,7 @@ static void apply_speed(chassis_body_speed_cmd_t cmd)
         float pwm = chassis_pid_step(
             &s_pid[i],
             targets[i] * s_mot[i].dir_sign,         /* 方向修正后的目标 */
-            chassis_encoder_get_speed(&s_enc[i]));   /* 编码器反馈      */
+            wheel_fb_mps[i]);                        /* 本周期真实编码器反馈 */
         chassis_motor_set_pwm(&s_mot[i], pwm);
     }
 }
@@ -345,7 +346,7 @@ void chassis_ctrl_task_20ms(void)
     }
     }
 
-    apply_speed(cmd);
+    apply_speed(cmd, ws);
 }
 
 /*--- 运动指令 ---*/

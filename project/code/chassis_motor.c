@@ -44,7 +44,19 @@ void chassis_motor_set_pwm(chassis_motor_t *motor, float pwm_signed)
      *   pwm_signed <  0  →  GPIO_LOW （反转）
      *
      * 注意：若实车方向与预期相反，不要修改这里的逻辑，
-     *       请到 chassis_config.h 修改对应轮的 DIR_SIGN 宏。
+    /**
+     * @brief DIR_SIGN 宏用于配置每个车轮的电机旋转方向与实际车辆运动方向的对应关系。
+     *
+     * 在 chassis_config.h 文件中，每个轮子都有一个对应的 DIR_SIGN 宏定义（通常为 1 或 -1）。
+     * 该宏用于修正电机正转时车辆实际的前进/后退方向，确保控制逻辑与实际运动一致。
+     *
+     * 例如：
+     * - DIR_SIGN 为 1：电机正转时，车辆朝预期方向运动。
+     * - DIR_SIGN 为 -1：电机正转时，车辆朝相反方向运动，需要反向修正。
+     *
+     * 若发现车辆某个轮子的运动方向与预期不符，请到 chassis_config.h 修改对应轮的 DIR_SIGN 宏。
+   
+             请到 chassis_config.h 修改对应轮的 DIR_SIGN 宏。
      */
     if (pwm_signed >= 0.0f)
     {
