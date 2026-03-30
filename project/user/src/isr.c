@@ -68,7 +68,6 @@ void PIT_IRQHandler(void)
         pit_flag_clear(PIT_CH2);
 
         chassis_menu_task_10ms();
-        chassis_menu_render_100ms();
     }
     
     if(pit_flag_get(PIT_CH3))

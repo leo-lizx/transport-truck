@@ -69,4 +69,45 @@ float chassis_pid_step(chassis_pid_t *pid, float target, float feedback);
  */
 void chassis_pid_reset(chassis_pid_t *pid);
 
+/** 单轮 PID 调试快照（用于串口打印） */
+typedef struct
+{
+    uint8 wheel_index;   /**< 当前调试轮子索引 */
+    float target_value;  /**< 当前目标值 */
+    float actual_value;  /**< 当前实际值 */
+} chassis_pid_debug_snapshot_t;
+
+/**
+ * @brief  选择当前 PID 调试轮子（每次仅跟踪一个轮子）
+ * @param  wheel_index 轮子索引：CHASSIS_WHEEL_LF/RF/LB/RB
+ */
+void chassis_pid_debug_select_wheel(chassis_wheel_index_t wheel_index);
+
+/**
+ * @brief  喂入单轮调试样本（由控制层在 20ms 控制任务中调用）
+ * @param  wheel_index  样本所属轮子索引
+ * @param  target_value 目标值
+ * @param  actual_value 实际反馈值
+ */
+void chassis_pid_debug_feed_sample(chassis_wheel_index_t wheel_index,
+                                   float target_value,
+                                   float actual_value);
+
+/**
+ * @brief  读取当前单轮 PID 调试快照
+ * @param  out_snapshot 输出快照指针
+ */
+void chassis_pid_debug_get_snapshot(chassis_pid_debug_snapshot_t *out_snapshot);
+
+/**
+ * @brief  清零单轮 PID 调试缓存
+ */
+void chassis_pid_debug_reset(void);
+
+/**
+ * @brief  单轮 PID 调试打印任务（建议主循环每 5ms 调用）
+ *         内部 100ms 打印一次，printf 仅输出：目标值 实际值
+ */
+void chassis_pid_debug_task_5ms(void);
+
 #endif /* CHASSIS_PID_H */

@@ -36,16 +36,25 @@ typedef enum
 
 typedef enum
 {
-    MENU_PARAM_WHEEL_KP = 0, /* 轮速 PID 比例项 */
-    MENU_PARAM_WHEEL_KI,     /* 轮速 PID 积分项 */
-    MENU_PARAM_WHEEL_KD,     /* 轮速 PID 微分项 */
-    MENU_PARAM_POS_KP,       /* 位置环比例项 */
-    MENU_PARAM_YAW_KP,       /* 航向环比例项 */
-    MENU_PARAM_MAX_V,        /* 线速度上限 */
-    MENU_PARAM_MAX_W,        /* 角速度上限 */
-    MENU_PARAM_ACC_V,        /* 线加速度上限 */
-    MENU_PARAM_ACC_W,        /* 角加速度上限 */
-    MENU_PARAM_COUNT,        /* 参数总数 */
+    MENU_PARAM_LF_KP = 0, /* 左前轮 PID 比例项 */
+    MENU_PARAM_LF_KI,     /* 左前轮 PID 积分项 */
+    MENU_PARAM_LF_KD,     /* 左前轮 PID 微分项 */
+    MENU_PARAM_RF_KP,     /* 右前轮 PID 比例项 */
+    MENU_PARAM_RF_KI,     /* 右前轮 PID 积分项 */
+    MENU_PARAM_RF_KD,     /* 右前轮 PID 微分项 */
+    MENU_PARAM_LB_KP,     /* 左后轮 PID 比例项 */
+    MENU_PARAM_LB_KI,     /* 左后轮 PID 积分项 */
+    MENU_PARAM_LB_KD,     /* 左后轮 PID 微分项 */
+    MENU_PARAM_RB_KP,     /* 右后轮 PID 比例项 */
+    MENU_PARAM_RB_KI,     /* 右后轮 PID 积分项 */
+    MENU_PARAM_RB_KD,     /* 右后轮 PID 微分项 */
+    MENU_PARAM_POS_KP,    /* 位置环比例项 */
+    MENU_PARAM_YAW_KP,    /* 航向环比例项 */
+    MENU_PARAM_MAX_V,     /* 线速度上限 */
+    MENU_PARAM_MAX_W,     /* 角速度上限 */
+    MENU_PARAM_ACC_V,     /* 线加速度上限 */
+    MENU_PARAM_ACC_W,     /* 角加速度上限 */
+    MENU_PARAM_COUNT,     /* 参数总数 */
 } menu_param_id_enum;
 
 typedef struct
@@ -71,7 +80,7 @@ typedef struct
 #define CHASSIS_MENU_FLASH_SECTOR      (127U)       /* 参数存储扇区编号 */
 #define CHASSIS_MENU_FLASH_PAGE        (FLASH_PAGE_7) /* 参数存储页编号 */
 #define CHASSIS_MENU_FLASH_MAGIC       (0x4D4E5455U)   /* "MNTU" */
-#define CHASSIS_MENU_FLASH_VERSION     (1U)         /* 当前参数布局版本 */
+#define CHASSIS_MENU_FLASH_VERSION     (2U)         /* 当前参数布局版本 */
 
 typedef struct
 {
@@ -81,7 +90,6 @@ typedef struct
     uint32 checksum;              /* 数据完整性校验和 */
 } chassis_menu_flash_blob_t;
 
-static chassis_tune_params_t s_menu_params;             /* 菜单当前参数缓存 */
 static menu_level_enum s_menu_level = MENU_LEVEL_ROOT;  /* 当前菜单层级 */
 static uint8 s_root_index = 0U;                         /* 一级菜单当前页索引 */
 static uint8 s_param_index = 0U;                        /* 二级菜单当前参数索引 */
@@ -94,9 +102,18 @@ static uint8 s_full_refresh_done = 0U;                  /* 是否至少完成过
 
 static const menu_param_meta_t s_param_meta[MENU_PARAM_COUNT] =
 {
-    { "Wheel Kp",   1U, 1.00f,  0.00f,  400.0f },
-    { "Wheel Ki",   2U, 0.20f,  0.00f,   80.0f },
-    { "Wheel Kd",   2U, 0.10f,  0.00f,   40.0f },
+    { "LF Kp",      1U, 1.00f,  0.00f,  400.0f },
+    { "LF Ki",      2U, 0.20f,  0.00f,   80.0f },
+    { "LF Kd",      2U, 0.10f,  0.00f,   40.0f },
+    { "RF Kp",      1U, 1.00f,  0.00f,  400.0f },
+    { "RF Ki",      2U, 0.20f,  0.00f,   80.0f },
+    { "RF Kd",      2U, 0.10f,  0.00f,   40.0f },
+    { "LB Kp",      1U, 1.00f,  0.00f,  400.0f },
+    { "LB Ki",      2U, 0.20f,  0.00f,   80.0f },
+    { "LB Kd",      2U, 0.10f,  0.00f,   40.0f },
+    { "RB Kp",      1U, 1.00f,  0.00f,  400.0f },
+    { "RB Ki",      2U, 0.20f,  0.00f,   80.0f },
+    { "RB Kd",      2U, 0.10f,  0.00f,   40.0f },
     { "Pos Kp",     2U, 0.05f,  0.00f,    5.0f },
     { "Yaw Kp",     2U, 0.05f,  0.00f,   10.0f },
     { "Max V m/s",  2U, 0.01f,  0.05f,    1.5f },
@@ -105,7 +122,10 @@ static const menu_param_meta_t s_param_meta[MENU_PARAM_COUNT] =
     { "Acc W d/s2", 1U, 5.00f, 20.00f, 1000.0f },
 };
 
-static const uint8 s_page_pid_params[]   = { MENU_PARAM_WHEEL_KP, MENU_PARAM_WHEEL_KI, MENU_PARAM_WHEEL_KD }; /* PID 页参数映射 */
+static const uint8 s_page_pid_lf_params[] = { MENU_PARAM_LF_KP, MENU_PARAM_LF_KI, MENU_PARAM_LF_KD }; /* PID-LF 页参数映射 */
+static const uint8 s_page_pid_rf_params[] = { MENU_PARAM_RF_KP, MENU_PARAM_RF_KI, MENU_PARAM_RF_KD }; /* PID-RF 页参数映射 */
+static const uint8 s_page_pid_lb_params[] = { MENU_PARAM_LB_KP, MENU_PARAM_LB_KI, MENU_PARAM_LB_KD }; /* PID-LB 页参数映射 */
+static const uint8 s_page_pid_rb_params[] = { MENU_PARAM_RB_KP, MENU_PARAM_RB_KI, MENU_PARAM_RB_KD }; /* PID-RB 页参数映射 */
 static const uint8 s_page_nav_params[]   = { MENU_PARAM_POS_KP, MENU_PARAM_YAW_KP };                           /* NAV 页参数映射 */
 static const uint8 s_page_limit_params[] = { MENU_PARAM_MAX_V, MENU_PARAM_MAX_W, MENU_PARAM_ACC_V, MENU_PARAM_ACC_W }; /* LIMIT 页参数映射 */
 
@@ -113,7 +133,10 @@ static const menu_page_meta_t s_pages[] =
 {
     { "LIMIT", s_page_limit_params, (uint8)(sizeof(s_page_limit_params) / sizeof(s_page_limit_params[0])) },
     { "NAV",   s_page_nav_params,   (uint8)(sizeof(s_page_nav_params)   / sizeof(s_page_nav_params[0])) },
-    { "PID",   s_page_pid_params,   (uint8)(sizeof(s_page_pid_params)   / sizeof(s_page_pid_params[0])) },
+    { "PID-LF", s_page_pid_lf_params, (uint8)(sizeof(s_page_pid_lf_params) / sizeof(s_page_pid_lf_params[0])) },
+    { "PID-RF", s_page_pid_rf_params, (uint8)(sizeof(s_page_pid_rf_params) / sizeof(s_page_pid_rf_params[0])) },
+    { "PID-LB", s_page_pid_lb_params, (uint8)(sizeof(s_page_pid_lb_params) / sizeof(s_page_pid_lb_params[0])) },
+    { "PID-RB", s_page_pid_rb_params, (uint8)(sizeof(s_page_pid_rb_params) / sizeof(s_page_pid_rb_params[0])) },
 };
 
 #define MENU_PAGE_COUNT ((uint8)(sizeof(s_pages) / sizeof(s_pages[0]))) /* 一级菜单页数 */
@@ -124,35 +147,53 @@ static float menu_get_param_value(menu_param_id_enum id)
     /* 按参数 ID 路由到当前参数结构中的实际字段。 */
     switch (id)
     {
-        case MENU_PARAM_WHEEL_KP: return s_menu_params.wheel_pid_kp;         /* 轮速环比例项 */
-        case MENU_PARAM_WHEEL_KI: return s_menu_params.wheel_pid_ki;         /* 轮速环积分项 */
-        case MENU_PARAM_WHEEL_KD: return s_menu_params.wheel_pid_kd;         /* 轮速环微分项 */
-        case MENU_PARAM_POS_KP:   return s_menu_params.pos_kp;               /* 位置环比例项 */
-        case MENU_PARAM_YAW_KP:   return s_menu_params.yaw_kp;               /* 航向环比例项 */
-        case MENU_PARAM_MAX_V:    return s_menu_params.max_linear_speed_mps; /* 最大线速度上限 */
-        case MENU_PARAM_MAX_W:    return s_menu_params.max_yaw_speed_dps;    /* 最大角速度上限 */
-        case MENU_PARAM_ACC_V:    return s_menu_params.cmd_accel_limit_mps2; /* 线速度加速度限制 */
-        case MENU_PARAM_ACC_W:    return s_menu_params.cmd_accel_limit_dps2; /* 角速度加速度限制 */
-        default:                  return s_menu_params.wheel_pid_kp;         /* 异常 ID 回退值 */
+        case MENU_PARAM_LF_KP:  return g_chassis_tune_params.wheel_pid_kp[CHASSIS_WHEEL_LF]; /* 左前轮 Kp */
+        case MENU_PARAM_LF_KI:  return g_chassis_tune_params.wheel_pid_ki[CHASSIS_WHEEL_LF]; /* 左前轮 Ki */
+        case MENU_PARAM_LF_KD:  return g_chassis_tune_params.wheel_pid_kd[CHASSIS_WHEEL_LF]; /* 左前轮 Kd */
+        case MENU_PARAM_RF_KP:  return g_chassis_tune_params.wheel_pid_kp[CHASSIS_WHEEL_RF]; /* 右前轮 Kp */
+        case MENU_PARAM_RF_KI:  return g_chassis_tune_params.wheel_pid_ki[CHASSIS_WHEEL_RF]; /* 右前轮 Ki */
+        case MENU_PARAM_RF_KD:  return g_chassis_tune_params.wheel_pid_kd[CHASSIS_WHEEL_RF]; /* 右前轮 Kd */
+        case MENU_PARAM_LB_KP:  return g_chassis_tune_params.wheel_pid_kp[CHASSIS_WHEEL_LB]; /* 左后轮 Kp */
+        case MENU_PARAM_LB_KI:  return g_chassis_tune_params.wheel_pid_ki[CHASSIS_WHEEL_LB]; /* 左后轮 Ki */
+        case MENU_PARAM_LB_KD:  return g_chassis_tune_params.wheel_pid_kd[CHASSIS_WHEEL_LB]; /* 左后轮 Kd */
+        case MENU_PARAM_RB_KP:  return g_chassis_tune_params.wheel_pid_kp[CHASSIS_WHEEL_RB]; /* 右后轮 Kp */
+        case MENU_PARAM_RB_KI:  return g_chassis_tune_params.wheel_pid_ki[CHASSIS_WHEEL_RB]; /* 右后轮 Ki */
+        case MENU_PARAM_RB_KD:  return g_chassis_tune_params.wheel_pid_kd[CHASSIS_WHEEL_RB]; /* 右后轮 Kd */
+        case MENU_PARAM_POS_KP: return g_chassis_tune_params.pos_kp;                             /* 位置环比例项 */
+        case MENU_PARAM_YAW_KP: return g_chassis_tune_params.yaw_kp;                             /* 航向环比例项 */
+        case MENU_PARAM_MAX_V:  return g_chassis_tune_params.max_linear_speed_mps;               /* 最大线速度上限 */
+        case MENU_PARAM_MAX_W:  return g_chassis_tune_params.max_yaw_speed_dps;                  /* 最大角速度上限 */
+        case MENU_PARAM_ACC_V:  return g_chassis_tune_params.cmd_accel_limit_mps2;               /* 线速度加速度限制 */
+        case MENU_PARAM_ACC_W:  return g_chassis_tune_params.cmd_accel_limit_dps2;               /* 角速度加速度限制 */
+        default:               return g_chassis_tune_params.wheel_pid_kp[CHASSIS_WHEEL_LF];      /* 异常 ID 回退值 */
     }
 }
 
 /* 根据参数ID写入当前参数值。 */
 static void menu_set_param_value(menu_param_id_enum id, float value)
 {
-    /* 按参数 ID 写回对应字段，所有修改都落在 s_menu_params 中。 */
+    /* 按参数 ID 写回对应字段，所有修改都落在全局参数单源中。 */
     switch (id)
     {
-        case MENU_PARAM_WHEEL_KP: s_menu_params.wheel_pid_kp = value; break;         /* 设置轮速 Kp */
-        case MENU_PARAM_WHEEL_KI: s_menu_params.wheel_pid_ki = value; break;         /* 设置轮速 Ki */
-        case MENU_PARAM_WHEEL_KD: s_menu_params.wheel_pid_kd = value; break;         /* 设置轮速 Kd */
-        case MENU_PARAM_POS_KP:   s_menu_params.pos_kp = value; break;               /* 设置位置环 Kp */
-        case MENU_PARAM_YAW_KP:   s_menu_params.yaw_kp = value; break;               /* 设置航向环 Kp */
-        case MENU_PARAM_MAX_V:    s_menu_params.max_linear_speed_mps = value; break; /* 设置线速度上限 */
-        case MENU_PARAM_MAX_W:    s_menu_params.max_yaw_speed_dps = value; break;    /* 设置角速度上限 */
-        case MENU_PARAM_ACC_V:    s_menu_params.cmd_accel_limit_mps2 = value; break; /* 设置线加速度上限 */
-        case MENU_PARAM_ACC_W:    s_menu_params.cmd_accel_limit_dps2 = value; break; /* 设置角加速度上限 */
-        default: break;                                                           /* 异常 ID 直接忽略 */
+        case MENU_PARAM_LF_KP: g_chassis_tune_params.wheel_pid_kp[CHASSIS_WHEEL_LF] = value; break; /* 设置左前轮 Kp */
+        case MENU_PARAM_LF_KI: g_chassis_tune_params.wheel_pid_ki[CHASSIS_WHEEL_LF] = value; break; /* 设置左前轮 Ki */
+        case MENU_PARAM_LF_KD: g_chassis_tune_params.wheel_pid_kd[CHASSIS_WHEEL_LF] = value; break; /* 设置左前轮 Kd */
+        case MENU_PARAM_RF_KP: g_chassis_tune_params.wheel_pid_kp[CHASSIS_WHEEL_RF] = value; break; /* 设置右前轮 Kp */
+        case MENU_PARAM_RF_KI: g_chassis_tune_params.wheel_pid_ki[CHASSIS_WHEEL_RF] = value; break; /* 设置右前轮 Ki */
+        case MENU_PARAM_RF_KD: g_chassis_tune_params.wheel_pid_kd[CHASSIS_WHEEL_RF] = value; break; /* 设置右前轮 Kd */
+        case MENU_PARAM_LB_KP: g_chassis_tune_params.wheel_pid_kp[CHASSIS_WHEEL_LB] = value; break; /* 设置左后轮 Kp */
+        case MENU_PARAM_LB_KI: g_chassis_tune_params.wheel_pid_ki[CHASSIS_WHEEL_LB] = value; break; /* 设置左后轮 Ki */
+        case MENU_PARAM_LB_KD: g_chassis_tune_params.wheel_pid_kd[CHASSIS_WHEEL_LB] = value; break; /* 设置左后轮 Kd */
+        case MENU_PARAM_RB_KP: g_chassis_tune_params.wheel_pid_kp[CHASSIS_WHEEL_RB] = value; break; /* 设置右后轮 Kp */
+        case MENU_PARAM_RB_KI: g_chassis_tune_params.wheel_pid_ki[CHASSIS_WHEEL_RB] = value; break; /* 设置右后轮 Ki */
+        case MENU_PARAM_RB_KD: g_chassis_tune_params.wheel_pid_kd[CHASSIS_WHEEL_RB] = value; break; /* 设置右后轮 Kd */
+        case MENU_PARAM_POS_KP: g_chassis_tune_params.pos_kp = value; break;                           /* 设置位置环 Kp */
+        case MENU_PARAM_YAW_KP: g_chassis_tune_params.yaw_kp = value; break;                           /* 设置航向环 Kp */
+        case MENU_PARAM_MAX_V:  g_chassis_tune_params.max_linear_speed_mps = value; break;             /* 设置线速度上限 */
+        case MENU_PARAM_MAX_W:  g_chassis_tune_params.max_yaw_speed_dps = value; break;                /* 设置角速度上限 */
+        case MENU_PARAM_ACC_V:  g_chassis_tune_params.cmd_accel_limit_mps2 = value; break;             /* 设置线加速度上限 */
+        case MENU_PARAM_ACC_W:  g_chassis_tune_params.cmd_accel_limit_dps2 = value; break;             /* 设置角加速度上限 */
+        default: break;                                                                          /* 异常 ID 直接忽略 */
     }
 }
 
@@ -221,9 +262,8 @@ static uint8 menu_load_params_from_flash(void)
         return 0U;                                /* 返回失败 */
     }
 
-    chassis_ctrl_set_tune_params(&blob.params);   /* 将 Flash 参数下发到控制层并触发限幅 */
-    chassis_ctrl_get_tune_params(&s_menu_params); /* 回读控制层实际生效值到菜单缓存 */
-    menu_set_status("STATUS: LOAD OK");          /* 更新状态提示 */
+    chassis_ctrl_set_tune_params(&blob.params);  /* 将 Flash 参数下发到控制层并触发限幅 */
+    menu_set_status("STATUS: LOAD OK");         /* 更新状态提示 */
     return 1U;                                    /* 返回成功 */
 }
 
@@ -243,7 +283,7 @@ static uint8 menu_save_params_to_flash(void)
     /* 组织写入镜像，先写头和参数，再回填校验和。 */
     blob.magic = CHASSIS_MENU_FLASH_MAGIC;     /* 写入魔数，识别有效数据块 */
     blob.version = CHASSIS_MENU_FLASH_VERSION; /* 写入版本号，便于未来扩展 */
-    blob.params = s_menu_params;               /* 写入当前参数快照 */
+    blob.params = g_chassis_tune_params;       /* 写入当前参数快照 */
     blob.checksum = 0U;                        /* 校验前先清零 */
 
     payload_words = (uint16)((sizeof(chassis_menu_flash_blob_t) - sizeof(uint32)) / 4U); /* 参与校验的数据字数 */
@@ -277,12 +317,14 @@ static void menu_apply_current_param_delta(float delta)
     menu_param_id_enum id = menu_get_current_param_id(); /* 当前选中的参数 ID */
     const menu_param_meta_t *meta = &s_param_meta[id];   /* 参数元数据（步进/限幅） */
     float value = menu_get_param_value(id);              /* 参数当前值 */
+    chassis_tune_params_t params;                        /* 下发给控制层的参数副本 */
 
     /* 先叠加增量，再做上下限保护。 */
     value = chassis_clamp_f(value + delta, meta->min_val, meta->max_val); /* 参数值加减并限幅 */
     /* 回写参数并实时下发到底盘控制层。 */
-    menu_set_param_value(id, value);              /* 写回菜单参数缓存 */
-    chassis_ctrl_set_tune_params(&s_menu_params); /* 立即下发到底盘控制模块 */
+    menu_set_param_value(id, value);              /* 写回全局参数单源 */
+    params = g_chassis_tune_params;               /* 复制一份非 volatile 副本用于接口入参 */
+    chassis_ctrl_set_tune_params(&params);        /* 立即下发到底盘控制模块 */
     s_need_redraw = 1U;                           /* 标记界面需要重绘 */
 }
 
@@ -503,8 +545,6 @@ static void menu_draw_pose(uint8 force_refresh)
 
 void chassis_menu_init(void)
 {
-    /* 读取控制层当前生效参数，作为菜单初值。 */
-    chassis_ctrl_get_tune_params(&s_menu_params); /* 从控制层拉取参数到菜单缓存 */
     /* 初始化 Flash 驱动：0 表示成功。 */
     s_flash_ready = (0U == flash_init()) ? 1U : 0U; /* 初始化 Flash 并记录可用标志 */
     /* 读取并应用 Flash 参数（失败会保持默认参数）。 */

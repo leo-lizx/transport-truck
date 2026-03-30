@@ -240,14 +240,49 @@
  *    3. 若有振荡加 Kd 抑制
  * ====================================================================== */
 
-/** 比例增益 Kp — 控制响应速度 */
-#define CHASSIS_WHEEL_PID_KP            (120.0f)
+/** 轮速 PID 默认比例增益 Kp（作为各轮初值模板） */
+#define CHASSIS_WHEEL_PID_DEFAULT_KP    (120.0f)
 
-/** 积分增益 Ki — 消除稳态误差 */
-#define CHASSIS_WHEEL_PID_KI            (8.0f)
+/** 轮速 PID 默认积分增益 Ki（作为各轮初值模板） */
+#define CHASSIS_WHEEL_PID_DEFAULT_KI    (8.0f)
 
-/** 微分增益 Kd — 抑制振荡 */
-#define CHASSIS_WHEEL_PID_KD            (1.0f)
+/** 轮速 PID 默认微分增益 Kd（作为各轮初值模板） */
+#define CHASSIS_WHEEL_PID_DEFAULT_KD    (1.0f)
+
+/** 左前轮初始 PID：Kp */
+#define CHASSIS_WHEEL_PID_LF_KP         (CHASSIS_WHEEL_PID_DEFAULT_KP)
+/** 左前轮初始 PID：Ki */
+#define CHASSIS_WHEEL_PID_LF_KI         (CHASSIS_WHEEL_PID_DEFAULT_KI)
+/** 左前轮初始 PID：Kd */
+#define CHASSIS_WHEEL_PID_LF_KD         (CHASSIS_WHEEL_PID_DEFAULT_KD)
+
+/** 右前轮初始 PID：Kp */
+#define CHASSIS_WHEEL_PID_RF_KP         (CHASSIS_WHEEL_PID_DEFAULT_KP)
+/** 右前轮初始 PID：Ki */
+#define CHASSIS_WHEEL_PID_RF_KI         (CHASSIS_WHEEL_PID_DEFAULT_KI)
+/** 右前轮初始 PID：Kd */
+#define CHASSIS_WHEEL_PID_RF_KD         (CHASSIS_WHEEL_PID_DEFAULT_KD)
+
+/** 左后轮初始 PID：Kp */
+#define CHASSIS_WHEEL_PID_LB_KP         (CHASSIS_WHEEL_PID_DEFAULT_KP)
+/** 左后轮初始 PID：Ki */
+#define CHASSIS_WHEEL_PID_LB_KI         (CHASSIS_WHEEL_PID_DEFAULT_KI)
+/** 左后轮初始 PID：Kd */
+#define CHASSIS_WHEEL_PID_LB_KD         (CHASSIS_WHEEL_PID_DEFAULT_KD)
+
+/** 右后轮初始 PID：Kp */
+#define CHASSIS_WHEEL_PID_RB_KP         (CHASSIS_WHEEL_PID_DEFAULT_KP)
+/** 右后轮初始 PID：Ki */
+#define CHASSIS_WHEEL_PID_RB_KI         (CHASSIS_WHEEL_PID_DEFAULT_KI)
+/** 右后轮初始 PID：Kd */
+#define CHASSIS_WHEEL_PID_RB_KD         (CHASSIS_WHEEL_PID_DEFAULT_KD)
+
+/** 兼容宏：保持旧名称可用 */
+#define CHASSIS_WHEEL_PID_KP            (CHASSIS_WHEEL_PID_DEFAULT_KP)
+/** 兼容宏：保持旧名称可用 */
+#define CHASSIS_WHEEL_PID_KI            (CHASSIS_WHEEL_PID_DEFAULT_KI)
+/** 兼容宏：保持旧名称可用 */
+#define CHASSIS_WHEEL_PID_KD            (CHASSIS_WHEEL_PID_DEFAULT_KD)
 
 /* ======================================================================
  *  四轮引脚分配

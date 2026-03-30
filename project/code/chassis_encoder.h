@@ -28,7 +28,7 @@ typedef struct
     encoder_index_enum    index;     /**< 编码器硬件通道编号 */
     encoder_channel1_enum ch1_pin;   /**< A 相（CH1）信号引脚 */
     encoder_channel2_enum ch2_pin;   /**< B 相（CH2）信号引脚 */
-    float                 dir_sign;  /**< 方向修正系数：与对应电机的 DIR_SIGN 一致 */
+    float                 dir_sign;  /**< 编码器方向修正系数（由 CHASSIS_*_ENC_SIGN 配置） */
     float                 speed_mps; /**< 最近一次读取的轮速（m/s），正值=正向 */
 } chassis_encoder_t;
 

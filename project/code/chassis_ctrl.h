@@ -64,11 +64,13 @@ typedef struct
 } chassis_attitude_debug_info_t;
 
 /** 运行时可调参数（用于按键菜单在线调参） */
+#define CHASSIS_CTRL_TUNE_WHEEL_COUNT   (4U)
+
 typedef struct
 {
-    float wheel_pid_kp;
-    float wheel_pid_ki;
-    float wheel_pid_kd;
+    float wheel_pid_kp[CHASSIS_CTRL_TUNE_WHEEL_COUNT];
+    float wheel_pid_ki[CHASSIS_CTRL_TUNE_WHEEL_COUNT];
+    float wheel_pid_kd[CHASSIS_CTRL_TUNE_WHEEL_COUNT];
 
     float pos_kp;
     float yaw_kp;
@@ -79,6 +81,9 @@ typedef struct
     float cmd_accel_limit_mps2;
     float cmd_accel_limit_dps2;
 } chassis_tune_params_t;
+
+/* 全局运行时调参参数（单一数据源，默认值在 chassis_ctrl.c 初始化） */
+extern volatile chassis_tune_params_t g_chassis_tune_params;
 
 /* ========================== 公共 API ========================== */
 
@@ -126,6 +131,26 @@ void chassis_ctrl_set_move_yaw_cmd(float vx_body_mps, float vy_body_mps, float t
  * @param  target_yaw_deg  目标航向角（度）
  */
 void chassis_ctrl_hold_yaw(float target_yaw_deg);
+
+/**
+ * @brief  启动单轮 PID 调试模式
+ *         仅指定轮子参与速度闭环，其余轮子目标速度固定为 0。
+ * @param  wheel_index      调试轮子索引（0:LF 1:RF 2:LB 3:RB）
+ * @param  target_speed_mps 该轮目标速度（m/s）
+ */
+void chassis_ctrl_start_single_wheel_pid_debug(uint8 wheel_index,
+                                               float target_speed_mps);
+
+/**
+ * @brief  更新单轮 PID 调试目标速度（m/s）
+ * @param  target_speed_mps 新目标速度（m/s）
+ */
+void chassis_ctrl_set_single_wheel_pid_debug_target(float target_speed_mps);
+
+/**
+ * @brief  退出单轮 PID 调试模式并停车
+ */
+void chassis_ctrl_stop_single_wheel_pid_debug(void);
 
 /**
  * @brief  进入航向调试模式：固定 0 度航向保持，停止平移

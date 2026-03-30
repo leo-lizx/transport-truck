@@ -3,6 +3,12 @@
  *===========================================================================*/
 
 #include "chassis_pid.h"
+#include <stdio.h>
+
+/* ---------------------- 单轮 PID 调试缓存 ---------------------- */
+static volatile uint8 s_pid_debug_wheel_index = (uint8)CHASSIS_WHEEL_LF; /* 当前选中的调试轮子 */
+static volatile float s_pid_debug_target_value = 0.0f;                    /* 最近一次目标值 */
+static volatile float s_pid_debug_actual_value = 0.0f;                    /* 最近一次实际值 */
 
 /**
  * @brief  初始化增量式 PID 控制器
@@ -57,4 +63,61 @@ void chassis_pid_reset(chassis_pid_t *pid)
     pid->error_k_1 = 0.0f;
     pid->error_k_2 = 0.0f;
     pid->output    = 0.0f;
+}
+
+void chassis_pid_debug_select_wheel(chassis_wheel_index_t wheel_index)
+{
+    if ((uint8)wheel_index >= (uint8)CHASSIS_WHEEL_COUNT)
+    {
+        return;
+    }
+
+    s_pid_debug_wheel_index = (uint8)wheel_index;
+}
+
+void chassis_pid_debug_feed_sample(chassis_wheel_index_t wheel_index,
+                                   float target_value,
+                                   float actual_value)
+{
+    if ((uint8)wheel_index != s_pid_debug_wheel_index)
+    {
+        return;
+    }
+
+    s_pid_debug_target_value = target_value;
+    s_pid_debug_actual_value = actual_value;
+}
+
+void chassis_pid_debug_get_snapshot(chassis_pid_debug_snapshot_t *out_snapshot)
+{
+    if (0 == out_snapshot)
+    {
+        return;
+    }
+
+    out_snapshot->wheel_index  = s_pid_debug_wheel_index;
+    out_snapshot->target_value = s_pid_debug_target_value;
+    out_snapshot->actual_value = s_pid_debug_actual_value;
+}
+
+void chassis_pid_debug_reset(void)
+{
+    s_pid_debug_target_value = 0.0f;
+    s_pid_debug_actual_value = 0.0f;
+}
+
+void chassis_pid_debug_task_5ms(void)
+{
+    static uint8 div = 0U;
+    chassis_pid_debug_snapshot_t snapshot;
+
+    div++;
+    if (div < 20U)
+    {
+        return; /* 100ms 分频打印 */
+    }
+    div = 0U;
+
+    chassis_pid_debug_get_snapshot(&snapshot);
+    printf("%.4f,  %4f\r\n", snapshot.target_value, snapshot.actual_value);
 }
