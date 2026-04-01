@@ -123,7 +123,7 @@
 #define CHASSIS_MAX_YAW_SPEED_DPS       (90.0f)
 
 /** 单个轮子允许的最大线速度（m/s），超出时四轮按比例缩放 */
-#define CHASSIS_MAX_WHEEL_SPEED_MPS     (0.60f)
+#define CHASSIS_MAX_WHEEL_SPEED_MPS     (5.0f)
 
 /** 在线调参时允许的线速度上限硬限制（m/s） */
 #define CHASSIS_TUNE_MAX_LINEAR_SPEED_LIMIT_MPS  (1.50f)

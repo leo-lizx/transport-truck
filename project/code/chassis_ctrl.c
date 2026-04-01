@@ -36,6 +36,13 @@
 #define WHEEL_STOP_FEEDBACK_EPS_MPS       (0.030f)  /* 反馈接近 0 的判据 */
 
 /* ---------------------- 控制模式 ---------------------- */
+/*
+ * 单轮 PID 调试专用开关：
+ * 1 = 仅保留 MODE_SINGLE_WHEEL_PID_DEBUG 主链路，其余模式逻辑临时屏蔽（保留在 #else 以便恢复）
+ * 0 = 启用全部控制模式
+ */
+#define CHASSIS_CTRL_SINGLE_WHEEL_PID_DEBUG_ONLY   (1)
+
 typedef enum {
     MODE_YAW_HOLD = 0,      /* 原地航向保持（默认）            */
     MODE_POINT_NAV,         /* 网格点位导航                    */
@@ -122,6 +129,28 @@ static volatile uint8 s_wheel_fb_lpf_inited = 0U;
 
 /* ====================== 内部工具函数 ====================== */
 
+/** 调试轮索引安全校验：非法值回退到左前轮 */
+static uint8 debug_wheel_index_safe(uint8 wheel_index)
+{
+    return (wheel_index < (uint8)CHASSIS_WHEEL_COUNT) ? wheel_index
+                                                       : (uint8)CHASSIS_WHEEL_LF;
+}
+
+/** 调试目标速度限幅：限制在轮速上限范围内 */
+static float debug_target_speed_clamp(float target_speed_mps)
+{
+    return chassis_clamp_f(target_speed_mps,
+                           -CHASSIS_MAX_WHEEL_SPEED_MPS,
+                            CHASSIS_MAX_WHEEL_SPEED_MPS);
+}
+
+/** 停止指定轮子并清理 PID 状态 */
+static void stop_wheel_with_pid_reset(uint8 wheel_index)
+{
+    chassis_pid_reset(&s_pid[wheel_index]);
+    chassis_motor_stop(&s_mot[wheel_index]);
+}
+
 /** 参数安全限幅，防止异常值进入控制链 */
 static chassis_tune_params_t sanitize(chassis_tune_params_t p)
 {
@@ -197,8 +226,7 @@ static void force_stop(void)
     s_yaw_i    = 0.0f;
 
     for (i = 0U; i < (uint8)CHASSIS_WHEEL_COUNT; ++i) {
-        chassis_pid_reset(&s_pid[i]);
-        chassis_motor_stop(&s_mot[i]);
+        stop_wheel_with_pid_reset(i);
         s_wheel_fb_lpf[i] = 0.0f;
     }
     s_wheel_fb_lpf_inited = 0U;
@@ -227,8 +255,7 @@ static void apply_speed(chassis_body_speed_cmd_t cmd,
         if ((fabsf(targets[i]) < WHEEL_STOP_TARGET_EPS_MPS) &&
             (fabsf(wheel_fb_mps[i]) < WHEEL_STOP_FEEDBACK_EPS_MPS))
         {
-            chassis_pid_reset(&s_pid[i]);
-            chassis_motor_stop(&s_mot[i]);
+            stop_wheel_with_pid_reset(i);
             continue;
         }
 
@@ -250,16 +277,10 @@ static void apply_single_wheel_pid_debug(const float wheel_fb_mps[CHASSIS_WHEEL_
     uint8 debug_idx;
     uint8 i;
 
-    debug_idx = s_debug_wheel_index;
-    if (debug_idx >= (uint8)CHASSIS_WHEEL_COUNT)
-    {
-        debug_idx = (uint8)CHASSIS_WHEEL_LF;
-    }
+    debug_idx = debug_wheel_index_safe(s_debug_wheel_index);
 
     /* 仅指定调试轮子允许非零目标速度。 */
-    targets[debug_idx] = chassis_clamp_f(s_debug_wheel_target_mps,
-                                         -CHASSIS_MAX_WHEEL_SPEED_MPS,
-                                          CHASSIS_MAX_WHEEL_SPEED_MPS);
+    targets[debug_idx] = debug_target_speed_clamp(s_debug_wheel_target_mps);
 
     /* 调试模式不输出车体运动指令。 */
     s_last_cmd = (chassis_body_speed_cmd_t){0};
@@ -280,8 +301,7 @@ static void apply_single_wheel_pid_debug(const float wheel_fb_mps[CHASSIS_WHEEL_
             if ((fabsf(targets[i]) < WHEEL_STOP_TARGET_EPS_MPS) &&
                 (fabsf(feedback_for_pid) < WHEEL_STOP_FEEDBACK_EPS_MPS))
             {
-                chassis_pid_reset(&s_pid[i]);
-                chassis_motor_stop(&s_mot[i]);
+                stop_wheel_with_pid_reset(i);
                 debug_feedback_value = feedback_for_pid;
                 continue;
             }
@@ -333,8 +353,7 @@ static void apply_single_wheel_pid_debug(const float wheel_fb_mps[CHASSIS_WHEEL_
         }
         else
         {
-            chassis_pid_reset(&s_pid[i]);
-            chassis_motor_stop(&s_mot[i]);
+            stop_wheel_with_pid_reset(i);
         }
     }
 
@@ -432,9 +451,11 @@ void chassis_ctrl_task_20ms(void)
 {
     float ws_raw[CHASSIS_WHEEL_COUNT]; /* 四轮原始速度反馈 */
     float ws_pid[CHASSIS_WHEEL_COUNT]; /* 供闭环使用的滤波速度反馈 */
+#if (0 == CHASSIS_CTRL_SINGLE_WHEEL_PID_DEBUG_ONLY)
     float vx_raw, vy_raw;
     float yaw_rad, cy, sy;
     chassis_body_speed_cmd_t cmd = {0};
+#endif
     uint8 i;
 
     /* 1) 编码器采样 */
@@ -455,6 +476,22 @@ void chassis_ctrl_task_20ms(void)
     }
     s_wheel_fb_lpf_inited = 1U;
 
+#if (1 == CHASSIS_CTRL_SINGLE_WHEEL_PID_DEBUG_ONLY)
+    /*
+     * 当前仅调试单轮 PID：
+     * - MODE_SINGLE_WHEEL_PID_DEBUG: 执行单轮闭环
+     * - 其他模式: 强制停机（相当于暂时注释掉其他模式主控制逻辑）
+     */
+    if (MODE_SINGLE_WHEEL_PID_DEBUG == s_mode)
+    {
+        apply_single_wheel_pid_debug(ws_pid);
+    }
+    else
+    {
+        force_stop();
+    }
+    return;
+#else
     /* 2) 逆运动学 → 车体速度反馈 */
     chassis_mecanum_inverse(ws_pid, &vx_raw, &vy_raw);
     s_fb_vx = vx_raw * CHASSIS_ODOM_SCALE_X;
@@ -530,6 +567,7 @@ void chassis_ctrl_task_20ms(void)
     }
 
     apply_speed(cmd, ws_pid);
+#endif
 }
 
 /*--- 运动指令 ---*/
@@ -569,16 +607,10 @@ void chassis_ctrl_start_single_wheel_pid_debug(uint8 wheel_index,
 {
     uint8 safe_wheel;
 
-    safe_wheel = wheel_index;
-    if (safe_wheel >= (uint8)CHASSIS_WHEEL_COUNT)
-    {
-        safe_wheel = (uint8)CHASSIS_WHEEL_LF;
-    }
+    safe_wheel = debug_wheel_index_safe(wheel_index);
 
     s_debug_wheel_index = safe_wheel;
-    s_debug_wheel_target_mps = chassis_clamp_f(target_speed_mps,
-                                               -CHASSIS_MAX_WHEEL_SPEED_MPS,
-                                                CHASSIS_MAX_WHEEL_SPEED_MPS);
+    s_debug_wheel_target_mps = debug_target_speed_clamp(target_speed_mps);
     s_debug_fb_sign_mul[safe_wheel] = 1.0f;
     s_debug_fb_sign_mismatch_cnt[safe_wheel] = 0U;
 
@@ -592,9 +624,7 @@ void chassis_ctrl_start_single_wheel_pid_debug(uint8 wheel_index,
 
 void chassis_ctrl_set_single_wheel_pid_debug_target(float target_speed_mps)
 {
-    s_debug_wheel_target_mps = chassis_clamp_f(target_speed_mps,
-                                               -CHASSIS_MAX_WHEEL_SPEED_MPS,
-                                                CHASSIS_MAX_WHEEL_SPEED_MPS);
+    s_debug_wheel_target_mps = debug_target_speed_clamp(target_speed_mps);
 }
 
 void chassis_ctrl_stop_single_wheel_pid_debug(void)
