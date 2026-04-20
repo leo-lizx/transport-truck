@@ -10,6 +10,18 @@ static volatile uint8 s_pid_debug_wheel_index = (uint8)CHASSIS_WHEEL_LF; /* 当�
 static volatile float s_pid_debug_target_value = 0.0f;                    /* 最近一次目标值 */
 static volatile float s_pid_debug_actual_value = 0.0f;                    /* 最近一次实际值 */
 
+static const char *pid_debug_wheel_name(uint8 wheel_index)
+{
+    switch (wheel_index)
+    {
+        case (uint8)CHASSIS_WHEEL_LF: return "LF";
+        case (uint8)CHASSIS_WHEEL_RF: return "RF";
+        case (uint8)CHASSIS_WHEEL_LB: return "LB";
+        case (uint8)CHASSIS_WHEEL_RB: return "RB";
+        default: return "UK";
+    }
+}
+
 /**
  * @brief  初始化增量式 PID 控制器
  */
@@ -110,6 +122,7 @@ void chassis_pid_debug_task_5ms(void)
 {
     static uint8 div = 0U;
     chassis_pid_debug_snapshot_t snapshot;
+    const char *wheel_name;
 
     div++;
     if (div < 20U)
@@ -119,5 +132,9 @@ void chassis_pid_debug_task_5ms(void)
     div = 0U;
 
     chassis_pid_debug_get_snapshot(&snapshot);
-    printf("%.4f,  %4f\r\n", snapshot.target_value, snapshot.actual_value);
+    wheel_name = pid_debug_wheel_name(snapshot.wheel_index);
+    printf("[%s] tgt=%.4f m/s, act=%.4f m/s\r\n",
+           wheel_name,
+           snapshot.target_value,
+           snapshot.actual_value);
 }

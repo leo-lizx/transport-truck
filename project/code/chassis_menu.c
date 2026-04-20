@@ -99,6 +99,10 @@ static char s_status_text[24] = "STATUS: READY";       /* 当前状态文本 */
 static char s_status_text_prev[24] = "";               /* 上次状态文本（用于变化检测） */
 static uint8 s_flash_ready = 0U;                        /* Flash 可用标志 */
 static uint8 s_full_refresh_done = 0U;                  /* 是否至少完成过一次整屏绘制 */
+static uint8 s_param_hold_inc_ticks = 0U;               /* K3 长按连发节拍计数（10ms 基准） */
+static uint8 s_param_hold_dec_ticks = 0U;               /* K4 长按连发节拍计数（10ms 基准） */
+
+#define MENU_PARAM_HOLD_REPEAT_TICKS     (5U)           /* 长按连发周期：5*10ms=50ms */
 
 static const menu_param_meta_t s_param_meta[MENU_PARAM_COUNT] =
 {
@@ -375,6 +379,8 @@ static void menu_handle_root_keys(void)
 static void menu_handle_param_keys(void)
 {
     const menu_page_meta_t *page = &s_pages[s_root_index]; /* 当前页面参数集合 */
+    key_state_enum key3_state = key_get_state(KEY_3);      /* K3 当前状态 */
+    key_state_enum key4_state = key_get_state(KEY_4);      /* K4 当前状态 */
 
     if (KEY_SHORT_PRESS == key_get_state(KEY_1))
     {
@@ -392,7 +398,7 @@ static void menu_handle_param_keys(void)
         s_need_redraw = 1U; /* 通知渲染层更新光标位置 */
     }
 
-    if (KEY_SHORT_PRESS == key_get_state(KEY_3))
+    if (KEY_SHORT_PRESS == key3_state)
     {
         menu_param_id_enum id = menu_get_current_param_id(); /* 当前参数 ID */
         /* K3 短按：按 step 增加参数值。 */
@@ -400,7 +406,7 @@ static void menu_handle_param_keys(void)
         menu_apply_current_param_delta(s_param_meta[id].step); /* 参数增加一个步进 */
     }
 
-    if (KEY_SHORT_PRESS == key_get_state(KEY_4))
+    if (KEY_SHORT_PRESS == key4_state)
     {
         menu_param_id_enum id = menu_get_current_param_id(); /* 当前参数 ID */
         /* K4 短按：按 step 减小参数值。 */
@@ -416,12 +422,36 @@ static void menu_handle_param_keys(void)
         s_need_redraw = 1U;            /* 通知渲染层全刷 */
     }
 
-    if (KEY_LONG_PRESS == key_get_state(KEY_4))
+    if (KEY_LONG_PRESS == key3_state)
     {
-        /* K4 长按：保存当前参数到 Flash。 */
-        key_clear_state(KEY_4);      /* 消费该次长按事件 */
-        menu_save_params_to_flash(); /* 执行参数保存 */
-        s_need_redraw = 1U;          /* 刷新状态行显示保存结果 */
+        menu_param_id_enum id = menu_get_current_param_id(); /* 当前参数 ID */
+        /* K3 长按：按固定节拍连续增加参数值。 */
+        if ((0U == s_param_hold_inc_ticks) || (s_param_hold_inc_ticks >= MENU_PARAM_HOLD_REPEAT_TICKS))
+        {
+            menu_apply_current_param_delta(s_param_meta[id].step); /* 连续增加一个步进 */
+            s_param_hold_inc_ticks = 0U;                            /* 重置连发计数 */
+        }
+        s_param_hold_inc_ticks++; /* 累计长按时长，达到节拍后再次连发 */
+    }
+    else
+    {
+        s_param_hold_inc_ticks = 0U; /* 释放后清连发计数 */
+    }
+
+    if (KEY_LONG_PRESS == key4_state)
+    {
+        menu_param_id_enum id = menu_get_current_param_id(); /* 当前参数 ID */
+        /* K4 长按：按固定节拍连续减小参数值。 */
+        if ((0U == s_param_hold_dec_ticks) || (s_param_hold_dec_ticks >= MENU_PARAM_HOLD_REPEAT_TICKS))
+        {
+            menu_apply_current_param_delta(-s_param_meta[id].step); /* 连续减少一个步进 */
+            s_param_hold_dec_ticks = 0U;                             /* 重置连发计数 */
+        }
+        s_param_hold_dec_ticks++; /* 累计长按时长，达到节拍后再次连发 */
+    }
+    else
+    {
+        s_param_hold_dec_ticks = 0U; /* 释放后清连发计数 */
     }
 }
 
@@ -558,6 +588,8 @@ void chassis_menu_init(void)
     s_need_redraw = 1U;             /* 标记需要首次刷新 */
     s_render_ticks = 0U;            /* 渲染节拍计数清零 */
     s_full_refresh_done = 0U;       /* 清除“已全刷”标志 */
+    s_param_hold_inc_ticks = 0U;    /* K3 连发计数清零 */
+    s_param_hold_dec_ticks = 0U;    /* K4 连发计数清零 */
 }
 
 //-------------------------------------------------------------------------

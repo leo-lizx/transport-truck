@@ -53,7 +53,7 @@
 #define MAIN_SINGLE_WHEEL_PID_DEBUG_MODE   (1)
 
 /* 单轮 PID 调试参数（按需修改） */
-#define MAIN_PID_DEBUG_WHEEL_INDEX         (CHASSIS_WHEEL_LF)
+#define MAIN_PID_DEBUG_WHEEL_INDEX         (CHASSIS_WHEEL_RF)
 #define MAIN_PID_DEBUG_TARGET_MPS          (0.40f)
 
 /* 航向保持测试目标角（单位：度，可按需修改） */
@@ -137,7 +137,6 @@ int main(void)
     // ------------------------------------------------------------------
     chassis_ctrl_init();
     chassis_menu_init();
-
     // 发车位修正：第一列，距最底边界约 1m（折算到网格后为 G(1,7)）。
     chassis_ctrl_set_pose(chassis_grid_x_to_m(CHASSIS_START_GRID_X),
                           chassis_grid_y_to_m(CHASSIS_START_GRID_Y),

@@ -15,9 +15,9 @@
  *     Stage2 — 指定箱→目标映射（分类模式）
  *     Stage3 — 炸弹墙体求解辅助函数
  *
- *   内存占用：
- *     单箱 BFS 状态空间 = 12×16×12×16 = 36864
- *     visited 数组 36KB + 队列 72KB ≈ 108KB (RT1064 1MB RAM 充裕)
+ *   内存占用（优化后）：
+ *     单箱状态空间 = 12×16×12×16 = 36864
+ *     位图+4bit前驱记录约 32KB（替代原 108KB 队列方案）
  *===========================================================================*/
 
 #include "zf_common_headfile.h"
@@ -169,10 +169,23 @@ uint8 Sokoban_Solve_Stage2(const uint8 map[MAP_ROWS][MAP_COLS],
                            SokoFullSolution_t *result);
 
 /**
+ * @brief  检测当前地图是否存在明显死局（如箱子被卡在非目标角落）
+ *
+ * @param  map           当前地图
+ * @param  dead_box_pos  [out] 死局箱子坐标，可为 NULL
+ * @return 1=检测到死局, 0=未检测到
+ */
+uint8 Sokoban_Is_Deadlock(const uint8 map[MAP_ROWS][MAP_COLS],
+                          Point_t *dead_box_pos);
+
+/**
  * @brief  第三阶段辅助 — 寻找最优炸弹爆破墙体
  *
  * 遍历所有内部墙体，逐个假设被炸掉(3×3范围清除)，
- * 检查 blocked_target 是否变得可达，选距离最短的墙体。
+ * 根据“破局收益”评分选最优墙体：
+ *   1) blocked_target 可达性
+ *   2) 爆炸后可达目标数量
+ *   3) 清除墙体数量与路径代价
  *
  * @param  map             当前地图
  * @param  player_pos      玩家坐标

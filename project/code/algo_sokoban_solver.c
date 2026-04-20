@@ -13,21 +13,27 @@ static const int8 s_dc[4] = {  0,  0, -1,  1 };
 /** 单箱 BFS 状态空间大小 = MAP_ROWS × MAP_COLS × MAP_ROWS × MAP_COLS */
 #define SB_RC           (MAP_ROWS * MAP_COLS)               /* 192   */
 #define SB_STATE_COUNT  ((uint32)SB_RC * (uint32)SB_RC)     /* 36864 */
+#define SB_BITMAP_BYTES ((SB_STATE_COUNT + 7u) / 8u)
+#define SB_NIBBLE_BYTES ((SB_STATE_COUNT + 1u) / 2u)
 
 /*===========================================================================
- *  静态大数组 — 放在全局/静态区，避免栈溢出
+ *  静态数组（位图压缩版）
  *
- *  sb_came_from[i]:
+ *  sb_parent_nibble[i] (4bit / 状态):
  *      0       = 未访问
  *      1..4    = 到达该状态的动作编号 + 1 (UP+1, DOWN+1, LEFT+1, RIGHT+1)
  *      5       = 起始状态标记
  *
- *  sb_queue[i]: BFS 队列, 存放状态扁平索引 (uint16, 最大 36863)
+ *  sb_visited_bm     : 已访问状态位图
+ *  sb_frontier_cur_bm: 当前层前沿位图
+ *  sb_frontier_nxt_bm: 下一层前沿位图
  *
- *  总内存: 36864 + 36864×2 = 110,592 字节 ≈ 108 KB
+ *  总内存约: 18KB + 4.5KB * 3 ≈ 31.5KB
  *===========================================================================*/
-static uint8  sb_came_from[SB_STATE_COUNT];
-static uint16 sb_queue[SB_STATE_COUNT];
+static uint8 sb_parent_nibble[SB_NIBBLE_BYTES];
+static uint8 sb_visited_bm[SB_BITMAP_BYTES];
+static uint8 sb_frontier_cur_bm[SB_BITMAP_BYTES];
+static uint8 sb_frontier_nxt_bm[SB_BITMAP_BYTES];
 
 /** 子地图临时缓冲 */
 static uint8  sb_sub_map[MAP_ROWS][MAP_COLS];
@@ -226,6 +232,39 @@ static inline uint8 sb_is_free(const uint8 map[MAP_ROWS][MAP_COLS], int8 r, int8
     return (map[r][c] == MAP_EMPTY || map[r][c] == MAP_TARGET) ? 1 : 0;
 }
 
+/** 位图: 读取 bit */
+static inline uint8 sb_bm_test(const uint8 *bm, uint16 idx)
+{
+    return (uint8)((bm[idx >> 3] >> (idx & 7u)) & 1u);
+}
+
+/** 位图: 写入 bit=1 */
+static inline void sb_bm_set(uint8 *bm, uint16 idx)
+{
+    bm[idx >> 3] |= (uint8)(1u << (idx & 7u));
+}
+
+/** 4bit 数组: 获取值 */
+static inline uint8 sb_nibble_get(const uint8 *arr, uint16 idx)
+{
+    uint8 v = arr[idx >> 1];
+    if (idx & 1u) {
+        return (uint8)((v >> 4) & 0x0Fu);
+    }
+    return (uint8)(v & 0x0Fu);
+}
+
+/** 4bit 数组: 写入值 (0..15) */
+static inline void sb_nibble_set(uint8 *arr, uint16 idx, uint8 val)
+{
+    uint8 *p = &arr[idx >> 1];
+    if (idx & 1u) {
+        *p = (uint8)((*p & 0x0Fu) | ((val & 0x0Fu) << 4));
+    } else {
+        *p = (uint8)((*p & 0xF0u) | (val & 0x0Fu));
+    }
+}
+
 /*===========================================================================
  *  核心：单箱 BFS 求解
  *
@@ -239,8 +278,8 @@ static uint8 sokoban_bfs_single(const uint8 sub_map[MAP_ROWS][MAP_COLS],
                                 Point_t player, Point_t box, Point_t target,
                                 SokoActionSeq_t *sol)
 {
-    uint32 head = 0, tail = 0;
     uint16 start_idx, goal_idx = 0;
+    uint8 found = 0;
 
     if (0 == sol) return 0;
     if (!map_is_inner_cell(player.y, player.x) ||
@@ -250,63 +289,80 @@ static uint8 sokoban_bfs_single(const uint8 sub_map[MAP_ROWS][MAP_COLS],
     }
 
     sol->count = 0;
-    memset(sb_came_from, 0, SB_STATE_COUNT);
+    memset(sb_parent_nibble, 0, sizeof(sb_parent_nibble));
+    memset(sb_visited_bm, 0, sizeof(sb_visited_bm));
+    memset(sb_frontier_cur_bm, 0, sizeof(sb_frontier_cur_bm));
+    memset(sb_frontier_nxt_bm, 0, sizeof(sb_frontier_nxt_bm));
 
     /* 起点已是终点 */
     if (box.y == target.y && box.x == target.x) return 1;
 
     start_idx = sb_encode(player.y, player.x, box.y, box.x);
-    sb_came_from[start_idx] = 5;            /* 标记为起始 */
-    sb_queue[tail++] = start_idx;
+    sb_nibble_set(sb_parent_nibble, start_idx, 5u);   /* 标记为起始 */
+    sb_bm_set(sb_visited_bm, start_idx);
+    sb_bm_set(sb_frontier_cur_bm, start_idx);
 
-    while (head < tail) {
-        uint16 cur_idx = sb_queue[head++];
-        int8 pr, pc, br, bc;
-        sb_decode(cur_idx, &pr, &pc, &br, &bc);
+    while (1) {
+        uint8 has_next = 0;
 
-        for (int d = 0; d < 4; d++) {
-            int8 npr = pr + s_dr[d];
-            int8 npc = pc + s_dc[d];
-            int8 nbr, nbc;
+        memset(sb_frontier_nxt_bm, 0, sizeof(sb_frontier_nxt_bm));
 
-            if (npr == br && npc == bc) {
-                /* ---------- 推箱 ---------- */
-                nbr = br + s_dr[d];
-                nbc = bc + s_dc[d];
-                if (!sb_is_free(sub_map, nbr, nbc)) continue;
-            } else {
-                /* ---------- 普通行走 ---------- */
-                if (!sb_is_free(sub_map, npr, npc)) continue;
-                nbr = br;
-                nbc = bc;
+        for (uint16 cur_idx = 0; cur_idx < (uint16)SB_STATE_COUNT; cur_idx++) {
+            int8 pr, pc, br, bc;
+            if (!sb_bm_test(sb_frontier_cur_bm, cur_idx)) continue;
+
+            sb_decode(cur_idx, &pr, &pc, &br, &bc);
+
+            for (int d = 0; d < 4; d++) {
+                int8 npr = pr + s_dr[d];
+                int8 npc = pc + s_dc[d];
+                int8 nbr, nbc;
+
+                if (npr == br && npc == bc) {
+                    /* ---------- 推箱 ---------- */
+                    nbr = br + s_dr[d];
+                    nbc = bc + s_dc[d];
+                    if (!sb_is_free(sub_map, nbr, nbc)) continue;
+                } else {
+                    /* ---------- 普通行走 ---------- */
+                    if (!sb_is_free(sub_map, npr, npc)) continue;
+                    nbr = br;
+                    nbc = bc;
+                }
+
+                uint16 nidx = sb_encode(npr, npc, nbr, nbc);
+                if (sb_bm_test(sb_visited_bm, nidx)) continue;   /* 已访问 */
+
+                sb_bm_set(sb_visited_bm, nidx);
+                sb_bm_set(sb_frontier_nxt_bm, nidx);
+                sb_nibble_set(sb_parent_nibble, nidx, (uint8)(d + 1));
+                has_next = 1;
+
+                /* 箱子到达目标 → 成功 */
+                if (nbr == target.y && nbc == target.x) {
+                    goal_idx = nidx;
+                    found = 1;
+                    break;
+                }
             }
 
-            uint16 nidx = sb_encode(npr, npc, nbr, nbc);
-            if (sb_came_from[nidx] != 0) continue;   /* 已访问 */
-
-            sb_came_from[nidx] = (uint8)(d + 1);     /* 记录到达动作 */
-            sb_queue[tail++] = nidx;
-
-            /* 箱子到达目标 → 成功 */
-            if (nbr == target.y && nbc == target.x) {
-                goal_idx = nidx;
-                goto found;
-            }
-
-            if (tail >= SB_STATE_COUNT) return 0;     /* 队列溢出保护 */
+            if (found) break;
         }
-    }
-    return 0;   /* 无解 */
 
-found:
+        if (found) break;
+        if (!has_next) return 0;   /* 无新前沿, 无解 */
+
+        memcpy(sb_frontier_cur_bm, sb_frontier_nxt_bm, sizeof(sb_frontier_cur_bm));
+    }
+
     /* -------- 从终态反向回溯提取动作序列 -------- */
     {
         SokoAction_e rev_buf[SOKOBAN_MAX_ACTIONS];
         uint16 steps = 0;
         uint16 idx   = goal_idx;
 
-        while (sb_came_from[idx] != 5) {        /* 5 = 起始标记 */
-            uint8 act = sb_came_from[idx] - 1;  /* 0..3 */
+        while (sb_nibble_get(sb_parent_nibble, idx) != 5u) {       /* 5 = 起始标记 */
+            uint8 act = (uint8)(sb_nibble_get(sb_parent_nibble, idx) - 1u);  /* 0..3 */
             if (steps >= SOKOBAN_MAX_ACTIONS) return 0;
             rev_buf[steps++] = (SokoAction_e)act;
 
@@ -387,6 +443,44 @@ static Point_t simulate_actions(const SokoActionSeq_t *sol,
     end.y = pr;
     end.x = pc;
     return end;
+}
+
+/*===========================================================================
+ *  第三阶段辅助：死局检测 / 炸弹收益评估
+ *===========================================================================*/
+
+/** 判断格子是否属于“阻挡物”（越界、墙、箱子、炸弹均视为阻挡） */
+static uint8 is_blocker_cell(const uint8 map[MAP_ROWS][MAP_COLS], int8 r, int8 c)
+{
+    if (!map_is_inner_cell(r, c)) return 1;
+    return (map[r][c] == MAP_WALL || map[r][c] == MAP_BOX || map[r][c] == MAP_BOMB) ? 1 : 0;
+}
+
+/** 角落死局：箱子位于两个垂直阻挡夹角内（且该格不是目标） */
+uint8 Sokoban_Is_Deadlock(const uint8 map[MAP_ROWS][MAP_COLS],
+                          Point_t *dead_box_pos)
+{
+    for (int8 r = (int8)CHASSIS_GRID_INNER_MIN_Y; r <= (int8)CHASSIS_GRID_INNER_MAX_Y; r++) {
+        for (int8 c = (int8)CHASSIS_GRID_INNER_MIN_X; c <= (int8)CHASSIS_GRID_INNER_MAX_X; c++) {
+            if (map[r][c] != MAP_BOX) continue;
+
+            {
+                uint8 up    = is_blocker_cell(map, r - 1, c);
+                uint8 down  = is_blocker_cell(map, r + 1, c);
+                uint8 left  = is_blocker_cell(map, r, c - 1);
+                uint8 right = is_blocker_cell(map, r, c + 1);
+
+                if ((up && left) || (up && right) || (down && left) || (down && right)) {
+                    if (dead_box_pos) {
+                        dead_box_pos->x = c;
+                        dead_box_pos->y = r;
+                    }
+                    return 1;
+                }
+            }
+        }
+    }
+    return 0;
 }
 
 /*===========================================================================
@@ -575,13 +669,20 @@ uint8 Sokoban_Find_Bomb_Wall(const uint8 map[MAP_ROWS][MAP_COLS],
     static uint8   tmp_map[MAP_ROWS][MAP_COLS];
     static NavPath_t tmp_path;
 
-    int16 best_len = 32767;
+    int32 best_score = -2147483647;
     uint8 found    = 0;
+
+    if (!bomb_wall_pos) return 0;
 
     /* 遍历所有内部墙体（最外圈不可炸） */
     for (int8 r = 1; r < MAP_ROWS - 1; r++) {
         for (int8 c = 1; c < MAP_COLS - 1; c++) {
             if (map[r][c] != MAP_WALL) continue;
+
+            uint8 cleared_walls = 0;
+            uint8 reachable_targets = 0;
+            uint16 blocked_len = 0;
+            int32 score;
 
             /* 假设在 (r, c) 引爆炸弹，3×3 范围清除内墙 */
             memcpy(tmp_map, map, sizeof(tmp_map));
@@ -590,20 +691,45 @@ uint8 Sokoban_Find_Bomb_Wall(const uint8 map[MAP_ROWS][MAP_COLS],
                     int8 rr = r + dr, cc = c + dc;
                     if (rr >= 1 && rr < MAP_ROWS - 1 &&
                         cc >= 1 && cc < MAP_COLS - 1) {
-                        if (tmp_map[rr][cc] == MAP_WALL)
+                        if (tmp_map[rr][cc] == MAP_WALL) {
                             tmp_map[rr][cc] = MAP_EMPTY;
+                            cleared_walls++;
+                        }
                     }
                 }
             }
 
-            /* 检查 blocked_target 是否变得可达 */
-            if (Algo_Nav_BFS(tmp_map, player_pos, blocked_target, &tmp_path)) {
-                if ((int16)tmp_path.step_count < best_len) {
-                    best_len = (int16)tmp_path.step_count;
-                    bomb_wall_pos->x = c;
-                    bomb_wall_pos->y = r;
-                    found = 1;
+            /* 统计爆炸后可达目标数量 */
+            for (int8 tr = (int8)CHASSIS_GRID_INNER_MIN_Y; tr <= (int8)CHASSIS_GRID_INNER_MAX_Y; tr++) {
+                for (int8 tc = (int8)CHASSIS_GRID_INNER_MIN_X; tc <= (int8)CHASSIS_GRID_INNER_MAX_X; tc++) {
+                    if (tmp_map[tr][tc] != MAP_TARGET) continue;
+                    {
+                        Point_t tp = {tc, tr};
+                        if (Algo_Nav_BFS(tmp_map, player_pos, tp, &tmp_path)) {
+                            reachable_targets++;
+                        }
+                    }
                 }
+            }
+
+            /* 优先考虑 blocked_target 破局能力（若给定） */
+            if (blocked_target.x >= 0 && blocked_target.y >= 0) {
+                if (!Algo_Nav_BFS(tmp_map, player_pos, blocked_target, &tmp_path)) {
+                    continue; /* 该墙无法破当前卡点，直接跳过 */
+                }
+                blocked_len = tmp_path.step_count;
+            }
+
+            /* 收益评分：可达目标数主导，兼顾清墙数量与路径代价 */
+            score = (int32)reachable_targets * 1000
+                  + (int32)cleared_walls * 20
+                  - (int32)blocked_len;
+
+            if (!found || score > best_score) {
+                best_score = score;
+                bomb_wall_pos->x = c;
+                bomb_wall_pos->y = r;
+                found = 1;
             }
         }
     }

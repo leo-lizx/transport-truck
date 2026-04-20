@@ -18,6 +18,9 @@
 #include "chassis_mecanum.h"
 #include <math.h>
 
+/* 软限位依赖：地图由 app_game_logic.c 维护 */
+extern uint8 g_game_map[CHASSIS_GRID_ROWS][CHASSIS_GRID_COLS];
+
 /* ---------------------- 航向闭环常量 ---------------------- */
 #define YAW_DEADZONE_DEG   0.30f    /* 航向误差死区               */
 #define YAW_KI             0.030f   /* 航向 I 增益                */
@@ -34,6 +37,14 @@
 #define WHEEL_FB_LPF_ALPHA                (0.35f)   /* 轮速反馈一阶低通系数，越小越平滑 */
 #define WHEEL_STOP_TARGET_EPS_MPS         (0.015f)  /* 目标接近 0 的判据 */
 #define WHEEL_STOP_FEEDBACK_EPS_MPS       (0.030f)  /* 反馈接近 0 的判据 */
+
+/* 软限位保护参数（防止里程计漂移导致虚拟地图“撞墙”） */
+#define SOFT_LIMIT_LOOKAHEAD_S             (0.22f)   /* 前瞻时间窗，越大越保守 */
+#define SOFT_LIMIT_SIDE_OFFSET_M           (0.08f)   /* 左右试探偏移 */
+#define SOFT_LIMIT_BRAKE_SCALE             (0.28f)   /* 触发时线速度缩放 */
+#define SOFT_LIMIT_AVOID_WZ_DPS            (35.0f)   /* 避障微调角速度 */
+#define SOFT_LIMIT_MIN_MOVE_EPS_MPS        (0.01f)   /* 小于此速度不触发预测 */
+#define SOFT_LIMIT_MAP_WALL                (1U)      /* 与地图编码 MAP_WALL 保持一致 */
 
 /* ---------------------- 控制模式 ---------------------- */
 typedef enum {
@@ -202,6 +213,97 @@ static void force_stop(void)
         s_wheel_fb_lpf[i] = 0.0f;
     }
     s_wheel_fb_lpf_inited = 0U;
+}
+
+/** 软限位：网格是否在可通行内场 */
+static inline uint8 soft_limit_is_inner_grid(int16 gx, int16 gy)
+{
+    if (gx < (int16)CHASSIS_GRID_INNER_MIN_X || gx > (int16)CHASSIS_GRID_INNER_MAX_X) return 0;
+    if (gy < (int16)CHASSIS_GRID_INNER_MIN_Y || gy > (int16)CHASSIS_GRID_INNER_MAX_Y) return 0;
+    return 1;
+}
+
+/** 软限位：判断网格是否为墙/边界障碍 */
+static uint8 soft_limit_is_wall_grid(int16 gx, int16 gy)
+{
+    if (!soft_limit_is_inner_grid(gx, gy)) return 1;
+    return (g_game_map[gy][gx] == SOFT_LIMIT_MAP_WALL) ? 1 : 0;
+}
+
+/** 软限位：按全局坐标点判断是否会撞墙 */
+static uint8 soft_limit_is_wall_point(float x_m, float y_m)
+{
+    uint8 gx = chassis_m_to_grid_x(x_m);
+    uint8 gy = chassis_m_to_grid_y(y_m);
+    return soft_limit_is_wall_grid((int16)gx, (int16)gy);
+}
+
+/**
+ * 软限位保护：预测下一步位置，若即将撞墙则减速并施加微转向。
+ *
+ * 逻辑：
+ * 1) 以前瞻时间预测车体中心落点。
+ * 2) 若前方落点位于墙体，则线速度强制缩放。
+ * 3) 对比前左/前右两个试探点，向更空旷一侧施加角速度偏置。
+ */
+static void apply_soft_limit_guard(chassis_body_speed_cmd_t *cmd)
+{
+    float yaw_rad;
+    float cy, sy;
+    float vxg, vyg;
+    float v_norm;
+    float nx, ny;
+    float left_x, left_y;
+    float right_x, right_y;
+    uint8 front_hit;
+    uint8 left_hit;
+    uint8 right_hit;
+
+    if (!cmd) return;
+
+    v_norm = sqrtf(cmd->vx_body_mps * cmd->vx_body_mps +
+                   cmd->vy_body_mps * cmd->vy_body_mps);
+    if (v_norm < SOFT_LIMIT_MIN_MOVE_EPS_MPS) return;
+
+    yaw_rad = s_pose.yaw_deg * CHASSIS_DEG_TO_RAD_F;
+    cy = cosf(yaw_rad);
+    sy = sinf(yaw_rad);
+
+    /* 车体系速度 -> 全局速度 */
+    vxg = cy * cmd->vx_body_mps - sy * cmd->vy_body_mps;
+    vyg = sy * cmd->vx_body_mps + cy * cmd->vy_body_mps;
+
+    nx = s_pose.x_m + vxg * SOFT_LIMIT_LOOKAHEAD_S;
+    ny = s_pose.y_m + vyg * SOFT_LIMIT_LOOKAHEAD_S;
+    front_hit = soft_limit_is_wall_point(nx, ny);
+
+    if (!front_hit) return;
+
+    /* 触发软限位：先强制减速，避免继续顶墙 */
+    cmd->vx_body_mps *= SOFT_LIMIT_BRAKE_SCALE;
+    cmd->vy_body_mps *= SOFT_LIMIT_BRAKE_SCALE;
+
+    /* 使用法向偏移评估左右绕行可行性 */
+    left_x  = nx - sy * SOFT_LIMIT_SIDE_OFFSET_M;
+    left_y  = ny + cy * SOFT_LIMIT_SIDE_OFFSET_M;
+    right_x = nx + sy * SOFT_LIMIT_SIDE_OFFSET_M;
+    right_y = ny - cy * SOFT_LIMIT_SIDE_OFFSET_M;
+
+    left_hit  = soft_limit_is_wall_point(left_x, left_y);
+    right_hit = soft_limit_is_wall_point(right_x, right_y);
+
+    if (left_hit && !right_hit) {
+        cmd->wz_dps -= SOFT_LIMIT_AVOID_WZ_DPS;
+    } else if (!left_hit && right_hit) {
+        cmd->wz_dps += SOFT_LIMIT_AVOID_WZ_DPS;
+    } else {
+        /* 两侧同样拥挤/开阔：保留原命令转向方向，给一个固定偏置 */
+        if (cmd->wz_dps >= 0.0f) {
+            cmd->wz_dps += SOFT_LIMIT_AVOID_WZ_DPS;
+        } else {
+            cmd->wz_dps -= SOFT_LIMIT_AVOID_WZ_DPS;
+        }
+    }
 }
 
 /** 完整执行链路: 滤波 → 运动学 → PID → 电机 */
@@ -528,6 +630,9 @@ void chassis_ctrl_task_20ms(void)
         break;
     }
     }
+
+    /* 5) 软限位保护：即将撞墙时减速并微调方向 */
+    apply_soft_limit_guard(&cmd);
 
     apply_speed(cmd, ws_pid);
 }
