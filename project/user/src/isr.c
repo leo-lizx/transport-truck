@@ -37,6 +37,7 @@
 #include "zf_common_debug.h"
 #include "isr.h"
 #include "chassis_menu.h"
+#include "app_link.h"   /* P0-1: 视觉?主控帧协议解析层 */
 
 
 
@@ -54,6 +55,7 @@ void PIT_IRQHandler(void)
         pit_flag_clear(PIT_CH0);
 
         chassis_ctrl_task_5ms();   // 5ms: IMU 姿态采样 + 航向角积分
+        app_link_tick(5U);         // P0-1: 推进协议层 ms 时基, 驱动字节超时检测
     }
     
     if(pit_flag_get(PIT_CH1))
@@ -79,14 +81,19 @@ void PIT_IRQHandler(void)
 }
 
 void LPUART1_IRQHandler(void)
-{
-   if(kLPUART_RxDataRegFullFlag & LPUART_GetStatusFlags(LPUART1))
+{ /* P0-1 改造说明:
+     *   LPUART1 (B12/B13) 同时承担 debug 输出与 OpenART 视觉数据接收。
+     *   debug 模块只用 TX, RX 由本协议层独占, 因此这里直接把字节交给
+     *   app_link_isr_feed_byte() 而不再喂 debug 环形缓冲 (避免 64B 缓冲溢出).
+     *   ─ 字节级零拷贝, 单次中断耗时 < 5 ?s.
+     *   ─ 状态机内部已做溢出/超时/同步保护, 不会卡死.
+     */
+    if(kLPUART_RxDataRegFullFlag & LPUART_GetStatusFlags(LPUART1))
     {
-        // 接收中断
-    #if DEBUG_UART_USE_INTERRUPT                        // 如果开启 debug 串口中断
-        debug_interrupr_handler();                      // 调用 debug 串口接收处理函数 数据会被 debug 环形缓冲区读取
-    #endif                                              // 如果修改了 DEBUG_UART_INDEX 那这段代码需要放到对应的串口中断去
+        uint8 rx_byte = uart_read_byte(UART_1);         /* 读 LPUART1 数据寄存器并清 RDRF */
+        app_link_isr_feed_byte(rx_byte);
     }
+
         
     LPUART_ClearStatusFlags(LPUART1, kLPUART_RxOverrunFlag);    // 不允许删除
 }

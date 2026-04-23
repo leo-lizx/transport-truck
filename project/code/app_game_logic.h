@@ -73,13 +73,14 @@
 
 // 游戏主流程状态机枚举
 typedef enum {
-    STAGE_WAIT_START = 0,     // 发车区等待
-    STAGE_RECOGNIZE_MAP,      // 识别地图与箱子
-    STAGE_PLAN_PATH,          // 寻路/推箱策略计算
-    STAGE_EXECUTE_ACTION,     // 执行推箱动作
-    STAGE_LEVEL_JUDGE,        // 一关完成后判断是否进入下一关
-    STAGE_DEADLOCK_RESET,     // 死局恢复：回发车区静止3秒后重置
-    STAGE_DONE                // 全流程完成
+    STAGE_WAIT_START = 0,           // 发车区等待
+    STAGE_RECOGNIZE_MAP,            // 识别地图与箱子
+    STAGE_PLAN_PATH,                // 寻路/推箱策略计算
+    STAGE_EXECUTE_ACTION,           // 执行推箱动作
+    STAGE_LEVEL_JUDGE,              // 一关完成后判断是否进入下一关
+    STAGE_DEADLOCK_RESET,           // 死局恢复：回发车区静止3秒后重置
+    STAGE_DONE,                     // 全流程完成
+    STAGE_PAUSE_ON_LINK_LOSS        // 【P0-2】视觉链路超时刹停, 链路恢复后自动续跑
 } GameStage_e;
 
 // 地图全局变量 (由副镜头串口解析后写入此数组)
@@ -87,5 +88,14 @@ extern uint8 g_game_map[MAP_ROWS][MAP_COLS];
 
 // 业务调度函数
 void Game_Logic_Task_Run(void);
+
+/* ==================================================================
+ * 【P0-2】链路状态查询接口
+ * Game_Link_Is_Alive():
+ *   1: 视觉端心跳 / MAP 帧在 LINK_LOSS_MS 内仍可见
+ *   0: 链路已超时, 状态机已进入 STAGE_PAUSE_ON_LINK_LOSS
+ * 用途: 菜单 / IPS 显示、调试上位机查询。
+ * ================================================================== */
+uint8 Game_Link_Is_Alive(void);
 
 #endif

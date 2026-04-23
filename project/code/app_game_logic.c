@@ -1,11 +1,28 @@
 #include "app_game_logic.h"
+#include "app_link.h"      /* P0-2: 读取 g_link_last_hb_ms 判断链路是否在线; P0-3: 拷贝 seq-lock 地图快照 */
 
+/*
+ * P0-3 说明:
+ *   g_game_map 现已降级为 "主循环侧的稳定地图快照", 唯一写者是
+ *   Game_Logic_Task_Run() 入口处的 app_link_get_map_snapshot();
+ *   LPUART1 ISR 不再直接写它. 业务层各 stage handler 继续裸读 g_game_map 即可,
+ *   不会再读到半更新地图.
+ */
 uint8 g_game_map[MAP_ROWS][MAP_COLS];
 Point_t g_player_pos = {(int8)CHASSIS_START_GRID_X, (int8)CHASSIS_START_GRID_Y};
 
 #define GAME_LOGIC_TASK_PERIOD_MS      (5U)
 #define DEADLOCK_RESET_HOLD_MS         (3000U)
 #define DEADLOCK_RESET_HOLD_TICKS      (DEADLOCK_RESET_HOLD_MS / GAME_LOGIC_TASK_PERIOD_MS)
+
+/* ==================================================================
+ * 【P0-2】视觉链路超时回退参数
+ *   LINK_LOSS_MS  : 触发"掉线"判定的静默时长门槛
+ *   LINK_OK_MS    : 触发"恢复"判定的静默时长门槛 (< LINK_LOSS_MS, 形成迟滞防抖)
+ *   视觉端策略 = MAP 帧约 16ms/帧 + 心跳 100ms/次, 200ms 给出 ~2 个心跳余量
+ * ================================================================== */
+#define LINK_LOSS_MS                   (200U)
+#define LINK_OK_MS                     (100U)
 
 typedef enum {
     EXEC_NONE = 0,
@@ -15,6 +32,12 @@ typedef enum {
 
 static GameStage_e current_stage = STAGE_WAIT_START;
 static uint8 is_navigating = 0;
+
+/* ----- 【P0-2】链路状态相关静态变量 -------------------------------- */
+static uint8        s_link_alive       = 0U;     /* 当前链路状态: 1=在线 0=离线/未启动 */
+static uint8        s_link_ever_alive  = 0U;     /* 是否曾经在线过 (开机直接没数据时, 保持 WAIT 而非 LOSS) */
+static GameStage_e  s_stage_resume     = STAGE_WAIT_START; /* LOSS 触发时保存原状态, 恢复时回到该状态 */
+static uint32       s_link_last_seen_ms = 0U;    /* 最近一次确认 alive 时的 g_link_last_hb_ms 快照 (调试) */
 
 static SokoFullSolution_t    g_soko_solution;
 static SokoWaypointPath_t    g_soko_waypoints;
@@ -170,7 +193,9 @@ static uint8 exec_push_box_solution(void)
 
 static uint8 find_first_unreachable_target(Point_t *blocked_target)
 {
-    NavPath_t nav_tmp;
+    /* P0-4: NavPath_t (Point_t[200]+uint16 ~402B) \u7531\u6808\u8fc1\u81f3\u6587\u4ef6\u7ea7 BSS\u3002
+     *       \u672c\u51fd\u6570\u4ec5\u5728 STAGE_DEADLOCK_RESET (\u4e3b\u5faa\u73af\u7ebf\u7a0b) \u8c03\u7528, \u65e0\u9012\u5f52\u65e0 ISR\u3002 */
+    static NavPath_t nav_tmp;
 
     if (!blocked_target) return 0;
 
@@ -400,8 +425,92 @@ static void stage_done_handler(void)
     /* 比赛流程完成，维持静止即可。 */
 }
 
+/* ==================================================================
+ * 【P0-2】视觉链路监控 + 超时回退
+ * ----------------------------------------------------------------
+ * update_link_state():
+ *   每个调度 tick 在 Game_Logic_Task_Run 入口被调用一次
+ *   - 用 (now - g_link_last_hb_ms) 与 LINK_LOSS_MS / LINK_OK_MS 做迟滞判定
+ *   - 状态翻转时:
+ *       OK  -> LOSS : 保存 current_stage 到 s_stage_resume, 切到 PAUSE, 立即 chassis_ctrl_stop()
+ *       LOSS-> OK   : current_stage 还原为 s_stage_resume, 状态机自然续跑
+ *
+ * stage_pause_on_link_loss_handler():
+ *   PAUSE 状态下不做任何业务逻辑, 只是周期性确保电机维持在停车状态
+ *   (chassis_ctrl_stop 已是幂等, 但为避免反复清 PID 积分, 这里只在
+ *    LOSS 触发瞬间调用一次, handler 内不再重复调.)
+ * ================================================================== */
+
+uint8 Game_Link_Is_Alive(void)
+{
+    return s_link_alive;
+}
+
+static void update_link_state(void)
+{
+    /* 32 位字段在 M7 上读取原子, 无需临界区                                       */
+    uint32 last_ok = g_link_last_hb_ms;
+    uint32 now_ms  = app_link_get_ms();    /* 与 g_link_last_hb_ms 同源时基, 步长一致  */
+    uint32 silence_ms = (now_ms >= last_ok) ? (now_ms - last_ok) : 0U;
+
+    if (!s_link_ever_alive) {
+        /* 上电后还没收到过任何帧: 不进入 LOSS 状态, 让用户看到的是 WAIT_START */
+        if (last_ok != 0U) {
+            s_link_ever_alive  = 1U;
+            s_link_alive       = 1U;
+            s_link_last_seen_ms = now_ms;
+        }
+        return;
+    }
+
+    if (s_link_alive) {
+        /* 在线 -> 检查是否需要触发 LOSS                                          */
+        if (silence_ms > LINK_LOSS_MS) {
+            s_link_alive = 0U;
+            if (current_stage != STAGE_PAUSE_ON_LINK_LOSS) {
+                s_stage_resume = current_stage;     /* 保存恢复点                  */
+                current_stage  = STAGE_PAUSE_ON_LINK_LOSS;
+                chassis_ctrl_stop();                /* 立即刹停 (force_stop)        */
+                is_navigating = 0U;
+            }
+        } else {
+            s_link_last_seen_ms = now_ms;
+        }
+    } else {
+        /* 离线 -> 检查是否恢复 (用 LINK_OK_MS 做迟滞)                            */
+        if (silence_ms < LINK_OK_MS) {
+            s_link_alive = 1U;
+            if (current_stage == STAGE_PAUSE_ON_LINK_LOSS) {
+                /* 安全策略: 链路恢复后强制重新识别地图, 避免基于陈旧地图直接执行  */
+                current_stage = STAGE_RECOGNIZE_MAP;
+                /* s_stage_resume 已不再使用, 但保留供调试观察 */
+                (void)s_stage_resume;
+            }
+        }
+    }
+}
+
+static void stage_pause_on_link_loss_handler(void)
+{
+    /* 视觉链路掉线期间维持静止, 不读 g_game_map, 不下发新目标.
+     * 链路恢复由 update_link_state() 自动切回 STAGE_RECOGNIZE_MAP.
+     * 此处刻意保持空, 避免反复调用 chassis_ctrl_stop() 把 PID 积分清得过频.
+     */
+}
+
 void Game_Logic_Task_Run(void)
 {
+    /* P0-2: 链路监控总闸 — 必须先于状态分发                                      */
+    update_link_state();
+
+    /* P0-3: 链路在线时刷新 g_game_map 私有快照 (seq-lock 拷贝).
+     *       链路 LOSS 期间冻结上次快照, 配合 P0-2 恢复策略 (强制 RECOGNIZE_MAP) 自洽.
+     *       上电首帧到达前 s_link_alive=0, g_game_map 维持 BSS 0 = MAP_EMPTY, 业务侧无副作用. */
+    if (s_link_alive)
+    {
+        app_link_get_map_snapshot(g_game_map);
+    }
+
     sync_player_pos();
 
     switch (current_stage) {
@@ -431,6 +540,10 @@ void Game_Logic_Task_Run(void)
 
         case STAGE_DONE:
             stage_done_handler();
+            break;
+
+        case STAGE_PAUSE_ON_LINK_LOSS:
+            stage_pause_on_link_loss_handler();
             break;
 
         default:

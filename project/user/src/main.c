@@ -38,6 +38,7 @@
 #include "chassis_pid.h"
 #include "chassis_menu.h"
 #include "app_game_logic.h"
+#include "app_link.h"   /* P0-1: 视觉?主控帧协议 */
 
 /*
  * main 运行模式：
@@ -119,6 +120,7 @@ int main(void)
 #if (0 == MAIN_YAW_HOLD_TEST_MODE)
     uart_init(UART_1, 115200, UART1_TX_B12, UART1_RX_B13);
     uart_rx_interrupt(UART_1, 1);
+    app_link_init();                /* P0-1: 协议解析层初始化, 必须在 uart_rx_interrupt 之后 */
 #endif
 
     // ------------------------------------------------------------------

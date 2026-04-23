@@ -50,6 +50,11 @@ static Point_t bfs_queue[MAP_ROWS * MAP_COLS];
 static Point_t parent_map[MAP_ROWS][MAP_COLS];
 static uint8   bfs_visited[MAP_ROWS][MAP_COLS];
 
+/* P0-4: Algo_Nav_BFS 反推路径用临时缓冲, 由栈迁至 BSS (~400B)。
+ *       与 bfs_queue/parent_map/bfs_visited 共享同一条非可重入约束:
+ *       仅允许主循环线程同时调用 1 次, 严禁 ISR / 嵌套 / 递归调用。 */
+static Point_t s_nav_temp_path[200];
+
 /** 判断坐标是否位于可通行内场（最外圈边界不可进入） */
 static inline uint8 map_is_inner_cell(int8 y, int8 x)
 {
@@ -184,18 +189,23 @@ uint8 Algo_Nav_BFS(const uint8 map[MAP_ROWS][MAP_COLS],
     }
 
     if (found) {
-        Point_t temp_path[200];
+        /* P0-4: temp_path 由栈数组 (Point_t[200]=400B) 迁至文件级 static s_nav_temp_path,
+         *       与 bfs_queue/parent_map/bfs_visited 同属本函数私有 BSS, 非可重入。 */
         uint16 step = 0;
         Point_t curr = end;
 
         while (curr.x != start.x || curr.y != start.y) {
-            temp_path[step++] = curr;
+            s_nav_temp_path[step++] = curr;
             curr = parent_map[curr.y][curr.x];
+            if (step >= (uint16)(sizeof(s_nav_temp_path) / sizeof(s_nav_temp_path[0]))) {
+                /* 路径异常超长 (>200), 防越界直接判失败; 正常 12x16 地图最大步数 <192 */
+                return 0;
+            }
         }
 
         result_path->step_count = step;
         for (int i = 0; i < step; i++) {
-            result_path->path[i] = temp_path[step - 1 - i];
+            result_path->path[i] = s_nav_temp_path[step - 1 - i];
         }
         return 1;
     }
