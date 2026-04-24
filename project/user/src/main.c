@@ -37,6 +37,15 @@
 #include "chassis_ctrl.h"
 #include "chassis_pid.h"
 #include "chassis_menu.h"
+#include "app_game_logic.h"
+#include "app_link.h"   /* P0-1: 视觉?主控帧协议 */
+
+/*
+ * main 运行模式：
+ * 1 = 航向保持测试模式（默认）：进入后保持目标航向角
+ * 0 = 游戏状态机模式
+ */
+#define MAIN_YAW_HOLD_TEST_MODE   (1)
 
 /* 单轮 PID 调试参数（按需修改）
  * wheel_index: 0=LF 1=RF 2=LB 3=RB
@@ -73,43 +82,102 @@ int main(void)
 {
     uint8 menu_render_div = 0U;
 
-    /* 1) 时钟/调试串口 */
-    clock_init(SYSTEM_CLOCK_600M);
-    debug_init();
+    clock_init(SYSTEM_CLOCK_600M);  // 不可删除
+    debug_init();                   // 调试端口初始化
 
-    /* 2) 菜单显示与按键 */
+    // ------------------------------------------------------------------
+    // 1. 通信外设初始化
+    // ------------------------------------------------------------------
+    // 串口1: 与 OpenART 视觉模块通信 (波特率需与 OpenART 一致)
+#if (0 == MAIN_YAW_HOLD_TEST_MODE)
+    uart_init(UART_1, 115200, UART1_TX_B12, UART1_RX_B13);
+    uart_rx_interrupt(UART_1, 1);
+    app_link_init();                /* P0-1: 协议解析层初始化, 必须在 uart_rx_interrupt 之后 */
+#endif
+
+    // ------------------------------------------------------------------
+    // 2. IPS200 屏幕 + 按键初始化 (调参菜单)
+    // ------------------------------------------------------------------
     ips200_set_dir(IPS200_CROSSWISE);
     ips200_init(IPS200_TYPE_SPI);
     ips200_set_font(IPS200_8X16_FONT);
     ips200_set_color(RGB565_WHITE, RGB565_BLACK);
     key_init(10);
 
-    /* 3) 底盘与菜单参数初始化 */
+    // ------------------------------------------------------------------
+    // 3. 底盘控制子系统初始化 + 调参菜单
+    //    包括: IMU 零偏标定、电机 PWM、编码器、PID 参数
+    //    注意: 调用此函数前请确保车模静止放置在平面上
+    // ------------------------------------------------------------------
     chassis_ctrl_init();
     chassis_menu_init();
+    // 发车位修正：第一列，距最底边界约 1m（折算到网格后为 G(1,7)）。
+    chassis_ctrl_set_pose(chassis_grid_x_to_m(CHASSIS_START_GRID_X),
+                          chassis_grid_y_to_m(CHASSIS_START_GRID_Y),
+                          0.0f);
 
-    /* 4) 按 main 顶部宏覆盖左前轮 PID 并启动单轮调试模式 */
-    main_apply_left_front_pid_for_debug();
+#if (1 == MAIN_YAW_HOLD_TEST_MODE)
+#if (1 == MAIN_SINGLE_WHEEL_PID_DEBUG_MODE)
+    /* 单轮 PID 调试模式：
+     * - 仅 MAIN_PID_DEBUG_WHEEL_INDEX 参与闭环跟踪
+     * - 其他轮子目标固定为 0
+     * - menu 参数仍可实时生效，长按 K4 可走现有 flash 写入保存
+     */
     chassis_ctrl_start_single_wheel_pid_debug((uint8)MAIN_PID_DEBUG_WHEEL_INDEX,
                                               MAIN_PID_DEBUG_TARGET_MPS);
+#else
+    // 航向保持测试模式：仅设置一次目标航向，不运行推箱状态机。
+    // 持续闭环由 PIT_CH1 的 chassis_ctrl_task_20ms() 执行。
+    chassis_ctrl_hold_yaw(MAIN_HOLD_YAW_TARGET_DEG);
+#endif
+#else
+    // 游戏模式：仅设置初始航向基准。
+    chassis_ctrl_hold_yaw(0.0f);
+#endif
 
-    /* 5) 中断节拍：5ms 姿态、20ms 闭环、10ms 菜单按键 */
+    // ------------------------------------------------------------------
+    // 4. PIT 定时中断初始化
+    //    CH0: 5ms 姿态采样  CH1: 20ms 底盘闭环  CH2: 10ms 菜单扫描（渲染在主循环）
+    // ------------------------------------------------------------------
     pit_ms_init(PIT_CH0, 5);
     pit_ms_init(PIT_CH1, 20);
     pit_ms_init(PIT_CH2, 10);
 
-    /* 6) 主循环：打印单轮 PID 调试信息 + 菜单渲染 */
+    // ------------------------------------------------------------------
+    // 5. 主循环: 游戏状态机
+    //    Game_Logic_Task_Run 为非阻塞函数，内部维护推箱子状态机。
+    // ------------------------------------------------------------------
+    // 静态调试阶段可先不运行状态机，改为手动下发网格目标点。
+    // app_chassis_ctrl_move_to_grid(3, 5);
+
     while (1)
     {
+    #if (1 == MAIN_SINGLE_WHEEL_PID_DEBUG_MODE)
+        /* 单轮 PID 调试输出：每 100ms 仅打印“目标值 实际值”两列数字。 */
         chassis_pid_debug_task_5ms();
+    #else
+        // 航向闭环调试任务：100ms 打印一次目标角/当前角/误差/角速度指令。
+        chassis_ctrl_attitude_debug_task_5ms();
+    #endif
 
+    #if (1 == MAIN_YAW_HOLD_TEST_MODE)
+        /*
+         * 航向保持测试模式：
+         * 目标角已在初始化阶段设置，20ms 中断中持续执行闭环。
+         * 这里不重复调用 hold_yaw，避免反复清空积分项影响闭环效果。
+         */
+    #else
+        Game_Logic_Task_Run();                         // 运行推箱子游戏状态机 (非阻塞)
+    #endif
+
+        /* 菜单渲染放到主循环，避免在 PIT 中断内刷屏造成控制节拍抖动。 */
         menu_render_div++;
-        if (menu_render_div >= MAIN_MENU_RENDER_DIV)
+        if (menu_render_div >= 2U)
         {
             menu_render_div = 0U;
             chassis_menu_render_100ms();
         }
 
-        system_delay_ms(5);
+        system_delay_ms(5);                               // 主循环节拍
     }
 }

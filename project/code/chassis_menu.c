@@ -99,6 +99,10 @@ static char s_status_text[24] = "STATUS: READY";       /* 当前状态文本 */
 static char s_status_text_prev[24] = "";               /* 上次状态文本（用于变化检测） */
 static uint8 s_flash_ready = 0U;                        /* Flash 可用标志 */
 static uint8 s_full_refresh_done = 0U;                  /* 是否至少完成过一次整屏绘制 */
+static uint8 s_param_hold_inc_ticks = 0U;               /* K3 长按连发节拍计数（10ms 基准） */
+static uint8 s_param_hold_dec_ticks = 0U;               /* K4 长按连发节拍计数（10ms 基准） */
+
+#define MENU_PARAM_HOLD_REPEAT_TICKS     (5U)           /* 长按连发周期：5*10ms=50ms */
 
 static const menu_param_meta_t s_param_meta[MENU_PARAM_COUNT] =
 {
@@ -140,40 +144,6 @@ static const menu_page_meta_t s_pages[] =
 };
 
 #define MENU_PAGE_COUNT ((uint8)(sizeof(s_pages) / sizeof(s_pages[0]))) /* 一级菜单页数 */
-
-/* 统一短按事件消费：检测到短按后立即清状态并返回 1。 */
-static uint8 menu_take_short_press(uint8 key_id)
-{
-    if (KEY_SHORT_PRESS == key_get_state(key_id))
-    {
-        key_clear_state(key_id);
-        return 1U;
-    }
-    return 0U;
-}
-
-/* 统一长按事件消费：检测到长按后立即清状态并返回 1。 */
-static uint8 menu_take_long_press(uint8 key_id)
-{
-    if (KEY_LONG_PRESS == key_get_state(key_id))
-    {
-        key_clear_state(key_id);
-        return 1U;
-    }
-    return 0U;
-}
-
-/* 环形索引：前移一位。 */
-static uint8 menu_ring_prev(uint8 index, uint8 count)
-{
-    return (0U == index) ? (uint8)(count - 1U) : (uint8)(index - 1U);
-}
-
-/* 环形索引：后移一位。 */
-static uint8 menu_ring_next(uint8 index, uint8 count)
-{
-    return (uint8)((index + 1U) % count);
-}
 
 /* 根据参数ID读取当前参数值。 */
 static float menu_get_param_value(menu_param_id_enum id)
@@ -365,34 +335,41 @@ static void menu_apply_current_param_delta(float delta)
 /* 一级菜单按键处理：负责页面切换与进入二级。 */
 static void menu_handle_root_keys(void)
 {
-    if (menu_take_short_press(KEY_1))
+    if (KEY_SHORT_PRESS == key_get_state(KEY_1))
     {
         /* K1 短按：一级菜单上一页。 */
-        s_root_index = menu_ring_prev(s_root_index, MENU_PAGE_COUNT); /* 环形切换到上一页 */
+        key_clear_state(KEY_1); /* 消费该次按键事件 */
+        s_root_index = (0U == s_root_index) ? (MENU_PAGE_COUNT - 1U) : (uint8)(s_root_index - 1U); /* 环形切换到上一页 */
         s_need_redraw = 1U; /* 通知渲染层更新显示 */
     }
 
-    if (menu_take_short_press(KEY_2))
+    if (KEY_SHORT_PRESS == key_get_state(KEY_2))
     {
         /* K2 短按：一级菜单下一页。 */
-        s_root_index = menu_ring_next(s_root_index, MENU_PAGE_COUNT); /* 环形切换到下一页 */
+        key_clear_state(KEY_2); /* 消费该次按键事件 */
+        s_root_index = (uint8)((s_root_index + 1U) % MENU_PAGE_COUNT); /* 环形切换到下一页 */
         s_need_redraw = 1U; /* 通知渲染层更新显示 */
     }
 
-    if (menu_take_short_press(KEY_3))
+    if (KEY_SHORT_PRESS == key_get_state(KEY_3))
     {
         /* K3 短按：进入二级参数编辑。 */
+        key_clear_state(KEY_3);         /* 消费该次按键事件 */
         s_menu_level = MENU_LEVEL_PARAM; /* 进入二级参数编辑层 */
         s_param_index = 0U;             /* 二级默认选中第一个参数 */
         s_need_redraw = 1U;             /* 通知渲染层更新显示 */
     }
 
-    /* K4 短按：一级页面不使用，仅清状态防止残留。 */
-    (void)menu_take_short_press(KEY_4);
+    if (KEY_SHORT_PRESS == key_get_state(KEY_4))
+    {
+        /* K4 短按：一级页面不使用，清状态防止残留。 */
+        key_clear_state(KEY_4); /* 清理无效短按事件，防止状态堆积 */
+    }
 
-    if (menu_take_long_press(KEY_4))
+    if (KEY_LONG_PRESS == key_get_state(KEY_4))
     {
         /* K4 长按：保存当前参数到 Flash。 */
+        key_clear_state(KEY_4);       /* 消费该次长按事件 */
         menu_save_params_to_flash();  /* 执行参数保存 */
         s_need_redraw = 1U;           /* 刷新状态行显示保存结果 */
     }
@@ -402,55 +379,87 @@ static void menu_handle_root_keys(void)
 static void menu_handle_param_keys(void)
 {
     const menu_page_meta_t *page = &s_pages[s_root_index]; /* 当前页面参数集合 */
+    key_state_enum key3_state = key_get_state(KEY_3);      /* K3 当前状态 */
+    key_state_enum key4_state = key_get_state(KEY_4);      /* K4 当前状态 */
 
-    if (menu_take_short_press(KEY_1))
+    if (KEY_SHORT_PRESS == key_get_state(KEY_1))
     {
         /* K1 短按：切换到上一个参数项。 */
-        s_param_index = menu_ring_prev(s_param_index, page->param_count); /* 环形切换上一项 */
+        key_clear_state(KEY_1); /* 消费该次按键事件 */
+        s_param_index = (0U == s_param_index) ? (uint8)(page->param_count - 1U) : (uint8)(s_param_index - 1U); /* 环形切换上一项 */
         s_need_redraw = 1U; /* 通知渲染层更新光标位置 */
     }
 
-    if (menu_take_short_press(KEY_2))
+    if (KEY_SHORT_PRESS == key_get_state(KEY_2))
     {
         /* K2 短按：切换到下一个参数项。 */
-        s_param_index = menu_ring_next(s_param_index, page->param_count); /* 环形切换下一项 */
+        key_clear_state(KEY_2); /* 消费该次按键事件 */
+        s_param_index = (uint8)((s_param_index + 1U) % page->param_count); /* 环形切换下一项 */
         s_need_redraw = 1U; /* 通知渲染层更新光标位置 */
     }
 
-    if (menu_take_short_press(KEY_3))
+    if (KEY_SHORT_PRESS == key3_state)
     {
         menu_param_id_enum id = menu_get_current_param_id(); /* 当前参数 ID */
         /* K3 短按：按 step 增加参数值。 */
+        key_clear_state(KEY_3);                           /* 消费该次按键事件 */
         menu_apply_current_param_delta(s_param_meta[id].step); /* 参数增加一个步进 */
     }
 
-    if (menu_take_short_press(KEY_4))
+    if (KEY_SHORT_PRESS == key4_state)
     {
         menu_param_id_enum id = menu_get_current_param_id(); /* 当前参数 ID */
         /* K4 短按：按 step 减小参数值。 */
+        key_clear_state(KEY_4);                            /* 消费该次按键事件 */
         menu_apply_current_param_delta(-s_param_meta[id].step); /* 参数减少一个步进 */
     }
 
-    if (menu_take_long_press(KEY_1))
+    if (KEY_LONG_PRESS == key_get_state(KEY_1))
     {
         /* K1 长按：退出二级，返回一级菜单。 */
+        key_clear_state(KEY_1);        /* 消费该次长按事件 */
         s_menu_level = MENU_LEVEL_ROOT; /* 切回一级菜单层 */
         s_need_redraw = 1U;            /* 通知渲染层全刷 */
     }
 
-    if (menu_take_long_press(KEY_4))
+    if (KEY_LONG_PRESS == key3_state)
     {
-        /* K4 长按：保存当前参数到 Flash。 */
-        menu_save_params_to_flash(); /* 执行参数保存 */
-        s_need_redraw = 1U;          /* 刷新状态行显示保存结果 */
+        menu_param_id_enum id = menu_get_current_param_id(); /* 当前参数 ID */
+        /* K3 长按：按固定节拍连续增加参数值。 */
+        if ((0U == s_param_hold_inc_ticks) || (s_param_hold_inc_ticks >= MENU_PARAM_HOLD_REPEAT_TICKS))
+        {
+            menu_apply_current_param_delta(s_param_meta[id].step); /* 连续增加一个步进 */
+            s_param_hold_inc_ticks = 0U;                            /* 重置连发计数 */
+        }
+        s_param_hold_inc_ticks++; /* 累计长按时长，达到节拍后再次连发 */
+    }
+    else
+    {
+        s_param_hold_inc_ticks = 0U; /* 释放后清连发计数 */
+    }
+
+    if (KEY_LONG_PRESS == key4_state)
+    {
+        menu_param_id_enum id = menu_get_current_param_id(); /* 当前参数 ID */
+        /* K4 长按：按固定节拍连续减小参数值。 */
+        if ((0U == s_param_hold_dec_ticks) || (s_param_hold_dec_ticks >= MENU_PARAM_HOLD_REPEAT_TICKS))
+        {
+            menu_apply_current_param_delta(-s_param_meta[id].step); /* 连续减少一个步进 */
+            s_param_hold_dec_ticks = 0U;                             /* 重置连发计数 */
+        }
+        s_param_hold_dec_ticks++; /* 累计长按时长，达到节拍后再次连发 */
+    }
+    else
+    {
+        s_param_hold_dec_ticks = 0U; /* 释放后清连发计数 */
     }
 }
 
 /* 清理长按状态，避免按键长按后卡在某个状态位。 */
 static void menu_clear_long_press_flags(void)
 {
-    (void)menu_take_long_press(KEY_1); /* 清理 KEY_1 长按残留状态 */
-    (void)menu_take_long_press(KEY_2); /* 清理 KEY_2 长按残留状态 */
+    if (KEY_LONG_PRESS == key_get_state(KEY_1)) { key_clear_state(KEY_1); } /* 清理 KEY_1 长按残留状态 */
+    if (KEY_LONG_PRESS == key_get_state(KEY_2)) { key_clear_state(KEY_2); } /* 清理 KEY_2 长按残留状态 */
 }
 
 /* 公共头部绘制。 */
@@ -579,6 +588,8 @@ void chassis_menu_init(void)
     s_need_redraw = 1U;             /* 标记需要首次刷新 */
     s_render_ticks = 0U;            /* 渲染节拍计数清零 */
     s_full_refresh_done = 0U;       /* 清除“已全刷”标志 */
+    s_param_hold_inc_ticks = 0U;    /* K3 连发计数清零 */
+    s_param_hold_dec_ticks = 0U;    /* K4 连发计数清零 */
 }
 
 //-------------------------------------------------------------------------

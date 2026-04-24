@@ -1144,6 +1144,12 @@
             <name>$PROJ_DIR$\..\..\code\app_game_logic.h</name>
         </file>
         <file>
+            <name>$PROJ_DIR$\..\..\code\app_link.c</name>
+        </file>
+        <file>
+            <name>$PROJ_DIR$\..\..\code\app_link.h</name>
+        </file>
+        <file>
             <name>$PROJ_DIR$\..\..\code\chassis_config.h</name>
         </file>
         <file>

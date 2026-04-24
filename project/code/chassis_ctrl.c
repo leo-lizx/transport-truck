@@ -16,7 +16,11 @@
 #include "chassis_motor.h"
 #include "chassis_pid.h"
 #include "chassis_mecanum.h"
+#include "app_link.h"        /* P0-3: 软限位改用 app_link_get_map_snapshot() 拿一致地图副本   */
+#include "zf_common_headfile.h"  /* P0-3: __DMB() / __disable_irq() 内存屏障与临界区          */
 #include <math.h>
+
+/* 软限位依赖：P0-3 解耦 g_game_map 直访, 改为运行时 seq-lock 快照 (apply_soft_limit_guard 内部拷贝) */
 
 /* ---------------------- 航向闭环常量 ---------------------- */
 #define YAW_DEADZONE_DEG   0.30f    /* 航向误差死区               */
@@ -34,6 +38,14 @@
 #define WHEEL_FB_LPF_ALPHA                (0.35f)   /* 轮速反馈一阶低通系数，越小越平滑 */
 #define WHEEL_STOP_TARGET_EPS_MPS         (0.015f)  /* 目标接近 0 的判据 */
 #define WHEEL_STOP_FEEDBACK_EPS_MPS       (0.030f)  /* 反馈接近 0 的判据 */
+
+/* 软限位保护参数（防止里程计漂移导致虚拟地图“撞墙”） */
+#define SOFT_LIMIT_LOOKAHEAD_S             (0.22f)   /* 前瞻时间窗，越大越保守 */
+#define SOFT_LIMIT_SIDE_OFFSET_M           (0.08f)   /* 左右试探偏移 */
+#define SOFT_LIMIT_BRAKE_SCALE             (0.28f)   /* 触发时线速度缩放 */
+#define SOFT_LIMIT_AVOID_WZ_DPS            (35.0f)   /* 避障微调角速度 */
+#define SOFT_LIMIT_MIN_MOVE_EPS_MPS        (0.01f)   /* 小于此速度不触发预测 */
+#define SOFT_LIMIT_MAP_WALL                (1U)      /* 与地图编码 MAP_WALL 保持一致 */
 
 /* ---------------------- 控制模式 ---------------------- */
 /*
@@ -99,6 +111,62 @@ volatile chassis_tune_params_t g_chassis_tune_params = {
 static volatile chassis_pose_t           s_pose     = {0};
 static volatile chassis_body_speed_cmd_t s_last_cmd = {0};
 static volatile chassis_body_speed_cmd_t s_ramp     = {0};  /* 斜坡滤波状态 */
+
+/* ==================================================================
+ * 【P0-3】s_pose Seq-Lock
+ *   写者:
+ *     · chassis_ctrl_task_5ms()        — 写 yaw_deg     (PIT_IRQn)
+ *     · chassis_ctrl_task_20ms()       — 写 x_m / y_m   (PIT_IRQn, 与 5ms 同 IRQ, 不嵌套)
+ *     · chassis_ctrl_set_pose()        — 写全部三字段   (主循环, 必须 __disable_irq 防 PIT 抢占)
+ *   读者:
+ *     · chassis_ctrl_get_pose()        — 主循环
+ *     · apply_soft_limit_guard()       — PIT_IRQn 内, 与写者同 IRQ 互斥, 但 LPUART1 ISR 可能抢占,
+ *                                         走 seq-lock 读 仍然必要 (规范化语义)
+ * ================================================================== */
+static volatile uint32 s_pose_seq = 0U;
+
+static inline void pose_write_begin(void)
+{
+    s_pose_seq++;       /* 偶 -> 奇: 标记 updating */
+    __DMB();
+}
+static inline void pose_write_end(void)
+{
+    __DMB();
+    s_pose_seq++;       /* 奇 -> 偶: 标记 stable   */
+}
+
+/* seq-lock 读: dst 写入一致快照. 重试上限 4 次, 超限计数报警. */
+#define POSE_READ_RETRY_MAX    (4U)
+volatile uint32 g_chassis_pose_snapshot_retry_giveup = 0U;
+
+static void pose_read_snapshot(chassis_pose_t *dst)
+{
+    uint32 retry;
+    uint32 s1;
+    uint32 s2;
+
+    if (dst == NULL) { return; }
+
+    for (retry = 0U; retry <= POSE_READ_RETRY_MAX; ++retry)
+    {
+        s1 = s_pose_seq;
+        if ((s1 & 1U) != 0U) { continue; }
+        __DMB();
+        dst->x_m     = s_pose.x_m;
+        dst->y_m     = s_pose.y_m;
+        dst->yaw_deg = s_pose.yaw_deg;
+        __DMB();
+        s2 = s_pose_seq;
+        if (s1 == s2) { return; }
+    }
+
+    ++g_chassis_pose_snapshot_retry_giveup;
+    /* 兜底: 直接裸读 (与 P0-3 之前行为一致, 但极少进入此分支) */
+    dst->x_m     = s_pose.x_m;
+    dst->y_m     = s_pose.y_m;
+    dst->yaw_deg = s_pose.yaw_deg;
+}
 
 static volatile ctrl_mode_t s_mode    = MODE_YAW_HOLD;
 static volatile uint8       s_arrived = 1U;
@@ -230,6 +298,105 @@ static void force_stop(void)
         s_wheel_fb_lpf[i] = 0.0f;
     }
     s_wheel_fb_lpf_inited = 0U;
+}
+
+/** 软限位：网格是否在可通行内场 */
+static inline uint8 soft_limit_is_inner_grid(int16 gx, int16 gy)
+{
+    if (gx < (int16)CHASSIS_GRID_INNER_MIN_X || gx > (int16)CHASSIS_GRID_INNER_MAX_X) return 0;
+    if (gy < (int16)CHASSIS_GRID_INNER_MIN_Y || gy > (int16)CHASSIS_GRID_INNER_MAX_Y) return 0;
+    return 1;
+}
+
+/** 软限位：判断网格是否为墙/边界障碍 (P0-3: 改读传入的本地地图快照, 不再访 g_game_map) */
+static uint8 soft_limit_is_wall_grid(const uint8 map[APP_LINK_MAP_ROWS][APP_LINK_MAP_COLS],
+                                     int16 gx, int16 gy)
+{
+    if (!soft_limit_is_inner_grid(gx, gy)) return 1;
+    return (map[gy][gx] == SOFT_LIMIT_MAP_WALL) ? 1 : 0;
+}
+
+/** 软限位：按全局坐标点判断是否会撞墙 */
+static uint8 soft_limit_is_wall_point(const uint8 map[APP_LINK_MAP_ROWS][APP_LINK_MAP_COLS],
+                                      float x_m, float y_m)
+{
+    uint8 gx = chassis_m_to_grid_x(x_m);
+    uint8 gy = chassis_m_to_grid_y(y_m);
+    return soft_limit_is_wall_grid(map, (int16)gx, (int16)gy);
+}
+
+/**
+ * 软限位保护：预测下一步位置，若即将撞墙则减速并施加微转向。
+ *
+ * 逻辑：
+ * 1) 以前瞻时间预测车体中心落点。
+ * 2) 若前方落点位于墙体，则线速度强制缩放。
+ * 3) 对比前左/前右两个试探点，向更空旷一侧施加角速度偏置。
+ */
+static void apply_soft_limit_guard(chassis_body_speed_cmd_t *cmd)
+{
+    /* P0-3: 在 PIT_IRQn 上下文里取一致地图 + 一致位姿副本 (LPUART1 ISR 可能抢占) */
+    uint8           map_snap[APP_LINK_MAP_ROWS][APP_LINK_MAP_COLS];
+    chassis_pose_t  pose_snap;
+    float yaw_rad;
+    float cy, sy;
+    float vxg, vyg;
+    float v_norm;
+    float nx, ny;
+    float left_x, left_y;
+    float right_x, right_y;
+    uint8 front_hit;
+    uint8 left_hit;
+    uint8 right_hit;
+
+    if (!cmd) return;
+
+    v_norm = sqrtf(cmd->vx_body_mps * cmd->vx_body_mps +
+                   cmd->vy_body_mps * cmd->vy_body_mps);
+    if (v_norm < SOFT_LIMIT_MIN_MOVE_EPS_MPS) return;
+
+    app_link_get_map_snapshot(map_snap);   /* 192B 栈拷贝, 与 BFS 共享时序 */
+    pose_read_snapshot(&pose_snap);
+
+    yaw_rad = pose_snap.yaw_deg * CHASSIS_DEG_TO_RAD_F;
+    cy = cosf(yaw_rad);
+    sy = sinf(yaw_rad);
+
+    /* 车体系速度 -> 全局速度 */
+    vxg = cy * cmd->vx_body_mps - sy * cmd->vy_body_mps;
+    vyg = sy * cmd->vx_body_mps + cy * cmd->vy_body_mps;
+
+    nx = pose_snap.x_m + vxg * SOFT_LIMIT_LOOKAHEAD_S;
+    ny = pose_snap.y_m + vyg * SOFT_LIMIT_LOOKAHEAD_S;
+    front_hit = soft_limit_is_wall_point(map_snap, nx, ny);
+
+    if (!front_hit) return;
+
+    /* 触发软限位：先强制减速，避免继续顶墙 */
+    cmd->vx_body_mps *= SOFT_LIMIT_BRAKE_SCALE;
+    cmd->vy_body_mps *= SOFT_LIMIT_BRAKE_SCALE;
+
+    /* 使用法向偏移评估左右绕行可行性 */
+    left_x  = nx - sy * SOFT_LIMIT_SIDE_OFFSET_M;
+    left_y  = ny + cy * SOFT_LIMIT_SIDE_OFFSET_M;
+    right_x = nx + sy * SOFT_LIMIT_SIDE_OFFSET_M;
+    right_y = ny - cy * SOFT_LIMIT_SIDE_OFFSET_M;
+
+    left_hit  = soft_limit_is_wall_point(map_snap, left_x, left_y);
+    right_hit = soft_limit_is_wall_point(map_snap, right_x, right_y);
+
+    if (left_hit && !right_hit) {
+        cmd->wz_dps -= SOFT_LIMIT_AVOID_WZ_DPS;
+    } else if (!left_hit && right_hit) {
+        cmd->wz_dps += SOFT_LIMIT_AVOID_WZ_DPS;
+    } else {
+        /* 两侧同样拥挤/开阔：保留原命令转向方向，给一个固定偏置 */
+        if (cmd->wz_dps >= 0.0f) {
+            cmd->wz_dps += SOFT_LIMIT_AVOID_WZ_DPS;
+        } else {
+            cmd->wz_dps -= SOFT_LIMIT_AVOID_WZ_DPS;
+        }
+    }
 }
 
 /** 完整执行链路: 滤波 → 运动学 → PID → 电机 */
@@ -443,8 +610,13 @@ void chassis_ctrl_init(void)
 
 void chassis_ctrl_task_5ms(void)
 {
+    float yaw_now;
     chassis_imu_update_5ms();
-    s_pose.yaw_deg = chassis_imu_get_yaw_deg();
+    yaw_now = chassis_imu_get_yaw_deg();
+    /* P0-3: seq-lock 写 yaw_deg */
+    pose_write_begin();
+    s_pose.yaw_deg = yaw_now;
+    pose_write_end();
 }
 
 void chassis_ctrl_task_20ms(void)
@@ -497,12 +669,18 @@ void chassis_ctrl_task_20ms(void)
     s_fb_vx = vx_raw * CHASSIS_ODOM_SCALE_X;
     s_fb_vy = vy_raw * CHASSIS_ODOM_SCALE_Y;
 
-    /* 3) 里程计积分: 车体速度旋转到全局坐标系后累加 */
+    /* 3) 里程计积分: 车体速度旋转到全局坐标系后累加 (P0-3: seq-lock 写 x/y) */
     yaw_rad = s_pose.yaw_deg * CHASSIS_DEG_TO_RAD_F;
     cy = cosf(yaw_rad);
     sy = sinf(yaw_rad);
-    s_pose.x_m += (cy * s_fb_vx - sy * s_fb_vy) * CHASSIS_TASK_DT_20MS_S;
-    s_pose.y_m += (sy * s_fb_vx + cy * s_fb_vy) * CHASSIS_TASK_DT_20MS_S;
+    {
+        float new_x = s_pose.x_m + (cy * s_fb_vx - sy * s_fb_vy) * CHASSIS_TASK_DT_20MS_S;
+        float new_y = s_pose.y_m + (sy * s_fb_vx + cy * s_fb_vy) * CHASSIS_TASK_DT_20MS_S;
+        pose_write_begin();
+        s_pose.x_m = new_x;
+        s_pose.y_m = new_y;
+        pose_write_end();
+    }
 
     /* 4) 模式分支 → 生成车体速度指令 */
     switch (s_mode) {
@@ -565,6 +743,9 @@ void chassis_ctrl_task_20ms(void)
         break;
     }
     }
+
+    /* 5) 软限位保护：即将撞墙时减速并微调方向 */
+    apply_soft_limit_guard(&cmd);
 
     apply_speed(cmd, ws_pid);
 #endif
@@ -656,11 +837,13 @@ void chassis_ctrl_attitude_debug_start_zero(void)
 
 void chassis_ctrl_attitude_debug_get_state(chassis_attitude_debug_info_t *out)
 {
+    chassis_pose_t pose_snap;
     if (!out) return;
+    pose_read_snapshot(&pose_snap);     /* P0-3: 一致性快照, 避免与 5ms ISR 写竞争 */
     out->target_yaw_deg  = s_tgt_yaw_deg;
-    out->current_yaw_deg = s_pose.yaw_deg;
+    out->current_yaw_deg = pose_snap.yaw_deg;
     out->yaw_err_deg     = chassis_normalize_angle_deg(
-                               s_tgt_yaw_deg - s_pose.yaw_deg);
+                               s_tgt_yaw_deg - pose_snap.yaw_deg);
     out->wz_cmd_dps      = s_last_cmd.wz_dps;
 }
 
@@ -687,7 +870,9 @@ uint8 chassis_ctrl_is_arrived(void)
 
 chassis_pose_t chassis_ctrl_get_pose(void)
 {
-    chassis_pose_t c = { s_pose.x_m, s_pose.y_m, s_pose.yaw_deg };
+    /* P0-3: seq-lock 读, 防止主循环看到 (新yaw, 旧x, 旧y) 的撕裂 */
+    chassis_pose_t c;
+    pose_read_snapshot(&c);
     return c;
 }
 
@@ -703,10 +888,16 @@ chassis_body_speed_cmd_t chassis_ctrl_get_last_cmd(void)
 
 void chassis_ctrl_set_pose(float x_m, float y_m, float yaw_deg)
 {
+    /* P0-3: 主循环写者会被 PIT 抢占; 用临界区避免与 5ms/20ms ISR 写者交错破坏 seq 奇偶 */
+    float yaw_norm = chassis_normalize_angle_deg(yaw_deg);
+    __disable_irq();
+    pose_write_begin();
     s_pose.x_m     = x_m;
     s_pose.y_m     = y_m;
-    s_pose.yaw_deg = chassis_normalize_angle_deg(yaw_deg);
-    chassis_imu_set_yaw_deg(s_pose.yaw_deg);  /* 同步 IMU 防覆盖 */
+    s_pose.yaw_deg = yaw_norm;
+    pose_write_end();
+    __enable_irq();
+    chassis_imu_set_yaw_deg(yaw_norm);  /* 同步 IMU 防覆盖 (内部已自带防护) */
 }
 
 /*--- 运行时调参 ---*/
