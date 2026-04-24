@@ -89,65 +89,37 @@ static uint32 wait_for_tick(void)
  */
 #define MAIN_YAW_HOLD_TEST_MODE   (1)
 
-/* 单轮 PID 调试模式：
- * 1 = 启用（每次只调一个轮子 PID）
- * 0 = 关闭（保持原有航向/游戏逻辑）
+/* 单轮 PID 调试参数（按需修改）
+ * wheel_index: 0=LF 1=RF 2=LB 3=RB
  */
-#define MAIN_SINGLE_WHEEL_PID_DEBUG_MODE   (1)
+#define MAIN_PID_DEBUG_WHEEL_INDEX         (CHASSIS_WHEEL_LF)
+#define MAIN_PID_DEBUG_TARGET_MPS          (8.0f)
+#define MAIN_MENU_RENDER_DIV               (2U)
 
-/* 单轮 PID 调试参数（按需修改） */
-#define MAIN_PID_DEBUG_WHEEL_INDEX         (CHASSIS_WHEEL_RF)
-#define MAIN_PID_DEBUG_TARGET_MPS          (0.40f)
+/*
+ * 左前轮 PID 调试参数入口（按需修改）：
+ * - 该组参数会在初始化阶段覆盖到运行时调参结构。
+ * - 若置 0，则不在 main 内强制覆盖，继续沿用 Flash/菜单中的 PID。
+ */
+#define MAIN_PID_DEBUG_FORCE_LF_PID_FROM_MAIN   (0)
+#define MAIN_PID_DEBUG_LF_KP                    (120.0f)
+#define MAIN_PID_DEBUG_LF_KI                    (8.0f)
+#define MAIN_PID_DEBUG_LF_KD                    (1.0f)
 
-/* 航向保持测试目标角（单位：度，可按需修改） */
-#define MAIN_HOLD_YAW_TARGET_DEG  (0.0f)
+static void main_apply_left_front_pid_for_debug(void)
+{
+#if (1 == MAIN_PID_DEBUG_FORCE_LF_PID_FROM_MAIN)
+    chassis_tune_params_t tune_params;
 
-/*==========================================================================
- *  推箱子智能车完整调用流程 (第二十一届全国智能车竞赛 AI视觉组)
- *
- *  ┌─────────────────────────────────────────────────────────────────┐
- *  │ 系统初始化                                                       │
- *  │   clock_init  →  debug_init  →  uart_init (OpenART 通信)       │
- *  │   chassis_ctrl_init (IMU零偏/电机/编码器/PID)                    │
- *  │   pit_ms_init (5ms 姿态 + 20ms 控制 + 10ms 菜单)                │
- *  └──────────────────────────┬──────────────────────────────────────┘
- *                             ▼
- *  ┌─────────── while(1) 主循环 ──────────────────────────────────────┐
- *  │                                                                  │
- *  │  Game_Logic_Task_Run()  ← 游戏状态机 (非阻塞, 每轮调一次)       │
- *  │                                                                  │
- *  │  状态机流转:                                                      │
- *  │    PENDING_SCOUT ──→ 去最近箱子, 看前摄像头分阶段               │
- *  │         │ class_id==0               │ class_id>0                 │
- *  │         ▼                           ▼                            │
- *  │    STAGE_1_BASIC_EXEC         OBSERVE_ALL                       │
- *  │    (任意推箱, 推完→DONE)       (看遍所有箱子)                    │
- *  │                                  │ 无炸弹        │ 有炸弹        │
- *  │                                  ▼               ▼               │
- *  │                          STAGE_2_CLASS    STAGE_3_STRATEGY       │
- *  │                          (分类推箱→DONE)  (尝试分类推箱)         │
- *  │                                            │ 无解                │
- *  │                                            ▼                     │
- *  │                                     找不可达目标                  │
- *  │                                     Find_Bomb_Wall()             │
- *  │                                     Solve_Push_Bomb()            │
- *  │                                            │                     │
- *  │                                            ▼                     │
- *  │                                     STAGE_3_BOMB_PUSH           │
- *  │                                     (推炸弹到墙→爆炸)            │
- *  │                                            │                     │
- *  │                                            ▼                     │
- *  │                                     回到 STAGE_3 重试            │
- *  │                                     (循环直到推完→DONE)          │
- *  │                                                                  │
- *  └──────────────────────────────────────────────────────────────────┘
- *
- *  中断层 (isr.c):
- *    PIT_CH0  5ms  → chassis_ctrl_task_5ms()   航向角积分与姿态更新
- *    PIT_CH1  20ms → chassis_ctrl_task_20ms()  底盘闭环控制
- *    PIT_CH2  10ms → chassis_menu_task_10ms()  菜单按键扫描（渲染在主循环）
- *    UART_1         → OpenART 串口帧解析, 更新 g_game_map
- *==========================================================================*/
+    /* 先读取完整参数，再仅覆盖左前轮 PID。 */
+    chassis_ctrl_get_tune_params(&tune_params);
+    tune_params.wheel_pid_kp[CHASSIS_WHEEL_LF] = MAIN_PID_DEBUG_LF_KP;
+    tune_params.wheel_pid_ki[CHASSIS_WHEEL_LF] = MAIN_PID_DEBUG_LF_KI;
+    tune_params.wheel_pid_kd[CHASSIS_WHEEL_LF] = MAIN_PID_DEBUG_LF_KD;
+    chassis_ctrl_set_tune_params(&tune_params);
+#endif
+}
+
 int main(void)
 {
     uint8 menu_render_div = 0U;
