@@ -98,4 +98,19 @@ void Game_Logic_Task_Run(void);
  * ================================================================== */
 uint8 Game_Link_Is_Alive(void);
 
+/* ==================================================================
+ * 【P0-8】比赛失败原因枚举 + 查询接口
+ *   GAME_FAIL_NONE          : 无失败 (正常运行 / 正常完赛)
+ *   GAME_FAIL_OUT_OF_BOUNDS : 车体越过最外圈围墙, 比赛立即终止
+ * 用途: 调试上位机 / 菜单显示原因; 状态机决定是否切 STAGE_DONE.
+ * 注意: 触发后 Game_Logic_Task_Run 会强制 chassis_ctrl_stop() 并切 STAGE_DONE,
+ *       业务侧不会再回到 RECOGNIZE_MAP/PLAN_PATH 等任何执行态.
+ * ================================================================== */
+typedef enum {
+    GAME_FAIL_NONE = 0,
+    GAME_FAIL_OUT_OF_BOUNDS
+} GameFailureReason_e;
+
+GameFailureReason_e Game_Get_Failure_Reason(void);
+
 #endif

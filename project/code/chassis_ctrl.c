@@ -924,3 +924,199 @@ void chassis_ctrl_set_tune_params(const chassis_tune_params_t *in)
         s_pid[i].kd = safe.wheel_pid_kd[i];
     }
 }
+
+/* ==================================================================
+ * 【P0-8】发车区 / 越界几何判定 实现
+ * ----------------------------------------------------------------
+ * 设计取舍:
+ *   1) 全部判定基于 chassis_ctrl_get_pose() 的 seq-lock 快照 (已自带 P0-3 保护),
+ *      不读 g_game_map, 与软限位解耦.
+ *   2) 速度估算用 5ms 差分 + IIR 平滑, 避免占用 chassis_imu / chassis_encoder
+ *      的内部状态; 调用方必须保证 chassis_zone_tick() 周期 ≈ 5ms.
+ *   3) "完全离开发车区" 用车体外接圆与发车区矩形不相交判据,
+ *      比"几何中心在区外" 在边界处更稳, 与赛规"完全离开"语义一致.
+ *   4) OOB 滞回: 单向置位, 显式 chassis_zone_clear_oob() 才能清.
+ *      避免位姿抖动反复触发刹停清 PID 积分.
+ *   5) 全部状态为 file-static, 仅主循环单线程访问, 无锁.
+ * ================================================================== */
+
+/* 发车区矩形定义 (X_min, X_max, Y_min, Y_max) — Y 向下为正 */
+typedef struct {
+    float x_min_m;
+    float x_max_m;
+    float y_min_m;
+    float y_max_m;
+} chassis_rect_m_t;
+
+/* 上一帧位姿 (用于差分速度); inited=0 时跳过当帧差分 */
+static chassis_pose_t  s_zone_last_pose      = {0.0f, 0.0f, 0.0f};
+static uint8           s_zone_last_pose_inited = 0U;
+
+/* 一阶 IIR 平滑后的车体平移速度模长 (m/s) */
+static float           s_zone_speed_lpf_mps  = 0.0f;
+
+/* 静止累计计数 (单位: tick), 与 CHASSIS_STATIC_HOLD_MS 比较 */
+static uint16          s_zone_static_ticks   = 0U;
+#define ZONE_TICK_PERIOD_MS                 (5U)
+#define ZONE_STATIC_HOLD_TICKS              ((uint16)(CHASSIS_STATIC_HOLD_MS / ZONE_TICK_PERIOD_MS))
+
+/* 越界滞回标志 (1 = 已置位, 业务不复位则永久保持) */
+static uint8           s_zone_oob_latched    = 0U;
+
+/* ----- 内部辅助 ----- */
+
+/** 取指定发车区矩形 (LAUNCH_ZONE_ANY 由上层拆 LEFT/RIGHT 两次调用) */
+static void zone_get_launch_rect(LaunchZone_e zone, chassis_rect_m_t *out)
+{
+    /* Y 轴向下, "下边界" 即 Y = CHASSIS_MAP_HEIGHT_M */
+    out->y_max_m = CHASSIS_MAP_HEIGHT_M - CHASSIS_LAUNCH_ZONE_BOTTOM_OFFSET_M;
+    out->y_min_m = out->y_max_m - CHASSIS_LAUNCH_ZONE_H_M;
+
+    if (zone == LAUNCH_ZONE_RIGHT) {
+        out->x_max_m = CHASSIS_MAP_WIDTH_M;
+        out->x_min_m = CHASSIS_MAP_WIDTH_M - CHASSIS_LAUNCH_ZONE_W_M;
+    } else {
+        /* 默认左发车区 */
+        out->x_min_m = 0.0f;
+        out->x_max_m = CHASSIS_LAUNCH_ZONE_W_M;
+    }
+}
+
+/** 点是否在矩形内 (闭区间) */
+static uint8 zone_point_in_rect(float x, float y, const chassis_rect_m_t *r)
+{
+    return ((x >= r->x_min_m) && (x <= r->x_max_m) &&
+            (y >= r->y_min_m) && (y <= r->y_max_m)) ? 1U : 0U;
+}
+
+/**
+ * 圆 (cx, cy, R) 是否与矩形 r 不相交 (即 "完全离开矩形").
+ * 判据: 圆心到矩形最近点的距离 > R.
+ */
+static uint8 zone_circle_outside_rect(float cx, float cy, float radius_m,
+                                      const chassis_rect_m_t *r)
+{
+    float dx = 0.0f;
+    float dy = 0.0f;
+
+    if      (cx < r->x_min_m) dx = r->x_min_m - cx;
+    else if (cx > r->x_max_m) dx = cx - r->x_max_m;
+
+    if      (cy < r->y_min_m) dy = r->y_min_m - cy;
+    else if (cy > r->y_max_m) dy = cy - r->y_max_m;
+
+    return ((dx * dx + dy * dy) > (radius_m * radius_m)) ? 1U : 0U;
+}
+
+/* ----- 对外 API ----- */
+
+void chassis_zone_tick(void)
+{
+    chassis_pose_t  cur;
+    float           dx_m;
+    float           dy_m;
+    float           inst_speed_mps;
+    float           cx;
+    float           cy;
+    uint8           outside_field;
+
+    cur = chassis_ctrl_get_pose();
+
+    /* (1) 速度估算: 5ms 差分 + 一阶 IIR 平滑 */
+    if (s_zone_last_pose_inited) {
+        dx_m = cur.x_m - s_zone_last_pose.x_m;
+        dy_m = cur.y_m - s_zone_last_pose.y_m;
+        /* 已知 dt = ZONE_TICK_PERIOD_MS/1000 = 0.005s,
+         * 用乘以 200.0f 等价除以 0.005, 省一次浮点除法 */
+        inst_speed_mps = sqrtf(dx_m * dx_m + dy_m * dy_m) * 200.0f;
+        s_zone_speed_lpf_mps = (1.0f - CHASSIS_SPEED_LPF_ALPHA) * s_zone_speed_lpf_mps
+                             + CHASSIS_SPEED_LPF_ALPHA * inst_speed_mps;
+    } else {
+        s_zone_last_pose_inited = 1U;
+        s_zone_speed_lpf_mps    = 0.0f;
+    }
+    s_zone_last_pose = cur;
+
+    /* (2) 静止累计: 速度低于阈值才累加; 否则立即清零 */
+    if (s_zone_speed_lpf_mps < CHASSIS_STATIC_SPEED_EPS_MPS) {
+        if (s_zone_static_ticks < 0xFFFFU) {
+            s_zone_static_ticks++;
+        }
+    } else {
+        s_zone_static_ticks = 0U;
+    }
+
+    /* (3) OOB 滞回: 单向置位
+     *   已置位 → 不再判, 必须 chassis_zone_clear_oob() 才能解锁 */
+    if (s_zone_oob_latched) {
+        return;
+    }
+
+    /* 车体外接圆穿出最外圈围墙 > HYSTERESIS 才置位 */
+    cx = cur.x_m;
+    cy = cur.y_m;
+    outside_field = 0U;
+    if ((cx + CHASSIS_BODY_RADIUS_M) > (CHASSIS_MAP_WIDTH_M  + CHASSIS_OOB_HYSTERESIS_M)) outside_field = 1U;
+    if ((cx - CHASSIS_BODY_RADIUS_M) < (0.0f                 - CHASSIS_OOB_HYSTERESIS_M)) outside_field = 1U;
+    if ((cy + CHASSIS_BODY_RADIUS_M) > (CHASSIS_MAP_HEIGHT_M + CHASSIS_OOB_HYSTERESIS_M)) outside_field = 1U;
+    if ((cy - CHASSIS_BODY_RADIUS_M) < (0.0f                 - CHASSIS_OOB_HYSTERESIS_M)) outside_field = 1U;
+
+    if (outside_field) {
+        s_zone_oob_latched = 1U;
+    }
+}
+
+uint8 chassis_zone_is_in_launch(LaunchZone_e zone)
+{
+    chassis_pose_t   pose_snap;
+    chassis_rect_m_t rect;
+
+    pose_snap = chassis_ctrl_get_pose();
+
+    if (zone == LAUNCH_ZONE_ANY) {
+        zone_get_launch_rect(LAUNCH_ZONE_LEFT, &rect);
+        if (zone_point_in_rect(pose_snap.x_m, pose_snap.y_m, &rect)) return 1U;
+        zone_get_launch_rect(LAUNCH_ZONE_RIGHT, &rect);
+        return zone_point_in_rect(pose_snap.x_m, pose_snap.y_m, &rect);
+    }
+
+    zone_get_launch_rect(zone, &rect);
+    return zone_point_in_rect(pose_snap.x_m, pose_snap.y_m, &rect);
+}
+
+uint8 chassis_zone_is_fully_outside_launch(LaunchZone_e zone)
+{
+    chassis_pose_t   pose_snap;
+    chassis_rect_m_t rect;
+
+    pose_snap = chassis_ctrl_get_pose();
+
+    if (zone == LAUNCH_ZONE_ANY) {
+        /* 必须同时离开左 + 右两个发车区 */
+        zone_get_launch_rect(LAUNCH_ZONE_LEFT, &rect);
+        if (!zone_circle_outside_rect(pose_snap.x_m, pose_snap.y_m,
+                                      CHASSIS_BODY_RADIUS_M, &rect)) return 0U;
+        zone_get_launch_rect(LAUNCH_ZONE_RIGHT, &rect);
+        return zone_circle_outside_rect(pose_snap.x_m, pose_snap.y_m,
+                                        CHASSIS_BODY_RADIUS_M, &rect);
+    }
+
+    zone_get_launch_rect(zone, &rect);
+    return zone_circle_outside_rect(pose_snap.x_m, pose_snap.y_m,
+                                    CHASSIS_BODY_RADIUS_M, &rect);
+}
+
+uint8 chassis_zone_is_out_of_bounds(void)
+{
+    return s_zone_oob_latched;
+}
+
+void chassis_zone_clear_oob(void)
+{
+    s_zone_oob_latched = 0U;
+}
+
+uint8 chassis_zone_is_static(void)
+{
+    return (s_zone_static_ticks >= ZONE_STATIC_HOLD_TICKS) ? 1U : 0U;
+}

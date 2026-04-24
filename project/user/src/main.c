@@ -40,6 +40,48 @@
 #include "app_game_logic.h"
 #include "app_link.h"   /* P0-1: 视觉?主控帧协议 */
 
+/*==========================================================================
+ *  P0-5: 主循环 5ms tick 节拍 (替代 system_delay_ms 阻塞)
+ *  - PIT_CH0 ISR 每 5ms 调用 main_loop_on_pit_tick(), 累加 s_main_tick_pending
+ *  - 主循环用 wait_for_tick() 消费节拍, 期间 __WFI 进入低功耗等待中断唤醒
+ *  - 当一次消费的 tick > 1 表示主循环上一轮耗时 >5ms, 记入 overrun 仅观测不丢拍
+ *  - 三个计数器均为 file-static volatile, 仅 IPS / Live Watch 调试可见
+ *========================================================================*/
+static volatile uint32 s_main_tick_pending = 0U;   /* PIT_CH0 累加, 主循环消费 */
+static volatile uint32 s_main_tick_overrun = 0U;   /* 一次消费 >1 的累计差值 */
+static volatile uint32 s_main_tick_total   = 0U;   /* 主循环已消费的 tick 总数 */
+
+/* 由 isr.c 中 PIT_CH0 分支调用; 用 extern 声明对外可见, 实现见本文件末 */
+void main_loop_on_pit_tick(void)
+{
+    s_main_tick_pending++;
+}
+
+/*
+ * 阻塞直到下一个 5ms tick 到来, 返回本次消费的 tick 数 (>=1).
+ * - 没有 pending tick 时 __WFI() 让 CPU 休眠, 任意中断 (PIT/UART/SysTick) 可唤醒
+ * - 唤醒后 while 兜底再判一次, 防止 WFI 偶发未睡稳或被无关中断唤醒
+ * - 「读 + 清零」用 __disable_irq/__enable_irq 包成临界区, 与 PIT_CH0 ISR 互斥
+ */
+static uint32 wait_for_tick(void)
+{
+    uint32 ticks;
+    while (s_main_tick_pending == 0U)
+    {
+        __WFI();
+    }
+    __disable_irq();
+    ticks = s_main_tick_pending;
+    s_main_tick_pending = 0U;
+    __enable_irq();
+    if (ticks > 1U)
+    {
+        s_main_tick_overrun += (ticks - 1U);
+    }
+    s_main_tick_total += ticks;
+    return ticks;
+}
+
 /*
  * main 运行模式：
  * 1 = 航向保持测试模式（默认）：进入后保持目标航向角
@@ -180,6 +222,13 @@ int main(void)
 
     while (1)
     {
+        /*
+         * P0-5: 替代 system_delay_ms(5).
+         * 在此阻塞直到 PIT_CH0 5ms tick 到来, 期间 __WFI 休眠, 任意中断可唤醒.
+         * 注意 wait 必须在每轮主循环工作之前调用, 保证节拍对齐 PIT 边沿.
+         */
+        (void)wait_for_tick();
+
     #if (1 == MAIN_SINGLE_WHEEL_PID_DEBUG_MODE)
         /* 单轮 PID 调试输出：每 100ms 仅打印“目标值 实际值”两列数字。 */
         chassis_pid_debug_task_5ms();
@@ -206,6 +255,6 @@ int main(void)
             chassis_menu_render_100ms();
         }
 
-        system_delay_ms(5);                               // 主循环节拍
+        /* P0-5: 节拍由 wait_for_tick() 在循环顶部统一接管, 此处不再 system_delay_ms */
     }
 }

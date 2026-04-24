@@ -39,6 +39,17 @@ static uint8        s_link_ever_alive  = 0U;     /* 是否曾经在线过 (开�
 static GameStage_e  s_stage_resume     = STAGE_WAIT_START; /* LOSS 触发时保存原状态, 恢复时回到该状态 */
 static uint32       s_link_last_seen_ms = 0U;    /* 最近一次确认 alive 时的 g_link_last_hb_ms 快照 (调试) */
 
+/* ----- 【P0-8】OOB / 发车 / 死局静止 相关静态变量 ------------------
+ * s_failure_reason   : 比赛失败原因, 触发后状态机锁死在 STAGE_DONE
+ * s_wait_start_phase : WAIT_START 子相位
+ *                       0 = 还未到达起点 (沿用历史 MOVE_TO 行为)
+ *                       1 = 已到起点, 等待车被 "完全离开发车区" (人推 / 系统识别)
+ * s_default_launch_zone : 当前默认发车区 (左). 后续菜单可改, 默认 LAUNCH_ZONE_LEFT.
+ * --------------------------------------------------------------- */
+static GameFailureReason_e s_failure_reason     = GAME_FAIL_NONE;
+static uint8               s_wait_start_phase   = 0U;
+static LaunchZone_e        s_default_launch_zone = LAUNCH_ZONE_LEFT;
+
 static SokoFullSolution_t    g_soko_solution;
 static SokoWaypointPath_t    g_soko_waypoints;
 static uint8                 g_soko_sub_idx = 0;
@@ -289,17 +300,30 @@ static uint8 should_enter_next_level(void)
 
 static void stage_wait_start_handler(void)
 {
-    if (!is_navigating) {
-        HAL_CHASSIS_MOVE_TO(CHASSIS_START_GRID_X, CHASSIS_START_GRID_Y);
-        is_navigating = 1;
+    /* 【P0-8】WAIT_START 两段式:
+     *   phase 0: 主控主动 MOVE_TO 起点 (车被人放偏时复位到发车区中心)
+     *   phase 1: 等待车被 "完全离开发车区" → 视为发车成功 → 进入 RECOGNIZE_MAP
+     * 与赛规一致: "完全离开发车区" 即视为发车成功 (规则提炼.md §3 要点 1)
+     */
+    if (s_wait_start_phase == 0U) {
+        if (!is_navigating) {
+            HAL_CHASSIS_MOVE_TO(CHASSIS_START_GRID_X, CHASSIS_START_GRID_Y);
+            is_navigating = 1;
+            return;
+        }
+        if (!HAL_CHASSIS_IS_ARRIVED()) return;
+
+        is_navigating = 0;
+        s_wait_start_phase = 1U;
         return;
     }
 
-    if (!HAL_CHASSIS_IS_ARRIVED()) return;
-
-    is_navigating = 0;
-    reset_exec_context();
-    goto_stage(STAGE_RECOGNIZE_MAP);
+    /* phase 1: 持续判定是否已 "完全离开发车区" */
+    if (chassis_zone_is_fully_outside_launch(s_default_launch_zone)) {
+        s_wait_start_phase = 0U;     /* 重置子相位, 供后续 LEVEL_JUDGE 复用 */
+        reset_exec_context();
+        goto_stage(STAGE_RECOGNIZE_MAP);
+    }
 }
 
 static void stage_recognize_handler(void)
@@ -399,6 +423,10 @@ static void stage_level_judge_handler(void)
 
 static void stage_deadlock_reset_handler(void)
 {
+    /* 【P0-8】死局重置: 改为 "在发车区内 + 静止 ≥3s" 几何判据,
+     * 不再依赖 wall-clock tick, 与 chassis_zone_is_static() (PIT 5ms tick) 同源.
+     * (规则: 返回发车区静止 3s = 系统重置)
+     */
     if (!is_navigating) {
         HAL_CHASSIS_MOVE_TO(CHASSIS_START_GRID_X, CHASSIS_START_GRID_Y);
         is_navigating = 1;
@@ -410,13 +438,18 @@ static void stage_deadlock_reset_handler(void)
 
     is_navigating = 0;
 
-    if (g_reset_hold_ticks < DEADLOCK_RESET_HOLD_TICKS) {
-        g_reset_hold_ticks++;
-        return;
+    /* 必须 "在发车区内" + chassis_zone_is_static() (内部已含 3s 持续判定).
+     * chassis_zone_is_static 由 chassis_zone_tick() 周期更新, 在 Run() 入口已调一次. */
+    if (!chassis_zone_is_in_launch(s_default_launch_zone)) {
+        return;     /* 还未真正回到发车区, 继续等里程计/视觉拉车进入 */
+    }
+    if (!chassis_zone_is_static()) {
+        return;     /* 还未静止满 3s */
     }
 
     g_reset_hold_ticks = 0;
     reset_exec_context();
+    s_wait_start_phase = 0U;     /* 重置 WAIT_START 子相位, 下一关重新走 "复位→等离开" */
     goto_stage(STAGE_WAIT_START);
 }
 
@@ -444,6 +477,43 @@ static void stage_done_handler(void)
 uint8 Game_Link_Is_Alive(void)
 {
     return s_link_alive;
+}
+
+/* ==================================================================
+ * 【P0-8】对外查询: 比赛失败原因
+ * ================================================================== */
+GameFailureReason_e Game_Get_Failure_Reason(void)
+{
+    return s_failure_reason;
+}
+
+/*
+ * 越界检测 — 主循环侧调用, 仅在以下条件满足时 *判定+触发*:
+ *   1) 链路在线 (避免 PAUSE 期间陈旧位姿误触发)
+ *   2) 当前不在 WAIT_START / PAUSE_ON_LINK_LOSS / DONE
+ *   3) 尚未失败过 (s_failure_reason==NONE)
+ * 一旦触发: 立即 chassis_ctrl_stop() + 切 STAGE_DONE + 锁失败原因
+ */
+static void check_out_of_bounds(void)
+{
+    if (s_failure_reason != GAME_FAIL_NONE) {
+        return;     /* 已失败, 状态机锁死在 DONE, 不重复判 */
+    }
+    if (!s_link_alive) {
+        return;     /* PAUSE 优先, 链路掉线期间不判 OOB */
+    }
+    if (current_stage == STAGE_WAIT_START ||
+        current_stage == STAGE_PAUSE_ON_LINK_LOSS ||
+        current_stage == STAGE_DONE) {
+        return;
+    }
+
+    if (chassis_zone_is_out_of_bounds()) {
+        s_failure_reason = GAME_FAIL_OUT_OF_BOUNDS;
+        chassis_ctrl_stop();
+        is_navigating = 0U;
+        goto_stage(STAGE_DONE);
+    }
 }
 
 static void update_link_state(void)
@@ -502,6 +572,12 @@ void Game_Logic_Task_Run(void)
 {
     /* P0-2: 链路监控总闸 — 必须先于状态分发                                      */
     update_link_state();
+
+    /* P0-8: 几何判定 tick (速度估算 / 静止累计 / OOB 滞回), 必须先于 check_out_of_bounds */
+    chassis_zone_tick();
+
+    /* P0-8: 越界总闸 — 在链路监控之后, 在状态分发之前. 触发即锁 STAGE_DONE. */
+    check_out_of_bounds();
 
     /* P0-3: 链路在线时刷新 g_game_map 私有快照 (seq-lock 拷贝).
      *       链路 LOSS 期间冻结上次快照, 配合 P0-2 恢复策略 (强制 RECOGNIZE_MAP) 自洽.

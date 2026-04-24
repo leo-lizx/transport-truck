@@ -213,4 +213,68 @@ void chassis_ctrl_get_tune_params(chassis_tune_params_t *out_params);
  */
 void chassis_ctrl_set_tune_params(const chassis_tune_params_t *in_params);
 
+/* ==================================================================
+ * 【P0-8】发车区 / 越界几何判定 API
+ * ----------------------------------------------------------------
+ * 全部为 *只读查询*, 内部仅消费 chassis_ctrl_get_pose() 的 seq-lock 快照,
+ * 不下发任何控制指令, 状态机如何响应由 app_game_logic 决定.
+ *
+ * 调用约束: 仅在主循环侧调用 (app_game_logic 5ms tick).
+ * 速度估算: 由 chassis_zone_tick() 周期更新, 必须先于查询函数调用.
+ * ================================================================== */
+
+/** 发车区编号. 规则: 场地左右各一个发车区. */
+typedef enum {
+    LAUNCH_ZONE_LEFT  = 0,   /**< 左发车区 (x ∈ [0, 0.30]) */
+    LAUNCH_ZONE_RIGHT,       /**< 右发车区 (x ∈ [W-0.30, W]) */
+    LAUNCH_ZONE_ANY          /**< 任一发车区 (左 || 右) */
+} LaunchZone_e;
+
+/**
+ * @brief  几何判定周期 tick (建议 5ms 调用一次, 与 app_game_logic 对齐).
+ *         内部刷新位姿快照 + 平滑速度估算 + 越界滞回标志位.
+ *         若不调用, chassis_zone_is_static() / chassis_zone_is_out_of_bounds()
+ *         的结果将停留在初始态, 但其余基于位置的查询仍可用.
+ */
+void chassis_zone_tick(void);
+
+/**
+ * @brief  车体几何中心是否在指定发车区内.
+ * @param  zone  LAUNCH_ZONE_LEFT / RIGHT / ANY
+ * @return 1 = 在区内, 0 = 不在.
+ */
+uint8 chassis_zone_is_in_launch(LaunchZone_e zone);
+
+/**
+ * @brief  车体外接圆 (半径 CHASSIS_BODY_RADIUS_M) 是否完全离开发车区.
+ *         判据: 车体外接圆与发车区矩形不相交.
+ *         规则: "完全离开发车区" 即视为发车成功.
+ * @param  zone  LAUNCH_ZONE_LEFT / RIGHT / ANY (ANY 表示同时离开两个发车区)
+ * @return 1 = 完全离开, 0 = 仍有重叠.
+ */
+uint8 chassis_zone_is_fully_outside_launch(LaunchZone_e zone);
+
+/**
+ * @brief  车体外接圆是否越过最外圈围墙 (含 CHASSIS_OOB_HYSTERESIS_M 滞回).
+ *         规则: 越过最外圈 = 比赛立即结束.
+ * @return 1 = 已判定出界, 0 = 在场内.
+ *         状态由 chassis_zone_tick() 维护, 一旦置位需通过 chassis_zone_clear_oob()
+ *         手动清除 (避免业务侧自动复位).
+ */
+uint8 chassis_zone_is_out_of_bounds(void);
+
+/**
+ * @brief  清除越界标志 (用于复位流程或调试).
+ *         典型业务侧不应调用 — 出界=结束.
+ */
+void chassis_zone_clear_oob(void);
+
+/**
+ * @brief  车体是否处于静止状态: 平滑速度模长 < CHASSIS_STATIC_SPEED_EPS_MPS
+ *         且持续时间 ≥ CHASSIS_STATIC_HOLD_MS.
+ * @return 1 = 静止持续达标, 0 = 仍在动 / 未达时长.
+ *         必须周期调用 chassis_zone_tick() 才能正确累计.
+ */
+uint8 chassis_zone_is_static(void);
+
 #endif /* CHASSIS_CTRL_H */
