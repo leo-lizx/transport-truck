@@ -42,7 +42,7 @@
  * wheel_index: 0=LF 1=RF 2=LB 3=RB
  */
 #define MAIN_PID_DEBUG_WHEEL_INDEX         (CHASSIS_WHEEL_LF)
-#define MAIN_PID_DEBUG_TARGET_MPS          (4.5f)
+#define MAIN_PID_DEBUG_TARGET_MPS          (8.0f)
 #define MAIN_MENU_RENDER_DIV               (2U)
 
 /*
@@ -50,7 +50,7 @@
  * - 该组参数会在初始化阶段覆盖到运行时调参结构。
  * - 若置 0，则不在 main 内强制覆盖，继续沿用 Flash/菜单中的 PID。
  */
-#define MAIN_PID_DEBUG_FORCE_LF_PID_FROM_MAIN   (1)
+#define MAIN_PID_DEBUG_FORCE_LF_PID_FROM_MAIN   (0)
 #define MAIN_PID_DEBUG_LF_KP                    (120.0f)
 #define MAIN_PID_DEBUG_LF_KI                    (8.0f)
 #define MAIN_PID_DEBUG_LF_KD                    (1.0f)

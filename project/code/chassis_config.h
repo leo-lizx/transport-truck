@@ -123,7 +123,7 @@
 #define CHASSIS_MAX_YAW_SPEED_DPS       (90.0f)
 
 /** 单个轮子允许的最大线速度（m/s），超出时四轮按比例缩放 */
-#define CHASSIS_MAX_WHEEL_SPEED_MPS     (5.0f)
+#define CHASSIS_MAX_WHEEL_SPEED_MPS     (15.0f)
 
 /** 在线调参时允许的线速度上限硬限制（m/s） */
 #define CHASSIS_TUNE_MAX_LINEAR_SPEED_LIMIT_MPS  (1.50f)
@@ -250,11 +250,11 @@
 #define CHASSIS_WHEEL_PID_DEFAULT_KD    (1.0f)
 
 /** 左前轮初始 PID：Kp */
-#define CHASSIS_WHEEL_PID_LF_KP         (CHASSIS_WHEEL_PID_DEFAULT_KP)
+#define CHASSIS_WHEEL_PID_LF_KP         (300.0f)
 /** 左前轮初始 PID：Ki */
-#define CHASSIS_WHEEL_PID_LF_KI         (CHASSIS_WHEEL_PID_DEFAULT_KI)
+#define CHASSIS_WHEEL_PID_LF_KI         (0.0f)
 /** 左前轮初始 PID：Kd */
-#define CHASSIS_WHEEL_PID_LF_KD         (CHASSIS_WHEEL_PID_DEFAULT_KD)
+#define CHASSIS_WHEEL_PID_LF_KD         (0.0f)
 
 /** 右前轮初始 PID：Kp */
 #define CHASSIS_WHEEL_PID_RF_KP         (CHASSIS_WHEEL_PID_DEFAULT_KP)
