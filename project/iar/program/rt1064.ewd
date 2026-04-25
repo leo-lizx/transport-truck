@@ -328,7 +328,7 @@
                 <option>
                     <name>CMSISDAPResetList</name>
                     <version>1</version>
-                    <state>2</state>
+                    <state>1</state>
                 </option>
                 <option>
                     <name>CMSISDAPHWResetDuration</name>
@@ -1261,7 +1261,7 @@
                 </option>
                 <option>
                     <name>CCSTLinkTargetVoltage</name>
-                    <state>###Uninitialized###</state>
+                    <state>3.3</state>
                 </option>
             </data>
         </settings>
@@ -1320,7 +1320,7 @@
                 </option>
                 <option>
                     <name>CCMSPFetTargetVoltage</name>
-                    <state>###Uninitialized###</state>
+                    <state>3.0</state>
                 </option>
                 <option>
                     <name>CCMSPFetVCCDefault</name>

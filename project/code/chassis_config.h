@@ -177,7 +177,7 @@
 #define CHASSIS_MAX_YAW_SPEED_DPS       (90.0f)
 
 /** 单个轮子允许的最大线速度（m/s），超出时四轮按比例缩放 */
-#define CHASSIS_MAX_WHEEL_SPEED_MPS     (15.0f)
+#define CHASSIS_MAX_WHEEL_SPEED_MPS     (12.0f)
 
 /** 在线调参时允许的线速度上限硬限制（m/s） */
 #define CHASSIS_TUNE_MAX_LINEAR_SPEED_LIMIT_MPS  (1.50f)
@@ -304,32 +304,32 @@
 #define CHASSIS_WHEEL_PID_DEFAULT_KD    (1.0f)
 
 /** 左前轮初始 PID：Kp */
-#define CHASSIS_WHEEL_PID_LF_KP         (300.0f)
+#define CHASSIS_WHEEL_PID_LF_KP         (40.0f)
 /** 左前轮初始 PID：Ki */
-#define CHASSIS_WHEEL_PID_LF_KI         (0.0f)
+#define CHASSIS_WHEEL_PID_LF_KI         (35.0f)
 /** 左前轮初始 PID：Kd */
 #define CHASSIS_WHEEL_PID_LF_KD         (0.0f)
 
 /** 右前轮初始 PID：Kp */
-#define CHASSIS_WHEEL_PID_RF_KP         (CHASSIS_WHEEL_PID_DEFAULT_KP)
+#define CHASSIS_WHEEL_PID_RF_KP         (40.0f)
 /** 右前轮初始 PID：Ki */
-#define CHASSIS_WHEEL_PID_RF_KI         (CHASSIS_WHEEL_PID_DEFAULT_KI)
+#define CHASSIS_WHEEL_PID_RF_KI         (20.0f)
 /** 右前轮初始 PID：Kd */
-#define CHASSIS_WHEEL_PID_RF_KD         (CHASSIS_WHEEL_PID_DEFAULT_KD)
+#define CHASSIS_WHEEL_PID_RF_KD         (0.0f)
 
 /** 左后轮初始 PID：Kp */
-#define CHASSIS_WHEEL_PID_LB_KP         (CHASSIS_WHEEL_PID_DEFAULT_KP)
+#define CHASSIS_WHEEL_PID_LB_KP         (40.0f)
 /** 左后轮初始 PID：Ki */
-#define CHASSIS_WHEEL_PID_LB_KI         (CHASSIS_WHEEL_PID_DEFAULT_KI)
+#define CHASSIS_WHEEL_PID_LB_KI         (25.0f)
 /** 左后轮初始 PID：Kd */
-#define CHASSIS_WHEEL_PID_LB_KD         (CHASSIS_WHEEL_PID_DEFAULT_KD)
+#define CHASSIS_WHEEL_PID_LB_KD         (0.0f)
 
 /** 右后轮初始 PID：Kp */
-#define CHASSIS_WHEEL_PID_RB_KP         (CHASSIS_WHEEL_PID_DEFAULT_KP)
+#define CHASSIS_WHEEL_PID_RB_KP         (40.0f)
 /** 右后轮初始 PID：Ki */
-#define CHASSIS_WHEEL_PID_RB_KI         (CHASSIS_WHEEL_PID_DEFAULT_KI)
+#define CHASSIS_WHEEL_PID_RB_KI         (23.0f)
 /** 右后轮初始 PID：Kd */
-#define CHASSIS_WHEEL_PID_RB_KD         (CHASSIS_WHEEL_PID_DEFAULT_KD)
+#define CHASSIS_WHEEL_PID_RB_KD         (0.0f)
 
 /** 兼容宏：保持旧名称可用 */
 #define CHASSIS_WHEEL_PID_KP            (CHASSIS_WHEEL_PID_DEFAULT_KP)
@@ -392,17 +392,19 @@
  * ================================================================================
  */
 
-/** 编码器统一方向修正系数（前进为正） */
-#define CHASSIS_ENCODER1_SIGN          (1.0f)   /**< ENCODER1 -> 右前轮 RF */
-#define CHASSIS_ENCODER2_SIGN          (-1.0f)  /**< ENCODER2 -> 左后轮 LB */
-#define CHASSIS_ENCODER3_SIGN          (-1.0f)  /**< ENCODER3 -> 右后轮 RB */
-#define CHASSIS_ENCODER4_SIGN          (1.0f)   /**< ENCODER4 -> 左前轮 LF */
+/** 编码器统一方向修正系数（前进为正, 标定方法见上方注释表第一/二条）
+ *  注意: 这里的数值是"每个 ENCODER 通道"的常量, 不要随便改;
+ *  改的话先看 wfb 调试输出, 确认前进时该通道速度是不是正. */
+#define CHASSIS_ENCODER1_SIGN          (1.0f)   /**< ENCODER1 (C0/C1)  -> 左后轮 LB */
+#define CHASSIS_ENCODER2_SIGN          (-1.0f)  /**< ENCODER2 (C2/C24) -> 右后轮 RB */
+#define CHASSIS_ENCODER3_SIGN          (-1.0f)  /**< ENCODER3 (C3/C4)  -> 右前轮 RF */
+#define CHASSIS_ENCODER4_SIGN          (1.0f)   /**< ENCODER4 (C5/C25) -> 左前轮 LF */
 
-/** 轮子到编码器符号映射（便于四轮统一引用） */
+/** 轮子到编码器符号映射（按上方实车标定表的轮->ENCODER 关系组合） */
 #define CHASSIS_LF_ENC_SIGN            CHASSIS_ENCODER4_SIGN
-#define CHASSIS_RF_ENC_SIGN            CHASSIS_ENCODER1_SIGN
-#define CHASSIS_LB_ENC_SIGN            CHASSIS_ENCODER2_SIGN
-#define CHASSIS_RB_ENC_SIGN            CHASSIS_ENCODER3_SIGN
+#define CHASSIS_RF_ENC_SIGN            CHASSIS_ENCODER3_SIGN
+#define CHASSIS_LB_ENC_SIGN            CHASSIS_ENCODER1_SIGN
+#define CHASSIS_RB_ENC_SIGN            CHASSIS_ENCODER2_SIGN
 
 /* ---------- 左前轮 (LF) ---------- */
 #define CHASSIS_LF_PWM_CHANNEL      PWM2_MODULE2_CHB_C11        /**< PWM 输出: C11 引脚 */
@@ -412,29 +414,40 @@
 #define CHASSIS_LF_ENC_CH2          QTIMER2_ENCODER2_CH2_C25     /**< 编码器 B 相: C25 引脚 */
 #define CHASSIS_LF_DIR_SIGN         (1.0f)                       /**< 方向修正: 1.0=正向, -1.0=反向 */
 
-/* ---------- 右前轮 (RF) ---------- */
-#define CHASSIS_RF_PWM_CHANNEL      PWM2_MODULE3_CHB_D3           /**< PWM 输出: D3  引脚 */
-#define CHASSIS_RF_DIR_PIN          D2                             /**< 方向控制: D2  引脚 */
-#define CHASSIS_RF_ENC_INDEX        QTIMER1_ENCODER1               /**< 编码器定时器通道（实车标定：ENCODER1） */
-#define CHASSIS_RF_ENC_CH1          QTIMER1_ENCODER1_CH1_C0        /**< 编码器 A 相: C0  引脚 */
-#define CHASSIS_RF_ENC_CH2          QTIMER1_ENCODER1_CH2_C1        /**< 编码器 B 相: C1 引脚 */
-#define CHASSIS_RF_DIR_SIGN         (1.0f)                         /**< 方向修正 */
+/* ---------- 右前轮 (RF) ---------- *
+ * 电机 PWM/DIR: 实车接线验证后物理走 C6/C7 (摆脱原“MOTOR1=C8/C9”文档, 以实车为准).
+ * 编码器: ENCODER_3 (QTIMER2_ENCODER1, C3/C4) -- 已经 wfb 调试输出验证, 别动.
+ * 修复记录(2026-04-25 #2): 原 C8/C9 PWM/DIR 实测驱动的是 RB 电机, 与 RB 组对调后纲正.
+ */
+#define CHASSIS_RF_PWM_CHANNEL      PWM2_MODULE3_CHB_D3            /**< PWM 输出: C6 引脚 (物理 -> RF 电机) */
+#define CHASSIS_RF_DIR_PIN          D2                             /**< 方向控制: C7 引脚 (物理 -> RF 电机) */
+#define CHASSIS_RF_ENC_INDEX        QTIMER2_ENCODER1               /**< 编码器定时器通道（实车标定：ENCODER3） */
+#define CHASSIS_RF_ENC_CH1          QTIMER2_ENCODER1_CH1_C3        /**< 编码器 A 相: C3 引脚 */
+#define CHASSIS_RF_ENC_CH2          QTIMER2_ENCODER1_CH2_C4        /**< 编码器 B 相: C4 引脚 */
+#define CHASSIS_RF_DIR_SIGN         (1.0f)                        /**< 方向修正: 沿 C6/C7 旧 "RB" 槽继承(-1.0); 交换后请用单轮正速制验证, 反向则取反 */
 
-/* ---------- 左后轮 (LB) ---------- */
-#define CHASSIS_LB_PWM_CHANNEL      PWM2_MODULE0_CHA_C6            /**< PWM 输出: C6  引脚 */
-#define CHASSIS_LB_DIR_PIN          C7                              /**< 方向控制: C7  引脚 */
-#define CHASSIS_LB_ENC_INDEX        QTIMER1_ENCODER2                /**< 编码器定时器通道（实车标定：ENCODER2） */
-#define CHASSIS_LB_ENC_CH1          QTIMER1_ENCODER2_CH1_C2         /**< 编码器 A 相: C2 引脚 */
-#define CHASSIS_LB_ENC_CH2          QTIMER1_ENCODER2_CH2_C24        /**< 编码器 B 相: C24 引脚 */
-#define CHASSIS_LB_DIR_SIGN         (-1.0f)                         /**< 方向修正（实测前进为负） */
+/* ---------- 左后轮 (LB) ---------- *
+ * 实车标定: MOTOR3(D3/D2) + ENCODER_1(QTIMER1_ENCODER1, C0/C1)
+ * 修复记录(2026-04-25): 旧 #define 误用 C6/C7 + C2/C24, 已纠正.
+ */
+#define CHASSIS_LB_PWM_CHANNEL      PWM2_MODULE0_CHA_C6             /**< PWM 输出: D3  引脚 (MOTOR3) */
+#define CHASSIS_LB_DIR_PIN          C7                              /**< 方向控制: D2  引脚 (MOTOR3) */
+#define CHASSIS_LB_ENC_INDEX        QTIMER1_ENCODER1                /**< 编码器定时器通道（实车标定：ENCODER1） */
+#define CHASSIS_LB_ENC_CH1          QTIMER1_ENCODER1_CH1_C0         /**< 编码器 A 相: C0  引脚 */
+#define CHASSIS_LB_ENC_CH2          QTIMER1_ENCODER1_CH2_C1         /**< 编码器 B 相: C1  引脚 */
+#define CHASSIS_LB_DIR_SIGN         (1.0f)                          /**< 方向修正: 沿 D3/D2 旧 "RF" 槽继承(+1.0), 修复后请用单轮调试再验证 */
 
-/* ---------- 右后轮 (RB) ---------- */
-#define CHASSIS_RB_PWM_CHANNEL      PWM2_MODULE1_CHA_C8          /**< PWM 输出: C8  引脚 */
-#define CHASSIS_RB_DIR_PIN          C9                            /**< 方向控制: C9  引脚 */
-#define CHASSIS_RB_ENC_INDEX        QTIMER2_ENCODER1              /**< 编码器定时器通道（实车标定：ENCODER3） */
-#define CHASSIS_RB_ENC_CH1          QTIMER2_ENCODER1_CH1_C3       /**< 编码器 A 相: C3  引脚 */
-#define CHASSIS_RB_ENC_CH2          QTIMER2_ENCODER1_CH2_C4       /**< 编码器 B 相: C4 引脚 */
-#define CHASSIS_RB_DIR_SIGN         (-1.0f)                       /**< 方向修正（实测前进为负） */
+/* ---------- 右后轮 (RB) ---------- *
+ * 电机 PWM/DIR: 实车接线验证后物理走 C8/C9 (摆脱原“MOTOR2=C6/C7”文档, 以实车为准).
+ * 编码器: ENCODER_2 (QTIMER1_ENCODER2, C2/C24) -- 已经 wfb 调试验证.
+ * 修复记录(2026-04-25 #2): 原 C6/C7 与 RF 电机点接反了, 已与 RF 组对换.
+ */
+#define CHASSIS_RB_PWM_CHANNEL      PWM2_MODULE1_CHA_C8             /**< PWM 输出: C8 引脚 (物理 -> RB 电机) */
+#define CHASSIS_RB_DIR_PIN          C9                               /**< 方向控制: C9 引脚 (物理 -> RB 电机) */
+#define CHASSIS_RB_ENC_INDEX        QTIMER1_ENCODER2                 /**< 编码器定时器通道（实车标定：ENCODER2） */
+#define CHASSIS_RB_ENC_CH1          QTIMER1_ENCODER2_CH1_C2          /**< 编码器 A 相: C2  引脚 */
+#define CHASSIS_RB_ENC_CH2          QTIMER1_ENCODER2_CH2_C24         /**< 编码器 B 相: C24 引脚 */
+#define CHASSIS_RB_DIR_SIGN         (1.0f)                          /**< 方向修正: 沿 C8/C9 旧 "RF" 槽继承(-1.0); 交换后请用单轮正速制验证, 反向则取反 */
 
 /* ======================================================================
  *  轮子编号枚举 — 统一四轮索引，用于数组下标

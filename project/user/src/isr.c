@@ -1,35 +1,35 @@
 /*********************************************************************************************************************
-* RT1064DVL6A Opensourec Library ����RT1064DVL6A ��Դ�⣩��һ�����ڹٷ� SDK �ӿڵĵ�������Դ��
-* Copyright (c) 2022 SEEKFREE ��ɿƼ�
+* RT1064DVL6A Opensourec Library 即（RT1064DVL6A 开源库）是一个基于官方 SDK 接口的第三方开源库
+* Copyright (c) 2022 SEEKFREE 逐飞科技
 * 
-* ���ļ��� RT1064DVL6A ��Դ���һ����
+* 本文件是 RT1064DVL6A 开源库的一部分
 * 
-* RT1064DVL6A ��Դ�� ���������
-* �����Ը���������������ᷢ���� GPL��GNU General Public License���� GNUͨ�ù�������֤��������
-* �� GPL �ĵ�3�棨�� GPL3.0������ѡ��ģ��κκ����İ汾�����·�����/���޸���
+* RT1064DVL6A 开源库 是免费软件
+* 您可以根据自由软件基金会发布的 GPL（GNU General Public License，即 GNU通用公共许可证）的条款
+* 即 GPL 的第3版（即 GPL3.0）或（您选择的）任何后来的版本，重新发布和/或修改它
 * 
-* ����Դ��ķ�����ϣ�����ܷ������ã�����δ�������κεı�֤
-* ����û�������������Ի��ʺ��ض���;�ı�֤
-* ����ϸ����μ� GPL
+* 本开源库的发布是希望它能发挥作用，但并未对其作任何的保证
+* 甚至没有隐含的适销性或适合特定用途的保证
+* 更多细节请参见 GPL
 * 
-* ��Ӧ�����յ�����Դ���ͬʱ�յ�һ�� GPL �ĸ���
-* ���û�У������<https://www.gnu.org/licenses/>
+* 您应该在收到本开源库的同时收到一份 GPL 的副本
+* 如果没有，请参阅<https://www.gnu.org/licenses/>
 * 
-* ����ע����
-* ����Դ��ʹ�� GPL3.0 ��Դ����֤Э�� ������������Ϊ���İ汾
-* ��������Ӣ�İ��� libraries/doc �ļ����µ� GPL3_permission_statement.txt �ļ���
-* ����֤������ libraries �ļ����� �����ļ����µ� LICENSE �ļ�
-* ��ӭ��λʹ�ò����������� ���޸�����ʱ���뱣����ɿƼ��İ�Ȩ����������������
+* 额外注明：
+* 本开源库使用 GPL3.0 开源许可证协议 以上许可申明为译文版本
+* 许可申明英文版在 libraries/doc 文件夹下的 GPL3_permission_statement.txt 文件中
+* 许可证副本在 libraries 文件夹下 即该文件夹下的 LICENSE 文件
+* 欢迎各位使用并传播本程序 但修改内容时必须保留逐飞科技的版权声明（即本声明）
 * 
-* �ļ�����          isr
-* ��˾����          �ɶ���ɿƼ����޹�˾
-* �汾��Ϣ          �鿴 libraries/doc �ļ����� version �ļ� �汾˵��
-* ��������          IAR 8.32.4 or MDK 5.33
-* ����ƽ̨          RT1064DVL6A
-* ��������          https://seekfree.taobao.com/
+* 文件名称          isr
+* 公司名称          成都逐飞科技有限公司
+* 版本信息          查看 libraries/doc 文件夹内 version 文件 版本说明
+* 开发环境          IAR 8.32.4 or MDK 5.33
+* 适用平台          RT1064DVL6A
+* 店铺链接          https://seekfree.taobao.com/
 * 
-* �޸ļ�¼
-* ����              ����                ��ע
+* 修改记录
+* 日期              作者                备注
 * 2022-09-21        SeekFree            first version
 ********************************************************************************************************************/
 
@@ -37,16 +37,16 @@
 #include "zf_common_debug.h"
 #include "isr.h"
 #include "chassis_menu.h"
-#include "app_link.h"   /* P0-1: �Ӿ�?����֡Э������� */
+#include "app_link.h"   /* P0-1: 视觉?主控帧协议解析层 */
 
-/* P0-5: ��ѭ�� 5ms ���Ļ��ѹ���, ʵ��λ�� user/src/main.c */
+/* P0-5: 主循环 5ms 节拍唤醒钩子, 实现位于 user/src/main.c */
 extern void main_loop_on_pit_tick(void);
 
 
 void CSI_IRQHandler(void)
 {
-    CSI_DriverIRQHandler();     // ����SDK�Դ����жϺ��� ���������������������õĻص�����
-    __DSB();                    // ����ͬ������
+    CSI_DriverIRQHandler();     // 调用SDK自带的中断函数 这个函数最后会调用我们设置的回调函数
+    __DSB();                    // 数据同步隔离
 }
 
 void PIT_IRQHandler(void)
@@ -55,16 +55,16 @@ void PIT_IRQHandler(void)
     {
         pit_flag_clear(PIT_CH0);
 
-        chassis_ctrl_task_5ms();   // 5ms: IMU ��̬���� + ����ǻ���
-        app_link_tick(5U);         // P0-1: �ƽ�Э��� ms ʱ��, �����ֽڳ�ʱ���
-        main_loop_on_pit_tick();   // P0-5: ������ѭ�� 5ms ���� (��� system_delay_ms)
+        chassis_ctrl_task_5ms();   // 5ms: IMU 姿态采样 + 航向角积分
+        app_link_tick(5U);         // P0-1: 推进协议层 ms 时基, 驱动字节超时检测
+        main_loop_on_pit_tick();   // P0-5: 唤醒主循环 5ms 节拍 (替代 system_delay_ms)
     }
     
     if(pit_flag_get(PIT_CH1))
     {
         pit_flag_clear(PIT_CH1);
 
-        chassis_ctrl_task_20ms();  // 20ms: ������ + ��̼� + PID + ����
+        chassis_ctrl_task_20ms();  // 20ms: 编码器 + 里程计 + PID + 导航
     }
     
     if(pit_flag_get(PIT_CH2))
@@ -83,21 +83,21 @@ void PIT_IRQHandler(void)
 }
 
 void LPUART1_IRQHandler(void)
-{ /* P0-1 ����˵��:
-     *   LPUART1 (B12/B13) ͬʱ�е� debug ����� OpenART �Ӿ����ݽ��ա�
-     *   debug ģ��ֻ�� TX, RX �ɱ�Э����ռ, �������ֱ�Ӱ��ֽڽ���
-     *   app_link_isr_feed_byte() ������ι debug ���λ��� (���� 64B �������).
-     *   �� �ֽڼ��㿽��, �����жϺ�ʱ < 5 ?s.
-     *   �� ״̬���ڲ��������/��ʱ/ͬ������, ���Ῠ��.
+{ /* P0-1 改造说明:
+     *   LPUART1 (B12/B13) 同时承担 debug 输出与 OpenART 视觉数据接收。
+     *   debug 模块只用 TX, RX 由本协议层独占, 因此这里直接把字节交给
+     *   app_link_isr_feed_byte() 而不再喂 debug 环形缓冲 (避免 64B 缓冲溢出).
+     *   ─ 字节级零拷贝, 单次中断耗时 < 5 ?s.
+     *   ─ 状态机内部已做溢出/超时/同步保护, 不会卡死.
      */
     if(kLPUART_RxDataRegFullFlag & LPUART_GetStatusFlags(LPUART1))
     {
-        uint8 rx_byte = uart_read_byte(UART_1);         /* �� LPUART1 ���ݼĴ������� RDRF */
+        uint8 rx_byte = uart_read_byte(UART_1);         /* 读 LPUART1 数据寄存器并清 RDRF */
         app_link_isr_feed_byte(rx_byte);
     }
 
         
-    LPUART_ClearStatusFlags(LPUART1, kLPUART_RxOverrunFlag);    // ������ɾ��
+    LPUART_ClearStatusFlags(LPUART1, kLPUART_RxOverrunFlag);    // 不允许删除
 }
 
 
@@ -105,57 +105,57 @@ void LPUART2_IRQHandler(void)
 {
     if(kLPUART_RxDataRegFullFlag & LPUART_GetStatusFlags(LPUART2))
     {
-        // �����ж�
+        // 接收中断
         
     }
         
-    LPUART_ClearStatusFlags(LPUART2, kLPUART_RxOverrunFlag);    // ������ɾ��
+    LPUART_ClearStatusFlags(LPUART2, kLPUART_RxOverrunFlag);    // 不允许删除
 }
 
 void LPUART3_IRQHandler(void)
 {
     if(kLPUART_RxDataRegFullFlag & LPUART_GetStatusFlags(LPUART3))
     {
-        // �����ж�
+        // 接收中断
         
     }
         
-    LPUART_ClearStatusFlags(LPUART3, kLPUART_RxOverrunFlag);    // ������ɾ��
+    LPUART_ClearStatusFlags(LPUART3, kLPUART_RxOverrunFlag);    // 不允许删除
 }
 
 void LPUART4_IRQHandler(void)
 {
     if(kLPUART_RxDataRegFullFlag & LPUART_GetStatusFlags(LPUART4))
     {
-        // �����ж� 
+        // 接收中断 
         flexio_camera_uart_handler();
         
         gnss_uart_callback();
     }
         
-    LPUART_ClearStatusFlags(LPUART4, kLPUART_RxOverrunFlag);    // ������ɾ��
+    LPUART_ClearStatusFlags(LPUART4, kLPUART_RxOverrunFlag);    // 不允许删除
 }
 
 void LPUART5_IRQHandler(void)
 {
     if(kLPUART_RxDataRegFullFlag & LPUART_GetStatusFlags(LPUART5))
     {
-        // �����ж�
+        // 接收中断
         camera_uart_handler();
     }
         
-    LPUART_ClearStatusFlags(LPUART5, kLPUART_RxOverrunFlag);    // ������ɾ��
+    LPUART_ClearStatusFlags(LPUART5, kLPUART_RxOverrunFlag);    // 不允许删除
 }
 
 void LPUART6_IRQHandler(void)
 {
     if(kLPUART_RxDataRegFullFlag & LPUART_GetStatusFlags(LPUART6))
     {
-        // �����ж�
+        // 接收中断
         
     }
         
-    LPUART_ClearStatusFlags(LPUART6, kLPUART_RxOverrunFlag);    // ������ɾ��
+    LPUART_ClearStatusFlags(LPUART6, kLPUART_RxOverrunFlag);    // 不允许删除
 }
 
 
@@ -163,12 +163,12 @@ void LPUART8_IRQHandler(void)
 {
     if(kLPUART_RxDataRegFullFlag & LPUART_GetStatusFlags(LPUART8))
     {
-        // �����ж�
+        // 接收中断
         wireless_module_uart_handler();
         
     }
         
-    LPUART_ClearStatusFlags(LPUART8, kLPUART_RxOverrunFlag);    // ������ɾ��
+    LPUART_ClearStatusFlags(LPUART8, kLPUART_RxOverrunFlag);    // 不允许删除
 }
 
 
@@ -176,7 +176,7 @@ void GPIO1_Combined_0_15_IRQHandler(void)
 {
     if(exti_flag_get(B0))
     {
-        exti_flag_clear(B0);// ����жϱ�־λ
+        exti_flag_clear(B0);// 清除中断标志位
     }
     
 }
@@ -187,7 +187,7 @@ void GPIO1_Combined_16_31_IRQHandler(void)
     wireless_module_spi_handler();
     if(exti_flag_get(B16))
     {
-        exti_flag_clear(B16); // ����жϱ�־λ
+        exti_flag_clear(B16); // 清除中断标志位
     }
 
     
@@ -199,20 +199,20 @@ void GPIO2_Combined_0_15_IRQHandler(void)
     
     if(exti_flag_get(C0))
     {
-        exti_flag_clear(C0);// ����жϱ�־λ
+        exti_flag_clear(C0);// 清除中断标志位
     }
 
 }
 
 void GPIO2_Combined_16_31_IRQHandler(void)
 {
-    // -----------------* ToF INT �����ж� Ԥ���жϴ������� *-----------------
+    // -----------------* ToF INT 更新中断 预置中断处理函数 *-----------------
     tof_module_exti_handler();
-    // -----------------* ToF INT �����ж� Ԥ���жϴ������� *-----------------
+    // -----------------* ToF INT 更新中断 预置中断处理函数 *-----------------
     
     if(exti_flag_get(C16))
     {
-        exti_flag_clear(C16); // ����жϱ�־λ
+        exti_flag_clear(C16); // 清除中断标志位
     }
     
 }
@@ -225,7 +225,7 @@ void GPIO3_Combined_0_15_IRQHandler(void)
 
     if(exti_flag_get(D4))
     {
-        exti_flag_clear(D4);// ����жϱ�־λ
+        exti_flag_clear(D4);// 清除中断标志位
     }
 }
 
@@ -238,14 +238,14 @@ void GPIO3_Combined_0_15_IRQHandler(void)
 
 
 /*
-�жϺ������ƣ��������ö�Ӧ���ܵ��жϺ���
-Sample usage:��ǰ���������ڶ�ʱ���ж�
+中断函数名称，用于设置对应功能的中断函数
+Sample usage:当前启用了周期定时器中断
 void PIT_IRQHandler(void)
 {
-    //��������־λ
+    //务必清除标志位
     __DSB();
 }
-�ǵý����жϺ������־λ
+记得进入中断后清除标志位
 CTI0_ERROR_IRQHandler
 CTI1_ERROR_IRQHandler
 CORE_IRQHandler

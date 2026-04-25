@@ -3,10 +3,11 @@
  *===========================================================================*/
 
 #include "chassis_pid.h"
+#include "chassis_ctrl.h"
 #include <stdio.h>
 
 /* ---------------------- 单轮 PID 调试缓存 ---------------------- */
-static volatile uint8 s_pid_debug_wheel_index = (uint8)CHASSIS_WHEEL_LF; /* 当前选中的调试轮子 */
+static volatile uint8 s_pid_debug_wheel_index = (uint8)CHASSIS_WHEEL_RF; /* 当前选中的调试轮子 */
 static volatile float s_pid_debug_target_value = 0.0f;                    /* 最近一次目标值 */
 static volatile float s_pid_debug_actual_value = 0.0f;                    /* 最近一次实际值 */
 
@@ -122,7 +123,8 @@ void chassis_pid_debug_task_5ms(void)
 {
     static uint8 div = 0U;
     chassis_pid_debug_snapshot_t snapshot;
-    const char *wheel_name;
+    // const char *wheel_name;
+    float wheel_fb[4];
 
     div++;
     if (div < 20U)
@@ -132,9 +134,24 @@ void chassis_pid_debug_task_5ms(void)
     div = 0U;
 
     chassis_pid_debug_get_snapshot(&snapshot);
-    wheel_name = pid_debug_wheel_name(snapshot.wheel_index);
-    printf("[%s] tgt=%.4f m/s, act=%.4f m/s\r\n",
-           wheel_name,
+    // wheel_name = pid_debug_wheel_name(snapshot.wheel_index);
+    (void)pid_debug_wheel_name; /* 抑制 unused 警告: 当前打印没带轮名标签, 函数留着以备重启 */
+
+    /* 同步取 4 路 LPF 速度快照, 用于"接线诊断": 手转任一物理轮观察哪个 index 在动 */
+    chassis_ctrl_get_wheel_feedback_snapshot(wheel_fb);
+
+    /*
+     * Firewater 协议两条曲线分组同时输出:
+     *   pid_<wheel>:target,actual           — 当前调试轮 PID 跟踪曲线
+     *   wfb:LF,RF,LB,RB                     — 4 路反馈巡检 (诊断接线用)
+     * 接线自检方法: 让车停稳, 手转某一物理轮, 看 wfb 4 个数值里哪一列变化,
+     *   该列下标 0/1/2/3 即该物理轮在软件里实际对应的 index.
+     *   若与你期望不符, 去 chassis_config.h 把对应 LF/RF/LB/RB 的 ENC_INDEX
+     *   /ENC_CH1/ENC_CH2 三个宏改正 (整组对调, 不要只改一个).
+     */
+    printf("%.4f,%.4f\n",
            snapshot.target_value,
            snapshot.actual_value);
+    // printf("wfb:%.4f,%.4f,%.4f,%.4f\n",
+    //        wheel_fb[0], wheel_fb[1], wheel_fb[2], wheel_fb[3]);
 }

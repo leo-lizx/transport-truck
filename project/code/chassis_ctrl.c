@@ -31,8 +31,24 @@
 /* 单轮 PID 调试起步补偿参数（用于克服静摩擦） */
 #define WHEEL_DEBUG_START_SPEED_EPS_MPS   (0.03f)   /* 低于此反馈速度视为静止 */
 #define WHEEL_DEBUG_START_TARGET_EPS_MPS  (0.05f)   /* 低于此目标速度不启用补偿 */
-#define WHEEL_DEBUG_START_PWM_MIN         (1200.0f) /* 起步最小 PWM 幅值 */
-#define WHEEL_DEBUG_SIGN_FIX_CONFIRM_CNT  (6U)      /* 反号连续计数达到该值后自动翻转反馈符号 */
+#define WHEEL_DEBUG_START_PWM_MIN         (800.0f)  /* 起步最小 PWM 幅值 */
+#define WHEEL_DEBUG_TARGET_RAMP_MPS_PER_TICK (0.8f) /* 20ms 每拍目标最多变化量 */
+#define WHEEL_DEBUG_SIGN_FIX_GUARD_TICKS  (40U)     /* 起步保护期: 800ms 内只允许一次自动反号 */
+#define WHEEL_DEBUG_SIGN_FIX_CONFIRM_CNT  (12U)     /* 反号连续计数(@20ms)达到该值才翻转反馈符号 */
+/*
+ * P0-修复(抖动): 自动反号本意是开机查接线用, 运行中触发会清零 PID, 引发周期性
+ * "一抖一抖"现象. 改为: 仅在启动保护期(s_debug_startup_guard_ticks > 0)期间
+ * 允许检测/翻转, 且每次启动只允许翻转一次. 之后无论反馈相位如何都不再动符号.
+ *
+ * P0-修复(2026-04-25 顿挫): 即使加了启动保护期, 启动初几拍编码器/电机瞬态
+ * 仍可能让"目标·反馈反号"连续 12 拍触发翻转, 翻转动作里 chassis_pid_reset()
+ * 会把 pid->output 清零 -> 实际 PWM 跌到 0 -> "顿一下后再起来". 在
+ * chassis_config.h 里 ENC_SIGN/DIR_SIGN 已用 wfb 自检 + 单轮验证标定到位的
+ * 工程下, 这个自动机制只会破坏闭环, 默认关闭. 真要重新标轮时再打开.
+ */
+#ifndef WHEEL_DEBUG_AUTO_FLIP_FB_SIGN
+#define WHEEL_DEBUG_AUTO_FLIP_FB_SIGN     (0)
+#endif
 
 /* 轮速闭环抗抖参数（抑制低速量化噪声和来回翻向） */
 #define WHEEL_FB_LPF_ALPHA                (0.35f)   /* 轮速反馈一阶低通系数，越小越平滑 */
@@ -185,6 +201,9 @@ static volatile uint8 s_debug_wheel_index = (uint8)CHASSIS_WHEEL_LF;
 static volatile float s_debug_wheel_target_mps = 0.0f;
 static volatile float s_debug_fb_sign_mul[CHASSIS_WHEEL_COUNT] = {1.0f, 1.0f, 1.0f, 1.0f};
 static volatile uint8 s_debug_fb_sign_mismatch_cnt[CHASSIS_WHEEL_COUNT] = {0U, 0U, 0U, 0U};
+static volatile uint8 s_debug_fb_sign_flipped[CHASSIS_WHEEL_COUNT] = {0U, 0U, 0U, 0U}; /* 本次启动周期内是否已自动翻转过, 防止反复跳 */
+static volatile float  s_debug_target_ramp_mps      = 0.0f;
+static volatile uint16 s_debug_startup_guard_ticks  = 0U;
 
 /* 航向积分项 */
 static volatile float s_yaw_i  = 0.0f;
@@ -242,6 +261,7 @@ static chassis_tune_params_t sanitize(chassis_tune_params_t p)
     return p;
 }
 
+#if (0 == CHASSIS_CTRL_SINGLE_WHEEL_PID_DEBUG_ONLY)
 /** 车体速度矢量限幅: (vx,vy)模长 ≤ max_linear, |wz| ≤ max_yaw */
 static void limit_speed(chassis_body_speed_cmd_t *c)
 {
@@ -285,6 +305,8 @@ static chassis_body_speed_cmd_t ramp_filter(chassis_body_speed_cmd_t tgt)
 }
 
 /** 紧急停机: 清零滤波器、PID、PWM */
+#endif /* (0 == CHASSIS_CTRL_SINGLE_WHEEL_PID_DEBUG_ONLY) */
+
 static void force_stop(void)
 {
     uint8 i;
@@ -300,6 +322,7 @@ static void force_stop(void)
     s_wheel_fb_lpf_inited = 0U;
 }
 
+#if (0 == CHASSIS_CTRL_SINGLE_WHEEL_PID_DEBUG_ONLY)
 /** 软限位：网格是否在可通行内场 */
 static inline uint8 soft_limit_is_inner_grid(int16 gx, int16 gy)
 {
@@ -435,6 +458,7 @@ static void apply_speed(chassis_body_speed_cmd_t cmd,
         chassis_motor_set_pwm(&s_mot[i], pwm_motor_domain);
     }
 }
+#endif /* (0 == CHASSIS_CTRL_SINGLE_WHEEL_PID_DEBUG_ONLY) */
 
 /** 单轮 PID 调试链路：仅一个轮子给目标速度，其余轮子目标为 0 */
 static void apply_single_wheel_pid_debug(const float wheel_fb_mps[CHASSIS_WHEEL_COUNT])
@@ -446,8 +470,29 @@ static void apply_single_wheel_pid_debug(const float wheel_fb_mps[CHASSIS_WHEEL_
 
     debug_idx = debug_wheel_index_safe(s_debug_wheel_index);
 
-    /* 仅指定调试轮子允许非零目标速度。 */
-    targets[debug_idx] = debug_target_speed_clamp(s_debug_wheel_target_mps);
+    /* 仅指定调试轮子允许非零目标速度，并用斜坡避免目标速度突变。 */
+    {
+        float set_target = debug_target_speed_clamp(s_debug_wheel_target_mps);
+        float diff = set_target - s_debug_target_ramp_mps;
+        float step_lim = WHEEL_DEBUG_TARGET_RAMP_MPS_PER_TICK;
+        if (diff > step_lim)
+        {
+            s_debug_target_ramp_mps += step_lim;
+        }
+        else if (diff < -step_lim)
+        {
+            s_debug_target_ramp_mps -= step_lim;
+        }
+        else
+        {
+            s_debug_target_ramp_mps = set_target;
+        }
+    }
+    targets[debug_idx] = s_debug_target_ramp_mps;
+    if (s_debug_startup_guard_ticks > 0U)
+    {
+        s_debug_startup_guard_ticks--;
+    }
 
     /* 调试模式不输出车体运动指令。 */
     s_last_cmd = (chassis_body_speed_cmd_t){0};
@@ -473,8 +518,18 @@ static void apply_single_wheel_pid_debug(const float wheel_fb_mps[CHASSIS_WHEEL_
                 continue;
             }
 
-            /* 若目标与反馈长期反号，自动翻转该轮反馈符号，打断正反馈发散。 */
-            if ((fabsf(targets[i]) > WHEEL_DEBUG_START_TARGET_EPS_MPS) &&
+            /*
+             * 若目标与反馈长期反号, 自动翻转该轮反馈符号, 打断正反馈发散.
+             * P0-修复(抖动): 仅在启动保护期内、且本次启动还没翻过的前提下才允许触发,
+             * 防止运行中 PID 振荡产生短时反号导致周期性翻转 + 重置 PID, 形成
+             * "一抖一抖"的周期性抽搐.
+             * P0-修复(2026-04-25 顿挫): 默认编译关闭. 见顶部
+             *   WHEEL_DEBUG_AUTO_FLIP_FB_SIGN 注释.
+             */
+#if (WHEEL_DEBUG_AUTO_FLIP_FB_SIGN != 0)
+            if ((s_debug_startup_guard_ticks > 0U) &&
+                (s_debug_fb_sign_flipped[i] == 0U) &&
+                (fabsf(targets[i]) > WHEEL_DEBUG_START_TARGET_EPS_MPS) &&
                 (fabsf(wheel_fb_mps[i]) > WHEEL_DEBUG_START_SPEED_EPS_MPS))
             {
                 if ((targets[i] * feedback_for_pid) < 0.0f)
@@ -493,6 +548,7 @@ static void apply_single_wheel_pid_debug(const float wheel_fb_mps[CHASSIS_WHEEL_
                 {
                     s_debug_fb_sign_mul[i] = -s_debug_fb_sign_mul[i];
                     s_debug_fb_sign_mismatch_cnt[i] = 0U;
+                    s_debug_fb_sign_flipped[i] = 1U; /* 本次启动只允许翻一次 */
                     chassis_pid_reset(&s_pid[i]);
                     feedback_for_pid = wheel_fb_mps[i] * s_debug_fb_sign_mul[i];
                 }
@@ -501,18 +557,30 @@ static void apply_single_wheel_pid_debug(const float wheel_fb_mps[CHASSIS_WHEEL_
             {
                 s_debug_fb_sign_mismatch_cnt[i] = 0U;
             }
+#else
+            /* 自动反号默认关闭, 维持中性状态以备宏开启时不会误触发 */
+            s_debug_fb_sign_mismatch_cnt[i] = 0U;
+#endif
 
             /* 单轮调试同样在“前进符号域”做闭环，打印值和控制值保持一致。 */
             pwm_forward_domain = chassis_pid_step(&s_pid[i], targets[i], feedback_for_pid);
             pwm_motor_domain = pwm_forward_domain * s_mot[i].dir_sign;
 
-            /* 起步抗静摩擦：目标非零但轮速接近零时，给最小启动 PWM。 */
+            /*
+             * 起步抗静摩擦: 目标非零但轮速接近零时, 给最小启动 PWM.
+             * P0-修复(抖动): 软启动覆盖电机 PWM 时, 同步把 PID 内部累加器 pid->output
+             * 钳到与之等价的"前进域"PWM 上, 实现无扰切换 (bumpless transfer).
+             * 否则等反馈一过 0.03 m/s 软启动释放, PID 累加器还停在低值或继续增量,
+             * 会让最终 PWM 在 800 与 PID 自由值之间产生明显阶跃, 形成第二种抖动源.
+             */
             if ((fabsf(targets[i]) > WHEEL_DEBUG_START_TARGET_EPS_MPS) &&
                 (fabsf(feedback_for_pid) < WHEEL_DEBUG_START_SPEED_EPS_MPS) &&
                 (fabsf(pwm_motor_domain) < WHEEL_DEBUG_START_PWM_MIN))
             {
                 float target_sign = (targets[i] >= 0.0f) ? 1.0f : -1.0f;
                 pwm_motor_domain = WHEEL_DEBUG_START_PWM_MIN * target_sign * s_mot[i].dir_sign;
+                /* PID 累加器钳到前进域等价值, 让下次 chassis_pid_step 在此基础上做增量 */
+                s_pid[i].output = WHEEL_DEBUG_START_PWM_MIN * target_sign;
             }
 
             chassis_motor_set_pwm(&s_mot[i], pwm_motor_domain);
@@ -529,6 +597,7 @@ static void apply_single_wheel_pid_debug(const float wheel_fb_mps[CHASSIS_WHEEL_
                                   debug_feedback_value);
 }
 
+#if (0 == CHASSIS_CTRL_SINGLE_WHEEL_PID_DEBUG_ONLY)
 /**
  * 航向 PI 闭环
  * @param err        航向误差(°)，已归一化
@@ -558,6 +627,7 @@ static float yaw_pi(float err, uint8 compensate)
 
     return wz;
 }
+#endif /* (0 == CHASSIS_CTRL_SINGLE_WHEEL_PID_DEBUG_ONLY) */
 
 /** 模式切换辅助: 清积分 + 设模式 */
 static void enter_mode(ctrl_mode_t m)
@@ -593,14 +663,18 @@ void chassis_ctrl_init(void)
     s_tgt_yaw_deg  = 0.0f;
     s_cmd_vx       = 0.0f;
     s_cmd_vy       = 0.0f;
-    s_debug_wheel_index = (uint8)CHASSIS_WHEEL_LF;
+    /*
+     * 不在这里写死调试轮索引. 真正的"选轮"由 chassis_ctrl_start_single_wheel_pid_debug()
+     * 统一负责 (它会同时设置 s_debug_wheel_index 和 chassis_pid.c 里的
+     * s_pid_debug_wheel_index). 这里写死任何一个轮都会变成跟 main 里 MAIN_PID_DEBUG_WHEEL_INDEX
+     * 不一致的隐藏 footgun.
+     */
     s_debug_wheel_target_mps = 0.0f;
     s_fb_vx        = 0.0f;
     s_fb_vy        = 0.0f;
     s_mode         = MODE_YAW_HOLD;
     s_arrived      = 1U;
 
-    chassis_pid_debug_select_wheel(CHASSIS_WHEEL_LF);
     chassis_pid_debug_reset();
 
     force_stop();
@@ -794,6 +868,9 @@ void chassis_ctrl_start_single_wheel_pid_debug(uint8 wheel_index,
     s_debug_wheel_target_mps = debug_target_speed_clamp(target_speed_mps);
     s_debug_fb_sign_mul[safe_wheel] = 1.0f;
     s_debug_fb_sign_mismatch_cnt[safe_wheel] = 0U;
+    s_debug_fb_sign_flipped[safe_wheel] = 0U; /* 新一轮启动, 重置"已翻过"标记 */
+    s_debug_target_ramp_mps = 0.0f;
+    s_debug_startup_guard_ticks = WHEEL_DEBUG_SIGN_FIX_GUARD_TICKS;
 
     force_stop();
     chassis_pid_debug_select_wheel((chassis_wheel_index_t)safe_wheel);
@@ -824,6 +901,17 @@ void chassis_ctrl_stop(void)
     enter_mode(MODE_YAW_HOLD);
     s_arrived = 1U;
     force_stop();
+}
+
+void chassis_ctrl_get_wheel_feedback_snapshot(float out_wheel_fb_mps[4])
+{
+    uint8 i;
+    if (0 == out_wheel_fb_mps) return;
+    /* 直接读 LPF 后的速度快照, 与 PID 闭环用的反馈完全一致 */
+    for (i = 0U; i < (uint8)CHASSIS_WHEEL_COUNT; ++i)
+    {
+        out_wheel_fb_mps[i] = s_wheel_fb_lpf[i];
+    }
 }
 
 /*--- 航向调试 ---*/

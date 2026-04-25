@@ -66,3 +66,4 @@ project/code/plan.md
 *.rt1064_build_cache
 
 .vscode
+*.icf

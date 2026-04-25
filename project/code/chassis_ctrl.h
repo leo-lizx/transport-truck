@@ -153,6 +153,14 @@ void chassis_ctrl_set_single_wheel_pid_debug_target(float target_speed_mps);
 void chassis_ctrl_stop_single_wheel_pid_debug(void);
 
 /**
+ * @brief  读取 4 路轮速反馈快照 (LPF 后, 单位 m/s).
+ *         用于诊断接线: 调单轮 PID 时一并打印 4 路反馈, 手转任一物理轮观察哪个 index 在动,
+ *         即可反推出该物理轮接的是哪个软件 wheel index, 进而修正 chassis_config.h 的 ENC 引脚定义.
+ * @param  out_wheel_fb_mps 4 元素输出数组 (LF/RF/LB/RB), 必须非空.
+ */
+void chassis_ctrl_get_wheel_feedback_snapshot(float out_wheel_fb_mps[4]);
+
+/**
  * @brief  进入航向调试模式：固定 0 度航向保持，停止平移
  *         推荐在 main 初始化完成后调用一次。
  */

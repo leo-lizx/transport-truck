@@ -37,7 +37,6 @@ static uint8 is_navigating = 0;
 static uint8        s_link_alive       = 0U;     /* 当前链路状态: 1=在线 0=离线/未启动 */
 static uint8        s_link_ever_alive  = 0U;     /* 是否曾经在线过 (开机直接没数据时, 保持 WAIT 而非 LOSS) */
 static GameStage_e  s_stage_resume     = STAGE_WAIT_START; /* LOSS 触发时保存原状态, 恢复时回到该状态 */
-static uint32       s_link_last_seen_ms = 0U;    /* 最近一次确认 alive 时的 g_link_last_hb_ms 快照 (调试) */
 
 /* ----- 【P0-8】OOB / 发车 / 死局静止 相关静态变量 ------------------
  * s_failure_reason   : 比赛失败原因, 触发后状态机锁死在 STAGE_DONE
@@ -64,7 +63,6 @@ static uint16                g_bomb_wp_idx = 0;
 
 static uint8                 g_box_to_target[SOKOBAN_MAX_BOXES] = {0};
 static uint8                 g_current_level = 1;
-static uint16                g_reset_hold_ticks = 0;
 static ExecMode_e            g_exec_mode = EXEC_NONE;
 
 static void reset_exec_context(void)
@@ -430,7 +428,6 @@ static void stage_deadlock_reset_handler(void)
     if (!is_navigating) {
         HAL_CHASSIS_MOVE_TO(CHASSIS_START_GRID_X, CHASSIS_START_GRID_Y);
         is_navigating = 1;
-        g_reset_hold_ticks = 0;
         return;
     }
 
@@ -447,7 +444,6 @@ static void stage_deadlock_reset_handler(void)
         return;     /* 还未静止满 3s */
     }
 
-    g_reset_hold_ticks = 0;
     reset_exec_context();
     s_wait_start_phase = 0U;     /* 重置 WAIT_START 子相位, 下一关重新走 "复位→等离开" */
     goto_stage(STAGE_WAIT_START);
@@ -528,7 +524,6 @@ static void update_link_state(void)
         if (last_ok != 0U) {
             s_link_ever_alive  = 1U;
             s_link_alive       = 1U;
-            s_link_last_seen_ms = now_ms;
         }
         return;
     }
@@ -543,8 +538,6 @@ static void update_link_state(void)
                 chassis_ctrl_stop();                /* 立即刹停 (force_stop)        */
                 is_navigating = 0U;
             }
-        } else {
-            s_link_last_seen_ms = now_ms;
         }
     } else {
         /* 离线 -> 检查是否恢复 (用 LINK_OK_MS 做迟滞)                            */

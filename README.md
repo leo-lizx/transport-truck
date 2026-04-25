@@ -35,11 +35,9 @@ visual-group/
 | 编码器 | `chassis_encoder.c/.h` | 正交脉冲 → 轮速 |
 | IMU | `chassis_imu.c/.h` | IMU660RB SPI，零偏标定 + 航向积分 |
 | 麦轮运动学 | `chassis_mecanum.c/.h` | 正/逆运动学 + 等比例限速 |
-| 顶层底盘 | `chassis_ctrl.c/.h` | 5/20ms 闭环 + 网格定点 + 航向保持 + **几何区域判定** |
-| 调用层 | `chassis_pose_ctrl_call_example.c/.h` | `app_control_pipeline_*` 对外封装 |
+| 顶层底盘 | `chassis_ctrl.c/.h` | 5/20ms 闭环 + 网格定点 + 航向保持 + **几何区域判定** + `chassis_ctrl_move_to_grid()` 对外 API |
 | 调参菜单 | `chassis_menu.c/.h` | 2 寸 IPS + 4 按键 + Flash 持久化 |
-| BFS 寻路 | `algo_bfs_scout.c/.h` | 纯走位寻路 + 最近箱子观察点搜索 |
-| 推箱求解 | `algo_sokoban_solver.c/.h` | 地图分解法 + 单箱位图 BFS + 炸弹策略 |
+| 推箱求解 | `algo_sokoban_solver.c/.h` | 地图分解法 + 单箱位图 BFS + 炸弹策略 + 导航 BFS（合并原 `algo_bfs_scout`）|
 | 游戏状态机 | `app_game_logic.c/.h` | 7+1 态主流程 + 链路守护 |
 | **链路协议** | `app_link.c/.h` | CRC8 帧解析 + seq-lock 地图快照 + 心跳超时 |
 
@@ -62,7 +60,7 @@ visual-group/
    │  ⑤ switch(current_stage) │                            │   │
    └──────────────────────────┼────────────────────────────┘   │
                               ▼                                │
-                  app_control_pipeline_move_to_grid()          │
+                  chassis_ctrl_move_to_grid()                 │
                               │                                │
    PIT_CH0 (5ms): IMU 采样 + 航向积分 + 链路 tick               │
    PIT_CH1 (20ms): 编码器 → 里程计 → 导航 P → 麦轮逆 → PID → PWM│
@@ -139,7 +137,7 @@ OOB 触发 → `chassis_ctrl_stop()` + 切 `STAGE_DONE` + `s_failure_reason = GA
   ├─ 单箱 BFS：状态 = (玩家行列, 箱子行列)，状态空间 12×16×12×16=36864
   │   位图前沿 + 4-bit 前驱压缩存储 ≈ 31.5KB（旧版 108KB）
   ├─ 路点压缩：同方向连续移动合并为转弯点
-  └─ 逐路点导航：app_control_pipeline_move_to_grid 逐点执行
+  └─ 逐路点导航：chassis_ctrl_move_to_grid 逐点执行
 ```
 
 ### 三阶段 API
@@ -159,13 +157,13 @@ OOB 触发 → `chassis_ctrl_stop()` + 切 `STAGE_DONE` + `s_failure_reason = GA
 
 ## 6. 引脚 & 关键参数
 
-### 电机 / 编码器
-| 轮 | PWM | DIR | ENC A | ENC B |
-|---|---|---|---|---|
-| 左前 LF | C11 | C10 | C0 | C1 |
-| 右前 RF | C8 | C9 | C2 | C24 |
-| 左后 LB | D3 | D2 | C3 | C25 |
-| 右后 RB | C6 | C7 | B18 | B19 |
+### 电机 / 编码器（2026-04-25 实车标定修正版，详见 `chassis_config.h`）
+| 轮 | PWM | DIR | ENC A | ENC B | ENC 通道 |
+|---|---|---|---|---|---|
+| 左前 LF | C11 | C10 | C5  | C25 | QTIMER2_ENCODER2 (ENCODER_4) |
+| 右前 RF | C6  | C7  | C3  | C4  | QTIMER2_ENCODER1 (ENCODER_3) |
+| 左后 LB | D3  | D2  | C0  | C1  | QTIMER1_ENCODER1 (ENCODER_1) |
+| 右后 RB | C8  | C9  | C2  | C24 | QTIMER1_ENCODER2 (ENCODER_2) |
 
 ### 通信 / 外设
 | 用途 | 引脚 |
