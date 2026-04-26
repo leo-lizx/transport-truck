@@ -62,18 +62,21 @@ define symbol m_boot_hdr_dcd_data_start      = 0x70001030;
 
 /* Sizes */
 /* ------------------------------------------------------------------
- * P0-4 (2026-04-24): 主 C 栈由 4KB 扩至 8KB。
+ * P0-4 (2026-04-24): main C stack 4KB -> 8KB.
  *
- * 扩容理由：
- *   1) 主循环路径 Game_Logic_Task_Run -> find_first_unreachable_target
- *      (NavPath_t nav_tmp ~402B) -> Algo_Nav_BFS (Point_t temp_path[200] ~400B)
- *      叠加单次调用即占栈 ~800B；
- *   2) 同时存在 PIT_IRQn (apply_soft_limit_guard 内 192B 地图快照 + pose 快照)
- *      与 LPUART1 ISR 互相抢占的嵌套帧；
- *   3) 4KB 栈余量已逼近上限，留 8KB 可承受 P0-5 PIT-tick 化后再增长一档调用深度。
+ * Reason:
+ *   1) main path Game_Logic_Task_Run -> find_first_unreachable_target
+ *      (NavPath_t nav_tmp ~402B) -> Algo_Nav_BFS (Point_t temp_path[200] ~400B),
+ *      single call already costs ~800B on stack;
+ *   2) PIT_IRQn (apply_soft_limit_guard with 192B map + pose snapshot) and
+ *      LPUART1 ISR can preempt each other, nested frames;
+ *   3) old 4KB margin too tight; 8KB leaves room for P0-5 PIT-tick refactor.
  *
- * 容量影响：DTCM 总 448KB (0x20000000~0x2006FFFF)，多占 4KB <1%，不挤压 ZI/data。
- * 堆 (__size_heap__) 当前未使用，维持 1KB 不变。
+ * Cost: DTCM total 448KB, +4KB (<1%), no impact on ZI/data.
+ * Heap (__size_heap__) unused, kept at 1KB.
+ *
+ * NOTE: icf parser does not handle multi-byte (UTF-8) inside block comments
+ * reliably -- keep this file ASCII only.
  * ------------------------------------------------------------------ */
 if (isdefinedsymbol(__stack_size__)) {
   define symbol __size_cstack__        = __stack_size__;
