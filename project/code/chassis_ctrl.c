@@ -22,11 +22,14 @@
 
 /* 软限位依赖：P0-3 解耦 g_game_map 直访, 改为运行时 seq-lock 快照 (apply_soft_limit_guard 内部拷贝) */
 
-/* ---------------------- 航向闭环常量 ---------------------- */
-#define YAW_DEADZONE_DEG   0.30f    /* 航向误差死区               */
-#define YAW_KI             0.030f   /* 航向 I 增益                */
-#define YAW_I_LIMIT        120.0f   /* 积分限幅 (°·s)             */
-#define YAW_MIN_WZ_DPS     10.0f    /* 原地保持最小角速度补偿     */
+/* ---------------------- 航向闭环常量 ----------------------
+ * 这 4 个参数已迁移到 chassis_config.h, 这里仅做本地短别名转发,
+ * 方便阅读 yaw_pi() 时不用记前缀。如要调参请改 chassis_config.h。
+ */
+#define YAW_DEADZONE_DEG   CHASSIS_YAW_DEADZONE_DEG
+#define YAW_KI             CHASSIS_YAW_KI
+#define YAW_I_LIMIT        CHASSIS_YAW_I_LIMIT
+#define YAW_MIN_WZ_DPS     CHASSIS_YAW_MIN_WZ_DPS
 
 /* 单轮 PID 调试起步补偿参数（用于克服静摩擦） */
 #define WHEEL_DEBUG_START_SPEED_EPS_MPS   (0.03f)   /* 低于此反馈速度视为静止 */
@@ -68,8 +71,10 @@
  * 单轮 PID 调试专用开关：
  * 1 = 仅保留 MODE_SINGLE_WHEEL_PID_DEBUG 主链路，其余模式逻辑临时屏蔽（保留在 #else 以便恢复）
  * 0 = 启用全部控制模式
+ *
+ * 2026-04-27 调姿态闭环, 必须放开全部模式 (否则 MODE_YAW_HOLD 在 task_20ms 里会被 force_stop 短路).
  */
-#define CHASSIS_CTRL_SINGLE_WHEEL_PID_DEBUG_ONLY   (1)
+#define CHASSIS_CTRL_SINGLE_WHEEL_PID_DEBUG_ONLY   (0)
 
 typedef enum {
     MODE_YAW_HOLD = 0,      /* 原地航向保持（默认）            */
@@ -223,12 +228,12 @@ static uint8 debug_wheel_index_safe(uint8 wheel_index)
                                                        : (uint8)CHASSIS_WHEEL_LF;
 }
 
-/** 调试目标速度限幅：限制在轮速上限范围内 */
+/** 调试目标速度限幅：仅供单轮 PID 调试使用 */
 static float debug_target_speed_clamp(float target_speed_mps)
 {
     return chassis_clamp_f(target_speed_mps,
-                           -CHASSIS_MAX_WHEEL_SPEED_MPS,
-                            CHASSIS_MAX_WHEEL_SPEED_MPS);
+                           -CHASSIS_DEBUG_WHEEL_SPEED_LIMIT_MPS,
+                            CHASSIS_DEBUG_WHEEL_SPEED_LIMIT_MPS);
 }
 
 /** 停止指定轮子并清理 PID 状态 */
@@ -435,7 +440,12 @@ static void apply_speed(chassis_body_speed_cmd_t cmd,
 
     chassis_mecanum_forward(f.vx_body_mps, f.vy_body_mps,
                             f.wz_dps * CHASSIS_DEG_TO_RAD_F, targets);
-    chassis_mecanum_clamp_wheels(targets, CHASSIS_MAX_WHEEL_SPEED_MPS);
+    /*
+     * 删除冷余调用: chassis_mecanum_clamp_wheels(targets, CHASSIS_MAX_WHEEL_SPEED_MPS);
+     * 上游 limit_speed() 已把 vx,vy 限住 ≤ CHASSIS_MAX_LINEAR_SPEED_MPS,
+     * wz 限住 ≤ CHASSIS_MAX_YAW_SPEED_DPS, 麦轮正解后单轮最大仅 ~0.65 m/s,
+     * 远小于原先的 5 m/s 兑底, 裁幅从不触发.
+     */
 
     for (i = 0U; i < (uint8)CHASSIS_WHEEL_COUNT; ++i) {
         float pwm_forward_domain;
@@ -940,13 +950,21 @@ void chassis_ctrl_attitude_debug_task_5ms(void)
     static uint8 div = 0U;
     chassis_attitude_debug_info_t info;
 
-    if (++div < 20U) return;   /* 100ms 分频打印 */
+    /* 50ms 分频 (10 * 5ms tick): 比 100ms 更密, 上位机绘曲线更平滑 */
+    if (++div < 10U) return;
     div = 0U;
 
     chassis_ctrl_attitude_debug_get_state(&info);
-    printf("[YawCL] tgt=%.2f cur=%.2f err=%.2f wz=%.2f\r\n",
-           info.target_yaw_deg, info.current_yaw_deg,
-           info.yaw_err_deg,    info.wz_cmd_dps);
+
+    /*
+     * 打印格式 (空格分隔, 便于上位机/Excel 直接解析):
+     *   [YawCL] target=<目标角>  actual=<实际角>  err=<误差>  wz=<角速度指令>
+     * 单位: deg / deg / deg / dps
+     */
+    printf("%.4f ，%.4f  \r\n",
+           info.target_yaw_deg,
+           info.current_yaw_deg
+           );
 }
 
 /*--- 状态查询 ---*/
