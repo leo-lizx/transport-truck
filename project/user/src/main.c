@@ -93,12 +93,17 @@ static uint32 wait_for_tick(void)
 #define MAIN_RUN_MODE_SINGLE_WHEEL    (2)
 
 /* >>>>>>>>>>>> 改这里切换调试模式 <<<<<<<<<<<< */
-#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_SINGLE_WHEEL)  /* 单轮 PID 调试 */
+#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_YAW_HOLD)      /* 姿态闭环调试 */
 /* <<<<<<<<<<<< 改这里切换调试模式 >>>>>>>>>>>> */
 
 /* 航向保持目标角 (deg), 仅 YAW_HOLD 模式生效 */
 #define MAIN_HOLD_YAW_TARGET_DEG      (0.0f)
 
+/* ========================================================================== */
+/*  ⬇⬇⬇ 以下是单轮 PID 调试专用代码, 仅在 MAIN_RUN_MODE_SINGLE_WHEEL 生效 ⬇⬇⬇  */
+/*  ⬇⬇⬇ 姿态闭环调试阶段这里全部被 #if 屏蔽, 不会被编译, 不要删 ⬇⬇⬇          */
+/* ========================================================================== */
+#if (MAIN_RUN_MODE == MAIN_RUN_MODE_SINGLE_WHEEL)
 /*---------------------------------------------------------------------------
  * 单轮 PID 调试参数 (仅 SINGLE_WHEEL 模式生效)
  *   WHEEL_INDEX : 0=LF 1=RF 2=LB 3=RB
@@ -107,16 +112,23 @@ static uint32 wait_for_tick(void)
  *                 0=沿用 menu/Flash 中的 PID
  *-------------------------------------------------------------------------*/
 #define MAIN_PID_DEBUG_WHEEL_INDEX    (CHASSIS_WHEEL_RB)
-#define MAIN_PID_DEBUG_TARGET_MPS     (3.0f)   /* 当前单轮 PID 调试目标; 上限 12 m/s */
+#define MAIN_PID_DEBUG_TARGET_MPS     (3.0f)   /* 单轮 PID 调试目标; 上限 12 m/s */
 
 #define MAIN_PID_DEBUG_FORCE_PID      (1)
-#define MAIN_PID_DEBUG_KP             (40.0f)  /* 当前左前轮 P 参数 */
-#define MAIN_PID_DEBUG_KI             (23.0f)    /* 先纯 P, P 调好后再加 I */
-#define MAIN_PID_DEBUG_KD             (0.0f)    /* 一般 D 不加; 仅在抑制超调时再加 */
+#define MAIN_PID_DEBUG_KP             (40.0f)
+#define MAIN_PID_DEBUG_KI             (23.0f)
+#define MAIN_PID_DEBUG_KD             (0.0f)
+#endif /* MAIN_RUN_MODE_SINGLE_WHEEL */
+/* ========================================================================== */
+/*  ⬆⬆⬆ 单轮 PID 调试专用代码结束 ⬆⬆⬆                                            */
+/* ========================================================================== */
 
 /* 菜单渲染分频 (主循环 5ms tick * N), N=20 => 100ms 刷一次 */
 #define MAIN_MENU_RENDER_DIV          (20U)
 
+/* ========================================================================== */
+/*  ⬇⬇⬇ 单轮 PID 调试辅助函数, 仅 SINGLE_WHEEL 模式下编译 ⬇⬇⬇              */
+/* ========================================================================== */
 #if (MAIN_RUN_MODE == MAIN_RUN_MODE_SINGLE_WHEEL) && (1 == MAIN_PID_DEBUG_FORCE_PID)
 /*
  * 把 main 内 KP/KI/KD 写进 chassis_tune_params, 仅覆盖被调试的那一个轮子,
@@ -134,6 +146,9 @@ static void main_apply_debug_wheel_pid(void)
     chassis_ctrl_set_tune_params(&tune_params);
 }
 #endif
+/* ========================================================================== */
+/*  ⬆⬆⬆ 单轮 PID 调试辅助函数结束 ⬆⬆⬆                                          */
+/* ========================================================================== */
 
 int main(void)
 {
@@ -174,6 +189,7 @@ int main(void)
                           0.0f);
 
 #if (MAIN_RUN_MODE == MAIN_RUN_MODE_SINGLE_WHEEL)
+    /* ⬇⬇⬇ 单轮 PID 调试启动逻辑, 姿态调试阶段这里被 #if 屏蔽 ⬇⬇⬇ */
     /* 单轮 PID 调试模式: 仅一个轮子参与闭环, 其余轮子目标恒 0;
      * 闭环执行体在 PIT_CH1 / chassis_ctrl_task_20ms 内. */
   #if (1 == MAIN_PID_DEBUG_FORCE_PID)
@@ -182,7 +198,7 @@ int main(void)
     chassis_ctrl_start_single_wheel_pid_debug((uint8)MAIN_PID_DEBUG_WHEEL_INDEX,
                                               MAIN_PID_DEBUG_TARGET_MPS);
 #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_YAW_HOLD)
-    /* 航向保持测试: 只设一次目标角, 后续 20ms 中断中持续闭环. */
+    /* ✅ 姿态闭环调试走这里: 只设一次目标角, 后续 PIT_CH1 20ms 中断中持续闭环. */
     chassis_ctrl_hold_yaw(MAIN_HOLD_YAW_TARGET_DEG);
 #else
     /* 游戏模式: 设置初始航向基准, 等待状态机调度. */
@@ -214,10 +230,11 @@ int main(void)
         (void)wait_for_tick();
 
     #if (MAIN_RUN_MODE == MAIN_RUN_MODE_SINGLE_WHEEL)
+        /* ⬇⬇⬇ 单轮 PID 打印, 姿态调试阶段这里被 #if 屏蔽 ⬇⬇⬇ */
         /* 单轮 PID 调试: 100ms 打印目标速度/实际速度两列, 上位机绘曲线 */
         chassis_pid_debug_task_5ms();
     #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_YAW_HOLD)
-        /* 航向闭环调试: 100ms 打印目标角/当前角/误差/角速度指令 */
+        /* ✅ 姿态闭环调试打印走这里: 100ms 打印 [YawCL] tgt/cur/err/wz, 用于画角度曲线 */
         chassis_ctrl_attitude_debug_task_5ms();
     #else
         Game_Logic_Task_Run();          /* 推箱子状态机 (非阻塞) */

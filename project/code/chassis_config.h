@@ -171,13 +171,17 @@
  * ====================================================================== */
 
 /** 车体平移最大合成线速度（m/s），矢量模长不超过此值 */
-#define CHASSIS_MAX_LINEAR_SPEED_MPS    (0.35f)
+#define CHASSIS_MAX_LINEAR_SPEED_MPS    (1.35f)
 
 /** 车体最大旋转角速度（°/s） */
 #define CHASSIS_MAX_YAW_SPEED_DPS       (90.0f)
 
-/** 单个轮子允许的最大线速度（m/s），超出时四轮按比例缩放 */
-#define CHASSIS_MAX_WHEEL_SPEED_MPS     (12.0f)
+/**
+ * 单轮 PID 调试模式下调试轮目标速度上限（m/s）。
+ * 仅被 debug_target_speed_clamp() 使用。正常控制路径上不需要这个限幅,
+ * 轮端速度由 CHASSIS_MAX_LINEAR_SPEED_MPS + CHASSIS_MAX_YAW_SPEED_DPS 上游限定。
+ */
+#define CHASSIS_DEBUG_WHEEL_SPEED_LIMIT_MPS  (5.0f)
 
 /** 在线调参时允许的线速度上限硬限制（m/s） */
 #define CHASSIS_TUNE_MAX_LINEAR_SPEED_LIMIT_MPS  (1.50f)
@@ -194,6 +198,36 @@
 
 /** 航向环 Kp：值越大，朝向对准越快；过大易振荡 */
 #define CHASSIS_YAW_KP                  (2.20f)
+
+/* ----- 航向闭环 (yaw_pi) 其余参数：原本散落在 chassis_ctrl.c, 集中到此 ----- */
+
+/**
+ * 航向误差死区（度）。
+ * |err| <= 该值时输出 wz=0 且 I 项缓慢衰减, 抑制原地小幅抖动。
+ * 调大: 更稳但允许残差变大；调小: 跟踪更紧但易抽搐。
+ */
+#define CHASSIS_YAW_DEADZONE_DEG        (0.30f)
+
+/**
+ * 航向 I 增益。
+ * 用于消除稳态误差（如轮子对地摩擦不一致导致的偏角）。
+ * 先把 KP 调到不振荡, 再缓慢加 KI；过大会反复过冲。
+ */
+#define CHASSIS_YAW_KI                  (0.030f)
+
+/**
+ * 航向积分项幅值上限（°·s）。
+ * 防止长期堵转或大误差时积分饱和, 松开后冲过头。
+ * 经验值: 30~120, 越保守越小。
+ */
+#define CHASSIS_YAW_I_LIMIT             (120.0f)
+
+/**
+ * 原地航向保持时的最小角速度补偿（°/s）。
+ * 用于克服车轮静摩擦：误差脱离死区但 PI 输出还很小时, 强制给一个最小 wz。
+ * 离地调试可设为 0；落地按"刚好能起转"来标定。
+ */
+#define CHASSIS_YAW_MIN_WZ_DPS          (10.0f)
 
 /* ======================================================================
  *  IMU 航向角积分参数
