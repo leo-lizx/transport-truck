@@ -276,10 +276,28 @@
  * ====================================================================== */
 
 /**
+ * IMU 偏航角来源轴选择 (P0-修复 2026-04-29 IMU 装反):
+ *   原本 IMU 平装, yaw 来自 gyro_z (绕 Z 轴 / 偏航轴);
+ *   现在 IMU 不可抗因素侧装/倒装, 原本测 pitch 的 Y 轴变成了真正的偏航轴,
+ *   于是 yaw 应该来自 gyro_y (绕 Y 轴 / 原 pitch 轴)。
+ *
+ * 取值:
+ *   0 = CHASSIS_IMU_YAW_AXIS_Z  原始 Z 轴 (IMU 正装, 标准方案)
+ *   1 = CHASSIS_IMU_YAW_AXIS_Y  Y 轴      (IMU 侧装, 当前实车)
+ *   2 = CHASSIS_IMU_YAW_AXIS_X  X 轴      (IMU 另一种侧装)
+ *
+ * 切换后若发现 yaw 增减方向跟实车转向反, 改 CHASSIS_IMU_YAW_SIGN 即可。
+ */
+#define CHASSIS_IMU_YAW_AXIS_Z           (0)
+#define CHASSIS_IMU_YAW_AXIS_Y           (1)
+#define CHASSIS_IMU_YAW_AXIS_X           (2)
+#define CHASSIS_IMU_YAW_AXIS             CHASSIS_IMU_YAW_AXIS_Y
+
+/**
  * Yaw 积分方向系数。
  * 若实车左转（逆时针）时 yaw 数值减小，请改为 -1.0f。
  */
-#define CHASSIS_IMU_YAW_SIGN             (1.0f)
+#define CHASSIS_IMU_YAW_SIGN             (-1.0f)
 
 /**
  * Yaw 角速度死区（°/s）。
@@ -298,6 +316,35 @@
  * 用于抑制长期积分漂移。
  */
 #define CHASSIS_IMU_BIAS_ADAPT_ALPHA     (0.002f)
+
+/* ----------------------------------------------------------------------
+ *  IMU 零偏在线辨识 (P0-改进 2026-04-29):
+ *  ------------------------------------------------------------------
+ *  问题: 仅靠 deadzone (单拍 |w|<TH) 判定静止, 实际车在轻微震动 / 慢速
+ *        漂移时也会被认为静止 -> bias 被错误地往运动方向慢慢拉, 跑久了
+ *        即便没人推车, yaw 也会持续漂。
+ *
+ *  方案: 滑动窗口方差检测静止 (Allan 方差 / VINS 静止判别的简化版)。
+ *        每拍把"原始 gyro" 入循环 buffer, 检查最近 N 拍的均值/方差:
+ *          - 方差 < STILL_VAR_TH (°/s)^2 -> 真静止
+ *            -> 用窗口均值以 BIAS_FAST_ALPHA 快速更新 bias
+ *          - 否则保持 bias 不变, 但仍允许 deadzone 抑制小噪声
+ *
+ *  优点: 通用, 不依赖具体安装轴, 也不依赖加速度计模长辅助。
+ * ---------------------------------------------------------------------- */
+
+/** 滑窗长度 (5ms 一拍, 64 = 320ms) - 长一点更稳, 太长则静止判定迟钝 */
+#define CHASSIS_IMU_STILL_WINDOW_LEN     (64U)
+
+/** 静止判别阈值: 窗口方差上限 (°/s)^2
+ *  典型 IMU 静止噪声 ~0.05 °/s -> 方差 ~0.0025; 留 4~10 倍裕度
+ *  阈值过大 -> 把缓慢运动当静止 -> bias 被污染;
+ *  阈值过小 -> 永远不识别静止 -> bias 不更新, 长时间漂移 */
+#define CHASSIS_IMU_STILL_VAR_TH_DPS2    (0.020f)
+
+/** 静止确认时, bias 快速更新系数 (EMA 拉向窗口均值, 比慢通道快 50 倍)
+ *  0.10 -> 时间常数 ~10 拍 = 50ms 完成一次 bias 校准 */
+#define CHASSIS_IMU_BIAS_FAST_ALPHA      (0.10f)
 
 /* ======================================================================
  *  缓加速参数 — 防止目标速度突变导致轮胎打滑

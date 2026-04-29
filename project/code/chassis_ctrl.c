@@ -991,17 +991,22 @@ void chassis_ctrl_attitude_debug_task_5ms(void)
     chassis_ctrl_get_wheel_feedback_snapshot(fb_snap);
 
     /*
-     * 一行打印, 空格分隔, 单位:
-     *   tgt actual err [deg]   wz [dps]
-     *   PWM[LF RF LB RB] 前进符号域 (未乘 dir_sign)
-     *   FB[LF RF LB RB]  m/s
-     *
-     * 方向自检:
-     *   - err > 0  应有 wz > 0  (yaw_pi 同号)
-     *   - wz > 0   按麦轮公式: PWM_LF<0 PWM_RF>0 PWM_LB<0 PWM_RB>0 (左侧后转, 右侧前转 -> 车体俯视逆时针)
-     *   - 如果实车转向跟 "逆时针" 反, 翻 chassis_config.h 的 CHASSIS_IMU_YAW_SIGN
+     * VOFA+ FireWater 协议格式: 纯 ASCII, 通道用 ',' 分隔, 行尾 '\n', 无前缀。
+     * 通道顺序 (共 12 路, 在 VOFA+ 里按这个顺序绑变量名即可):
+     *   ch01 = target_yaw_deg          目标航向 (deg)
+     *   ch02 = current_yaw_deg         当前航向 (deg)
+     *   ch03 = yaw_err_deg             航向误差 (deg)
+     *   ch04 = wz_cmd_dps              角速度指令 (dps)
+     *   ch05 = pwm_LF (前进符号域, 未乘 dir_sign)
+     *   ch06 = pwm_RF
+     *   ch07 = pwm_LB
+     *   ch08 = pwm_RB
+     *   ch09 = fb_LF (m/s)
+     *   ch10 = fb_RF
+     *   ch11 = fb_LB
+     *   ch12 = fb_RB
      */
-    printf("[YawCL] tgt=%6.2f act=%6.2f err=%6.2f wz=%6.2f | PWM=%6.0f %6.0f %6.0f %6.0f | FB=%5.2f %5.2f %5.2f %5.2f\r\n",
+    printf("%.4f,%.4f,%.4f,%.4f,%.2f,%.2f,%.2f,%.2f,%.4f,%.4f,%.4f,%.4f\n",
            info.target_yaw_deg,
            info.current_yaw_deg,
            info.yaw_err_deg,
