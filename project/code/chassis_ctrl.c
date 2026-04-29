@@ -55,8 +55,14 @@
 
 /* 轮速闭环抗抖参数（抑制低速量化噪声和来回翻向） */
 #define WHEEL_FB_LPF_ALPHA                (0.35f)   /* 轮速反馈一阶低通系数，越小越平滑 */
-#define WHEEL_STOP_TARGET_EPS_MPS         (0.015f)  /* 目标接近 0 的判据 */
-#define WHEEL_STOP_FEEDBACK_EPS_MPS       (0.030f)  /* 反馈接近 0 的判据 */
+/* P0-修复 2026-04-29 姿态环“一段一段”真凶:
+ * 原阈值 0.015 m/s, 但 yaw 转 1° 需 wheel target ≈ 0.023 m/s, 仅高出 53%,
+ * wz 一抖 target 跌破 → stop_wheel_with_pid_reset 把 PWM 拍 0 → 下一拍
+ * target 变大又恢复 → PWM 跳变 → 表现为输出“段段起止”。
+ * 将阈值调到 0.005 m/s, 让 yaw±1° 场景 (target ≈0.023) 有 4.5x 余量,
+ * 小抖动不会再跳变 → PWM 输出连续. */
+#define WHEEL_STOP_TARGET_EPS_MPS         (0.005f)  /* 原 0.015, 调小防小角度阈值跳变 */
+#define WHEEL_STOP_FEEDBACK_EPS_MPS       (0.010f)  /* 原 0.030, 同步调小 */
 
 /* 软限位保护参数（防止里程计漂移导致虚拟地图“撞墙”） */
 #define SOFT_LIMIT_LOOKAHEAD_S             (0.22f)   /* 前瞻时间窗，越大越保守 */
@@ -217,6 +223,10 @@ static volatile float s_yaw_i  = 0.0f;
 static volatile float s_fb_vx  = 0.0f;
 static volatile float s_fb_vy  = 0.0f;
 static volatile float s_wheel_fb_lpf[CHASSIS_WHEEL_COUNT] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+/* P0-重构 2026-04-29 PWM 连续化: 原静摩擦突破状态机已移除,
+ * 改为 apply_speed() 里的加性前馈 (不覆写 PID 内部状态, PWM 输出连续).
+ * 用不到了, 代码保留 stop_wheel_with_pid_reset() 仅供 force_stop() 使用. */
 static volatile uint8 s_wheel_fb_lpf_inited = 0U;
 
 /* ====================== 内部工具函数 ====================== */
@@ -452,34 +462,44 @@ static void apply_speed(chassis_body_speed_cmd_t cmd,
     for (i = 0U; i < (uint8)CHASSIS_WHEEL_COUNT; ++i) {
         float pwm_forward_domain;
         float pwm_motor_domain;
+        const float abs_target = fabsf(targets[i]);
 
-        /* 低速停轮抑抖：目标和反馈都接近 0 时直接停车并清 PID 累积。 */
-        if ((fabsf(targets[i]) < WHEEL_STOP_TARGET_EPS_MPS) &&
-            (fabsf(wheel_fb_mps[i]) < WHEEL_STOP_FEEDBACK_EPS_MPS))
-        {
-            stop_wheel_with_pid_reset(i);
-            continue;
-        }
-
-        /* 速度环统一使用"前进符号域"：目标和反馈都直接用 m/s 前进为正。 */
+        /* P0-重构 2026-04-29 PWM 连续化: PID 永远连续计算, 不再做 WHEEL_STOP
+         * 硬清零 (旧版 stop_wheel_with_pid_reset 会把 pid->output 拍 0 ->
+         * 下一拍从 0 重新累加 -> PWM 跌崖式跳变, 表现为"一段一段").
+         * target=0 且 fb≈0 时增量 PID 自然衰减到 0, 不需要手动中断. */
         pwm_forward_domain = chassis_pid_step(&s_pid[i], targets[i], wheel_fb_mps[i]);
 
         /*
-         * 静摩擦突破 (P0-修复 2026-04-27 姿态闭环落地不动):
-         * 增量 PID 启动时 output=0, 在地面上轮子动不起来 -> 反馈一直 0 ->
-         * P 项不再贡献增量, 只剩 Ki*e 慢慢爬, 落地要好几秒才有动作。
-         * 这里把 |output| 强行抬到 BREAKAWAY_PWM_MIN, 同步写回 pid->output 让
-         * 下一拍增量从这个基线继续累加, 避免出现"突破一拍又跌回 0"的顿挫。
+         * 静摩擦前馈 (P0-重构 2026-04-29):
+         *
+         * 旧版状态机问题: 进入 breakaway 时直接 s_pid[i].output = kick (覆盖!),
+         * PID 输出从 <FLOOR 阶跃到 ≥FLOOR; 退出时又恢复 PID 自累加.
+         * 状态机 on/off 翻转 = PWM 阶跃 = "一段一段"输出.
+         *
+         * 新方案: 去状态机, 改纯加性平滑前馈
+         *   ff = sign(target) * FLOOR * smooth_ramp(|target|)
+         * 性质:
+         *   · target=0      → ff=0,                输出 = PID
+         *   · |target|=EPS  → ff=0   (边界连续过零)
+         *   · |target|≥2EPS → ff=±FLOOR (静摩擦补偿到位)
+         *   · 不覆盖 PID 内部状态, 闭环不会被打断
+         *   · PID 看到反馈起来后会主动减小输出, 与 ff 自然平衡
          */
-        if ((fabsf(targets[i]) >= CHASSIS_WHEEL_BREAKAWAY_TARGET_EPS_MPS) &&
-            (fabsf(wheel_fb_mps[i]) < CHASSIS_WHEEL_BREAKAWAY_SPEED_EPS_MPS) &&
-            (fabsf(pwm_forward_domain) < CHASSIS_WHEEL_BREAKAWAY_PWM_MIN))
-        {
-            pwm_forward_domain = (targets[i] >= 0.0f)
-                                 ?  CHASSIS_WHEEL_BREAKAWAY_PWM_MIN
-                                 : -CHASSIS_WHEEL_BREAKAWAY_PWM_MIN;
-            s_pid[i].output    = pwm_forward_domain;
+        if (abs_target > CHASSIS_WHEEL_BREAKAWAY_TARGET_EPS_MPS) {
+            float ramp = (abs_target - CHASSIS_WHEEL_BREAKAWAY_TARGET_EPS_MPS)
+                       /  CHASSIS_WHEEL_BREAKAWAY_TARGET_EPS_MPS;
+            float ff_pwm;
+            if (ramp > 1.0f) ramp = 1.0f;
+            ff_pwm = CHASSIS_WHEEL_BREAKAWAY_PWM_FLOOR * ramp;
+            if (targets[i] < 0.0f) ff_pwm = -ff_pwm;
+            pwm_forward_domain += ff_pwm;
         }
+
+        /* PID + 前馈叠加后再做总限幅, 避免硬件溢出 */
+        pwm_forward_domain = chassis_clamp_f(pwm_forward_domain,
+                                             -CHASSIS_MOTOR_PWM_MAX,
+                                              CHASSIS_MOTOR_PWM_MAX);
 
         /* 仅在最终电机输出时再乘电机方向修正系数，避免符号链路混乱。 */
         pwm_motor_domain = pwm_forward_domain * s_mot[i].dir_sign;
@@ -636,21 +656,34 @@ static void apply_single_wheel_pid_debug(const float wheel_fb_mps[CHASSIS_WHEEL_
 static float yaw_pi(float err, uint8 compensate)
 {
     float wz;
+    float p_term;
+    float i_term;
+    float d_term;
+    const float yaw_rate_dps = chassis_imu_get_yaw_rate_dps();   /* 实测车体角速度 */
 
-    /* 死区内：积分缓慢衰减，输出零 */
+    /*
+     * P0-修复 2026-04-29 (姿态环输出“一段一段”的 bug):
+     * 原代码在 |err|<=死区时直接 return 0, 导致 wz 在 err 跨越死区边界
+     * (正常抖动) 时出现“实际 PI 值 ↔ 0”阶跃 -> 表现为 wz 一段一段。
+     * 现改为软死区: P/D 始终连续计算, 仅在死区内衰减 I 项防止静态抹搽。
+     */
+    p_term = g_chassis_tune_params.yaw_kp * err;
+    d_term = -CHASSIS_YAW_KD * yaw_rate_dps;
+
     if (fabsf(err) <= YAW_DEADZONE_DEG) {
         s_yaw_i *= 0.80f;
-        return 0.0f;
+        /* 不再 return 0; P/D 项下面照常输出, 保证 wz 连续 */
+    } else if (fabsf(err) < CHASSIS_YAW_I_BAND_DEG) {
+        /* 条件积分 (anti-windup): 仅在中等误差区间累加。 */
+        s_yaw_i += err * CHASSIS_TASK_DT_20MS_S;
+        s_yaw_i  = chassis_clamp_f(s_yaw_i, -YAW_I_LIMIT, YAW_I_LIMIT);
     }
+    i_term = YAW_KI * s_yaw_i;
 
-    /* PI 计算 */
-    s_yaw_i += err * CHASSIS_TASK_DT_20MS_S;
-    s_yaw_i  = chassis_clamp_f(s_yaw_i, -YAW_I_LIMIT, YAW_I_LIMIT);
-
-    wz = g_chassis_tune_params.yaw_kp * err + YAW_KI * s_yaw_i;
+    wz = p_term + i_term + d_term;
     wz = chassis_clamp_f(wz, -g_chassis_tune_params.max_yaw_speed_dps, g_chassis_tune_params.max_yaw_speed_dps);
 
-    /* 低速补偿: 确保有误差就有可执行输出 */
+    /* 低速补偿: 默认 YAW_MIN_WZ_DPS=0 已禁用, 静摩擦交给轮端 breakaway */
     if (compensate && fabsf(wz) < YAW_MIN_WZ_DPS)
         wz = (err >= 0.0f) ? YAW_MIN_WZ_DPS : -YAW_MIN_WZ_DPS;
 

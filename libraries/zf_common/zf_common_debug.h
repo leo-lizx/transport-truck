@@ -41,10 +41,20 @@
 // 如果修改串口并开启了 debug UART 的中断接收 需要同步更换 debug_interrupr_handler 函数到对应的中断服务函数
 // 如果修改串口并开启了 debug UART 的中断接收 需要同步更换 debug_interrupr_handler 函数到对应的中断服务函数
 // 如果修改串口并开启了 debug UART 的中断接收 需要同步更换 debug_interrupr_handler 函数到对应的中断服务函数
-#define DEBUG_UART_INDEX            (UART_1)                                    // 指定 debug uart 所使用的的串口
-#define DEBUG_UART_BAUDRATE         (115200)                                    // 指定 debug uart 所使用的的串口波特率
-#define DEBUG_UART_TX_PIN           (UART1_TX_B12 )                             // 指定 debug uart 所使用的的串口引脚
-#define DEBUG_UART_RX_PIN           (UART1_RX_B13)                              // 指定 debug uart 所使用的的串口引脚
+// =====================================================================
+// >>> 提醒(MOD-2026): debug printf 已从 UART_1(B12/B13) 切换到 UART_8(D16/D17)
+//     用途      : 接逐飞"无线转串口"模块, 用于 VOFA+ FireWater 上位机收包
+//     依据      : project/RT1064智能车推荐引脚分配.txt 第36行 "TX:D16 RX:D17"
+//     副作用    : 1) printf / zf_log / zf_assert 全部走 UART_8, 不再从 USB-串口转换器输出
+//                 2) UART_1 (B12/B13) 现在被 main.c 的 OpenART 视觉通信独占, 不再冲突
+//                 3) 接收中断已绑定 LPUART8_IRQHandler (见 project/user/src/isr.c:162),
+//                    若再换串口, 需同步迁移中断服务函数
+//     回退方法  : 把 INDEX/TX/RX 三宏改回 UART_1 / UART1_TX_B12 / UART1_RX_B13 即可
+// =====================================================================
+#define DEBUG_UART_INDEX            (UART_8)                                    // 指定 debug uart 所使用的的串口 (无线模块)
+#define DEBUG_UART_BAUDRATE         (115200)                                    // 指定 debug uart 波特率 (须与无线模块一致)
+#define DEBUG_UART_TX_PIN           (UART8_TX_D16)                              // 指定 debug uart TX 引脚 -> 无线模块 RX
+#define DEBUG_UART_RX_PIN           (UART8_RX_D17)                              // 指定 debug uart RX 引脚 -> 无线模块 TX
 
 #define DEBUG_UART_USE_INTERRUPT    (1)                                         // 是否启用 debug uart 接收中断
 

@@ -55,4 +55,10 @@ void chassis_imu_set_yaw_deg(float yaw_deg);
  */
 uint8 chassis_imu_is_still(void);
 
+/**
+ * @brief  读取滑窗 LPF 后的偏航角速度 (供姿态环 D 项使用)
+ * @return 偏航角速度 (°/s, 已完成零偏补偿 / 符号修正 / LPF)
+ */
+float chassis_imu_get_yaw_rate_dps(void);
+
 #endif /* CHASSIS_IMU_H */

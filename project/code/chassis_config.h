@@ -173,8 +173,11 @@
 /** 车体平移最大合成线速度（m/s），矢量模长不超过此值 */
 #define CHASSIS_MAX_LINEAR_SPEED_MPS    (1.35f)
 
-/** 车体最大旋转角速度（°/s） */
-#define CHASSIS_MAX_YAW_SPEED_DPS       (90.0f)
+/** 车体最大旋转角速度（°/s）
+ *  P0-修复 2026-04-29 姿态闭环转速慢: 原 90°/s 对应单轮仅 ≈0.4 m/s,
+ *  远低于 MAX_LINEAR=1.35, 大量裕度被浪费 -> 提到 180°/s, 单轮
+ *  约 0.8 m/s, 依然不会触发 WHEEL_SPEED_CAP。 */
+#define CHASSIS_MAX_YAW_SPEED_DPS       (180.0f)
 
 /**
  * 单轮 PID 调试模式下调试轮目标速度上限（m/s）。
@@ -211,25 +214,53 @@
 /** 位置环 Kp：值越大，向目标点收敛越快；过大易超调 */
 #define CHASSIS_POS_KP                  (0.90f)
 
-/** 航向环 Kp：值越大，朝向对准越快；过大易振荡 */
-#define CHASSIS_YAW_KP                  (3.20f)
+/** 航向环 Kp：值越大，朝向对准越快；过大易振荡
+ *  P0-调参 2026-04-29: 取消 YAW_MIN_WZ 阶跃后 wz 连续, 可适度提 KP 加快响应。 */
+#define CHASSIS_YAW_KP                  (3.00f)
 
 /* ----- 航向闭环 (yaw_pi) 其余参数：原本散落在 chassis_ctrl.c, 集中到此 ----- */
 
 /**
  * 航向误差死区（度）。
- * |err| <= 该值时输出 wz=0 且 I 项缓慢衰减, 抑制原地小幅抖动。
- * 调大: 更稳但允许残差变大；调小: 跟踪更紧但易抽搐。
+ * |err| <= 该值时 P/D 项依然计算 (输出连续), 仅接近 0 时 I 项衰减,
+ * 用“软死区”避免 wz 阶跃 -> 保证姿态环输出连续。
+ * 调大: 允许更大残差但更稳; 调小: 跟踪更紧但易抽搽。
+ * (P0-修复 2026-04-29: 原者在死区内直接 return 0 造成 wz 阶跃,
+ *  现仅用于控制 I 项衰减, 不再阶跃输出)
  */
-#define CHASSIS_YAW_DEADZONE_DEG        (0.30f)
+#define CHASSIS_YAW_DEADZONE_DEG        (1.0f)
 
 /**
  * 航向 I 增益。
  * 用于消除稳态误差（如轮子对地摩擦不一致导致的偏角）。
  * 先把 KP 调到不振荡, 再缓慢加 KI；过大会反复过冲。
  */
-#define CHASSIS_YAW_KI                  (0.030f)
+#define CHASSIS_YAW_KI                  (0.03f)
+/**
+ * 航向 D 增益 (P0-新增 2026-04-29 抗超调).
+ * D = -KD * yaw_rate_dps (derivative-on-measurement, 无 setpoint kick).
+ * 物理意义: 阻尼项, 车体转得越快越要"踩刹车", 抑制冲过头.
+ *
+ * 调参顺序:
+ *   1. 先把 KD=0, 调 KP 到刚好不振荡;
+ *   2. 加 KD: 0.05 起步, 每次 +0.05;
+ *   3. 太大: 高频抖动 / 听到电机嗡嗡响 -> 回退;
+ *   4. 太小: 仍有 5%+ 超调 -> 继续加.
+ * 经验范围: 0.05 ~ 0.50, 当前 0.15 适合中等惯量 (4 麦轮 + 摄像头云台).
+ */
+#define CHASSIS_YAW_KD                  (0.015f)
 
+/**
+ * 航向条件积分带宽 (°, P0-新增 2026-04-29 防积分饱和).
+ * 仅当 |err| < 此值时才累积 I 项, 大误差阶段 I 上锁.
+ * 这样大角度阶跃响应不会"先冲过头再回拉", 显著缩短调节时间.
+ *
+ * 取值: 通常 = 死区*5 ~ 期望稳态精度*10, 当前 5° 对应车体已转到接近目标
+ * 才开始消除残差.
+ *   - 调小: 稳态更准但中等误差残留时间变长;
+ *   - 调大: 收敛更快但可能恢复轻度超调.
+ */
+#define CHASSIS_YAW_I_BAND_DEG          (100.0f)
 /**
  * 航向积分项幅值上限（°·s）。
  * 防止长期堵转或大误差时积分饱和, 松开后冲过头。
@@ -239,37 +270,50 @@
 
 /**
  * 原地航向保持时的最小角速度补偿（°/s）。
- * 用于克服车轮静摩擦：误差脱离死区但 PI 输出还很小时, 强制给一个最小 wz。
- * 离地调试可设为 0；落地按"刚好能起转"来标定。
+ *
+ * P0-重要修复 2026-04-29 (姿态闭环 jump-rotate):
+ *   原设计用途: 补偿车轮静摩擦 -> err 出死区但 PI 输出还很小时
+ *   强制拍个最小 wz, 让车子能动起来。
+ *   问题: 该补偿是个阶跃函数 (wz 从真实 PI 值 一下跳到 ±10),
+ *   导致轮端目标速度也阶跃, 与轮端 breakaway 状态机双重阶跃叠加
+ *   -> PWM “一段一段”地给 -> 车体一跳一跳地转。
+ *
+ *   现改为 0 禁用: 静摩擦补偿交给轮端 breakaway 机制处理
+ *   (见 chassis_config.h 同名节), 它按目标缩放 PWM + 迟滞防抖,
+ *   不会造成 wz 阶跃。
+ *
+ * 什么时候考虑重启 (调回 ≥5):
+ *   - 如果未来改拿位置环, 发现在某些场合 breakaway 不足, 车身微转
+ *     仍起不来, 可适度调到 3~5°/s 作为堆叠保险。但一般不需要。
  */
-#define CHASSIS_YAW_MIN_WZ_DPS          (10.0f)
+#define CHASSIS_YAW_MIN_WZ_DPS          (0.0f)
 
 /* ======================================================================
- *  轮速 PID 静摩擦突破 (Stiction breakaway)
+ *  轮速 PID 静摩擦前馈 (Stiction feed-forward)
  *
- *  问题: 增量式 PID 启动瞬间 output=0, 即便目标速度有十几 cm/s, 每 20ms 拍
- *  只涨 Kp*Δe + Ki*e 这点 PWM, 落到地面后橡胶轮 + 配重的静摩擦动辄要 1500+
- *  PWM 才肯转, 结果 PID 要爬好几秒才能"动起来" -> 看起来像是姿态环不工作。
+ *  原问题: 增量式 PID 启动瞬间 output=0, 落地后 4 麦轮整车静摩擦动辄
+ *  1500+ PWM, PID 要爬好几秒才能动起来。
  *
- *  机制: 当目标速度 |v_tgt| >= TARGET_EPS 但反馈 |v_fb| < SPEED_EPS, 且当前
- *  PID 累积输出 |u| < PWM_MIN 时, 把 u 强行拍到 ±PWM_MIN, 给电机一个突破
- *  静摩擦的初值。一旦轮子转起来 (|v_fb| >= SPEED_EPS) 就交回 PID 自动调速。
+ *  当前实现 (apply_speed): 加性平滑前馈, 不覆写 PID 内部状态。
+ *      ff = sign(target) * FLOOR * smooth_ramp((|target|-EPS)/EPS)
+ *      pwm = pid_output + ff
+ *  - |target| ≤ EPS:        ff = 0,        全靠 PID
+ *  - EPS < |target| < 2EPS: ff 从 0 线性升到 FLOOR (边界连续过零)
+ *  - |target| ≥ 2EPS:       ff = ±FLOOR    (静摩擦补偿到位)
  *
- *  调参: 离地空载可调到 0 关闭; 落地若启动迟缓就把 PWM_MIN 往上抬, 直到
- *  地面上轻推一下方向就能立刻有响应。注意 PWM_MIN 不能高过 PWM_DUTY_MAX 的
- *  ~25%, 否则小目标速度会顿挫。
+ *  仅 2 个调参旋钮:
+ *      TARGET_EPS_MPS — 触发阈值, 也是 ramp 分母
+ *      PWM_FLOOR      — 饱和幅值
+ *
+ *  调参: 落地起步迟 -> FLOOR +200; 起步过冲 -> FLOOR -200。
  * ====================================================================== */
 
-/** 静摩擦突破: 目标速度阈值 (m/s), 低于此不触发 (避免 0 速度时上电就转) */
-#define CHASSIS_WHEEL_BREAKAWAY_TARGET_EPS_MPS  (0.020f)
+/** 静摩擦前馈: 触发阈值 (m/s), 同时用作 smooth_ramp 分母 */
+#define CHASSIS_WHEEL_BREAKAWAY_TARGET_EPS_MPS  (0.050f)
 
-/** 静摩擦突破: 反馈速度阈值 (m/s), 反馈低于此视为"还没转起来" */
-#define CHASSIS_WHEEL_BREAKAWAY_SPEED_EPS_MPS   (0.030f)
-
-/** 静摩擦突破: 强制施加的最小 PWM 幅值, 需大到能克服整车静摩擦
- *  PWM_DUTY_MAX=10000, 2500 ≈ 25% duty, 这是 4 麦轮整车的经验起转点;
- *  若仍迟缓, 按 500 一档往上加, 上限别超 4000 (40%) 否则小角度过冲。 */
-#define CHASSIS_WHEEL_BREAKAWAY_PWM_MIN         (2500.0f)
+/** 静摩擦前馈: 饱和幅值 (PWM 原始单位, PWM_DUTY_MAX=10000)
+ *  10% duty 是 4 麦轮整车的经验起转点; 别超 4000 (40%) 否则小目标过冲 */
+#define CHASSIS_WHEEL_BREAKAWAY_PWM_FLOOR       (1000.0f)
 
 /* ======================================================================
  *  IMU 航向角积分参数
@@ -303,7 +347,7 @@
  * Yaw 角速度死区（°/s）。
  * 抑制静止抖动，过大将导致小角速度被吞掉。
  */
-#define CHASSIS_IMU_GYRO_DEADZONE_DPS    (0.8f)
+#define CHASSIS_IMU_GYRO_DEADZONE_DPS    (1.8f)
 
 /**
  * Yaw 角速度一阶低通系数，范围 (0, 1]。

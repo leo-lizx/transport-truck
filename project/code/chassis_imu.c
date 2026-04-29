@@ -41,8 +41,15 @@ volatile EulerAngle_t car_angle = {0.0f, 0.0f, 0.0f};
 /** Z 轴陀螺仪静态零偏（单位：度/秒） */
 static float s_gyro_z_bias_dps = 0.0f;
 
-/** Z 轴角速度一阶低通状态（单位：度/秒） */
+/** Z 轴角速度一阶低通状态（单位：度/秒） - 经死区, 用于 yaw 积分 */
 static float s_yaw_rate_lpf_dps = 0.0f;
+
+/* P0-修复 2026-04-29 段段 bug:
+ * 给 D 项专用的“无死区”角速度 LPF。原 s_yaw_rate_lpf_dps 经死区(0.8 dps)处理,
+ * 与 KD=300 组合时, 死区边界附近 D 项在 0 ↔ -240 之间反复跳, 直接造成
+ * yaw_pi 输出“一段一段”。D 项需要的是连续可微的角速度估计, 不能再死区。
+ * 此通道仅去 bias + LPF, 不做死区, 也不参与 yaw 积分。 */
+static float s_yaw_rate_for_d_dps = 0.0f;
 
 /* ----------------------------------------------------------------------
  *  滑窗静止检测 (P0-改进 2026-04-29 通用零偏在线辨识)
@@ -135,11 +142,16 @@ void chassis_imu_init(void)
     /* 步骤 3: 计算并保存平均零偏。 */
     s_gyro_z_bias_dps = gyro_z_sum_dps / (float)sample_count;
 
-    /* 步骤 4: 复位航向积分状态。 */
+    /* 步骤 4: 复位航向积分状态。
+     * P0-修复 2026-04-29 (0.5° 零偏 bug):
+     * 原本这里硬写 car_angle.yaw = CHASSIS_IMU_YAW_INIT_OFFSET_DEG (-0.5°),
+     * 实际会造成“上电就偏 -0.5°”的静态偏差, 与 bias 标定重复补偿。
+     * 现改为从 0 起, 依靠 bias 标定 + 滑窗辨识保证静止不漂. */
     car_angle.roll = 0.0f;
     car_angle.pitch = 0.0f;
     car_angle.yaw = 0.0f;
     s_yaw_rate_lpf_dps = 0.0f;
+    s_yaw_rate_for_d_dps = 0.0f;
 }
 
 /**
@@ -192,7 +204,27 @@ void chassis_imu_update_5ms(void)
     /* 步骤 3: 做零偏补偿与安装方向修正。 */
     yaw_rate_dps = (gyro_z_raw_dps - s_gyro_z_bias_dps) * IMU_YAW_SIGN;
 
-    /* 步骤 4: 小角速度死区抑噪 (滑窗判定为运动时, 仍可能有抖动残留) */
+    /* 步骤 3.5: D 项专用通道 (P0-修复 2026-04-29 段段 + 静止自走 bug)
+     * 软死区 (soft-deadzone): r' = sign(r) * max(|r|-d, 0)
+     *   - 边界处 r'=0 且斜率连续 -> KD*r' 不会跳变 -> 不会段段
+     *   - 静止噪声 (|r|<0.8 dps) 后 r'=0 -> D=0 -> 不会被 KD=300 放大拉走车
+     * 原因: 上一版完全去死区, KD=300 * 噪声 0.5 dps = 150 dps 虚假 wz 指令。 */
+    {
+        float r_abs = fabsf(yaw_rate_dps);
+        float r_for_d;
+        if (r_abs <= IMU_GYRO_DEADZONE_DPS)
+        {
+            r_for_d = 0.0f;
+        }
+        else
+        {
+            r_for_d = (yaw_rate_dps >= 0.0f) ? (r_abs - IMU_GYRO_DEADZONE_DPS)
+                                             : -(r_abs - IMU_GYRO_DEADZONE_DPS);
+        }
+        s_yaw_rate_for_d_dps += IMU_GYRO_LPF_ALPHA * (r_for_d - s_yaw_rate_for_d_dps);
+    }
+
+    /* 步骤 4: 小角速度硬死区 (yaw 积分通道专用, 不影响上面的 D 通道) */
     if (fabsf(yaw_rate_dps) < IMU_GYRO_DEADZONE_DPS)
     {
         yaw_rate_dps = 0.0f;
@@ -215,4 +247,11 @@ void chassis_imu_update_5ms(void)
     /* 步骤 7: 欧拉积分并归一化到 [-180, 180]。 */
     car_angle.yaw += s_yaw_rate_lpf_dps * IMU_DT_S;
     car_angle.yaw = chassis_normalize_angle_deg(car_angle.yaw);
+}
+
+/* P0-修复 2026-04-29 段段 bug: 改为返回“无死区”D 项专用通道,
+ * 避免 KD * yaw_rate 在死区边界突跳造成 wz_pi 输出段段。 */
+float chassis_imu_get_yaw_rate_dps(void)
+{
+    return s_yaw_rate_for_d_dps;
 }
