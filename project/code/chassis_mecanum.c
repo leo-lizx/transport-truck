@@ -14,22 +14,35 @@ void chassis_mecanum_forward(float vx_body_mps,
                              float out_wheel_mps[CHASSIS_WHEEL_COUNT])
 {
     /*
-     * 标准 X 型麦轮正运动学公式：
+     * 麦轮正运动学公式 (X / O 型由 CHASSIS_MECANUM_O_TYPE_LAYOUT 控制):
      *
-     *   v_LF = vy + vx - K·wz     （左前轮）
-     *   v_RF = vy - vx + K·wz     （右前轮）
-     *   v_LB = vy - vx - K·wz     （左后轮）
-     *   v_RB = vy + vx + K·wz     （右后轮）
+     *   X 型 (辊子在车顶画 X):
+     *     v_LF = vy + vx - K·wz
+     *     v_RF = vy - vx + K·wz
+     *     v_LB = vy - vx - K·wz
+     *     v_RB = vy + vx + K·wz
      *
-     * 物理含义：
-     *   vy（前进）对所有轮子产生等同的正向速度
-     *   vx（右平移）使左侧轮和右侧轮产生相反速度
-     *   wz（旋转）使对角线轮产生相反速度
+     *   O 型 (辊子在车顶画 O / 菱形, 当前实车): vx 项整体翻号
+     *     v_LF = vy - vx - K·wz
+     *     v_RF = vy + vx + K·wz
+     *     v_LB = vy + vx - K·wz
+     *     v_RB = vy - vx + K·wz
+     *
+     * 物理含义 (两种布局共通):
+     *   vy (前进) 对所有轮子产生等同正向速度
+     *   vx (横移) 使左右两侧轮产生相反速度, 符号差异源于辊子方向
+     *   wz (旋转) 使对角线轮产生相反速度, K = 半轴距 + 半轮距
      */
-    out_wheel_mps[CHASSIS_WHEEL_LF] = vy_body_mps + vx_body_mps - CHASSIS_MECANUM_K_M * wz_radps;
-    out_wheel_mps[CHASSIS_WHEEL_RF] = vy_body_mps - vx_body_mps + CHASSIS_MECANUM_K_M * wz_radps;
-    out_wheel_mps[CHASSIS_WHEEL_LB] = vy_body_mps - vx_body_mps - CHASSIS_MECANUM_K_M * wz_radps;
-    out_wheel_mps[CHASSIS_WHEEL_RB] = vy_body_mps + vx_body_mps + CHASSIS_MECANUM_K_M * wz_radps;
+#if (CHASSIS_MECANUM_O_TYPE_LAYOUT != 0)
+    const float vx_sign = -1.0f;   /* O 型: vx 整体翻号 */
+#else
+    const float vx_sign = +1.0f;   /* X 型: 标准方向 */
+#endif
+
+    out_wheel_mps[CHASSIS_WHEEL_LF] = vy_body_mps + vx_sign * vx_body_mps - CHASSIS_MECANUM_K_M * wz_radps;
+    out_wheel_mps[CHASSIS_WHEEL_RF] = vy_body_mps - vx_sign * vx_body_mps + CHASSIS_MECANUM_K_M * wz_radps;
+    out_wheel_mps[CHASSIS_WHEEL_LB] = vy_body_mps - vx_sign * vx_body_mps - CHASSIS_MECANUM_K_M * wz_radps;
+    out_wheel_mps[CHASSIS_WHEEL_RB] = vy_body_mps + vx_sign * vx_body_mps + CHASSIS_MECANUM_K_M * wz_radps;
 }
 
 /**
@@ -40,13 +53,21 @@ void chassis_mecanum_inverse(const float wheel_mps[CHASSIS_WHEEL_COUNT],
                              float *out_vy_mps)
 {
     /*
-     * 逆运动学：四轮速度取平均反解车体速度
+     * 逆运动学: 四轮速度取平均反解车体速度
      *
-     *   vx_body = (v_LF - v_RF - v_LB + v_RB) / 4
-     *   vy_body = (v_LF + v_RF + v_LB + v_RB) / 4
+     *   X 型: vx_body = (v_LF - v_RF - v_LB + v_RB) / 4
+     *   O 型: vx_body = (-v_LF + v_RF + v_LB - v_RB) / 4   (整体翻号)
+     *
+     *   vy_body 公式两种布局相同:
+     *           vy_body = (v_LF + v_RF + v_LB + v_RB) / 4
      */
+#if (CHASSIS_MECANUM_O_TYPE_LAYOUT != 0)
+    *out_vx_mps = (-wheel_mps[CHASSIS_WHEEL_LF] + wheel_mps[CHASSIS_WHEEL_RF]
+                 + wheel_mps[CHASSIS_WHEEL_LB] - wheel_mps[CHASSIS_WHEEL_RB]) * 0.25f;
+#else
     *out_vx_mps = (wheel_mps[CHASSIS_WHEEL_LF] - wheel_mps[CHASSIS_WHEEL_RF]
                  - wheel_mps[CHASSIS_WHEEL_LB] + wheel_mps[CHASSIS_WHEEL_RB]) * 0.25f;
+#endif
 
     *out_vy_mps = (wheel_mps[CHASSIS_WHEEL_LF] + wheel_mps[CHASSIS_WHEEL_RF]
                  + wheel_mps[CHASSIS_WHEEL_LB] + wheel_mps[CHASSIS_WHEEL_RB]) * 0.25f;

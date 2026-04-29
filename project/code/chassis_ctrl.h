@@ -173,6 +173,12 @@ void chassis_ctrl_attitude_debug_start_zero(void);
 void chassis_ctrl_attitude_debug_get_state(chassis_attitude_debug_info_t *out_info);
 
 /**
+ * @brief  读取四轮 PID 输出快照 (前进符号域, 未乘 dir_sign)
+ * @param  out_pwm  长度 4 的输出数组, 顺序: LF / RF / LB / RB
+ */
+void chassis_ctrl_attitude_debug_get_wheel_pwm(float out_pwm[4]);
+
+/**
  * @brief  航向闭环调试任务（建议主循环每 5ms 调用一次）
  *         内部 100ms 打印一次目标角/当前角/误差/角速度指令。
  */

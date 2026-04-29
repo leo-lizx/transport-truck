@@ -440,12 +440,14 @@ static void apply_speed(chassis_body_speed_cmd_t cmd,
 
     chassis_mecanum_forward(f.vx_body_mps, f.vy_body_mps,
                             f.wz_dps * CHASSIS_DEG_TO_RAD_F, targets);
+
     /*
-     * 删除冷余调用: chassis_mecanum_clamp_wheels(targets, CHASSIS_MAX_WHEEL_SPEED_MPS);
-     * 上游 limit_speed() 已把 vx,vy 限住 ≤ CHASSIS_MAX_LINEAR_SPEED_MPS,
-     * wz 限住 ≤ CHASSIS_MAX_YAW_SPEED_DPS, 麦轮正解后单轮最大仅 ~0.65 m/s,
-     * 远小于原先的 5 m/s 兑底, 裁幅从不触发.
+     * 单轮速度兜底限幅 (P0-修复 2026-04-27):
+     *   多指令叠加下某轮目标可能超 PID/PWM 能追上的范围, 单轮饱和会破坏
+     *   vx/vy/wz 比例 -> 直线偏 / 转弯半径跳变. 这里等比例缩放保证车体
+     *   运动方向不变, 上限见 chassis_config.h 的 CHASSIS_WHEEL_SPEED_CAP_MPS.
      */
+    chassis_mecanum_clamp_wheels(targets, CHASSIS_WHEEL_SPEED_CAP_MPS);
 
     for (i = 0U; i < (uint8)CHASSIS_WHEEL_COUNT; ++i) {
         float pwm_forward_domain;
@@ -459,8 +461,25 @@ static void apply_speed(chassis_body_speed_cmd_t cmd,
             continue;
         }
 
-        /* 速度环统一使用“前进符号域”：目标和反馈都直接用 m/s 前进为正。 */
+        /* 速度环统一使用"前进符号域"：目标和反馈都直接用 m/s 前进为正。 */
         pwm_forward_domain = chassis_pid_step(&s_pid[i], targets[i], wheel_fb_mps[i]);
+
+        /*
+         * 静摩擦突破 (P0-修复 2026-04-27 姿态闭环落地不动):
+         * 增量 PID 启动时 output=0, 在地面上轮子动不起来 -> 反馈一直 0 ->
+         * P 项不再贡献增量, 只剩 Ki*e 慢慢爬, 落地要好几秒才有动作。
+         * 这里把 |output| 强行抬到 BREAKAWAY_PWM_MIN, 同步写回 pid->output 让
+         * 下一拍增量从这个基线继续累加, 避免出现"突破一拍又跌回 0"的顿挫。
+         */
+        if ((fabsf(targets[i]) >= CHASSIS_WHEEL_BREAKAWAY_TARGET_EPS_MPS) &&
+            (fabsf(wheel_fb_mps[i]) < CHASSIS_WHEEL_BREAKAWAY_SPEED_EPS_MPS) &&
+            (fabsf(pwm_forward_domain) < CHASSIS_WHEEL_BREAKAWAY_PWM_MIN))
+        {
+            pwm_forward_domain = (targets[i] >= 0.0f)
+                                 ?  CHASSIS_WHEEL_BREAKAWAY_PWM_MIN
+                                 : -CHASSIS_WHEEL_BREAKAWAY_PWM_MIN;
+            s_pid[i].output    = pwm_forward_domain;
+        }
 
         /* 仅在最终电机输出时再乘电机方向修正系数，避免符号链路混乱。 */
         pwm_motor_domain = pwm_forward_domain * s_mot[i].dir_sign;
@@ -945,26 +964,52 @@ void chassis_ctrl_attitude_debug_get_state(chassis_attitude_debug_info_t *out)
     out->wz_cmd_dps      = s_last_cmd.wz_dps;
 }
 
+/** 调试用: 拷贝四轮反馈 + PID 输出快照, 方便诊断方向/PWM */
+void chassis_ctrl_attitude_debug_get_wheel_pwm(float out_pwm[CHASSIS_WHEEL_COUNT])
+{
+    uint8 i;
+    if (!out_pwm) return;
+    for (i = 0U; i < (uint8)CHASSIS_WHEEL_COUNT; ++i)
+    {
+        out_pwm[i] = s_pid[i].output;   /* 前进符号域 PWM, 未乘 dir_sign */
+    }
+}
+
 void chassis_ctrl_attitude_debug_task_5ms(void)
 {
     static uint8 div = 0U;
     chassis_attitude_debug_info_t info;
+    float pwm_snap[CHASSIS_WHEEL_COUNT];
+    float fb_snap[CHASSIS_WHEEL_COUNT];
 
     /* 50ms 分频 (10 * 5ms tick): 比 100ms 更密, 上位机绘曲线更平滑 */
     if (++div < 10U) return;
     div = 0U;
 
     chassis_ctrl_attitude_debug_get_state(&info);
+    chassis_ctrl_attitude_debug_get_wheel_pwm(pwm_snap);
+    chassis_ctrl_get_wheel_feedback_snapshot(fb_snap);
 
     /*
-     * 打印格式 (空格分隔, 便于上位机/Excel 直接解析):
-     *   [YawCL] target=<目标角>  actual=<实际角>  err=<误差>  wz=<角速度指令>
-     * 单位: deg / deg / deg / dps
+     * 一行打印, 空格分隔, 单位:
+     *   tgt actual err [deg]   wz [dps]
+     *   PWM[LF RF LB RB] 前进符号域 (未乘 dir_sign)
+     *   FB[LF RF LB RB]  m/s
+     *
+     * 方向自检:
+     *   - err > 0  应有 wz > 0  (yaw_pi 同号)
+     *   - wz > 0   按麦轮公式: PWM_LF<0 PWM_RF>0 PWM_LB<0 PWM_RB>0 (左侧后转, 右侧前转 -> 车体俯视逆时针)
+     *   - 如果实车转向跟 "逆时针" 反, 翻 chassis_config.h 的 CHASSIS_IMU_YAW_SIGN
      */
-    printf("%.4f ，%.4f  \r\n",
+    printf("[YawCL] tgt=%6.2f act=%6.2f err=%6.2f wz=%6.2f | PWM=%6.0f %6.0f %6.0f %6.0f | FB=%5.2f %5.2f %5.2f %5.2f\r\n",
            info.target_yaw_deg,
-           info.current_yaw_deg
-           );
+           info.current_yaw_deg,
+           info.yaw_err_deg,
+           info.wz_cmd_dps,
+           pwm_snap[CHASSIS_WHEEL_LF], pwm_snap[CHASSIS_WHEEL_RF],
+           pwm_snap[CHASSIS_WHEEL_LB], pwm_snap[CHASSIS_WHEEL_RB],
+           fb_snap[CHASSIS_WHEEL_LF], fb_snap[CHASSIS_WHEEL_RF],
+           fb_snap[CHASSIS_WHEEL_LB], fb_snap[CHASSIS_WHEEL_RB]);
 }
 
 /*--- 状态查询 ---*/

@@ -62,18 +62,24 @@ define symbol m_boot_hdr_dcd_data_start      = 0x70001030;
 
 /* Sizes */
 /* ------------------------------------------------------------------
- * P0-4 (2026-04-24): 主 C 栈由 4KB 扩至 8KB。
+ * NOTE: ICF files MUST be ASCII only. IAR linker lexer cannot parse
+ *       multi-byte (e.g. Chinese) chars and will report
+ *       "Error[Ms009]: comment unclosed at end of file".
+ *       Do NOT put Chinese comments here. Keep this block English.
  *
- * 扩容理由：
- *   1) 主循环路径 Game_Logic_Task_Run -> find_first_unreachable_target
- *      (NavPath_t nav_tmp ~402B) -> Algo_Nav_BFS (Point_t temp_path[200] ~400B)
- *      叠加单次调用即占栈 ~800B；
- *   2) 同时存在 PIT_IRQn (apply_soft_limit_guard 内 192B 地图快照 + pose 快照)
- *      与 LPUART1 ISR 互相抢占的嵌套帧；
- *   3) 4KB 栈余量已逼近上限，留 8KB 可承受 P0-5 PIT-tick 化后再增长一档调用深度。
+ * P0-4 (2026-04-24): main C stack expanded from 4KB to 8KB.
  *
- * 容量影响：DTCM 总 448KB (0x20000000~0x2006FFFF)，多占 4KB <1%，不挤压 ZI/data。
- * 堆 (__size_heap__) 当前未使用，维持 1KB 不变。
+ * Reason:
+ *   1) Main loop path Game_Logic_Task_Run -> find_first_unreachable_target
+ *      (NavPath_t nav_tmp ~402B) -> Algo_Nav_BFS (Point_t temp_path[200]
+ *      ~400B) consumes ~800B per call.
+ *   2) PIT_IRQn (apply_soft_limit_guard, ~192B map snapshot + pose snapshot)
+ *      can be preempted by LPUART1 ISR, producing nested frames.
+ *   3) Old 4KB margin was near the limit; 8KB leaves room for upcoming
+ *      P0-5 PIT-tick refactor that adds one more level of call depth.
+ *
+ * Footprint: DTCM total 448KB (0x20000000~0x2006FFFF), +4KB is <1%,
+ * no impact on ZI/data. Heap (__size_heap__) currently unused, kept 1KB.
  * ------------------------------------------------------------------ */
 if (isdefinedsymbol(__stack_size__)) {
   define symbol __size_cstack__        = __stack_size__;
