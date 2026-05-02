@@ -61,4 +61,14 @@ uint8 chassis_imu_is_still(void);
  */
 float chassis_imu_get_yaw_rate_dps(void);
 
+/**
+ * @brief  KF 角度量测更新接口 (P0-改进 2026-05-02 编码器融合):
+ *         外部模块 (如 chassis_ctrl 的 odom yaw) 提供一次 yaw 观测,
+ *         KF 以 H=[1,0] 做标量观测更新, R 越大代表越不信这一观测.
+ *         典型用法: ctrl 模块每 20ms 算 yaw_from_odom, 用 R=100°² 弱约束.
+ * @param yaw_obs_deg  观测到的 yaw 角 (度)
+ * @param R_deg2       观测噪声方差 (°²); 越大 = 越弱的修正力度
+ */
+void chassis_imu_kf_correct_angle(float yaw_obs_deg, float R_deg2);
+
 #endif /* CHASSIS_IMU_H */

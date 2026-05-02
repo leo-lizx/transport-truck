@@ -118,6 +118,14 @@ void chassis_ctrl_task_20ms(void);
 void chassis_ctrl_move_to_grid(uint8 target_x_grid, uint8 target_y_grid);
 
 /**
+ * @brief  以米为单位下发位置目标，并锁定全程航向角（不跟踪 atan2）
+ * @param  x_m          目标 X 坐标（米）
+ * @param  y_m          目标 Y 坐标（米）
+ * @param  hold_yaw_deg 全程保持的航向角（度）
+ */
+void chassis_ctrl_move_to_m(float x_m, float y_m, float hold_yaw_deg);
+
+/**
  * @brief  下发“移动 + 航向”指令（车体系速度 + 航向闭环目标角）
  *         该模式下不走点位导航，直接按速度指令运动，同时执行航向闭环。
  * @param  vx_body_mps     车体系 X 方向速度（m/s，向右为正）

@@ -202,6 +202,8 @@ static volatile uint8       s_arrived = 1U;
 static volatile float s_tgt_x_m       = 0.0f;
 static volatile float s_tgt_y_m       = 0.0f;
 static volatile float s_tgt_yaw_deg   = 0.0f;
+/* 1 = chassis_ctrl_move_to_m() 主动锁定航向, 禁止 POINT_NAV 任务用 atan2 覆盖 */
+static volatile uint8 s_nav_lock_yaw  = 0U;
 
 /* 外部移动+航向模式的平移指令 */
 static volatile float s_cmd_vx = 0.0f;
@@ -218,11 +220,22 @@ static volatile uint16 s_debug_startup_guard_ticks  = 0U;
 
 /* 航向积分项 */
 static volatile float s_yaw_i  = 0.0f;
+/* In-Position Schmitt 锁状态: 1 = 已在位 (输出硬归零, I 冻结)
+ * 由 yaw_pi() 内部按双阈值滞回切换, 模式切换/积分复位时强制清 0. */
+static volatile uint8 s_yaw_in_position = 0;
 
 /* 里程计反馈 */
 static volatile float s_fb_vx  = 0.0f;
 static volatile float s_fb_vy  = 0.0f;
 static volatile float s_wheel_fb_lpf[CHASSIS_WHEEL_COUNT] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+/* P0-改进 2026-05-02 编码器 yaw 弱观测: odom 推算的 yaw 角积分量,
+ * 每 20ms 用 (-vLF + vRF - vLB + vRB) / (4*K) 计算瞬时 wz_odom 后积分.
+ * 通过 chassis_imu_kf_correct_angle() 喂给 IMU KF, R 设大让长期对齐, 短期不打架. */
+#if (CHASSIS_ODOM_YAW_FUSION_ENABLE != 0)
+static volatile float s_yaw_odom_deg = 0.0f;
+static volatile uint8 s_yaw_odom_inited = 0U;
+#endif
 
 /* P0-重构 2026-04-29 PWM 连续化: 原静摩擦突破状态机已移除,
  * 改为 apply_speed() 里的加性前馈 (不覆写 PID 内部状态, PWM 输出连续).
@@ -648,44 +661,190 @@ static void apply_single_wheel_pid_debug(const float wheel_fb_mps[CHASSIS_WHEEL_
 
 #if (0 == CHASSIS_CTRL_SINGLE_WHEEL_PID_DEBUG_ONLY)
 /**
- * 航向 PI 闭环
- * @param err        航向误差(°)，已归一化
- * @param compensate 非零时启用最小角速度补偿（原地保持专用，抵消静摩擦）
- * @return           角速度指令(°/s)
+ * sqrt_controller —— 时间最优"位置 → 速度"控制器
+ * 来源: ArduPilot AC_AttitudeControl::sqrt_controller (GPLv3, 已工业验证多年).
+ *
+ * 数学原理:
+ *   远处:  v(err) = sign(err) * sqrt(2 * a_max * |err|)   <- 最大减速曲线
+ *   近处:  v(err) = p * err                              <- 线性 P, 平滑无 chatter
+ *   切点:  |err| = a_max / p^2  (此处两段一阶光滑衔接, 速率与斜率连续)
+ *
+ * 几何含义: 远处按"以 a_max 减速恰好停在目标"的速度走 -> 不会超调;
+ *          近处用线性 P 避免 sqrt 在 0 附近无穷大斜率引起的抖动.
+ *
+ * 调参口诀:
+ *   - p:     只决定"近 0"段快慢, 大胆加大 (4~10), 不影响大角度
+ *   - a_max: 决定减速距离 = v_max^2 / (2*a_max), 受底盘物理减速能力限制
+ *
+ * @param error    位置误差 (°)
+ * @param p        线性段比例增益 (°/s per °)
+ * @param accel_max 最大减速度 (°/s²); <=0 退化为纯 P
+ * @return         期望角速度 (°/s)
  */
-static float yaw_pi(float err, uint8 compensate)
+static float sqrt_controller(float error, float p, float accel_max)
 {
-    float wz;
-    float p_term;
-    float i_term;
-    float d_term;
-    const float yaw_rate_dps = chassis_imu_get_yaw_rate_dps();   /* 实测车体角速度 */
+    float correction_rate;
 
-    /*
-     * P0-修复 2026-04-29 (姿态环输出“一段一段”的 bug):
-     * 原代码在 |err|<=死区时直接 return 0, 导致 wz 在 err 跨越死区边界
-     * (正常抖动) 时出现“实际 PI 值 ↔ 0”阶跃 -> 表现为 wz 一段一段。
-     * 现改为软死区: P/D 始终连续计算, 仅在死区内衰减 I 项防止静态抹搽。
-     */
-    p_term = g_chassis_tune_params.yaw_kp * err;
-    d_term = -CHASSIS_YAW_KD * yaw_rate_dps;
-
-    if (fabsf(err) <= YAW_DEADZONE_DEG) {
-        s_yaw_i *= 0.80f;
-        /* 不再 return 0; P/D 项下面照常输出, 保证 wz 连续 */
-    } else if (fabsf(err) < CHASSIS_YAW_I_BAND_DEG) {
-        /* 条件积分 (anti-windup): 仅在中等误差区间累加。 */
-        s_yaw_i += err * CHASSIS_TASK_DT_20MS_S;
-        s_yaw_i  = chassis_clamp_f(s_yaw_i, -YAW_I_LIMIT, YAW_I_LIMIT);
+    if (accel_max <= 0.0f) {
+        correction_rate = error * p;
+    } else if (p <= 0.0f) {
+        if (error > 0.0f) {
+            correction_rate = sqrtf(2.0f * accel_max * error);
+        } else if (error < 0.0f) {
+            correction_rate = -sqrtf(2.0f * accel_max * (-error));
+        } else {
+            correction_rate = 0.0f;
+        }
+    } else {
+        /* linear_dist: 线性段长度, p 越大切换点越近 (平方反比) */
+        float linear_dist = accel_max / (p * p);
+        if (error > linear_dist) {
+            /* 远处 sqrt 段, 减 0.5*linear_dist 让两段在切点处 v 与 dv/derr 都连续 */
+            correction_rate = sqrtf(2.0f * accel_max * (error - linear_dist * 0.5f));
+        } else if (error < -linear_dist) {
+            correction_rate = -sqrtf(2.0f * accel_max * ((-error) - linear_dist * 0.5f));
+        } else {
+            correction_rate = error * p;
+        }
     }
-    i_term = YAW_KI * s_yaw_i;
+    return correction_rate;
+}
 
-    wz = p_term + i_term + d_term;
-    wz = chassis_clamp_f(wz, -g_chassis_tune_params.max_yaw_speed_dps, g_chassis_tune_params.max_yaw_speed_dps);
+/**
+ * 航向 PI 闭环
+ * @param err              航向误差(°)，已归一化
+ * @param enable_rate_loop 是否启用内环 rATE PI 反馈:
+ *                          1 = MODE_YAW_HOLD / POINT_NAV (静止或低振动) -> 完整级联, 享KI学摩擦
+ *                          0 = MODE_MOVE_YAW (平动中) -> 开环 rate, 避免 IMU 振动噪声被KI放大成限环
+ *                          原因: 平动时底盘振动使 IMU yaw_rate 噪声 ±10°/s, 进 rate_err
+ *                          进 I -> wz 护 -> 麦轮护 -> 车体更护. 平动期间只靠
+ *                          前馈+外环P 足以完成轨迹跟踪, 稳态偏差由后续 YAW_HOLD 兜底.
+ * @return                 角速度指令(°/s)
+ */
+/**
+ * @param allow_inpos_lock  1=允许 Schmitt-trigger 在位锁 (YAW_HOLD 静止保持);
+ *                          0=禁止锁 (POINT_NAV/MOVE_YAW 平动中, 锁会在 yaw_err≈0
+ *                            时立即触发导致姿态环整拍输出 0, 车体漂转无纠正)
+ */
+static float yaw_pi(float err, uint8 enable_rate_loop, uint8 allow_inpos_lock)
+{
+    const float yaw_rate_dps = chassis_imu_get_yaw_rate_dps();   /* 实测车体角速度 */
+    float wz;
 
-    /* 低速补偿: 默认 YAW_MIN_WZ_DPS=0 已禁用, 静摩擦交给轮端 breakaway */
-    if (compensate && fabsf(wz) < YAW_MIN_WZ_DPS)
-        wz = (err >= 0.0f) ? YAW_MIN_WZ_DPS : -YAW_MIN_WZ_DPS;
+#if (CHASSIS_YAW_USE_CASCADED_CTRL != 0)
+    /* ==================================================================
+     * 0) In-Position Schmitt-trigger 锁 (P0-改进 2026-05-02 收尾抖动)
+     *    工业伺服通用结构, 解决 "wz_target 残值 + 轮端 breakaway 阶跃"
+     *    引发的 20Hz 极限环. 一旦判为在位 -> 全链路硬归零, I 冻结,
+     *    必须 |err| 越过更大的释放阈值才解锁.
+     *
+     *    allow_inpos_lock=0 时整个块旁路: 平动模式下 yaw_err≈0 会立即触发
+     *    锁定 -> 姿态环输出恒为 0 -> 车体自由漂转, 这是严重 bug.
+     * ================================================================== */
+    if (allow_inpos_lock) {
+        const float abs_err  = fabsf(err);
+        const float abs_rate = fabsf(yaw_rate_dps);
+
+        if (s_yaw_in_position) {
+            /* 已在位: 误差超过释放阈值才解锁 */
+            if (abs_err > CHASSIS_YAW_INPOS_EXIT_DEG) {
+                s_yaw_in_position = 0;
+            }
+        } else {
+            /* 未在位: 误差进入入锁阈值 + 车体已稳定 -> 锁死 */
+            if ((abs_err < CHASSIS_YAW_INPOS_ENTER_DEG) &&
+                (abs_rate < CHASSIS_YAW_INPOS_SETTLE_DPS)) {
+                s_yaw_in_position = 1;
+                s_yaw_i = 0.0f;        /* 锁定瞬间清空积分, 防解锁后甩出 */
+            }
+        }
+
+        if (s_yaw_in_position) {
+            /* 整条链路硬归零, 直接断开传染源 */
+            return 0.0f;
+        }
+    } else {
+        s_yaw_in_position = 0;   /* 平动中强制清除残留锁, 防 YAW_HOLD -> POINT_NAV 切换残留 */
+    }
+
+    /* ==================================================================
+     * 级联 P-PI + 速度前馈 (P0-改进 2026-05-02 移植自 ArduPilot)
+     * ================================================================== */
+    {
+        /* 1) 外环: 位置误差 -> 期望角速度 (sqrt 时间最优曲线) */
+        float wz_target = sqrt_controller(err,
+                                          g_chassis_tune_params.yaw_kp,
+                                          CHASSIS_YAW_ACCEL_MAX_DPS2);
+        float rate_err;
+        float kp_v_term;
+        float ki_v_term;
+
+        wz_target = chassis_clamp_f(wz_target,
+                                    -g_chassis_tune_params.max_yaw_speed_dps,
+                                     g_chassis_tune_params.max_yaw_speed_dps);
+
+        /* 2) 内环 PI 输入: 角速度跟踪误差 (仅静态开启反馈, 平动时 enable=0) */
+        if (enable_rate_loop) {
+            rate_err = wz_target - yaw_rate_dps;
+        } else {
+            /* 平动模式: rate_err 强制为 0 ->
+             *   - kp_v_term = 0    (不被 IMU 振动噪声驱动)
+             *   - I 仅按泄漏衰减, 不再累积振动能量
+             * 输出 = wz_target (纯前馈+外环P), 足以跟上轻量级转向需求。 */
+            rate_err = 0.0f;
+        }
+
+        /* 3) 反向积分卷绕保护: 误差换向时清零, 防止旧能量对抗新方向 */
+        if ((err * s_yaw_i) < 0.0f) {
+            s_yaw_i = 0.0f;
+        }
+
+        /* 4) I 全程累积 + 缓慢泄漏 (in-position 已在上方处理, 这里无需再判死区) */
+        s_yaw_i = s_yaw_i * (1.0f - CHASSIS_YAW_RATE_I_LEAK)
+                + rate_err * CHASSIS_TASK_DT_20MS_S;
+        s_yaw_i = chassis_clamp_f(s_yaw_i,
+                                  -CHASSIS_YAW_RATE_I_LIMIT,
+                                   CHASSIS_YAW_RATE_I_LIMIT);
+
+        kp_v_term = CHASSIS_YAW_RATE_KP * rate_err;
+        ki_v_term = CHASSIS_YAW_RATE_KI * s_yaw_i;
+
+        /* 5) 输出 = 前馈 + PI 修正 */
+        wz = wz_target + kp_v_term + ki_v_term;
+    }
+
+    /* 6) 输出截幅 */
+    wz = chassis_clamp_f(wz,
+                         -g_chassis_tune_params.max_yaw_speed_dps,
+                          g_chassis_tune_params.max_yaw_speed_dps);
+
+#else /* ============== 旧的单环 PID 路径 (回退) ============== */
+    {
+        float p_term = sqrt_controller(err, g_chassis_tune_params.yaw_kp, CHASSIS_YAW_ACCEL_MAX_DPS2);
+        float d_term = -CHASSIS_YAW_KD * yaw_rate_dps;
+        float i_term;
+
+        if ((err * s_yaw_i) < 0.0f) { s_yaw_i = 0.0f; }
+        if (fabsf(err) <= YAW_DEADZONE_DEG) {
+            float err_ratio = fabsf(err) / YAW_DEADZONE_DEG;
+            float wz_ratio  = fabsf(yaw_rate_dps) / 5.0f;
+            float scale = (err_ratio > wz_ratio) ? err_ratio : wz_ratio;
+            if (scale > 1.0f) { scale = 1.0f; }
+            scale = scale * scale;
+            s_yaw_i *= 0.20f;
+            p_term  *= scale;
+            d_term  *= scale;
+        } else if (fabsf(err) <= CHASSIS_YAW_I_BAND_DEG) {
+            s_yaw_i += err * CHASSIS_TASK_DT_20MS_S;
+            s_yaw_i  = chassis_clamp_f(s_yaw_i, -YAW_I_LIMIT, YAW_I_LIMIT);
+        }
+        i_term = YAW_KI * s_yaw_i;
+        wz = p_term + i_term + d_term;
+        if ((fabsf(err) <= YAW_DEADZONE_DEG) && (fabsf(wz) < 1.0f)) { wz = 0.0f; }
+        wz = chassis_clamp_f(wz, -g_chassis_tune_params.max_yaw_speed_dps,
+                                  g_chassis_tune_params.max_yaw_speed_dps);
+    }
+#endif
 
     return wz;
 }
@@ -694,8 +853,10 @@ static float yaw_pi(float err, uint8 compensate)
 /** 模式切换辅助: 清积分 + 设模式 */
 static void enter_mode(ctrl_mode_t m)
 {
-    s_yaw_i = 0.0f;
-    s_mode  = m;
+    s_yaw_i           = 0.0f;
+    s_yaw_in_position = 0;   /* 模式切换强制解锁, 防新目标被旧锁挡住 */
+    s_nav_lock_yaw    = 0U;  /* 默认关闭锁航, move_to_m 主动调用才打开 */
+    s_mode            = m;
 }
 
 /* ====================== 公共 API ====================== */
@@ -736,6 +897,12 @@ void chassis_ctrl_init(void)
     s_fb_vy        = 0.0f;
     s_mode         = MODE_YAW_HOLD;
     s_arrived      = 1U;
+
+#if (CHASSIS_ODOM_YAW_FUSION_ENABLE != 0)
+    /* 重置 odom yaw, 下一拍会自动 sync 到 IMU yaw */
+    s_yaw_odom_deg = 0.0f;
+    s_yaw_odom_inited = 0U;
+#endif
 
     chassis_pid_debug_reset();
 
@@ -805,6 +972,58 @@ void chassis_ctrl_task_20ms(void)
     s_fb_vx = vx_raw * CHASSIS_ODOM_SCALE_X;
     s_fb_vy = vy_raw * CHASSIS_ODOM_SCALE_Y;
 
+    /* 2b) 编码器 yaw 弱观测 (P0-改进 2026-05-02):
+     *   麦轮 O 型 yaw 逆运动学: wz_odom = (-vLF + vRF - vLB + vRB) / (4*K)  [rad/s]
+     *   积分得 yaw_odom_deg, 喂给 IMU KF 做长期对齐. R 大 -> 短期不被打滑污染.
+     *   首次进来 sync 到当前 IMU yaw, 之后两条独立积分, KF 慢慢把 IMU 拉过来. */
+#if (CHASSIS_ODOM_YAW_FUSION_ENABLE != 0)
+    {
+        float wz_odom_rad = (-ws_pid[CHASSIS_WHEEL_LF] + ws_pid[CHASSIS_WHEEL_RF]
+                             - ws_pid[CHASSIS_WHEEL_LB] + ws_pid[CHASSIS_WHEEL_RB])
+                            / (4.0f * CHASSIS_MECANUM_K_M);
+        float wz_odom_dps = wz_odom_rad * CHASSIS_RAD_TO_DEG_F;
+
+        if (0U == s_yaw_odom_inited) {
+            /* 启动时同步, 否则两路积分初值差会被 KF 立刻拉回去, 浪费 P 协方差 */
+            s_yaw_odom_deg = chassis_imu_get_yaw_deg();
+            s_yaw_odom_inited = 1U;
+        } else {
+            /*
+             * P0-修复 2026-05-02 (抬车空转污染 KF):
+             *   抬起车手转车体时, 麦轮空转 -> wz_odom 虚假大值 -> 持续注入
+             *   KF 把 angle 拉到错误位置 -> err 被消 -> 车轮停 -> 永久卡死.
+             *
+             *   修法 (Innovation Gating, KF 工程标准):
+             *     比较 IMU 直接测的 wz 与 odom 算的 wz, 差值超门限 ->
+             *     编码器与陀螺严重不符 (典型: 抬车 / 卡死 / 编码器故障),
+             *     本拍既不积分 odom 也不喂 KF, 把 odom 重新对齐到 IMU.
+             *
+             *   正常状态: 两者差值 < 10°/s, 直接喂 KF 完成长期对齐.
+             */
+            float wz_imu_dps = chassis_imu_get_yaw_rate_dps();
+            float wz_diff    = fabsf(wz_odom_dps - wz_imu_dps);
+
+            if (wz_diff > CHASSIS_ODOM_YAW_INNOV_GATE_DPS) {
+                /* 编码器与陀螺不一致 -> 抬车 / 打滑 / 故障, 完全不信 odom */
+                s_yaw_odom_deg = chassis_imu_get_yaw_deg();
+            } else {
+                float imu_yaw, diff;
+                s_yaw_odom_deg = chassis_normalize_angle_deg(
+                                    s_yaw_odom_deg + wz_odom_dps * CHASSIS_TASK_DT_20MS_S);
+
+                /* 二级保护: 长期累积偏差也要兜底, 大跳过滤 */
+                imu_yaw = chassis_imu_get_yaw_deg();
+                diff = chassis_normalize_angle_deg(s_yaw_odom_deg - imu_yaw);
+                if (fabsf(diff) < CHASSIS_ODOM_YAW_OUTLIER_DEG) {
+                    chassis_imu_kf_correct_angle(s_yaw_odom_deg, CHASSIS_ODOM_YAW_R_DEG2);
+                } else {
+                    s_yaw_odom_deg = imu_yaw;
+                }
+            }
+        }
+    }
+#endif
+
     /* 3) 里程计积分: 车体速度旋转到全局坐标系后累加 (P0-3: seq-lock 写 x/y) */
     yaw_rad = s_pose.yaw_deg * CHASSIS_DEG_TO_RAD_F;
     cy = cosf(yaw_rad);
@@ -825,36 +1044,83 @@ void chassis_ctrl_task_20ms(void)
         float dx   = s_tgt_x_m - s_pose.x_m;
         float dy   = s_tgt_y_m - s_pose.y_m;
         float dist = sqrtf(dx * dx + dy * dy);
+        float vxg, vyg, norm;
+        float v_drive_min = CHASSIS_POS_MIN_DRIVE_SPEED_MPS;
+        float yerr;
 
-        /* 到达判定 */
+        /*
+         * P0-修复 2026-05-02 (硬刹冲过头):
+         * dist <= EPSILON 直接 force_stop, 但 ramp/电机/麦轮都有惯性, 实测
+         * 会冲过 1~3cm. 这里改用"软到达": 进入 BRAKE_DIST 后线性减小最小推
+         * 进速度, 进 EPSILON 时已基本停下, force_stop 只是兜底.
+         */
         if (dist <= CHASSIS_TARGET_REACHED_EPSILON_M) {
             s_arrived = 1U;
+            /*
+             * P0-改进 2026-05-02 (到点接管):
+             * 进 YAW_HOLD 前把目标 yaw 锁到当前 yaw, 否则会用上次 hold_yaw
+             * 设的旧目标转一下 -> 用户视角"到了又转一圈".
+             */
+            s_tgt_yaw_deg = s_pose.yaw_deg;
             s_mode    = MODE_YAW_HOLD;
             force_stop();
             return;
         }
+        if ((CHASSIS_POS_BRAKE_DIST_M > 1e-6f) && (dist < CHASSIS_POS_BRAKE_DIST_M)) {
+            /* 线性 ramp: dist=BRAKE -> v=V_MIN; dist=EPSILON -> v=0 */
+            float ratio = (dist - CHASSIS_TARGET_REACHED_EPSILON_M)
+                        / (CHASSIS_POS_BRAKE_DIST_M - CHASSIS_TARGET_REACHED_EPSILON_M);
+            if (ratio < 0.0f) ratio = 0.0f;
+            if (ratio > 1.0f) ratio = 1.0f;
+            v_drive_min = CHASSIS_POS_MIN_DRIVE_SPEED_MPS * ratio;
+        }
 
         /* 位置 P → 全局速度（含模长限速） */
-        float vxg  = g_chassis_tune_params.pos_kp * dx;
-        float vyg  = g_chassis_tune_params.pos_kp * dy;
-        float norm = sqrtf(vxg * vxg + vyg * vyg);
+        vxg  = g_chassis_tune_params.pos_kp * dx;
+        vyg  = g_chassis_tune_params.pos_kp * dy;
+        norm = sqrtf(vxg * vxg + vyg * vyg);
+
+        /* P0-改进 2026-05-02 (终末段龟速爬):
+         * 纯 P 在 dist 接近 epsilon 时输出极小, 配合软到达 ramp 一起用 ->
+         * 中段恒速冲过去, 近 BRAKE_DIST 时 v_drive_min 自动衰减, 平滑刹车. */
+        if ((v_drive_min > 0.0f) && (norm < v_drive_min) && (dist > 1e-6f)) {
+            float sc = v_drive_min / (norm > 1e-6f ? norm : 1.0f);
+            vxg *= sc;
+            vyg *= sc;
+            norm = v_drive_min;
+        }
         if (norm > g_chassis_tune_params.max_linear_speed_mps && norm > 1e-6f) {
             float sc = g_chassis_tune_params.max_linear_speed_mps / norm;
             vxg *= sc;
             vyg *= sc;
         }
 
-        /* 航向追踪: 仅 P，朝向目标点 */
-        float tgt_yaw = atan2f(dy, dx) * CHASSIS_RAD_TO_DEG_F;
-        float yerr    = chassis_normalize_angle_deg(tgt_yaw - s_pose.yaw_deg);
-        s_yaw_i = 0.0f;  /* 移动态不积分 */
+        /*
+         * P0-修复 2026-05-02 (atan2 噪声风暴 + 裸 P yaw 控):
+         *   旧: tgt_yaw = atan2(dy,dx); wz = clamp(KP*err, ...)
+         *   两个问题:
+         *     1. dist 近 epsilon 时 atan2 对 odom 噪声 (1cm) 极敏感, 会跳 ±90°
+         *        -> wz 饱和摆头 -> 抖
+         *     2. 裸 P 绕过 yaw_pi() 全部改进 (sqrt_ctrl / in-position lock /
+         *        平动模式禁内环), 两套 yaw 控同时存在容易潜伏 bug
+         *
+         *   新策略: 距离门控 + 复用 yaw_pi(平动模式)
+         *     - 远场 (dist > YAW_TRACK_DIST): 把目标 yaw 实时更新为 atan2(dy,dx)
+         *     - 近场 (dist <= YAW_TRACK_DIST): 冻结 s_tgt_yaw_deg, 不再更新
+         *     - 一律走 yaw_pi(yerr, 0U) 平动模式, 共享所有保护逻辑
+         *   带来的副作用: 远场到近场切换时 s_tgt_yaw_deg 跳 -> yaw_pi 内
+         *   sqrt_ctrl 自动平滑收敛, 无需特殊处理.
+         */
+        /* s_nav_lock_yaw=1 时由调用者锁定航向, 禁止 atan2 覆盖 (move_to_m 接口) */
+        if (!s_nav_lock_yaw && dist > CHASSIS_POS_YAW_TRACK_DIST_M) {
+            s_tgt_yaw_deg = atan2f(dy, dx) * CHASSIS_RAD_TO_DEG_F;
+        }
+        yerr = chassis_normalize_angle_deg(s_tgt_yaw_deg - s_pose.yaw_deg);
 
         /* 全局 → 车体坐标变换 */
         cmd.vx_body_mps =  cy * vxg + sy * vyg;
         cmd.vy_body_mps = -sy * vxg + cy * vyg;
-        cmd.wz_dps      = chassis_clamp_f(g_chassis_tune_params.yaw_kp * yerr,
-                                          -g_chassis_tune_params.max_yaw_speed_dps,
-                                           g_chassis_tune_params.max_yaw_speed_dps);
+        cmd.wz_dps      = yaw_pi(yerr, 0U, 0U);  /* 平动+禁in-pos锁: 防 yaw_err≈0 时锁死姿态环 */
         break;
     }
 
@@ -862,7 +1128,7 @@ void chassis_ctrl_task_20ms(void)
         float yerr = chassis_normalize_angle_deg(s_tgt_yaw_deg - s_pose.yaw_deg);
         cmd.vx_body_mps = s_cmd_vx;
         cmd.vy_body_mps = s_cmd_vy;
-        cmd.wz_dps      = yaw_pi(yerr, 0U);  /* 不补偿最小角速度 */
+        cmd.wz_dps      = yaw_pi(yerr, 0U, 0U);  /* 平动+禁in-pos锁: 防 yaw_err≈0 时锁死姿态环 */
         break;
     }
 
@@ -875,7 +1141,15 @@ void chassis_ctrl_task_20ms(void)
         float yerr = chassis_normalize_angle_deg(s_tgt_yaw_deg - s_pose.yaw_deg);
         cmd.vx_body_mps = 0.0f;
         cmd.vy_body_mps = 0.0f;
-        cmd.wz_dps      = yaw_pi(yerr, 1U);  /* 补偿静摩擦 */
+        /*
+         * P0-修复 2026-05-02 (姿态环"一段一段"潜伏 bug):
+         * 旧代码这里传 compensate=1U, 启用 yaw_pi() 内的 YAW_MIN_WZ 阶跃补偿.
+         * 当前 CHASSIS_YAW_MIN_WZ_DPS=0 使其暂时无效, 但只要有人把它调大,
+         * wz 就会在零附近被一把抬到 ±YAW_MIN_WZ -> 麦轮目标阶跃 -> PWM 阶跃
+         * -> 车体段段抽搐. 新方案约定: 静摩擦统一由轮端 breakaway 前馈处理,
+         * yaw 输出全程保持连续, 不再做阶跃补偿. 与 MODE_MOVE_YAW 一致传 0U.
+         */
+        cmd.wz_dps      = yaw_pi(yerr, 1U, 1U);  /* 静止保持: 允许 in-pos 锁消除极限环 */
         break;
     }
     }
@@ -897,7 +1171,18 @@ void chassis_ctrl_move_to_grid(uint8 target_x_grid, uint8 target_y_grid)
     s_tgt_x_m = chassis_grid_x_to_m(x);
     s_tgt_y_m = chassis_grid_y_to_m(y);
 
-    enter_mode(MODE_POINT_NAV);
+    enter_mode(MODE_POINT_NAV);  /* enter_mode 内 s_nav_lock_yaw 被重置为 0, atan2 跟踪生效 */
+    s_arrived = 0U;
+}
+
+void chassis_ctrl_move_to_m(float x_m, float y_m, float hold_yaw_deg)
+{
+    s_tgt_x_m     = x_m;
+    s_tgt_y_m     = y_m;
+    s_tgt_yaw_deg = chassis_normalize_angle_deg(hold_yaw_deg);
+
+    enter_mode(MODE_POINT_NAV);  /* 先 enter_mode 重置标志, 再打开锁定, 顺序不能反 */
+    s_nav_lock_yaw = 1U;         /* 锁住姿态, 任务层不再用 atan2 覆盖 */
     s_arrived = 0U;
 }
 
@@ -1087,6 +1372,11 @@ void chassis_ctrl_set_pose(float x_m, float y_m, float yaw_deg)
     pose_write_end();
     __enable_irq();
     chassis_imu_set_yaw_deg(yaw_norm);  /* 同步 IMU 防覆盖 (内部已自带防护) */
+#if (CHASSIS_ODOM_YAW_FUSION_ENABLE != 0)
+    /* 重定位时也把 odom yaw 同步到新基准, 否则下一拍 KF 会被旧 odom 拉回去 */
+    s_yaw_odom_deg = yaw_norm;
+    s_yaw_odom_inited = 1U;
+#endif
 }
 
 /*--- 运行时调参 ---*/

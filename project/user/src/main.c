@@ -39,6 +39,7 @@
 #include "chassis_menu.h"
 #include "app_game_logic.h"
 #include "app_link.h"   /* P0-1: 视觉-主控帧协议 */
+#include <math.h>       /* sqrtf — POINT_NAV 调试打印用 */
 
 /*==========================================================================
  *  P0-5: 主循环 5ms tick 节拍 (替代 system_delay_ms 阻塞)
@@ -91,13 +92,21 @@ static uint32 wait_for_tick(void)
 #define MAIN_RUN_MODE_GAME            (0)
 #define MAIN_RUN_MODE_YAW_HOLD        (1)
 #define MAIN_RUN_MODE_SINGLE_WHEEL    (2)
+#define MAIN_RUN_MODE_POINT_NAV       (3)
 
 /* >>>>>>>>>>>> 改这里切换调试模式 <<<<<<<<<<<< */
-#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_YAW_HOLD)      /* 姿态闭环调试 */
+#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_POINT_NAV)     /* 位置闭环调试 */
 /* <<<<<<<<<<<< 改这里切换调试模式 >>>>>>>>>>>> */
 
 /* 航向保持目标角 (deg), 仅 YAW_HOLD 模式生效 */
 #define MAIN_HOLD_YAW_TARGET_DEG      (0.0f)
+
+/* 位置闭环目标坐标 (米), 仅 POINT_NAV 模式生效.
+ * 坐标系: X 向右为正, Y 向前为正, 原点 = 里程计初始位置.
+ * 改这两个宏换目标, 不需要算格数. */
+#define MAIN_POS_NAV_TARGET_X_M       (0.00f)   /* 向右 0.5m */
+#define MAIN_POS_NAV_TARGET_Y_M       (0.00f)   /* 不前进 */
+#define MAIN_POS_NAV_HOLD_YAW_DEG     (0.0f)    /* 全程锁住 0° 航向 */
 
 /* ========================================================================== */
 /*  ⬇⬇⬇ 以下是单轮 PID 调试专用代码, 仅在 MAIN_RUN_MODE_SINGLE_WHEEL 生效 ⬇⬇⬇  */
@@ -200,6 +209,9 @@ int main(void)
 #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_YAW_HOLD)
     /* ✅ 姿态闭环调试走这里: 只设一次目标角, 后续 PIT_CH1 20ms 中断中持续闭环. */
     chassis_ctrl_hold_yaw(MAIN_HOLD_YAW_TARGET_DEG);
+#elif (MAIN_RUN_MODE == MAIN_RUN_MODE_POINT_NAV)
+    /* ✅ 位置闭环调试走这里: 米坐标 + 锁定航向角, 20ms 任务内持续双闭环. */
+    chassis_ctrl_move_to_m(MAIN_POS_NAV_TARGET_X_M, MAIN_POS_NAV_TARGET_Y_M, MAIN_POS_NAV_HOLD_YAW_DEG);
 #else
     /* 游戏模式: 设置初始航向基准, 等待状态机调度. */
     chassis_ctrl_hold_yaw(0.0f);
@@ -234,8 +246,38 @@ int main(void)
         /* 单轮 PID 调试: 100ms 打印目标速度/实际速度两列, 上位机绘曲线 */
         chassis_pid_debug_task_5ms();
     #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_YAW_HOLD)
-        /* ✅ 姿态闭环调试打印走这里: 100ms 打印 [YawCL] tgt/cur/err/wz, 用于画角度曲线 */
+        /* ✅ 姿态闭环调试打印走这里: 50ms 打印 12 通道, 用于画角度曲线 */
         chassis_ctrl_attitude_debug_task_5ms();
+    #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_POINT_NAV)
+        /* ✅ 位置闭环调试打印走这里: 50ms 打印 7 通道
+         * ch01 = x_m       当前 X 坐标
+         * ch02 = y_m       当前 Y 坐标
+         * ch03 = tgt_x_m   目标 X
+         * ch04 = tgt_y_m   目标 Y
+         * ch05 = dist_m    剩余距离
+         * ch06 = yaw_deg   当前航向
+         * ch07 = arrived   到达标志 (0/1)
+         */
+        {
+            static uint8 s_pos_div = 0U;
+            if (++s_pos_div >= 10U) {
+                chassis_pose_t pose;
+                float tgt_x, tgt_y, dx, dy, dist_sq;
+                s_pos_div = 0U;
+                pose  = chassis_ctrl_get_pose();
+                tgt_x = MAIN_POS_NAV_TARGET_X_M;
+                tgt_y = MAIN_POS_NAV_TARGET_Y_M;
+                dx      = tgt_x - pose.x_m;
+                dy      = tgt_y - pose.y_m;
+                dist_sq = dx * dx + dy * dy;   /* 避免 sqrtf, 打印平方距离即可判断收敛 */
+                printf("%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%d\n",
+                       pose.x_m, pose.y_m,
+                       tgt_x, tgt_y,
+                       dist_sq,
+                       pose.yaw_deg,
+                       (int)chassis_ctrl_is_arrived());
+            }
+        }
     #else
         Game_Logic_Task_Run();          /* 推箱子状态机 (非阻塞) */
     #endif
