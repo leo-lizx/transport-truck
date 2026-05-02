@@ -1120,7 +1120,7 @@ void chassis_ctrl_task_20ms(void)
         /* 全局 → 车体坐标变换 */
         cmd.vx_body_mps =  cy * vxg + sy * vyg;
         cmd.vy_body_mps = -sy * vxg + cy * vyg;
-        cmd.wz_dps      = yaw_pi(yerr, 0U, 0U);  /* 平动+禁in-pos锁: 防 yaw_err≈0 时锁死姿态环 */
+        cmd.wz_dps      = yaw_pi(yerr, 1U, 0U);  /* 完整级联PI + 禁in-pos锁(平动中不锁) */
         break;
     }
 
@@ -1128,7 +1128,7 @@ void chassis_ctrl_task_20ms(void)
         float yerr = chassis_normalize_angle_deg(s_tgt_yaw_deg - s_pose.yaw_deg);
         cmd.vx_body_mps = s_cmd_vx;
         cmd.vy_body_mps = s_cmd_vy;
-        cmd.wz_dps      = yaw_pi(yerr, 0U, 0U);  /* 平动+禁in-pos锁: 防 yaw_err≈0 时锁死姿态环 */
+        cmd.wz_dps      = yaw_pi(yerr, 1U, 0U);  /* 完整级联PI + 禁in-pos锁(平动中不锁) */
         break;
     }
 
