@@ -212,6 +212,8 @@ static volatile float s_path_sin_phi  = 0.0f;
 /* D 项低通状态 (一阶 IIR, 消除 odom 高频噪声对 KD 的放大) */
 static float s_v_along_lpf = 0.0f;
 static float s_v_cross_lpf = 0.0f;
+/* Schmitt 触发器: 1 = X 轴已到位, 当前锁定 Y 轴优先; 0 = X 未完成 */
+static uint8_t s_axis_y_locked = 0U;
 
 /* 外部移动+航向模式的平移指令 */
 static volatile float s_cmd_vx = 0.0f;
@@ -866,6 +868,7 @@ static void enter_mode(ctrl_mode_t m)
     s_nav_lock_yaw    = 0U;  /* 默认关闭锁航, move_to_m 主动调用才打开 */
     s_v_along_lpf     = 0.0f;  /* 切换目标时清零 LPF, 避免旧速度残值污染新路径 D 项 */
     s_v_cross_lpf     = 0.0f;
+    s_axis_y_locked   = 0U;   /* 切换目标时复位轴锁, 重新从 X 轴开始 */
     s_mode            = m;
 }
 
@@ -1163,31 +1166,77 @@ void chassis_ctrl_task_20ms(void)
             s_v_cross_lpf = (1.0f - CHASSIS_POS_D_LPF_ALPHA) * s_v_cross_lpf
                           + CHASSIS_POS_D_LPF_ALPHA * vyg_meas;  /* 借用 cross 槽存 vyg LPF */
 
-            /* Gain scheduling: 近场降增益, 避免回程过冲 */
+            /* 线性 Gain scheduling (平滑版):
+             *   dist = RECOVERY_DIST : 全量增益 (scale=1.0)
+             *   dist = EPSILON       : 最小增益 (scale=KP_SCALE)
+             *   中间段线性插值, 无硬跳变.
+             *
+             * 关键: KD 与 KP 等比缩放 → 阻尼比恒定.
+             *   旧 step 方案: KP 突降 55%, KD 不变 → D 压过 P →
+             *   在 35cm 处车速 0.5m/s: KP_new×0.35-KD×0.5=-0.1(负!) → 刹车
+             *   → 停下来 → P 再大 → 再冲 → "停下抖动前进". */
             float kp_eff = g_chassis_tune_params.pos_kp;
+            float kd_eff = CHASSIS_POS_KD;
             if (dist < CHASSIS_POS_RECOVERY_DIST_M) {
-                kp_eff *= CHASSIS_POS_RECOVERY_KP_SCALE;
+                float gs_t = (dist - CHASSIS_TARGET_REACHED_EPSILON_M)
+                           / (CHASSIS_POS_RECOVERY_DIST_M - CHASSIS_TARGET_REACHED_EPSILON_M);
+                if (gs_t < 0.0f) gs_t = 0.0f;
+                if (gs_t > 1.0f) gs_t = 1.0f;
+                float gs = CHASSIS_POS_RECOVERY_KP_SCALE
+                         + (1.0f - CHASSIS_POS_RECOVERY_KP_SCALE) * gs_t;
+                kp_eff *= gs;
+                kd_eff *= gs;  /* D 与 P 同步缩, 保持 KD/KP 比不变 */
             }
 
 #if (CHASSIS_POS_AXIS_BY_AXIS_ENABLE != 0)
-            /* 曼哈顿: 选主轴, 只动主轴 */
-            if (fabsf(dx) > CHASSIS_POS_AXIS_SWITCH_TOL_M) {
-                /* X 轴优先 (绝对偏差大于切换容忍带) */
-                vxg = kp_eff * dx - CHASSIS_POS_KD * s_v_along_lpf;
-                vyg = 0.0f - CHASSIS_POS_KD * s_v_cross_lpf;  /* Y 仅做阻尼, 不主动推 */
-            } else if (fabsf(dy) > CHASSIS_POS_AXIS_SWITCH_TOL_M) {
-                /* X 已到位, 切到 Y 轴 */
-                vxg = 0.0f - CHASSIS_POS_KD * s_v_along_lpf;
-                vyg = kp_eff * dy - CHASSIS_POS_KD * s_v_cross_lpf;
-            } else {
-                /* 两轴都在容忍带内: 只做阻尼, 不再驱动 */
-                vxg = -CHASSIS_POS_KD * s_v_along_lpf;
-                vyg = -CHASSIS_POS_KD * s_v_cross_lpf;
+            /* 曼哈顿: 选主轴驱动, 非主轴命令 = 0 且立即清零其 ramp.
+             *
+             * 【定位不准根因】ramp 不清零时的过冲计算:
+             *   切轴瞬间 ramp.vx ≈ kp * dx_prev ≈ 0.5 m/s
+             *   ramp 以 3.0 m/s² 衰减 → 滑行距离 = 0.5²/(2*3.0) ≈ 42mm
+             *   42mm > TOL=2cm → |dx| 超出容忍带 → X 重新抢优先权
+             *   → X/Y 切轴振荡, Y 永远开不了头
+             *
+             * 修法: 每帧把非驱动轴的 s_ramp 清零, ramp_filter 下一步
+             * 输出 = 0, 轮端 PID 立即接管制动. */
+            /* 轴锁状态机: 进入 Y 轴用精度门限, 回切 X 用大偏差门限.
+             *
+             * 【Y 向抖动根因】旧逻辑把回切门限绑到 2*TOL=6cm:
+             *   Y 行驶时麦轮耦合/地面打滑让 X 里程计漂过 6cm
+             *   → 控制器回切 X → 本帧清零 Y ramp
+             *   → X 修回一点又切 Y → Y ramp 从 0 重爬
+             *   → 表现为抖动前进.
+             *
+             * 新逻辑: X 进 3cm 后锁定 Y, 只有 X 偏差超过 15cm 才回切;
+             * 终末小残差交给两轴都到容忍带后的 2D PD 收敛. */
+            {
+                float x_exit_thr = s_axis_y_locked
+                                   ? CHASSIS_POS_AXIS_RELOCK_TOL_M
+                                   : CHASSIS_POS_AXIS_SWITCH_TOL_M;
+
+                if (fabsf(dx) > x_exit_thr) {
+                    /* X 轴优先 (Y 锁未开或 X 偏差已超回滞门限) */
+                    s_axis_y_locked    = 0U;
+                    vxg = kp_eff * dx - kd_eff * s_v_along_lpf;
+                    vyg = 0.0f;
+                    s_ramp.vy_body_mps = 0.0f;  /* 清零 Y ramp */
+                } else if (fabsf(dy) > CHASSIS_POS_AXIS_SWITCH_TOL_M) {
+                    /* X 已到位, 切 Y 轴; 置 Y 锁防止噪声误回切 X */
+                    s_axis_y_locked    = 1U;
+                    vxg = 0.0f;
+                    s_ramp.vx_body_mps = 0.0f;  /* 清零 X ramp */
+                    vyg = kp_eff * dy - kd_eff * s_v_cross_lpf;
+                } else {
+                    /* 两轴都在容忍带内: 2D PD 平滑收敛 */
+                    s_axis_y_locked    = 1U;
+                    vxg = kp_eff * dx - kd_eff * s_v_along_lpf;
+                    vyg = kp_eff * dy - kd_eff * s_v_cross_lpf;
+                }
             }
 #else
-            /* 旧方案保留: 径向 P, 修正力始终指向目标 */
-            vxg = kp_eff * dx - CHASSIS_POS_KD * s_v_along_lpf;
-            vyg = kp_eff * dy - CHASSIS_POS_KD * s_v_cross_lpf;
+            /* 旧方案保留: 径向 PD */
+            vxg = kp_eff * dx - kd_eff * s_v_along_lpf;
+            vyg = kp_eff * dy - kd_eff * s_v_cross_lpf;
 #endif
         }
         norm = sqrtf(vxg * vxg + vyg * vyg);

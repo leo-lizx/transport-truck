@@ -134,10 +134,15 @@
  * 不再以最大速度冲回 -> 避免回程过冲再震荡.
  * 业内 gain scheduling 标准做法 (Tesla Autopilot lateral controller).
  */
-#define CHASSIS_POS_RECOVERY_DIST_M       (0.09f)
+/**
+ * 必须 > CHASSIS_POS_HOLD_EXIT_M (0.15m), 否则增益调度永不触发.
+ * 逻辑: 被推出保持区时 dist > HOLD_EXIT → 增益调度只在 dist < RECOVERY_DIST 时生效,
+ * 若 RECOVERY_DIST < HOLD_EXIT, 恢复全程在 RECOVERY_DIST 外 → 全量 KP → 必震荡.
+ */
+#define CHASSIS_POS_RECOVERY_DIST_M       (0.35f)
 
-/** 扰动恢复模式 KP 缩放因子 (0.5 = 一半增益) */
-#define CHASSIS_POS_RECOVERY_KP_SCALE     (0.10f)
+/** 扰动恢复模式 KP 缩放因子: 0.45 = 减少但仍有足够力驱动 */
+#define CHASSIS_POS_RECOVERY_KP_SCALE     (0.45f)
 
 /**
  * 轴向独立移动模式 (Manhattan / axis-by-axis).
@@ -147,8 +152,20 @@
  */
 #define CHASSIS_POS_AXIS_BY_AXIS_ENABLE   (1)
 
-/** axis-by-axis 模式: 当前轴误差 < 该值时切换到下一个轴 (米) */
-#define CHASSIS_POS_AXIS_SWITCH_TOL_M     (0.09f)
+/**
+ * axis-by-axis 模式: 当前轴误差 < 该值时切换到下一个轴 (米).
+ * 这个值决定最终定位精度, 因此保持与 EPSILON 同量级.
+ * 切轴后的重新锁回门限不要复用它, 否则 Y 行驶时 X 里程计/打滑漂移
+ * 只要超过几厘米就会回切 X, 并把 Y ramp 清零, 表现为抖动前进.
+ */
+#define CHASSIS_POS_AXIS_SWITCH_TOL_M     (0.03f)
+
+/**
+ * axis-by-axis 模式: 已切入 Y 轴后, X 偏差超过该值才允许重新回切 X.
+ * 必须明显大于普通编码器噪声和麦轮横向耦合漂移; 最终几厘米残差由终末
+ * 2D PD 收敛, 不在 Y 行驶中反复抢轴.
+ */
+#define CHASSIS_POS_AXIS_RELOCK_TOL_M     (0.15f)
 
 /**
  * 到位后 yaw 容忍带 (°). |yaw_err| < 该值即认为"航向也已到位",
@@ -716,8 +733,14 @@
  *  缓加速参数 — 防止目标速度突变导致轮胎打滑
  * ====================================================================== */
 
-/** 线速度最大加速度（m/s²），每 20ms 允许的最大变化量 */
-#define CHASSIS_CMD_ACCEL_LIMIT_MPS2    (1.20f)
+/**
+ * 线速度最大加速度（m/s²），每 20ms 允许的最大变化量.
+ * Manhattan 轴切换时 vy 从 0 起步, accel 决定"拐弯后加速时间":
+ *   1.2 m/s²: 0→2.35 m/s 需 ~2s, 2m 行程全程在爬坡, 最高仅 1.55 m/s
+ *   3.0 m/s²: 0→2.35 m/s 仅 0.78s, 2m 行程可短暂跑满速
+ * 麦轮横向移动靠滚轮分力, 不依赖轮端抓地, 比纵向更耐高加速.
+ */
+#define CHASSIS_CMD_ACCEL_LIMIT_MPS2    (3.00f)
 
 /** 角速度最大加速度（°/s²）
  *  P0-调参 2026-05-02 (大角度阶跃响应慢):
@@ -739,7 +762,8 @@
 #define CHASSIS_ODOM_SCALE_X            (0.417809f)
 
 /** Y 方向里程计缩放系数 */
-#define CHASSIS_ODOM_SCALE_Y            (0.447301336986f)
+//#define CHASSIS_ODOM_SCALE_Y            (0.447301336986f)
+#define CHASSIS_ODOM_SCALE_Y            (0.41f)
 
 /* ======================================================================
  *  车模物理尺寸 — 已经填入实际测量数据
@@ -890,9 +914,9 @@
  * ENCODER_4 -> 左前轮
  *
  * 四、电机驱动引脚（当前工程）
- * MOTOR1: DIR=C9,  PWM=C8   -> 右前轮 RF
- * MOTOR2: DIR=C7,  PWM=C6   -> 右后轮 RB
- * MOTOR3: DIR=D2,  PWM=D3   -> 左后轮 LB
+ * MOTOR1: DIR=C9,  PWM=C8   -> 右后轮 RB
+ * MOTOR2: DIR=C7,  PWM=C6   -> 左后轮 LB
+ * MOTOR3: DIR=D2,  PWM=D3   -> 右前轮 RF
  * MOTOR4: DIR=C10, PWM=C11  -> 左前轮 LF
  *
  * 五、使用注意
@@ -925,39 +949,36 @@
 #define CHASSIS_LF_DIR_SIGN         (1.0f)                       /**< 方向修正: 1.0=正向, -1.0=反向 */
 
 /* ---------- 右前轮 (RF) ---------- *
- * 电机 PWM/DIR: 实车接线验证后物理走 C6/C7 (摆脱原“MOTOR1=C8/C9”文档, 以实车为准).
+ * 电机 PWM/DIR: 实车接线验证后物理走 D3/D2, 以当前宏定义为准.
  * 编码器: ENCODER_3 (QTIMER2_ENCODER1, C3/C4) -- 已经 wfb 调试输出验证, 别动.
- * 修复记录(2026-04-25 #2): 原 C8/C9 PWM/DIR 实测驱动的是 RB 电机, 与 RB 组对调后纲正.
  */
-#define CHASSIS_RF_PWM_CHANNEL      PWM2_MODULE3_CHB_D3            /**< PWM 输出: C6 引脚 (物理 -> RF 电机) */
-#define CHASSIS_RF_DIR_PIN          D2                             /**< 方向控制: C7 引脚 (物理 -> RF 电机) */
+#define CHASSIS_RF_PWM_CHANNEL      PWM2_MODULE3_CHB_D3            /**< PWM 输出: D3 引脚 (物理 -> RF 电机) */
+#define CHASSIS_RF_DIR_PIN          D2                             /**< 方向控制: D2 引脚 (物理 -> RF 电机) */
 #define CHASSIS_RF_ENC_INDEX        QTIMER2_ENCODER1               /**< 编码器定时器通道（实车标定：ENCODER3） */
 #define CHASSIS_RF_ENC_CH1          QTIMER2_ENCODER1_CH1_C3        /**< 编码器 A 相: C3 引脚 */
 #define CHASSIS_RF_ENC_CH2          QTIMER2_ENCODER1_CH2_C4        /**< 编码器 B 相: C4 引脚 */
-#define CHASSIS_RF_DIR_SIGN         (1.0f)                        /**< 方向修正: 沿 C6/C7 旧 "RB" 槽继承(-1.0); 交换后请用单轮正速制验证, 反向则取反 */
+#define CHASSIS_RF_DIR_SIGN         (1.0f)                        /**< 方向修正: 1.0=正向, -1.0=反向 */
 
 /* ---------- 左后轮 (LB) ---------- *
- * 实车标定: MOTOR3(D3/D2) + ENCODER_1(QTIMER1_ENCODER1, C0/C1)
- * 修复记录(2026-04-25): 旧 #define 误用 C6/C7 + C2/C24, 已纠正.
+ * 实车标定: MOTOR2(C6/C7) + ENCODER_1(QTIMER1_ENCODER1, C0/C1)
  */
-#define CHASSIS_LB_PWM_CHANNEL      PWM2_MODULE0_CHA_C6             /**< PWM 输出: D3  引脚 (MOTOR3) */
-#define CHASSIS_LB_DIR_PIN          C7                              /**< 方向控制: D2  引脚 (MOTOR3) */
+#define CHASSIS_LB_PWM_CHANNEL      PWM2_MODULE0_CHA_C6             /**< PWM 输出: C6  引脚 (MOTOR2) */
+#define CHASSIS_LB_DIR_PIN          C7                              /**< 方向控制: C7  引脚 (MOTOR2) */
 #define CHASSIS_LB_ENC_INDEX        QTIMER1_ENCODER1                /**< 编码器定时器通道（实车标定：ENCODER1） */
 #define CHASSIS_LB_ENC_CH1          QTIMER1_ENCODER1_CH1_C0         /**< 编码器 A 相: C0  引脚 */
 #define CHASSIS_LB_ENC_CH2          QTIMER1_ENCODER1_CH2_C1         /**< 编码器 B 相: C1  引脚 */
-#define CHASSIS_LB_DIR_SIGN         (1.0f)                          /**< 方向修正: 沿 D3/D2 旧 "RF" 槽继承(+1.0), 修复后请用单轮调试再验证 */
+#define CHASSIS_LB_DIR_SIGN         (1.0f)                          /**< 方向修正: 1.0=正向, -1.0=反向 */
 
 /* ---------- 右后轮 (RB) ---------- *
- * 电机 PWM/DIR: 实车接线验证后物理走 C8/C9 (摆脱原“MOTOR2=C6/C7”文档, 以实车为准).
+ * 电机 PWM/DIR: 实车接线验证后物理走 C8/C9, 以当前宏定义为准.
  * 编码器: ENCODER_2 (QTIMER1_ENCODER2, C2/C24) -- 已经 wfb 调试验证.
- * 修复记录(2026-04-25 #2): 原 C6/C7 与 RF 电机点接反了, 已与 RF 组对换.
  */
 #define CHASSIS_RB_PWM_CHANNEL      PWM2_MODULE1_CHA_C8             /**< PWM 输出: C8 引脚 (物理 -> RB 电机) */
 #define CHASSIS_RB_DIR_PIN          C9                               /**< 方向控制: C9 引脚 (物理 -> RB 电机) */
 #define CHASSIS_RB_ENC_INDEX        QTIMER1_ENCODER2                 /**< 编码器定时器通道（实车标定：ENCODER2） */
 #define CHASSIS_RB_ENC_CH1          QTIMER1_ENCODER2_CH1_C2          /**< 编码器 A 相: C2  引脚 */
 #define CHASSIS_RB_ENC_CH2          QTIMER1_ENCODER2_CH2_C24         /**< 编码器 B 相: C24 引脚 */
-#define CHASSIS_RB_DIR_SIGN         (1.0f)                          /**< 方向修正: 沿 C8/C9 旧 "RF" 槽继承(-1.0); 交换后请用单轮正速制验证, 反向则取反 */
+#define CHASSIS_RB_DIR_SIGN         (1.0f)                          /**< 方向修正: 1.0=正向, -1.0=反向 */
 
 /* ======================================================================
  *  轮子编号枚举 — 统一四轮索引，用于数组下标
