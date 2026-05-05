@@ -104,8 +104,8 @@ static uint32 wait_for_tick(void)
 /* 位置闭环目标坐标 (米), 仅 POINT_NAV 模式生效.
  * 坐标系: X 向右为正, Y 向前为正, 原点 = 里程计初始位置.
  * 改这两个宏换目标, 不需要算格数. */
-#define MAIN_POS_NAV_TARGET_X_M       (0.00f)   /* 向右 0.5m */
-#define MAIN_POS_NAV_TARGET_Y_M       (0.00f)   /* 不前进 */
+#define MAIN_POS_NAV_TARGET_X_M       (3.10f)   /* 向右 0.5m */
+#define MAIN_POS_NAV_TARGET_Y_M       (2.25f)   /* 不前进 */
 #define MAIN_POS_NAV_HOLD_YAW_DEG     (0.0f)    /* 全程锁住 0° 航向 */
 
 /* ========================================================================== */
@@ -158,7 +158,6 @@ static void main_apply_debug_wheel_pid(void)
 /* ========================================================================== */
 /*  ⬆⬆⬆ 单轮 PID 调试辅助函数结束 ⬆⬆⬆                                          */
 /* ========================================================================== */
-
 int main(void)
 {
     uint8 menu_render_div = 0U;

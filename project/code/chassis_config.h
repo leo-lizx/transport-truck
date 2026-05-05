@@ -107,10 +107,58 @@
 #define CHASSIS_START_GRID_X            (CHASSIS_GRID_INNER_MIN_X)
 
 /** 发车区：距离最底边界约 1m（按 Y 步长折算后取最近网格） */
-#define CHASSIS_START_GRID_Y            (7U)
+#define CHASSIS_START_GRID_Y            (6U)    /* 5×0.24=1.20m, 与实测车中心吻合 */
 
 /** 到达目标点判定阈值（米），距目标小于此值即认为"已到达" */
-#define CHASSIS_TARGET_REACHED_EPSILON_M (0.03f)
+#define CHASSIS_TARGET_REACHED_EPSILON_M  (0.03f)
+
+/**
+ * 到达目标点时的速度判据（m/s）.
+ * dist < EPSILON 且 ||v_body|| < 该值 才置 s_arrived=1.
+ * 防止车以高速穿过目标点瞬间触发到位, 惯性冲出再触发 HOLD_EXIT 反复震荡.
+ * ROS Nav2 goal_checker 双判据标准: xy_goal_tolerance + vel_tolerance.
+ */
+#define CHASSIS_POS_ARRIVED_VEL_MPS       (0.05f)
+
+/**
+ * 到位后的 Schmitt 滞后释放阈值（米）.
+ * 已到位状态下, 只有被推出此距离才重新开启位置驱动.
+ * 放宽到 15cm: 物理动量在 cmd=0 后会让车滑行 5~10cm,
+ * 8cm 太紧会反复触发, 15cm 给惯性留余量, 同时仍小于一格 (24cm).
+ */
+#define CHASSIS_POS_HOLD_EXIT_M           (0.15f)
+
+/**
+ * 扰动恢复模式触发距离 (米).
+ * 当车被外力推出保持区且 dist < 该值时, 用「弱 KP + 强 KD」缓慢归位,
+ * 不再以最大速度冲回 -> 避免回程过冲再震荡.
+ * 业内 gain scheduling 标准做法 (Tesla Autopilot lateral controller).
+ */
+#define CHASSIS_POS_RECOVERY_DIST_M       (0.09f)
+
+/** 扰动恢复模式 KP 缩放因子 (0.5 = 一半增益) */
+#define CHASSIS_POS_RECOVERY_KP_SCALE     (0.10f)
+
+/**
+ * 轴向独立移动模式 (Manhattan / axis-by-axis).
+ * 1 = 先走 X 走完再走 Y, 不走斜线
+ * 0 = 走 CTE 直线 (旧默认)
+ * 优点: 麦轮 X/Y 解耦控制更稳, 扰动恢复时只动一个轴, 不会对角震荡.
+ */
+#define CHASSIS_POS_AXIS_BY_AXIS_ENABLE   (1)
+
+/** axis-by-axis 模式: 当前轴误差 < 该值时切换到下一个轴 (米) */
+#define CHASSIS_POS_AXIS_SWITCH_TOL_M     (0.09f)
+
+/**
+ * 到位后 yaw 容忍带 (°). |yaw_err| < 该值即认为"航向也已到位",
+ * wz 直接硬归零, 不再做任何修正.
+ *
+ * 这是 ROS Nav2 goal_checker 的 yaw_goal_tolerance 思路, 工业 AGV /
+ * ArduPilot loiter / PX4 hold 模式都用同一套: 双 tolerance + 死区
+ * 硬归零, 而不是让 PI 闭环去咬最后 1° 残差 (必产生极限环).
+ */
+#define CHASSIS_YAW_GOAL_TOLERANCE_DEG    (1.50f)
 
 /* ======================================================================
  *  【P0-8】发车区 / 越界几何参数
@@ -213,8 +261,42 @@
  *  导航控制增益（P 控制器参数）
  * ====================================================================== */
 
-/** 位置环 Kp：值越大，向目标点收敛越快；过大易超调 */
-#define CHASSIS_POS_KP                  (3.0f)
+/** 位置环 Kp：沿程方向增益（沿目标方向前进的速度 = Kp × 沿程距离）
+ *  物理意义: 决定「冲向目标」的速度, 与轨迹是否直线无关.
+ *  建议范围 1.5 ~ 4.0, 偏大冲得快但近点可能超调. */
+#define CHASSIS_POS_KP                  (2.50f)
+
+/**
+ * 位置环横向增益 Kp_cross（Cross-Track Error 修正增益）
+ *   物理意义: 横向偏差→横向修正速度. 设得比 CHASSIS_POS_KP 大
+ *   可以更快地把车「推回直线」而不影响前进速度.
+ *   建议 = 1.5 ~ 3 倍 CHASSIS_POS_KP. 设为 0 退化为纯 P(弧线).  */
+#define CHASSIS_POS_CTE_KP              (5.0f)
+
+/**
+ * 位置环 D 项增益 (沿程方向) - 速度阻尼.
+ * 业内标准 derivative-on-measurement: D 反馈用 odom 直接给的速度
+ * (s_fb_vx/vy), 不做差分以避免噪声放大. 等价于 PD 控制器, 抑制
+ * 由电机/麦轮惯性引起的 "冲过头 -> 倒回 -> 再冲" 前后震荡.
+ *
+ * 物理含义: v_cmd = KP * err - KD * v_meas
+ *   KD=0   : 纯 P, 欠阻尼必震荡
+ *   KD=KP  : 临界阻尼附近, 最快无超调
+ *   KD>KP  : 过阻尼, 收敛变慢但绝不超调
+ * 麦轮一般取 KD ≈ KP, 起点用 1.0 ~ 1.5 倍.
+ */
+#define CHASSIS_POS_KD                  (1.0f)
+
+/** 位置环横向 D 项增益 - 与 CTE_KP 配套 */
+#define CHASSIS_POS_CTE_KD              (2.0f)
+
+/**
+ * D 项低通滤波系数 α (一阶 IIR, Tesla/Waymo 标准做法).
+ * y = (1-α)*y_prev + α*x,  截止频率 ≈ α/(2π·dt).
+ * α=0.30 @ dt=20ms -> 截止 ≈ 2.4Hz, 衰减 odom 高频噪声 (~20Hz) 约 -18dB.
+ * 增大 α -> 响应更快但噪声更多; 减小 -> 更平滑但阻尼延迟增大.
+ */
+#define CHASSIS_POS_D_LPF_ALPHA         (0.30f)
 
 /**
  * 位置环最小推进速度 (m/s) - P0-改进 2026-05-02 (终末段龟速爬):
@@ -223,7 +305,7 @@
  *   做法: 当 dist > epsilon 但 P 输出模长 < V_MIN 时, 把模长抬到 V_MIN,
  *   方向仍由 dx/dy 决定. 工程上取略高于轮端 BREAKAWAY 启动速度.
  *   设为 0 -> 关闭最小推进, 退化为纯 P. */
-#define CHASSIS_POS_MIN_DRIVE_SPEED_MPS  (0.3f)
+#define CHASSIS_POS_MIN_DRIVE_SPEED_MPS  (0.02f)
 
 /**
  * 位置环 yaw 跟踪门距 (m) - P0-修复 2026-05-02 (atan2 噪声风暴):
@@ -242,7 +324,7 @@
  *   实际位置可能超目标 1~3cm. 此处用"软到达": dist 进入 BRAKE_DIST 后开始
  *   按线性把 V_MIN 衰减到 0, 进 EPSILON 时已经基本停下, 不再硬刹.
  *   建议 = 2 ~ 3 倍 V_MIN * 20ms (~5cm). */
-#define CHASSIS_POS_BRAKE_DIST_M         (0.06f)
+#define CHASSIS_POS_BRAKE_DIST_M         (0.10f)
 
 /** 航向环 Kp：值越大，朝向对准越快；过大易振荡
  *  P0-调参 2026-04-29: 取消 YAW_MIN_WZ 阶跃后 wz 连续, 可适度提 KP 加快响应。
@@ -256,7 +338,7 @@
  *  P0-回调 2026-05-02 (持续抖动):
  *      KP=4 + KD=0.01 + 死区 1° -> 在 ±1° 内激出高频小振荡. 回到 2.0,
  *      与 KD=0.08 / 死区 2° 配套, 小角度仍比老 0.65 快 3 倍, 不抖. */
-#define CHASSIS_YAW_KP                  (0.700f)
+#define CHASSIS_YAW_KP                  (1.900f)
 
 /** sqrt_controller 用的最大角加速度 (°/s²) - P0-改进 2026-05-02
  *  物理意义: 终末减速段每秒能掉多少 °/s 的角速度.
