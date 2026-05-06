@@ -39,7 +39,10 @@
 #include "chassis_menu.h"
 #include "app_game_logic.h"
 #include "app_link.h"   /* P0-1: 视觉-主控帧协议 */
+#include "algo_sokoban_solver.h"
+#include <stdarg.h>
 #include <math.h>       /* sqrtf — POINT_NAV 调试打印用 */
+#include <stdio.h>
 
 /*==========================================================================
  *  P0-5: 主循环 5ms tick 节拍 (替代 system_delay_ms 阻塞)
@@ -93,10 +96,165 @@ static uint32 wait_for_tick(void)
 #define MAIN_RUN_MODE_YAW_HOLD        (1)
 #define MAIN_RUN_MODE_SINGLE_WHEEL    (2)
 #define MAIN_RUN_MODE_POINT_NAV       (3)
+#define MAIN_RUN_MODE_SOKO_SELFTEST   (4)
 
 /* >>>>>>>>>>>> 改这里切换调试模式 <<<<<<<<<<<< */
-#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_POINT_NAV)     /* 位置闭环调试 */
+#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_SOKO_SELFTEST)     /* 推箱求解自测: DAP 串口输出固定测试图路径 */
 /* <<<<<<<<<<<< 改这里切换调试模式 >>>>>>>>>>>> */
+
+#if (MAIN_RUN_MODE == MAIN_RUN_MODE_SOKO_SELFTEST)
+/*
+ * 固定自测图: 由用户编辑的竖版地图整理为 12x16 横版格式.
+ * 目的: 保留原始关卡结构, 同时满足求解器固定 12 行 16 列的输入约束.
+ */
+static const char s_soko_selftest_map[MAP_ROWS][MAP_COLS + 1] = {
+    "################",
+    "#----------#---#",
+    "#----------##@-#",
+    "#----$------#--#",
+    "#--------------#",
+    "#---$-##-------#",
+    "#-----#-##-----#",
+    "#--$--#--------#",
+    "#-----#--------#",
+    "#-----#---#----#",
+    "#-----#---##...#",
+    "################"
+};
+
+static uint8 main_selftest_char_to_map(char ch)
+{
+    switch (ch)
+    {
+    case '#': return MAP_WALL;
+    case '-': return MAP_EMPTY;
+    case '.': return MAP_TARGET;
+    case '$': return MAP_BOX;
+    case '*': return MAP_BOMB;
+    case '@': return MAP_EMPTY;
+    default:  return MAP_EMPTY;
+    }
+}
+
+static char main_selftest_action_to_char(SokoAction_e act)
+{
+    switch (act)
+    {
+    case SOKO_ACT_UP:    return 'U';
+    case SOKO_ACT_DOWN:  return 'D';
+    case SOKO_ACT_LEFT:  return 'L';
+    case SOKO_ACT_RIGHT: return 'R';
+    default:             return '?';
+    }
+}
+
+static void main_selftest_log(const char *fmt, ...)
+{
+    char buffer[192];
+    va_list args;
+    int len;
+
+    va_start(args, fmt);
+    len = vsnprintf(buffer, sizeof(buffer), fmt, args);
+    va_end(args);
+    if (len <= 0)
+    {
+        return;
+    }
+
+    printf("%s", buffer);
+
+    if (len > (int)(sizeof(buffer) - 1U))
+    {
+        len = (int)(sizeof(buffer) - 1U);
+    }
+    uart_write_buffer(UART_1, (const uint8 *)buffer, (uint32)len);
+}
+
+static void main_selftest_print_map_and_player(Point_t player_pos)
+{
+    uint8 r;
+
+    main_selftest_log("MAP_ROWS=%d\n", (int)MAP_ROWS);
+    main_selftest_log("MAP_COLS=%d\n", (int)MAP_COLS);
+    main_selftest_log("PLAYER_START=%d,%d\n", (int)player_pos.x, (int)player_pos.y);
+    main_selftest_log("MAP_BEGIN\n");
+    for (r = 0U; r < MAP_ROWS; r++)
+    {
+        main_selftest_log("%s\n", s_soko_selftest_map[r]);
+    }
+    main_selftest_log("MAP_END\n");
+}
+
+static void main_run_soko_selftest_once(void)
+{
+    uint8 map[MAP_ROWS][MAP_COLS];
+    Point_t player_pos = {-1, -1};
+    SokoFullSolution_t solution;
+    uint8 r, c;
+
+    for (r = 0U; r < MAP_ROWS; r++)
+    {
+        for (c = 0U; c < MAP_COLS; c++)
+        {
+            char ch = s_soko_selftest_map[r][c];
+            if ('@' == ch)
+            {
+                player_pos.x = (int8)c;
+                player_pos.y = (int8)r;
+            }
+            map[r][c] = main_selftest_char_to_map(ch);
+        }
+    }
+
+    main_selftest_log("SOKO_MAP=T4\n");
+    main_selftest_print_map_and_player(player_pos);
+    if ((player_pos.x < 0) || (player_pos.y < 0))
+    {
+        main_selftest_log("SOLVED=0\n");
+        main_selftest_log("ERR=NO_PLAYER\n");
+        return;
+    }
+
+    memset(&solution, 0, sizeof(solution));
+    if (!Sokoban_Solve_Stage1(map, player_pos, &solution))
+    {
+        main_selftest_log("SOLVED=0\n");
+        main_selftest_log("ERR=NO_SOLUTION\n");
+        return;
+    }
+
+    main_selftest_log("SOLVED=%d\n", (int)solution.is_solved);
+    main_selftest_log("BOXES=%d\n", (int)solution.total_boxes);
+    for (r = 0U; r < solution.total_boxes; r++)
+    {
+        uint16 i;
+        main_selftest_log("SEG%d_COUNT=%d\n", (int)r, (int)solution.sub_solutions[r].count);
+        main_selftest_log("SEG%d_PATH=", (int)r);
+        for (i = 0U; i < solution.sub_solutions[r].count; i++)
+        {
+            main_selftest_log("%c", main_selftest_action_to_char(solution.sub_solutions[r].actions[i]));
+        }
+        main_selftest_log("\n");
+        main_selftest_log("PLAYER_END=%d,%d\n",
+                          (int)solution.player_end_pos[r].x,
+                          (int)solution.player_end_pos[r].y);
+    }
+}
+
+static void main_run_soko_selftest_periodic_5ms(void)
+{
+    static uint16 s_div = 0U;
+
+    s_div++;
+    if (s_div >= 200U)
+    {
+        s_div = 0U;
+        main_selftest_log("===SOKO_SELFTEST_ALIVE===\n");
+        main_run_soko_selftest_once();
+    }
+}
+#endif
 
 /* 航向保持目标角 (deg), 仅 YAW_HOLD 模式生效 */
 #define MAIN_HOLD_YAW_TARGET_DEG      (0.0f)
@@ -211,6 +369,10 @@ int main(void)
 #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_POINT_NAV)
     /* ✅ 位置闭环调试走这里: 米坐标 + 锁定航向角, 20ms 任务内持续双闭环. */
     chassis_ctrl_move_to_m(MAIN_POS_NAV_TARGET_X_M, MAIN_POS_NAV_TARGET_Y_M, MAIN_POS_NAV_HOLD_YAW_DEG);
+#elif (MAIN_RUN_MODE == MAIN_RUN_MODE_SOKO_SELFTEST)
+    /* 推箱求解自测: 不驱动车体, 仅保留底层初始化和 DAP 串口输出. */
+    uart_init(UART_1, 115200, UART1_TX_B12, UART1_RX_B13);
+    chassis_ctrl_stop();
 #else
     /* 游戏模式: 设置初始航向基准, 等待状态机调度. */
     chassis_ctrl_hold_yaw(0.0f);
@@ -277,6 +439,8 @@ int main(void)
                        (int)chassis_ctrl_is_arrived());
             }
         }
+    #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_SOKO_SELFTEST)
+        main_run_soko_selftest_periodic_5ms();
     #else
         Game_Logic_Task_Run();          /* 推箱子状态机 (非阻塞) */
     #endif

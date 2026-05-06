@@ -21,8 +21,9 @@ static const int8 s_dc[4] = {  0,  0, -1,  1 };
  *
  *  sb_parent_nibble[i] (4bit / 状态):
  *      0       = 未访问
- *      1..4    = 到达该状态的动作编号 + 1 (UP+1, DOWN+1, LEFT+1, RIGHT+1)
+ *      1..4    = 到达该状态的普通移动动作编号 + 1
  *      5       = 起始状态标记
+ *      6..9    = 到达该状态的推箱动作编号 + 6
  *
  *  sb_visited_bm     : 已访问状态位图
  *  sb_frontier_cur_bm: 当前层前沿位图
@@ -37,6 +38,9 @@ static uint8 sb_frontier_nxt_bm[SB_BITMAP_BYTES];
 
 /** 子地图临时缓冲 */
 static uint8  sb_sub_map[MAP_ROWS][MAP_COLS];
+
+#define SB_PARENT_START      (5u)
+#define SB_PARENT_PUSH_BASE  (6u)
 
 /*===========================================================================
  *  原 algo_bfs_scout.c 实现（合并到本文件）
@@ -327,12 +331,14 @@ static uint8 sokoban_bfs_single(const uint8 sub_map[MAP_ROWS][MAP_COLS],
                 int8 npr = pr + s_dr[d];
                 int8 npc = pc + s_dc[d];
                 int8 nbr, nbc;
+                uint8 is_push = 0U;
 
                 if (npr == br && npc == bc) {
                     /* ---------- 推箱 ---------- */
                     nbr = br + s_dr[d];
                     nbc = bc + s_dc[d];
                     if (!sb_is_free(sub_map, nbr, nbc)) continue;
+                    is_push = 1U;
                 } else {
                     /* ---------- 普通行走 ---------- */
                     if (!sb_is_free(sub_map, npr, npc)) continue;
@@ -345,7 +351,8 @@ static uint8 sokoban_bfs_single(const uint8 sub_map[MAP_ROWS][MAP_COLS],
 
                 sb_bm_set(sb_visited_bm, nidx);
                 sb_bm_set(sb_frontier_nxt_bm, nidx);
-                sb_nibble_set(sb_parent_nibble, nidx, (uint8)(d + 1));
+                sb_nibble_set(sb_parent_nibble, nidx,
+                              is_push ? (uint8)(d + SB_PARENT_PUSH_BASE) : (uint8)(d + 1));
                 has_next = 1;
 
                 /* 箱子到达目标 → 成功 */
@@ -371,9 +378,18 @@ static uint8 sokoban_bfs_single(const uint8 sub_map[MAP_ROWS][MAP_COLS],
         uint16 steps = 0;
         uint16 idx   = goal_idx;
 
-        while (sb_nibble_get(sb_parent_nibble, idx) != 5u) {       /* 5 = 起始标记 */
-            uint8 act = (uint8)(sb_nibble_get(sb_parent_nibble, idx) - 1u);  /* 0..3 */
+        while (sb_nibble_get(sb_parent_nibble, idx) != SB_PARENT_START) {
+            uint8 parent_code = sb_nibble_get(sb_parent_nibble, idx);
+            uint8 is_push;
+            uint8 act;
             if (steps >= SOKOBAN_MAX_ACTIONS) return 0;
+            if (parent_code >= SB_PARENT_PUSH_BASE) {
+                act = (uint8)(parent_code - SB_PARENT_PUSH_BASE);
+                is_push = 1U;
+            } else {
+                act = (uint8)(parent_code - 1U);
+                is_push = 0U;
+            }
             rev_buf[steps++] = (SokoAction_e)act;
 
             /* 还原前驱状态 */
@@ -384,8 +400,7 @@ static uint8 sokoban_bfs_single(const uint8 sub_map[MAP_ROWS][MAP_COLS],
             int8 prev_pc = pc2 - s_dc[act];
 
             int8 prev_br, prev_bc;
-            /* 是否发生过推箱: 玩家当前位置 = 箱子当前位置 - 方向偏移 */
-            if (pr2 == br2 - s_dr[act] && pc2 == bc2 - s_dc[act]) {
+            if (is_push) {
                 /* 推箱: 箱子之前在玩家现在的位置 */
                 prev_br = pr2;
                 prev_bc = pc2;
