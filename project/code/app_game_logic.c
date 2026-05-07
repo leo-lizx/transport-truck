@@ -1,5 +1,6 @@
 #include "app_game_logic.h"
 #include "app_link.h"      /* P0-2: 读取 g_link_last_hb_ms 判断链路是否在线; P0-3: 拷贝 seq-lock 地图快照 */
+#include "app_vision_fusion.h"
 
 /*
  * P0-3 说明:
@@ -156,6 +157,52 @@ static void sync_player_pos(void)
     g_player_pos.y = (int8)chassis_m_to_grid_y(pose.y_m);
 }
 
+/*
+ * 航点到位判定: odom 到位 + (可选) 视觉到站 Snap 状态机。
+ *
+ * 行为:
+ *   1) chassis_ctrl_is_arrived() == 0  → 直接返回 0 (并取消可能未结束的 Snap, 防跨航点串扰)。
+ *   2) 启用 Snap 时:
+ *        - 链路掉线 → 取消 Snap 并放行 (避免靠不上视觉时卡死);
+ *        - 否则把当前导航目标米坐标喂给 app_vision_fusion_snap_request(), 状态机内部处理短静止+表决+Snap;
+ *        - 状态 ∈ {DONE, TIMEOUT, REJECT} 视为放行 (REJECT 时按 odom 兜底);
+ *        - 状态 == PENDING / IDLE 视为继续等待。
+ *   3) 关闭 Snap → 直接 odom 到位即放行。
+ */
+static uint8 chassis_nav_arrived_for_waypoint(void)
+{
+    if (chassis_ctrl_is_arrived() == 0U)
+    {
+        app_vision_fusion_snap_cancel();
+        return 0U;
+    }
+
+#if CHASSIS_VISION_SNAP_ON_ARRIVE_ENABLE
+    if (s_link_alive == 0U)
+    {
+        app_vision_fusion_snap_cancel();
+        return 1U;
+    }
+    {
+        float tx_m = 0.0f;
+        float ty_m = 0.0f;
+        app_vision_snap_state_e st;
+        chassis_ctrl_get_point_nav_target_m(&tx_m, &ty_m);
+        app_vision_fusion_snap_request(tx_m, ty_m);
+        st = app_vision_fusion_snap_state();
+        if ((st == APP_VISION_SNAP_DONE)    ||
+            (st == APP_VISION_SNAP_TIMEOUT) ||
+            (st == APP_VISION_SNAP_REJECT))
+        {
+            return 1U;
+        }
+        return 0U;
+    }
+#else
+    return 1U;
+#endif
+}
+
 static uint8 exec_waypoints_common(const SokoWaypointPath_t *wp, uint16 *wp_idx)
 {
     if (!is_navigating) {
@@ -166,7 +213,7 @@ static uint8 exec_waypoints_common(const SokoWaypointPath_t *wp, uint16 *wp_idx)
         return 0;
     }
 
-    if (!HAL_CHASSIS_IS_ARRIVED()) return 0;
+    if (!chassis_nav_arrived_for_waypoint()) return 0;
 
     is_navigating = 0;
     (*wp_idx)++;
@@ -309,7 +356,7 @@ static void stage_wait_start_handler(void)
             is_navigating = 1;
             return;
         }
-        if (!HAL_CHASSIS_IS_ARRIVED()) return;
+        if (!chassis_nav_arrived_for_waypoint()) return;
 
         is_navigating = 0;
         s_wait_start_phase = 1U;
@@ -431,7 +478,7 @@ static void stage_deadlock_reset_handler(void)
         return;
     }
 
-    if (!HAL_CHASSIS_IS_ARRIVED()) return;
+    if (!chassis_nav_arrived_for_waypoint()) return;
 
     is_navigating = 0;
 
@@ -578,6 +625,21 @@ void Game_Logic_Task_Run(void)
     if (s_link_alive)
     {
         app_link_get_map_snapshot(g_game_map);
+    }
+
+    /* OpenART 低频位姿融合 + 一致性监控:
+     * 必须在 sync_player_pos 之前把视觉触发的硬重定位写回 odom, 否则本拍的 g_player_pos 仍是漂移值。
+     * - app_vision_fusion_task           : 运动中连续软融合 (默认编译为空)。
+     * - app_vision_fusion_consistency_tick: 大幅打滑/搬车时硬重定位 (安全网)。
+     * 链路掉线或处于 STAGE_DONE/PAUSE 时, 全部"不允许"，避免基于陈旧或冻结状态做判定。
+     */
+    {
+        uint8 allow_continuous = (uint8)((s_link_alive != 0U) && (current_stage != STAGE_DONE));
+        uint8 allow_consistency = (uint8)((s_link_alive != 0U) &&
+                                          (current_stage != STAGE_DONE) &&
+                                          (current_stage != STAGE_PAUSE_ON_LINK_LOSS));
+        app_vision_fusion_task(allow_continuous);
+        app_vision_fusion_consistency_tick(allow_consistency);
     }
 
     sync_player_pos();

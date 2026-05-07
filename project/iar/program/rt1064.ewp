@@ -1150,6 +1150,12 @@
             <name>$PROJ_DIR$\..\..\code\app_link.h</name>
         </file>
         <file>
+            <name>$PROJ_DIR$\..\..\code\app_vision_fusion.c</name>
+        </file>
+        <file>
+            <name>$PROJ_DIR$\..\..\code\app_vision_fusion.h</name>
+        </file>
+        <file>
             <name>$PROJ_DIR$\..\..\code\chassis_config.h</name>
         </file>
         <file>

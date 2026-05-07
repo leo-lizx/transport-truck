@@ -5,9 +5,9 @@
  *--------------------------------------------------------------------------------------------------------------------
  * 设计要点:
  *   1. 状态机式逐字节解析, 任意非法字节均 fallback 到等 SOF1, 不会卡死
- *   2. CRC8 查表实现 (256 B ROM), 单帧 (192B) 校验 < 50 µs
+ *   2. CRC8 查表实现 (256 B ROM), 单帧 (194B) 校验 < 50 µs
  *   3. 字节超时: 50 ms 内未收到下一字节 → 状态机复位 (防止半截帧污染下一帧)
- *   4. MAP 帧: LEN 必须 == 192, 且每个字符必须是合法符号 ('# - . $ * @'), 否则丢弃
+ *   4. MAP 帧: 兼容 LEN=192 纯地图与 LEN=194 地图+车辆坐标; 地图字符非法则丢弃
  *   5. 写 g_game_map 用 const 字符 → 枚举的查表映射, 与 app_game_logic.h 中 MAP_* 枚举对齐
  *   6. 不调用任何阻塞 API, 不分配堆内存
  *********************************************************************************************************************/
@@ -34,8 +34,11 @@ static          uint8            s_rx_payload[APP_LINK_MAX_PAYLOAD];
  * 全局可观测变量定义
  *=================================================================================================================*/
 volatile uint32   g_link_last_map_ms   = 0U;
+volatile uint32   g_link_last_car_ms   = 0U;
 volatile uint32   g_link_last_hb_ms    = 0U;
 volatile uint32   g_link_byte_last_ms  = 0U;
+volatile uint8    g_link_car_x         = 0U;
+volatile uint8    g_link_car_y         = 0U;
 app_link_stats_t  g_link_stats         = {0};
 
 /*-- ms 时基 (由 app_link_tick 累加, 仅 app_link.c 内部使用) ----------------------------------------------------*/
@@ -45,7 +48,7 @@ static volatile uint32 s_ms_now = 0U;
  * 【P0-3】地图权威副本 + Seq-Lock
  *-------------------------------------------------------------------------------------------------------------------
  * 设计:
- *   - s_map_authoritative: 只由 commit_map_frame() (LPUART1 ISR) 写; 任何读者一律走快照拷贝
+ *   - s_map_authoritative: 只由 commit_map_frame() (视觉 UART ISR) 写; 任何读者一律走快照拷贝
  *   - s_map_seq           : 偶 = 稳定, 奇 = 写者正在更新; 写者两次 ++, 读者循环到两次读取相等且偶数为止
  *   - 屏障 __DMB()         : 防止编译器/M7 把数据访问与 seq 自增重排
  *   - 重试上限             : 8 次, 已远超 ISR 单帧写时长 (3 µs) / 读时长 (1 µs) 的可能碰撞窗口
@@ -56,6 +59,61 @@ static uint8           s_map_authoritative[APP_LINK_MAP_ROWS][APP_LINK_MAP_COLS]
 static volatile uint32 s_map_seq = 0U;     /* 偶 = stable, 奇 = updating                  */
 
 volatile uint32 g_link_map_snapshot_retry_giveup = 0U;
+
+/* 【视觉融合】车辆格坐标权威副本 + seq-lock（仅 ISR 写；读者主循环） */
+#define APP_LINK_CAR_SNAPSHOT_RETRY_MAX  (8U)
+
+static volatile uint32 s_car_seq          = 0U;
+static volatile uint8  s_car_snap_x       = 0U;
+static volatile uint8  s_car_snap_y       = 0U;
+static volatile uint32 s_car_snap_ms      = 0U;
+static volatile uint32 s_car_frame_id     = 0U;
+static volatile uint8  s_car_snap_valid   = 0U;
+
+/*-------------------------------------------------------------------------------------------------------------------
+ * ISR 内调用: MAP 载荷已合法写入地图后，再提交车辆坐标（与地图同一帧语义一致）
+ *-----------------------------------------------------------------------------------------------------------------*/
+static void commit_car_snapshot(uint8 cx, uint8 cy)
+{
+    s_car_seq++;
+    __DMB();
+    s_car_snap_x     = cx;
+    s_car_snap_y     = cy;
+    s_car_snap_ms    = s_ms_now;
+    s_car_frame_id++;
+    s_car_snap_valid = 1U;
+    g_link_car_x     = cx;
+    g_link_car_y     = cy;
+    g_link_last_car_ms = s_ms_now;
+    __DMB();
+    s_car_seq++;
+}
+
+void app_link_get_car_snapshot(app_link_car_snapshot_t *out)
+{
+    uint32 retry;
+    uint32 s1;
+    uint32 s2;
+
+    if (out == NULL) { return; }
+
+    for (retry = 0U; retry <= APP_LINK_CAR_SNAPSHOT_RETRY_MAX; ++retry)
+    {
+        s1 = s_car_seq;
+        if ((s1 & 1U) != 0U) { continue; }
+        __DMB();
+        out->car_x    = s_car_snap_x;
+        out->car_y    = s_car_snap_y;
+        out->stamp_ms = s_car_snap_ms;
+        out->frame_id = s_car_frame_id;
+        out->valid    = s_car_snap_valid;
+        __DMB();
+        s2 = s_car_seq;
+        if (s1 == s2) { return; }
+    }
+
+    out->valid = 0U;
+}
 
 /*===================================================================================================================
  * CRC8 查表 (多项式 0x07, 初值 0x00, 不反射, 不异或输出 — 即标准 CRC-8/SMBUS 变种)
@@ -244,19 +302,40 @@ static void dispatch_frame(void)
     {
         case APP_LINK_TYPE_MAP:
         {
-            if (s_rx_len != (uint8)APP_LINK_MAP_PAYLOAD_LEN)
+            uint8 car_ready = 0U;
+            uint8 cx        = 0U;
+            uint8 cy        = 0U;
+
+            if ((s_rx_len != (uint8)APP_LINK_MAP_PAYLOAD_LEN) &&
+                (s_rx_len != (uint8)APP_LINK_MAP_WITH_POS_LEN))
             {
                 ++g_link_stats.frames_len_err;
                 break;
             }
+            if (s_rx_len == (uint8)APP_LINK_MAP_WITH_POS_LEN)
+            {
+                cx = s_rx_payload[APP_LINK_MAP_PAYLOAD_LEN];
+                cy = s_rx_payload[APP_LINK_MAP_PAYLOAD_LEN + 1U];
+                if ((cx >= (uint8)APP_LINK_MAP_COLS) || (cy >= (uint8)APP_LINK_MAP_ROWS))
+                {
+                    ++g_link_stats.frames_len_err;
+                    break;
+                }
+                car_ready = 1U;
+            }
+            /* 先落地地图，成功后再提交车辆坐标，避免地图被拒而车位已更新的撕裂 */
             if (commit_map_frame((const uint8 *)s_rx_payload) == 0U)
             {
-                ++g_link_stats.frames_len_err;      /* 含非法字符按 LEN 错统计   */
+                ++g_link_stats.frames_len_err;
                 break;
+            }
+            if (car_ready != 0U)
+            {
+                commit_car_snapshot(cx, cy);
             }
             ++g_link_stats.frames_ok;
             g_link_last_map_ms = s_ms_now;
-            g_link_last_hb_ms  = s_ms_now;          /* MAP 也算保活             */
+            g_link_last_hb_ms  = s_ms_now;
             break;
         }
 
@@ -303,9 +382,23 @@ void app_link_init(void)
     parser_reset();
 
     g_link_last_map_ms  = 0U;
+    g_link_last_car_ms  = 0U;
     g_link_last_hb_ms   = 0U;
     g_link_byte_last_ms = 0U;
+    g_link_car_x        = 0U;
+    g_link_car_y        = 0U;
     s_ms_now            = 0U;
+
+    /* 车辆坐标快照清零 */
+    s_car_seq++;
+    __DMB();
+    s_car_snap_x       = 0U;
+    s_car_snap_y       = 0U;
+    s_car_snap_ms      = 0U;
+    s_car_frame_id     = 0U;
+    s_car_snap_valid   = 0U;
+    __DMB();
+    s_car_seq++;
 
     g_link_stats.frames_ok           = 0U;
     g_link_stats.frames_crc_err      = 0U;

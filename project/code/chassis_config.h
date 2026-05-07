@@ -178,6 +178,141 @@
 #define CHASSIS_YAW_GOAL_TOLERANCE_DEG    (1.50f)
 
 /* ======================================================================
+ *  OpenART 视觉位姿融合（事件驱动 Snap 为主，连续融合为辅）
+ *  --------------------------------------------------------------------
+ *  设计选型 (见 视觉位姿融合实现说明.md §算法选型):
+ *    - 视觉只给整数格 (单元约 0.23m)，量化噪声 ±0.115m 远大于短距 odom 漂移 (~3cm)。
+ *    - 因此默认 *关闭* 运动中连续融合，改为「到站静止 → 多帧表决 → Snap 到格中心」+
+ *      「运动中一致性监控 → 大幅打滑/搬车时硬重定位」两类事件触发。
+ *    - 连续融合保留作可选，仅在视觉端升级到亚格坐标后才有正收益。
+ * ====================================================================== */
+
+/* ----- 1) 运动中连续融合 (默认关；语义专指"运动中"，不含到站 Snap) ---------- */
+
+/** 1=运动中按 PERIOD_MS 周期做软融合；0=运动中纯里程计 (推荐默认) */
+#ifndef CHASSIS_VISION_FUSION_ENABLE
+#define CHASSIS_VISION_FUSION_ENABLE      (0)
+#endif
+
+/** 主循环侧融合调用周期门槛（ms），内部累加 GAME_LOGIC 5ms tick */
+#ifndef CHASSIS_VISION_FUSION_PERIOD_MS
+#define CHASSIS_VISION_FUSION_PERIOD_MS   (75U)
+#endif
+
+/** 观测时间戳过期丢弃（ms），大于此视为不可用 */
+#ifndef CHASSIS_VISION_MAX_OBS_AGE_MS
+#define CHASSIS_VISION_MAX_OBS_AGE_MS     (180U)
+#endif
+
+/** 固定链路+处理延迟补偿（ms），叠加在 obs_age 上做前推：pred += v*(age+delay)/1000 */
+#ifndef CHASSIS_VISION_DELAY_COMP_MS
+#define CHASSIS_VISION_DELAY_COMP_MS      (40U)
+#endif
+
+/** 小于该误差（m）不修正，避免噪声抽动 */
+#ifndef CHASSIS_VISION_IGNORE_ERR_M
+#define CHASSIS_VISION_IGNORE_ERR_M       (0.03f)
+#endif
+
+/** 中等误差下指数平滑系数：pose += alpha*(vision_pred - pose) */
+#ifndef CHASSIS_VISION_SOFT_ALPHA
+#define CHASSIS_VISION_SOFT_ALPHA         (0.20f)
+#endif
+
+/** 车体近乎静止时放大 alpha（乘以该系数后上限 1） */
+#ifndef CHASSIS_VISION_ALPHA_STATIC_SCALE
+#define CHASSIS_VISION_ALPHA_STATIC_SCALE (1.50f)
+#endif
+
+#ifndef CHASSIS_VISION_STATIC_SPEED_MPS
+#define CHASSIS_VISION_STATIC_SPEED_MPS   (0.05f)
+#endif
+
+/** 大于该误差（m）认为观测可疑：仍可做校正但强制缩小有效 alpha（见实现） */
+#ifndef CHASSIS_VISION_LARGE_ERR_M
+#define CHASSIS_VISION_LARGE_ERR_M        (0.50f)
+#endif
+
+/** 单次融合 XY 最大修正模长（m），抑制突变 */
+#ifndef CHASSIS_VISION_MAX_STEP_M
+#define CHASSIS_VISION_MAX_STEP_M         (0.08f)
+#endif
+
+/* ----- 2) 到站 Snap (事件驱动；推荐默认开) -------------------------------- */
+
+/** 1=底盘 odom 到位后再做"短静止 + 多帧表决 + Snap 到格中心"才放行下一航点 */
+#ifndef CHASSIS_VISION_SNAP_ON_ARRIVE_ENABLE
+#define CHASSIS_VISION_SNAP_ON_ARRIVE_ENABLE (1)
+#endif
+
+/** 表决窗口最多采样多少帧 (按 frame_id 去重) */
+#ifndef CHASSIS_VISION_SNAP_VOTE_FRAMES
+#define CHASSIS_VISION_SNAP_VOTE_FRAMES   (5U)
+#endif
+
+/** 占比最高的格至少要拿到的票数 (≤ VOTE_FRAMES) */
+#ifndef CHASSIS_VISION_SNAP_VOTE_MIN
+#define CHASSIS_VISION_SNAP_VOTE_MIN      (3U)
+#endif
+
+/** 进入 Snap 前要求"短静止"的持续时间 (ms)，与赛规 3s 静止解耦 */
+#ifndef CHASSIS_VISION_SNAP_SETTLE_MS
+#define CHASSIS_VISION_SNAP_SETTLE_MS     (150U)
+#endif
+
+/** 短静止判据的速度阈 (m/s) */
+#ifndef CHASSIS_VISION_SNAP_SETTLE_SPEED_MPS
+#define CHASSIS_VISION_SNAP_SETTLE_SPEED_MPS (0.05f)
+#endif
+
+/** 表决采样时单帧允许的最大帧龄 (ms) */
+#ifndef CHASSIS_VISION_SNAP_MAX_SNAP_AGE_MS
+#define CHASSIS_VISION_SNAP_MAX_SNAP_AGE_MS (200U)
+#endif
+
+/** 表决总超时 (ms)；超时则放行航点 (避免链路卡滞死锁) */
+#ifndef CHASSIS_VISION_SNAP_TIMEOUT_MS
+#define CHASSIS_VISION_SNAP_TIMEOUT_MS    (800U)
+#endif
+
+/** Snap 与目标格曼哈顿差 ≤ 该值才接受表决；超过认为视觉报错，放行 odom */
+#ifndef CHASSIS_VISION_SNAP_MAX_GAP_CELLS
+#define CHASSIS_VISION_SNAP_MAX_GAP_CELLS (1U)
+#endif
+
+/* ----- 3) 运动中一致性监控 (安全网) -------------------------------------- */
+
+/** 1=每周期对比 odom 格 vs 视觉格，差距持续过大触发硬重定位 */
+#ifndef CHASSIS_VISION_CONSISTENCY_ENABLE
+#define CHASSIS_VISION_CONSISTENCY_ENABLE (1)
+#endif
+
+/** 监控调用周期 (ms)，内部按 5ms tick 累加 */
+#ifndef CHASSIS_VISION_CONSISTENCY_PERIOD_MS
+#define CHASSIS_VISION_CONSISTENCY_PERIOD_MS (100U)
+#endif
+
+/** 曼哈顿差阈值；持续 HOLD_MS 内不下降即触发 */
+#ifndef CHASSIS_VISION_CONSISTENCY_GAP_CELLS
+#define CHASSIS_VISION_CONSISTENCY_GAP_CELLS (2U)
+#endif
+
+/** 持续过大的判定窗 (ms) */
+#ifndef CHASSIS_VISION_CONSISTENCY_HOLD_MS
+#define CHASSIS_VISION_CONSISTENCY_HOLD_MS (600U)
+#endif
+
+/** 触发后冷却 (ms)，期间不再硬重定位，避免抖动 */
+#ifndef CHASSIS_VISION_CONSISTENCY_COOLDOWN_MS
+#define CHASSIS_VISION_CONSISTENCY_COOLDOWN_MS (1000U)
+#endif
+
+/** 监控帧的最大帧龄；过旧不参与判定 */
+#ifndef CHASSIS_VISION_CONSISTENCY_MAX_AGE_MS
+#define CHASSIS_VISION_CONSISTENCY_MAX_AGE_MS (250U)
+#endif
+
+/* ======================================================================
  *  【P0-8】发车区 / 越界几何参数
  *  --------------------------------------------------------------------
  *  全局坐标系约定 (来自本文件上方的 grid_to_m / m_to_grid):

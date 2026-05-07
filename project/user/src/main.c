@@ -91,16 +91,28 @@ static uint32 wait_for_tick(void)
  *    MAIN_RUN_MODE_GAME           : 游戏状态机 (推箱子) 完整运行
  *    MAIN_RUN_MODE_YAW_HOLD       : 航向保持测试 (车体不动, IMU 闭环只调 wz)
  *    MAIN_RUN_MODE_SINGLE_WHEEL   : 单轮 PID 调试 (只给一个轮子目标速度)
+ *    MAIN_RUN_MODE_OPENART1_TEST  : OpenART1 -> UART4 地图链路测试 (不驱动车体)
  *=========================================================================*/
 #define MAIN_RUN_MODE_GAME            (0)
 #define MAIN_RUN_MODE_YAW_HOLD        (1)
 #define MAIN_RUN_MODE_SINGLE_WHEEL    (2)
 #define MAIN_RUN_MODE_POINT_NAV       (3)
 #define MAIN_RUN_MODE_SOKO_SELFTEST   (4)
+#define MAIN_RUN_MODE_OPENART1_TEST   (5)
 
 /* >>>>>>>>>>>> 改这里切换调试模式 <<<<<<<<<<<< */
-#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_SOKO_SELFTEST)     /* 推箱求解自测: DAP 串口输出固定测试图路径 */
+#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_OPENART1_TEST)     /* OpenART1 地图链路: UART4 接收 194B MAP */
 /* <<<<<<<<<<<< 改这里切换调试模式 >>>>>>>>>>>> */
+
+/* OpenART1 地图链路硬件口: 若实测 UART4 走 D0/D1, 只改下面两行宏. */
+#define MAIN_OPENART1_UART            (UART_4)
+#define MAIN_OPENART1_UART_TX         (UART4_TX_C16)
+#define MAIN_OPENART1_UART_RX         (UART4_RX_C17)
+
+/* OpenART1 测试日志口: 接 DAP 下载器虚拟串口/USB-TTL, 只用于本轮链路观测. */
+#define MAIN_TEST_LOG_UART            (UART_1)
+#define MAIN_TEST_LOG_UART_TX         (UART1_TX_B12)
+#define MAIN_TEST_LOG_UART_RX         (UART1_RX_B13)
 
 #if (MAIN_RUN_MODE == MAIN_RUN_MODE_SOKO_SELFTEST)
 /*
@@ -326,11 +338,15 @@ int main(void)
     // ------------------------------------------------------------------
     // 1. 通信外设初始化
     // ------------------------------------------------------------------
-    // 串口1: 与 OpenART 视觉模块通信 (波特率需与 OpenART 一致)
-#if (MAIN_RUN_MODE == MAIN_RUN_MODE_GAME)
-    uart_init(UART_1, 115200, UART1_TX_B12, UART1_RX_B13);
-    uart_rx_interrupt(UART_1, 1);
+    // OpenART1: 地图识别模块, 通过 UART4 上报 MAP/HEARTBEAT 帧.
+#if ((MAIN_RUN_MODE == MAIN_RUN_MODE_GAME) || (MAIN_RUN_MODE == MAIN_RUN_MODE_OPENART1_TEST))
+    uart_init(MAIN_OPENART1_UART, 115200, MAIN_OPENART1_UART_TX, MAIN_OPENART1_UART_RX);
+    uart_rx_interrupt(MAIN_OPENART1_UART, 1);
     app_link_init();                /* P0-1: 协议解析层初始化, 必须在 uart_rx_interrupt 之后 */
+#endif
+
+#if (MAIN_RUN_MODE == MAIN_RUN_MODE_OPENART1_TEST)
+    uart_init(MAIN_TEST_LOG_UART, 115200, MAIN_TEST_LOG_UART_TX, MAIN_TEST_LOG_UART_RX);
 #endif
 
     // ------------------------------------------------------------------
@@ -373,6 +389,12 @@ int main(void)
     /* 推箱求解自测: 不驱动车体, 仅保留底层初始化和 DAP 串口输出. */
     uart_init(UART_1, 115200, UART1_TX_B12, UART1_RX_B13);
     chassis_ctrl_stop();
+#elif (MAIN_RUN_MODE == MAIN_RUN_MODE_OPENART1_TEST)
+    /* OpenART1 UART4 链路测试: 只收视觉帧和打印统计, 不进入游戏状态机. */
+    chassis_ctrl_stop();
+    ips200_clear();
+    ips200_show_string(0, 0, "OPENART1 UART4");
+    ips200_show_string(0, 16, "WAIT RX...");
 #else
     /* 游戏模式: 设置初始航向基准, 等待状态机调度. */
     chassis_ctrl_hold_yaw(0.0f);
@@ -441,13 +463,57 @@ int main(void)
         }
     #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_SOKO_SELFTEST)
         main_run_soko_selftest_periodic_5ms();
+    #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_OPENART1_TEST)
+        {
+            static uint16 s_link_print_div = 0U;
+            s_link_print_div++;
+            if (s_link_print_div >= 200U)
+            {
+                char log_buffer[128];
+                int log_len;
+                s_link_print_div = 0U;
+                log_len = snprintf(log_buffer, sizeof(log_buffer),
+                                   "LINK ok=%lu hb=%lu seq=%u crc=%lu len=%lu tout=%lu map_ms=%lu car=%u,%u\r\n",
+                                   g_link_stats.frames_ok,
+                                   g_link_stats.hb_cnt,
+                                   g_link_stats.last_hb_seq,
+                                   g_link_stats.frames_crc_err,
+                                   g_link_stats.frames_len_err,
+                                   g_link_stats.frames_byte_timeout,
+                                   g_link_last_map_ms,
+                                   g_link_car_x,
+                                   g_link_car_y);
+                if (log_len > 0)
+                {
+                    if (log_len > (int)(sizeof(log_buffer) - 1U))
+                    {
+                        log_len = (int)(sizeof(log_buffer) - 1U);
+                    }
+                    printf("%s", log_buffer);
+                    uart_write_buffer(MAIN_TEST_LOG_UART, (const uint8 *)log_buffer, (uint32)log_len);
+                }
+
+                ips200_show_string(0, 16, "OK      HB      ");
+                ips200_show_uint(24, 16, g_link_stats.frames_ok, 6);
+                ips200_show_uint(88, 16, g_link_stats.hb_cnt, 6);
+                ips200_show_string(0, 32, "CRC     LEN     ");
+                ips200_show_uint(32, 32, g_link_stats.frames_crc_err, 5);
+                ips200_show_uint(96, 32, g_link_stats.frames_len_err, 5);
+                ips200_show_string(0, 48, "CAR     ,       ");
+                ips200_show_uint(32, 48, g_link_car_x, 2);
+                ips200_show_uint(56, 48, g_link_car_y, 2);
+                ips200_show_string(0, 64, "MAPMS          ");
+                ips200_show_uint(48, 64, g_link_last_map_ms, 8);
+            }
+        }
     #else
         Game_Logic_Task_Run();          /* 推箱子状态机 (非阻塞) */
     #endif
 
         /* 菜单渲染放到主循环，避免在 PIT 中断内刷屏造成控制节拍抖动。 */
         menu_render_div++;
-        if (menu_render_div >= MAIN_MENU_RENDER_DIV)
+        if ((MAIN_RUN_MODE != MAIN_RUN_MODE_OPENART1_TEST) &&
+            (menu_render_div >= MAIN_MENU_RENDER_DIV))
         {
             menu_render_div = 0U;
             chassis_menu_render_100ms();

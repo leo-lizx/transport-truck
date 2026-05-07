@@ -1545,6 +1545,37 @@ chassis_body_speed_cmd_t chassis_ctrl_get_last_cmd(void)
     return c;
 }
 
+void chassis_ctrl_get_odom_velocity_global_mps(float *out_vx_g, float *out_vy_g)
+{
+    chassis_pose_t p;
+    float yaw_rad;
+    float cy;
+    float sy;
+    float vx_b;
+    float vy_b;
+    float vxg;
+    float vyg;
+
+    pose_read_snapshot(&p);
+    yaw_rad = p.yaw_deg * CHASSIS_DEG_TO_RAD_F;
+    cy      = cosf(yaw_rad);
+    sy      = sinf(yaw_rad);
+    vx_b    = s_fb_vx;
+    vy_b    = s_fb_vy;
+    /* 与里程计积分同一旋转: new_x += (cy*vx - sy*vy)*dt */
+    vxg     = cy * vx_b - sy * vy_b;
+    vyg     = sy * vx_b + cy * vy_b;
+
+    if (out_vx_g != NULL) { *out_vx_g = vxg; }
+    if (out_vy_g != NULL) { *out_vy_g = vyg; }
+}
+
+void chassis_ctrl_get_point_nav_target_m(float *out_x_m, float *out_y_m)
+{
+    if (out_x_m != NULL) { *out_x_m = s_tgt_x_m; }
+    if (out_y_m != NULL) { *out_y_m = s_tgt_y_m; }
+}
+
 /*--- 外部校正 ---*/
 
 void chassis_ctrl_set_pose(float x_m, float y_m, float yaw_deg)

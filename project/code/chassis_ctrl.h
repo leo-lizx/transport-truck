@@ -211,6 +211,18 @@ chassis_pose_t chassis_ctrl_get_pose(void);
 chassis_body_speed_cmd_t chassis_ctrl_get_last_cmd(void);
 
 /**
+ * @brief  里程计车体速度投影到全局坐标系（m/s），用于视觉延迟补偿。
+ *         内部使用编码器逆解算得到的 s_fb_vx/s_fb_vy（车体系）与当前 yaw。
+ */
+void chassis_ctrl_get_odom_velocity_global_mps(float *out_vx_g, float *out_vy_g);
+
+/**
+ * @brief  读取 POINT_NAV 当前目标点（米），与 chassis_ctrl_move_to_grid/move_to_m 下发的一致。
+ *         非点位模式时仍为最近一次目标，调用方需结合业务判断是否有效。
+ */
+void chassis_ctrl_get_point_nav_target_m(float *out_x_m, float *out_y_m);
+
+/**
  * @brief  紧急停止：立即清零所有控制状态并切断 PWM 输出
  */
 void chassis_ctrl_stop(void);

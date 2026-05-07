@@ -16,7 +16,7 @@
  *   - CRC8      : 多项式 0x07, 初值 0x00, 覆盖 TYPE..PAYLOAD (不包括 SOF)
  *
  * 当前任务实现:
- *   - TYPE=0x01 MAP        : 192 字节 ASCII 地图字符串 (12 行 × 16 列, 字符 # - . $ * @)
+ *   - TYPE=0x01 MAP        : 兼容 192B ASCII 地图; 推荐 194B = 192B 地图 + car_x + car_y
  *   - TYPE=0x10 HEARTBEAT  : 1 字节自增 seq, 用于链路保活与丢包率统计
  *
  * 不在本任务范围 (留给 P0-2 / P1):
@@ -37,8 +37,10 @@ extern "C" {
  *=================================================================================================================*/
 #define APP_LINK_SOF1               (0xAAU)         /* 帧起始字节 1                       */
 #define APP_LINK_SOF2               (0x55U)         /* 帧起始字节 2                       */
-#define APP_LINK_MAX_PAYLOAD        (200U)          /* PAYLOAD 上限 (略大于 MAP 192B)     */
+#define APP_LINK_MAX_PAYLOAD        (200U)          /* PAYLOAD 上限 (略大于 MAP 194B)     */
 #define APP_LINK_MAP_PAYLOAD_LEN    (192U)          /* 12 行 × 16 列 = 192 字节           */
+#define APP_LINK_MAP_POS_LEN        (2U)            /* MAP 扩展坐标: car_x + car_y        */
+#define APP_LINK_MAP_WITH_POS_LEN   (194U)          /* 192B 地图 + 2B 车辆坐标            */
 #define APP_LINK_MAP_ROWS           (12U)           /* P0-3: 地图行数 (与 MAP_ROWS 同义)  */
 #define APP_LINK_MAP_COLS           (16U)           /* P0-3: 地图列数 (与 MAP_COLS 同义)  */
 
@@ -79,12 +81,27 @@ typedef struct
  * 全局可观测变量 (仅读, 由 app_link.c 维护; volatile 因 ISR 写主循环读)
  *=================================================================================================================*/
 extern volatile uint32 g_link_last_map_ms;     /* 最近一次有效 MAP 帧落地时刻 (ms 时基: PIT 心跳累加)            */
+extern volatile uint32 g_link_last_car_ms;     /* 最近一次有效 MAP 坐标落地时刻 (ms 时基: PIT 心跳累加)           */
 extern volatile uint32 g_link_last_hb_ms;      /* 最近一次心跳 / 任意有效帧时刻, 供 P0-2 链路超时回退使用       */
 extern volatile uint32 g_link_byte_last_ms;    /* 最近一次收到任意字节的时刻, 供字节超时复位                    */
+extern volatile uint8  g_link_car_x;           /* 最近一次 OpenART1 识别到的车辆 X 坐标 (0~15)                  */
+extern volatile uint8  g_link_car_y;           /* 最近一次 OpenART1 识别到的车辆 Y 坐标 (0~11)                  */
 extern app_link_stats_t g_link_stats;          /* 统计计数 (P0-1 不要求原子读, 接受偶发撕裂)                    */
 
 /*-- P0-3: seq-lock 读端重试达到上限的累计次数, 长期保持 0 即说明并发保护无碰撞 --------------------------------*/
 extern volatile uint32 g_link_map_snapshot_retry_giveup;
+
+/*===================================================================================================================
+ * MAP 附带车辆格坐标 —— seq-lock 快照（供视觉融合 / 到站确认；与 g_link_car_x 同源更新）
+ *=================================================================================================================*/
+typedef struct
+{
+    uint8  car_x;       /* 0 ~ APP_LINK_MAP_COLS-1                              */
+    uint8  car_y;       /* 0 ~ APP_LINK_MAP_ROWS-1                              */
+    uint32 stamp_ms;    /* app_link 内部 ms，与 app_link_get_ms() 同源          */
+    uint32 frame_id;    /* 每成功提交一帧带坐标的 MAP 自增                       */
+    uint8  valid;       /* 是否至少收到过一帧 LEN=194 且地图校验通过的坐标       */
+} app_link_car_snapshot_t;
 
 /*===================================================================================================================
  * 对外 API
@@ -140,12 +157,20 @@ uint32 app_link_get_ms(void);
  * 参数: dst —— 12×16 目标缓冲区 (单元格枚举值, 与 MAP_EMPTY/WALL/TARGET/BOX/BOMB 一致)
  * 返回: 无
  * 备注:
- *   1. 写者位于 LPUART1 ISR (commit_map_frame), 读者可在主循环 / PIT 中断中调用, 均无阻塞
+ *   1. 写者位于视觉 UART ISR (commit_map_frame), 读者可在主循环 / PIT 中断中调用, 均无阻塞
  *   2. 内部最多重试 8 次; 超限则放弃本次拷贝并自增 g_link_map_snapshot_retry_giveup,
  *      调用方应保留上次快照 (本函数不会写脏数据, 但可能保留部分上次内容)
  *   3. 上电至首帧到达前, 拷贝结果为全 0 (= MAP_EMPTY), 业务层应配合 Game_Link_Is_Alive 使用
  *-----------------------------------------------------------------------------------------------------------------*/
 void app_link_get_map_snapshot(uint8 dst[APP_LINK_MAP_ROWS][APP_LINK_MAP_COLS]);
+
+/*-------------------------------------------------------------------------------------------------------------------
+ * 函数: app_link_get_car_snapshot
+ * 功能: seq-lock 读出最近一次有效的 MAP 车辆格坐标 + 时间戳 + 帧号，避免与 ISR 写入撕裂
+ * 参数: out —— 输出；可为 NULL（直接忽略）
+ * 返回: 无
+ *-----------------------------------------------------------------------------------------------------------------*/
+void app_link_get_car_snapshot(app_link_car_snapshot_t *out);
 
 #ifdef __cplusplus
 }
