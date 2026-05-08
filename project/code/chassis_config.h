@@ -116,9 +116,11 @@
  * 到达目标点时的速度判据（m/s）.
  * dist < EPSILON 且 ||v_body|| < 该值 才置 s_arrived=1.
  * 防止车以高速穿过目标点瞬间触发到位, 惯性冲出再触发 HOLD_EXIT 反复震荡.
- * ROS Nav2 goal_checker 双判据标准: xy_goal_tolerance + vel_tolerance.
- */
-#define CHASSIS_POS_ARRIVED_VEL_MPS       (0.05f)
+ * P0-调参 2026-05-08: 0.05 → 0.15.
+ *   配合 BRAKE_DIST 扩大到 22cm, 到达 EPSILON 时速度已 << 0.15 m/s,
+ *   不再出现「车以 0.1 m/s 穿过 EPSILON 但速度门拦下 s_arrived → 反向冲」的振荡.
+ *   0.15 m/s 仍远小于 MIN_DRIVE (0.05) 情形, 不会误触发高速穿越. */
+#define CHASSIS_POS_ARRIVED_VEL_MPS       (0.25f)
 
 /**
  * 到位后的 Schmitt 滞后释放阈值（米）.
@@ -139,10 +141,17 @@
  * 逻辑: 被推出保持区时 dist > HOLD_EXIT → 增益调度只在 dist < RECOVERY_DIST 时生效,
  * 若 RECOVERY_DIST < HOLD_EXIT, 恢复全程在 RECOVERY_DIST 外 → 全量 KP → 必震荡.
  */
-#define CHASSIS_POS_RECOVERY_DIST_M       (0.35f)
+/* P0-修复 2026-05-08 (快到目标停下然后慢爬抖动):
+ * 根因: RECOVERY_DIST=0.10m < HOLD_EXIT=0.15m, 违反"必须 > HOLD_EXIT"约束;
+ * 且 0.10m < BRAKE_DIST=0.22m, 导致 0.22~0.10m 段全量 KP 运行, 入场速
+ * 度 ~0.4m/s 时 D项(1.2×0.4=0.48) 超 P项(3.5×0.10=0.35) → 命令负值
+ * → 车停 → P重启 → 慢爬 → 循环 = "停下抖动前进".
+ * 修复: 恢复 0.35m, 保证 RECOVERY_DIST > BRAKE_DIST(0.22) > HOLD_EXIT(0.15). */
+#define CHASSIS_POS_RECOVERY_DIST_M       (0.0f)
 
-/** 扰动恢复模式 KP 缩放因子: 0.45 = 减少但仍有足够力驱动 */
-#define CHASSIS_POS_RECOVERY_KP_SCALE     (0.45f)
+/* P0-调参 2026-05-08: 0.45 → 0.60, 近点最小增益从 45% 提到 60%,
+ * 末段速度更充足, 不再龟速爬完最后几厘米. */
+#define CHASSIS_POS_RECOVERY_KP_SCALE     (0.250f)
 
 /**
  * 轴向独立移动模式 (Manhattan / axis-by-axis).
@@ -371,7 +380,7 @@
  * ====================================================================== */
 
 /** 车体平移最大合成线速度（m/s），矢量模长不超过此值 */
-#define CHASSIS_MAX_LINEAR_SPEED_MPS    (2.35f)
+#define CHASSIS_MAX_LINEAR_SPEED_MPS    (1.5f)
 
 /** 车体最大旋转角速度（°/s）
  *  P0-修复 2026-04-29 姿态闭环转速慢: 原 90°/s 对应单轮仅 ≈0.4 m/s,
@@ -415,15 +424,16 @@
 
 /** 位置环 Kp：沿程方向增益（沿目标方向前进的速度 = Kp × 沿程距离）
  *  物理意义: 决定「冲向目标」的速度, 与轨迹是否直线无关.
- *  建议范围 1.5 ~ 4.0, 偏大冲得快但近点可能超调. */
-#define CHASSIS_POS_KP                  (2.50f)
+ *  建议范围 1.5 ~ 4.0, 偏大冲得快但近点可能超调.
+ *  P0-调参 2026-05-08 (收敛太慢): 2.50 → 3.50, 加快远场逼近速度. */
+#define CHASSIS_POS_KP                  (2.0f)
 
 /**
  * 位置环横向增益 Kp_cross（Cross-Track Error 修正增益）
  *   物理意义: 横向偏差→横向修正速度. 设得比 CHASSIS_POS_KP 大
  *   可以更快地把车「推回直线」而不影响前进速度.
  *   建议 = 1.5 ~ 3 倍 CHASSIS_POS_KP. 设为 0 退化为纯 P(弧线).  */
-#define CHASSIS_POS_CTE_KP              (5.0f)
+#define CHASSIS_POS_CTE_KP              (15.0f)
 
 /**
  * 位置环 D 项增益 (沿程方向) - 速度阻尼.
@@ -436,19 +446,19 @@
  *   KD=KP  : 临界阻尼附近, 最快无超调
  *   KD>KP  : 过阻尼, 收敛变慢但绝不超调
  * 麦轮一般取 KD ≈ KP, 起点用 1.0 ~ 1.5 倍.
- */
-#define CHASSIS_POS_KD                  (1.0f)
+ * P0-调参 2026-05-08: KP 升至 3.50, KD 同步升至 1.20 维持阻尼比 (KD/KP≈0.34). */
+#define CHASSIS_POS_KD                  (0.50f)
 
 /** 位置环横向 D 项增益 - 与 CTE_KP 配套 */
-#define CHASSIS_POS_CTE_KD              (2.0f)
+#define CHASSIS_POS_CTE_KD              (0.50f)
 
 /**
  * D 项低通滤波系数 α (一阶 IIR, Tesla/Waymo 标准做法).
  * y = (1-α)*y_prev + α*x,  截止频率 ≈ α/(2π·dt).
  * α=0.30 @ dt=20ms -> 截止 ≈ 2.4Hz, 衰减 odom 高频噪声 (~20Hz) 约 -18dB.
  * 增大 α -> 响应更快但噪声更多; 减小 -> 更平滑但阻尼延迟增大.
- */
-#define CHASSIS_POS_D_LPF_ALPHA         (0.30f)
+ * P0-调参 2026-05-08 (抖动): 0.30 → 0.15, 截止降到 ~1.2Hz, D 信号更平滑. */
+#define CHASSIS_POS_D_LPF_ALPHA         (0.15f)
 
 /**
  * 位置环最小推进速度 (m/s) - P0-改进 2026-05-02 (终末段龟速爬):
@@ -456,8 +466,9 @@
  *   分到四个麦轮后单轮速度逼近静摩擦门槛, 表现为"间歇前进、慢慢爬完最后几 cm".
  *   做法: 当 dist > epsilon 但 P 输出模长 < V_MIN 时, 把模长抬到 V_MIN,
  *   方向仍由 dx/dy 决定. 工程上取略高于轮端 BREAKAWAY 启动速度.
- *   设为 0 -> 关闭最小推进, 退化为纯 P. */
-#define CHASSIS_POS_MIN_DRIVE_SPEED_MPS  (0.02f)
+ *   设为 0 -> 关闭最小推进, 退化为纯 P.
+ *   P0-调参 2026-05-08: 0.02 → 0.05, 确保末段能克服静摩擦. */
+#define CHASSIS_POS_MIN_DRIVE_SPEED_MPS  (0.0f)
 
 /**
  * 位置环 yaw 跟踪门距 (m) - P0-修复 2026-05-02 (atan2 噪声风暴):
@@ -475,8 +486,10 @@
  *   dist <= EPSILON 时直接 force_stop, 但 ramp 滤波器和电机仍有惯性输出,
  *   实际位置可能超目标 1~3cm. 此处用"软到达": dist 进入 BRAKE_DIST 后开始
  *   按线性把 V_MIN 衰减到 0, 进 EPSILON 时已经基本停下, 不再硬刹.
- *   建议 = 2 ~ 3 倍 V_MIN * 20ms (~5cm). */
-#define CHASSIS_POS_BRAKE_DIST_M         (0.10f)
+ *   建议 = 2 ~ 3 倍 V_MIN * 20ms (~5cm).
+ * P0-调参 2026-05-08 (到位速度过高导致抖动): 0.10 → 0.22,
+ *   让 KP+gain_sched 有足够路程把速度降至 ARRIVED_VEL 以下再进 EPSILON. */
+#define CHASSIS_POS_BRAKE_DIST_M         (0.04f)
 
 /** 航向环 Kp：值越大，朝向对准越快；过大易振荡
  *  P0-调参 2026-04-29: 取消 YAW_MIN_WZ 阶跃后 wz 连续, 可适度提 KP 加快响应。
@@ -490,7 +503,7 @@
  *  P0-回调 2026-05-02 (持续抖动):
  *      KP=4 + KD=0.01 + 死区 1° -> 在 ±1° 内激出高频小振荡. 回到 2.0,
  *      与 KD=0.08 / 死区 2° 配套, 小角度仍比老 0.65 快 3 倍, 不抖. */
-#define CHASSIS_YAW_KP                  (1.900f)
+#define CHASSIS_YAW_KP                  (3.50f)
 
 /** sqrt_controller 用的最大角加速度 (°/s²) - P0-改进 2026-05-02
  *  物理意义: 终末减速段每秒能掉多少 °/s 的角速度.
@@ -874,8 +887,8 @@
  *   1.2 m/s²: 0→2.35 m/s 需 ~2s, 2m 行程全程在爬坡, 最高仅 1.55 m/s
  *   3.0 m/s²: 0→2.35 m/s 仅 0.78s, 2m 行程可短暂跑满速
  * 麦轮横向移动靠滚轮分力, 不依赖轮端抓地, 比纵向更耐高加速.
- */
-#define CHASSIS_CMD_ACCEL_LIMIT_MPS2    (3.00f)
+ * P0-调参 2026-05-08 (收敛太慢): 3.00 → 5.00, 加快速度命令爬坡/刹车响应. */
+#define CHASSIS_CMD_ACCEL_LIMIT_MPS2    (1.50f)
 
 /** 角速度最大加速度（°/s²）
  *  P0-调参 2026-05-02 (大角度阶跃响应慢):
@@ -894,11 +907,12 @@
  * ====================================================================== */
 
 /** X 方向里程计缩放系数 */
-#define CHASSIS_ODOM_SCALE_X            (0.417809f)
+//#define CHASSIS_ODOM_SCALE_X            (0.468539f)
+#define CHASSIS_ODOM_SCALE_X            (0.4f)
 
 /** Y 方向里程计缩放系数 */
-//#define CHASSIS_ODOM_SCALE_Y            (0.447301336986f)
-#define CHASSIS_ODOM_SCALE_Y            (0.41f)
+#define CHASSIS_ODOM_SCALE_Y            (0.42f)
+//#define CHASSIS_ODOM_SCALE_Y            (0.43617f)
 
 /* ======================================================================
  *  车模物理尺寸 — 已经填入实际测量数据

@@ -1102,13 +1102,13 @@ void chassis_ctrl_task_20ms(void)
              * 也会输出几 °/s 的 wz, 配合轮端 breakaway/odom 噪声, 永远
              * 收敛不到 0 -> 极限环 -> 用户看到"到点后还在转".
              *
-             * 关键: 立即清零平移 ramp 状态, 截断"进场惯性".
-             * 根因: ramp_filter 以 accel_limit 速率缓慢从进场速度降向 0,
-             * 期间仍向前驱动车 -> 冲出 HOLD_EXIT -> 位置 P 重启反向推 ->
-             * ramp 再次缓降 -> 来回振荡. 保留 wz ramp 让航向平滑过渡.
+             * P0-修复 2026-05-08 (到位突然停下):
+             *   旧方案硬置零 s_ramp → ramp_filter 输出瞬间跳到 0 → 轮端目标
+             *   阶跃 → 电机抢刹车 → 车身抽动/"突然停".
+             *   新方案: 只清零 cmd, 让 ramp_filter 以 ACCEL_LIMIT 自然衰减;
+             *   BRAKE_DIST 已扩大到 22cm, 入场速度 << dv/frame, ramp 1~2 帧归零,
+             *   实际差别 < 1mm, 但消除了轮端阶跃. wz ramp 同样保留平滑过渡.
              * ============================================================ */
-            s_ramp.vx_body_mps = 0.0f;   /* 截断平移惯性, wz ramp 保留 */
-            s_ramp.vy_body_mps = 0.0f;
             cmd.vx_body_mps = 0.0f;
             cmd.vy_body_mps = 0.0f;
 
@@ -1215,16 +1215,19 @@ void chassis_ctrl_task_20ms(void)
                                    : CHASSIS_POS_AXIS_SWITCH_TOL_M;
 
                 if (fabsf(dx) > x_exit_thr) {
-                    /* X 轴优先 (Y 锁未开或 X 偏差已超回滞门限) */
+                    /* X 轴优先 (Y 锁未开或 X 偏差已超回滞门限).
+                     * P0-修复 2026-05-08: 不硬置零 s_ramp.vy, 让 ramp 以
+                     * ACCEL_LIMIT 自然衰减 Y → 消除切轴时"突然停"抖动.
+                     * 安全性: AXIS_RELOCK_TOL=15cm >> Y 惯性滑行距离 (<2cm at ACCEL=5). */
                     s_axis_y_locked    = 0U;
                     vxg = kp_eff * dx - kd_eff * s_v_along_lpf;
                     vyg = 0.0f;
-                    s_ramp.vy_body_mps = 0.0f;  /* 清零 Y ramp */
                 } else if (fabsf(dy) > CHASSIS_POS_AXIS_SWITCH_TOL_M) {
-                    /* X 已到位, 切 Y 轴; 置 Y 锁防止噪声误回切 X */
+                    /* X 已到位, 切 Y 轴; 置 Y 锁防止噪声误回切 X.
+                     * P0-修复 2026-05-08: 不硬置零 s_ramp.vx, 让 ramp 以
+                     * ACCEL_LIMIT 自然衰减 X → X/Y 平滑过渡无顿挫. */
                     s_axis_y_locked    = 1U;
                     vxg = 0.0f;
-                    s_ramp.vx_body_mps = 0.0f;  /* 清零 X ramp */
                     vyg = kp_eff * dy - kd_eff * s_v_cross_lpf;
                 } else {
                     /* 两轴都在容忍带内: 2D PD 平滑收敛 */
@@ -1291,7 +1294,7 @@ void chassis_ctrl_task_20ms(void)
         /* 全局 → 车体坐标变换 */
         cmd.vx_body_mps =  cy * vxg + sy * vyg;
         cmd.vy_body_mps = -sy * vxg + cy * vyg;
-        cmd.wz_dps      = yaw_pi(yerr, 1U, 0U);  /* 完整级联PI + 禁in-pos锁(平动中不锁) */
+        cmd.wz_dps      = yaw_pi(yerr, 0U, 0U);  /* 平动模式: 关闭内环 rate PI(平动震动噪声会污染I项) + 禁in-pos锁 */
         break;
     }
 
@@ -1299,7 +1302,7 @@ void chassis_ctrl_task_20ms(void)
         float yerr = chassis_normalize_angle_deg(s_tgt_yaw_deg - s_pose.yaw_deg);
         cmd.vx_body_mps = s_cmd_vx;
         cmd.vy_body_mps = s_cmd_vy;
-        cmd.wz_dps      = yaw_pi(yerr, 1U, 0U);  /* 完整级联PI + 禁in-pos锁(平动中不锁) */
+        cmd.wz_dps      = yaw_pi(yerr, 0U, 0U);  /* 完整级联PI + 禁in-pos锁(平动中不锁) */
         break;
     }
 
@@ -1325,8 +1328,13 @@ void chassis_ctrl_task_20ms(void)
     }
     }
 
-    /* 5) 软限位保护：即将撞墙时减速并微调方向 */
-    apply_soft_limit_guard(&cmd);
+    /* 5) 软限位保护：即将撞墙时减速并微调方向.
+     * POINT_NAV 模式下跳过: 目标始终是合法内场格, 0.22s 前瞻靠近边墙时
+     * 会误触发 BRAKE_SCALE=0.28 + 随机 wz, 表现为行进中反复抖动.
+     * 位置 PD + gain scheduling 已覆盖减速, 软限位只在自由运动模式保留. */
+    if (s_mode != MODE_POINT_NAV) {
+        apply_soft_limit_guard(&cmd);
+    }
 
     apply_speed(cmd, ws_pid);
 #endif

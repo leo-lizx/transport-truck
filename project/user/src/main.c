@@ -101,7 +101,7 @@ static uint32 wait_for_tick(void)
 #define MAIN_RUN_MODE_OPENART1_TEST   (5)
 
 /* >>>>>>>>>>>> 改这里切换调试模式 <<<<<<<<<<<< */
-#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_OPENART1_TEST)     /* OpenART1 地图链路: UART4 接收 194B MAP */
+#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_POINT_NAV)     /* OpenART1 地图链路: UART4 接收 194B MAP */
 /* <<<<<<<<<<<< 改这里切换调试模式 >>>>>>>>>>>> */
 
 /* OpenART1 地图链路硬件口: 若实测 UART4 走 D0/D1, 只改下面两行宏. */
@@ -271,12 +271,35 @@ static void main_run_soko_selftest_periodic_5ms(void)
 /* 航向保持目标角 (deg), 仅 YAW_HOLD 模式生效 */
 #define MAIN_HOLD_YAW_TARGET_DEG      (0.0f)
 
-/* 位置闭环目标坐标 (米), 仅 POINT_NAV 模式生效.
- * 坐标系: X 向右为正, Y 向前为正, 原点 = 里程计初始位置.
- * 改这两个宏换目标, 不需要算格数. */
-#define MAIN_POS_NAV_TARGET_X_M       (3.10f)   /* 向右 0.5m */
-#define MAIN_POS_NAV_TARGET_Y_M       (2.25f)   /* 不前进 */
-#define MAIN_POS_NAV_HOLD_YAW_DEG     (0.0f)    /* 全程锁住 0° 航向 */
+/* ============================================================
+ * 位置闭环坐标系 (POINT_NAV 模式) — 整数格约定
+ *   单位: 1 格步长 (X = 3.2m / 14 ≈ 0.2286m, Y = 2.4m / 10 = 0.24m)
+ *   范围: X ∈ [0, 14], Y ∈ [0, 10]   (0 = 左/上边界, 14/10 = 右/下边界)
+ *   起点: (0.5, 5.5) 格 — 发车区中心, 距左墙半格, 距上墙 5.5 格
+ *
+ *   目标坐标传整数即可, 内部按 grid * step 自动换算成米送入闭环.
+ *   起点用半整数 (0.5, 5.5) 描述发车区中心位置, 与硬件实测吻合.
+ * ============================================================ */
+#define MAIN_POS_NAV_START_X_GRID     (1.0f)
+#define MAIN_POS_NAV_START_Y_GRID     (5.5f)
+
+/* >>>>>>>>>>>> 改这两行换目标格 <<<<<<<<<<<< */
+#define MAIN_POS_NAV_TARGET_X_GRID    (1)     /* 整数 0..14, 14 = 右边界 */
+#define MAIN_POS_NAV_TARGET_Y_GRID    (1)     /* 整数 0..10, 10 = 下边界 */
+/* <<<<<<<<<<<< 改这两行换目标格 >>>>>>>>>>>> */
+
+#define MAIN_POS_NAV_HOLD_YAW_DEG     (0.0f)   /* 全程锁住 0° 航向 */
+
+/* 格 → 米换算 (POINT_NAV 专用, 不影响 BFS 的内场索引体系).
+ * 约定: 整数 n = 第 n 格中心 (1-based), 公式为 (n - 0.5) × STEP.
+ *   n=1  → 0.5 × STEP (第1格中心, 距左/上墙半格)
+ *   n=14 → 13.5 × STEP_X = 3.086m (第14格中心, 距右墙 0.114m, 可到达)
+ *   n=10 → 9.5  × STEP_Y = 2.28m  (第10格中心, 距下墙 0.12m,  可到达)
+ * 注: 若传入半整数 5.5 则 (5.5-0.5)×STEP = 5×STEP = 第5/6格边界, 用于起点描述. */
+#define MAIN_POS_GRID_TO_M_X(g)       (((float)(g) - 0.5f) * CHASSIS_GRID_STEP_X_M)
+#define MAIN_POS_GRID_TO_M_Y(g)       (((float)(g) - 0.5f) * CHASSIS_GRID_STEP_Y_M)
+#define MAIN_POS_NAV_TARGET_X_M       MAIN_POS_GRID_TO_M_X(MAIN_POS_NAV_TARGET_X_GRID)
+#define MAIN_POS_NAV_TARGET_Y_M       MAIN_POS_GRID_TO_M_Y(MAIN_POS_NAV_TARGET_Y_GRID)
 
 /* ========================================================================== */
 /*  ⬇⬇⬇ 以下是单轮 PID 调试专用代码, 仅在 MAIN_RUN_MODE_SINGLE_WHEEL 生效 ⬇⬇⬇  */
@@ -328,7 +351,7 @@ static void main_apply_debug_wheel_pid(void)
 /* ========================================================================== */
 /*  ⬆⬆⬆ 单轮 PID 调试辅助函数结束 ⬆⬆⬆                                          */
 /* ========================================================================== */
-int main(void)
+main(void)
 {
     uint8 menu_render_div = 0U;
 
@@ -365,9 +388,10 @@ int main(void)
     // ------------------------------------------------------------------
     chassis_ctrl_init();
     chassis_menu_init();
-    // 发车位修正：第一列，距最底边界约 1m（折算到网格后为 G(1,7)）。
-    chassis_ctrl_set_pose(chassis_grid_x_to_m(CHASSIS_START_GRID_X),
-                          chassis_grid_y_to_m(CHASSIS_START_GRID_Y),
+    /* 发车位: 整数格约定 (0.5, 5.5) → 自动换算成米送入里程计原点.
+     * 半整数表示发车区中心 (距左墙半格, 距上墙 5.5 格), 与实车摆放吻合. */
+    chassis_ctrl_set_pose(MAIN_POS_GRID_TO_M_X(MAIN_POS_NAV_START_X_GRID),
+                          MAIN_POS_GRID_TO_M_Y(MAIN_POS_NAV_START_Y_GRID),
                           0.0f);
 
 #if (MAIN_RUN_MODE == MAIN_RUN_MODE_SINGLE_WHEEL)
