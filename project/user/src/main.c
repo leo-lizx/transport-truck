@@ -284,8 +284,8 @@ static void main_run_soko_selftest_periodic_5ms(void)
 #define MAIN_POS_NAV_START_Y_GRID     (5.5f)
 
 /* >>>>>>>>>>>> 改这两行换目标格 <<<<<<<<<<<< */
-#define MAIN_POS_NAV_TARGET_X_GRID    (1)     /* 整数 0..14, 14 = 右边界 */
-#define MAIN_POS_NAV_TARGET_Y_GRID    (1)     /* 整数 0..10, 10 = 下边界 */
+#define MAIN_POS_NAV_TARGET_X_GRID    (14)     /* 整数 0..14, 14 = 右边界 */
+#define MAIN_POS_NAV_TARGET_Y_GRID    (10)     /* 整数 0..10, 10 = 下边界 */
 /* <<<<<<<<<<<< 改这两行换目标格 >>>>>>>>>>>> */
 
 #define MAIN_POS_NAV_HOLD_YAW_DEG     (0.0f)   /* 全程锁住 0° 航向 */
@@ -407,8 +407,12 @@ main(void)
     /* ✅ 姿态闭环调试走这里: 只设一次目标角, 后续 PIT_CH1 20ms 中断中持续闭环. */
     chassis_ctrl_hold_yaw(MAIN_HOLD_YAW_TARGET_DEG);
 #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_POINT_NAV)
-    /* ✅ 位置闭环调试走这里: 米坐标 + 锁定航向角, 20ms 任务内持续双闭环. */
-    chassis_ctrl_move_to_m(MAIN_POS_NAV_TARGET_X_M, MAIN_POS_NAV_TARGET_Y_M, MAIN_POS_NAV_HOLD_YAW_DEG);
+    /* 四角遍历: 从发车位依次跨走 左上→右上→右下→左下 四个内场角落, 只跑一圈.
+     * 用 MAIN_POS_GRID_TO_M_X/Y (含 -0.5 偏移) 定位格中心, 与 chassis_ctrl_set_pose
+     * 的初始位姿坐标系保持一致. chassis_grid_x_to_m 不含 0.5 偏移(格边缘), 不能用. */
+    chassis_ctrl_move_to_m(MAIN_POS_GRID_TO_M_X(CHASSIS_GRID_INNER_MIN_X),
+                           MAIN_POS_GRID_TO_M_Y(CHASSIS_GRID_INNER_MIN_Y),
+                           MAIN_POS_NAV_HOLD_YAW_DEG);  /* 第1角: 左上格中心 */
 #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_SOKO_SELFTEST)
     /* 推箱求解自测: 不驱动车体, 仅保留底层初始化和 DAP 串口输出. */
     uart_init(UART_1, 115200, UART1_TX_B12, UART1_RX_B13);
@@ -456,33 +460,50 @@ main(void)
         /* ✅ 姿态闭环调试打印走这里: 50ms 打印 12 通道, 用于画角度曲线 */
         chassis_ctrl_attitude_debug_task_5ms();
     #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_POINT_NAV)
-        /* ✅ 位置闭环调试打印走这里: 50ms 打印 7 通道
-         * ch01 = x_m       当前 X 坐标
-         * ch02 = y_m       当前 Y 坐标
-         * ch03 = tgt_x_m   目标 X
-         * ch04 = tgt_y_m   目标 Y
-         * ch05 = dist_m    剩余距离
-         * ch06 = yaw_deg   当前航向
-         * ch07 = arrived   到达标志 (0/1)
-         */
+        /* 四角驷審状态机: 到位后自动切到下一个角, 全部跨完即停. */
         {
-            static uint8 s_pos_div = 0U;
-            if (++s_pos_div >= 10U) {
-                chassis_pose_t pose;
-                float tgt_x, tgt_y, dx, dy, dist_sq;
-                s_pos_div = 0U;
-                pose  = chassis_ctrl_get_pose();
-                tgt_x = MAIN_POS_NAV_TARGET_X_M;
-                tgt_y = MAIN_POS_NAV_TARGET_Y_M;
-                dx      = tgt_x - pose.x_m;
-                dy      = tgt_y - pose.y_m;
-                dist_sq = dx * dx + dy * dy;   /* 避免 sqrtf, 打印平方距离即可判断收敛 */
-                printf("%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%d\n",
-                       pose.x_m, pose.y_m,
-                       tgt_x, tgt_y,
-                       dist_sq,
-                       pose.yaw_deg,
-                       (int)chassis_ctrl_is_arrived());
+            /* 内场四角坐标 (格): 左上 → 右上 → 右下 → 左下 */
+            static const uint8 s_nav_corners[4][2] = {
+                { CHASSIS_GRID_INNER_MIN_X, CHASSIS_GRID_INNER_MIN_Y },  /* 左上 */
+                { CHASSIS_GRID_INNER_MAX_X, CHASSIS_GRID_INNER_MIN_Y },  /* 右上 */
+                { CHASSIS_GRID_INNER_MAX_X, CHASSIS_GRID_INNER_MAX_Y },  /* 右下 */
+                { CHASSIS_GRID_INNER_MIN_X, CHASSIS_GRID_INNER_MAX_Y },  /* 左下 */
+            };
+            /* 当前目标角索引: 0-3 = 尚未完成, 4 = 全部跨完 */
+            static uint8 s_corner_step = 0U;
+
+            /* 检测到位后切下一个目标; 到达最后一角后不再下发新指令, 车停在左下角 */
+            if (chassis_ctrl_is_arrived() && (s_corner_step < 4U)) {
+                s_corner_step++;
+                if (s_corner_step < 4U) {
+                    /* 用格中心坐标 (MAIN_POS_GRID_TO_M 含 -0.5 偏移), 与初始位姿统一 */
+                    chassis_ctrl_move_to_m(
+                        MAIN_POS_GRID_TO_M_X(s_nav_corners[s_corner_step][0]),
+                        MAIN_POS_GRID_TO_M_Y(s_nav_corners[s_corner_step][1]),
+                        MAIN_POS_NAV_HOLD_YAW_DEG);
+                }
+            }
+
+            /* 50ms 打印: 当前位姿 / 当前目标 / 到位标志 / 当前步骤 */
+            {
+                static uint8 s_pos_div = 0U;
+                if (++s_pos_div >= 10U) {
+                    chassis_pose_t pose;
+                    float tgt_x, tgt_y, dx, dy, dist_sq;
+                    s_pos_div = 0U;
+                    pose = chassis_ctrl_get_pose();
+                    chassis_ctrl_get_point_nav_target_m(&tgt_x, &tgt_y);
+                    dx      = tgt_x - pose.x_m;
+                    dy      = tgt_y - pose.y_m;
+                    dist_sq = dx * dx + dy * dy;
+                    printf("%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%d,%d\n",
+                           pose.x_m, pose.y_m,
+                           tgt_x, tgt_y,
+                           dist_sq,
+                           pose.yaw_deg,
+                           (int)chassis_ctrl_is_arrived(),
+                           (int)s_corner_step);
+                }
             }
         }
     #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_SOKO_SELFTEST)
