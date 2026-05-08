@@ -110,25 +110,23 @@
 #define CHASSIS_START_GRID_Y            (6U)    /* 5×0.24=1.20m, 与实测车中心吻合 */
 
 /** 到达目标点判定阈值（米），距目标小于此值即认为"已到达" */
-#define CHASSIS_TARGET_REACHED_EPSILON_M  (0.03f)
+#define CHASSIS_TARGET_REACHED_EPSILON_M  (0.05f)
 
 /**
  * 到达目标点时的速度判据（m/s）.
  * dist < EPSILON 且 ||v_body|| < 该值 才置 s_arrived=1.
  * 防止车以高速穿过目标点瞬间触发到位, 惯性冲出再触发 HOLD_EXIT 反复震荡.
- * P0-调参 2026-05-08: 0.05 → 0.15.
- *   配合 BRAKE_DIST 扩大到 22cm, 到达 EPSILON 时速度已 << 0.15 m/s,
- *   不再出现「车以 0.1 m/s 穿过 EPSILON 但速度门拦下 s_arrived → 反向冲」的振荡.
- *   0.15 m/s 仍远小于 MIN_DRIVE (0.05) 情形, 不会误触发高速穿越. */
-#define CHASSIS_POS_ARRIVED_VEL_MPS       (0.25f)
+ * P0-修复 2026-05-08: 0.35 → 0.08.
+ *   0.35m/s 会把“高速穿过目标点”误判成到达, 之后惯性/锁航向还会把车带离目标.
+ *   收紧到 0.08m/s, 只有真正慢下来后才进入驻车保持. */
+#define CHASSIS_POS_ARRIVED_VEL_MPS       (0.09f)
 
 /**
  * 到位后的 Schmitt 滞后释放阈值（米）.
  * 已到位状态下, 只有被推出此距离才重新开启位置驱动.
- * 放宽到 15cm: 物理动量在 cmd=0 后会让车滑行 5~10cm,
- * 8cm 太紧会反复触发, 15cm 给惯性留余量, 同时仍小于一格 (24cm).
+ * 10cm 足够覆盖停车后几厘米的惯性滑移, 又不会让位置闭环在大范围内失效.
  */
-#define CHASSIS_POS_HOLD_EXIT_M           (0.15f)
+#define CHASSIS_POS_HOLD_EXIT_M           (0.10f)
 
 /**
  * 扰动恢复模式触发距离 (米).
@@ -137,21 +135,25 @@
  * 业内 gain scheduling 标准做法 (Tesla Autopilot lateral controller).
  */
 /**
- * 必须 > CHASSIS_POS_HOLD_EXIT_M (0.15m), 否则增益调度永不触发.
+ * 必须 > CHASSIS_POS_HOLD_EXIT_M, 否则增益调度永不触发.
  * 逻辑: 被推出保持区时 dist > HOLD_EXIT → 增益调度只在 dist < RECOVERY_DIST 时生效,
  * 若 RECOVERY_DIST < HOLD_EXIT, 恢复全程在 RECOVERY_DIST 外 → 全量 KP → 必震荡.
  */
 /* P0-修复 2026-05-08 (快到目标停下然后慢爬抖动):
- * 根因: RECOVERY_DIST=0.10m < HOLD_EXIT=0.15m, 违反"必须 > HOLD_EXIT"约束;
- * 且 0.10m < BRAKE_DIST=0.22m, 导致 0.22~0.10m 段全量 KP 运行, 入场速
- * 度 ~0.4m/s 时 D项(1.2×0.4=0.48) 超 P项(3.5×0.10=0.35) → 命令负值
- * → 车停 → P重启 → 慢爬 → 循环 = "停下抖动前进".
- * 修复: 恢复 0.35m, 保证 RECOVERY_DIST > BRAKE_DIST(0.22) > HOLD_EXIT(0.15). */
-#define CHASSIS_POS_RECOVERY_DIST_M       (0.0f)
+ * RECOVERY_DIST 需覆盖 BRAKE_DIST 与 HOLD_EXIT, 让末段全程进入温和增益区. */
+#define CHASSIS_POS_RECOVERY_DIST_M       (0.150f)
 
-/* P0-调参 2026-05-08: 0.45 → 0.60, 近点最小增益从 45% 提到 60%,
- * 末段速度更充足, 不再龟速爬完最后几厘米. */
-#define CHASSIS_POS_RECOVERY_KP_SCALE     (0.250f)
+/* 扰动恢复最小增益比例.
+ * 过大时被推开后会高速冲回目标, 麦轮惯性/打滑导致剧烈震荡. */
+#define CHASSIS_POS_RECOVERY_KP_SCALE     (0.85f)
+
+/* 扰动恢复区最大合成速度 (m/s).
+ * 只限制 dist < RECOVERY_DIST 的回位动作, 不影响远距离正常赶路. */
+#define CHASSIS_POS_RECOVERY_MAX_SPEED_MPS (0.30f)
+
+/* axis-by-axis 非驱动轴保持速度上限 (m/s).
+ * 切轴后只用于压住横向/纵向漂移, 不应该像主轴一样快速追赶, 否则会左右晃. */
+#define CHASSIS_POS_AXIS_HOLD_MAX_SPEED_MPS (0.1f)
 
 /**
  * 轴向独立移动模式 (Manhattan / axis-by-axis).
@@ -171,10 +173,9 @@
 
 /**
  * axis-by-axis 模式: 已切入 Y 轴后, X 偏差超过该值才允许重新回切 X.
- * 必须明显大于普通编码器噪声和麦轮横向耦合漂移; 最终几厘米残差由终末
- * 2D PD 收敛, 不在 Y 行驶中反复抢轴.
+ * 需要大于 SWITCH_TOL 以免频繁抢轴, 但不能太大; 否则 Y 行驶时 X 偏差会越积越多.
  */
-#define CHASSIS_POS_AXIS_RELOCK_TOL_M     (0.15f)
+#define CHASSIS_POS_AXIS_RELOCK_TOL_M     (0.10f)
 
 /**
  * 到位后 yaw 容忍带 (°). |yaw_err| < 该值即认为"航向也已到位",
@@ -380,7 +381,7 @@
  * ====================================================================== */
 
 /** 车体平移最大合成线速度（m/s），矢量模长不超过此值 */
-#define CHASSIS_MAX_LINEAR_SPEED_MPS    (1.5f)
+#define CHASSIS_MAX_LINEAR_SPEED_MPS    (2.50f)
 
 /** 车体最大旋转角速度（°/s）
  *  P0-修复 2026-04-29 姿态闭环转速慢: 原 90°/s 对应单轮仅 ≈0.4 m/s,
@@ -426,14 +427,14 @@
  *  物理意义: 决定「冲向目标」的速度, 与轨迹是否直线无关.
  *  建议范围 1.5 ~ 4.0, 偏大冲得快但近点可能超调.
  *  P0-调参 2026-05-08 (收敛太慢): 2.50 → 3.50, 加快远场逼近速度. */
-#define CHASSIS_POS_KP                  (2.0f)
+#define CHASSIS_POS_KP                  (4.50f)
 
 /**
  * 位置环横向增益 Kp_cross（Cross-Track Error 修正增益）
  *   物理意义: 横向偏差→横向修正速度. 设得比 CHASSIS_POS_KP 大
  *   可以更快地把车「推回直线」而不影响前进速度.
  *   建议 = 1.5 ~ 3 倍 CHASSIS_POS_KP. 设为 0 退化为纯 P(弧线).  */
-#define CHASSIS_POS_CTE_KP              (15.0f)
+#define CHASSIS_POS_CTE_KP              (10.00f)
 
 /**
  * 位置环 D 项增益 (沿程方向) - 速度阻尼.
@@ -446,11 +447,26 @@
  *   KD=KP  : 临界阻尼附近, 最快无超调
  *   KD>KP  : 过阻尼, 收敛变慢但绝不超调
  * 麦轮一般取 KD ≈ KP, 起点用 1.0 ~ 1.5 倍.
- * P0-调参 2026-05-08: KP 升至 3.50, KD 同步升至 1.20 维持阻尼比 (KD/KP≈0.34). */
-#define CHASSIS_POS_KD                  (0.50f)
+ * P0-调参 2026-05-08: KP 升至 3.50, KD 同步升至 1.20 维持阻尼比 (KD/KP≈0.34).
+ * 起调建议: KD ≈ 0.3~0.5 × KP; KD=0 等于无阻尼, 必超调. */
+#define CHASSIS_POS_KD                  (0.0f)
 
-/** 位置环横向 D 项增益 - 与 CTE_KP 配套 */
-#define CHASSIS_POS_CTE_KD              (0.50f)
+/** 位置环沿程方向积分增益 (m/s per m·s).
+ * 消除静摩擦/坡面等引起的稳态位置残差.
+ * 建议从 0 开始调, 每次 +0.05; 过大时车到位后缓慢漂移/越界. */
+#define CHASSIS_POS_KI                  (0.00f)
+
+/** 位置环积分输出上限 (m/s).
+ * 限制积分最大能贡献的速度, 防止卷绕后冲. */
+#define CHASSIS_POS_I_LIMIT             (0.35f)
+
+/** 条件积分带宽 (m): |dist| < 该值时才累积 I 项.
+ * 防止远场全程积分饱和, 通常取 2~5 倍 EPSILON. */
+#define CHASSIS_POS_I_BAND_M            (0.22f)
+
+/** 位置环横向/非驱动轴 D 项增益 - 与 CTE_KP 配套.
+ * 设得太低时保持轴像弹簧, Y 行驶时 X 会前后晃; 接近 POS_KD 可明显增阻尼. */
+#define CHASSIS_POS_CTE_KD              (6.00f)
 
 /**
  * D 项低通滤波系数 α (一阶 IIR, Tesla/Waymo 标准做法).
@@ -458,7 +474,7 @@
  * α=0.30 @ dt=20ms -> 截止 ≈ 2.4Hz, 衰减 odom 高频噪声 (~20Hz) 约 -18dB.
  * 增大 α -> 响应更快但噪声更多; 减小 -> 更平滑但阻尼延迟增大.
  * P0-调参 2026-05-08 (抖动): 0.30 → 0.15, 截止降到 ~1.2Hz, D 信号更平滑. */
-#define CHASSIS_POS_D_LPF_ALPHA         (0.15f)
+#define CHASSIS_POS_D_LPF_ALPHA         (0.05f)
 
 /**
  * 位置环最小推进速度 (m/s) - P0-改进 2026-05-02 (终末段龟速爬):
@@ -489,7 +505,7 @@
  *   建议 = 2 ~ 3 倍 V_MIN * 20ms (~5cm).
  * P0-调参 2026-05-08 (到位速度过高导致抖动): 0.10 → 0.22,
  *   让 KP+gain_sched 有足够路程把速度降至 ARRIVED_VEL 以下再进 EPSILON. */
-#define CHASSIS_POS_BRAKE_DIST_M         (0.04f)
+#define CHASSIS_POS_BRAKE_DIST_M         (0.13f)
 
 /** 航向环 Kp：值越大，朝向对准越快；过大易振荡
  *  P0-调参 2026-04-29: 取消 YAW_MIN_WZ 阶跃后 wz 连续, 可适度提 KP 加快响应。
@@ -888,7 +904,7 @@
  *   3.0 m/s²: 0→2.35 m/s 仅 0.78s, 2m 行程可短暂跑满速
  * 麦轮横向移动靠滚轮分力, 不依赖轮端抓地, 比纵向更耐高加速.
  * P0-调参 2026-05-08 (收敛太慢): 3.00 → 5.00, 加快速度命令爬坡/刹车响应. */
-#define CHASSIS_CMD_ACCEL_LIMIT_MPS2    (1.50f)
+#define CHASSIS_CMD_ACCEL_LIMIT_MPS2    (1.20f)
 
 /** 角速度最大加速度（°/s²）
  *  P0-调参 2026-05-02 (大角度阶跃响应慢):
@@ -908,10 +924,10 @@
 
 /** X 方向里程计缩放系数 */
 //#define CHASSIS_ODOM_SCALE_X            (0.468539f)
-#define CHASSIS_ODOM_SCALE_X            (0.4f)
+#define CHASSIS_ODOM_SCALE_X            (0.405f)
 
 /** Y 方向里程计缩放系数 */
-#define CHASSIS_ODOM_SCALE_Y            (0.42f)
+#define CHASSIS_ODOM_SCALE_Y            (0.431f)
 //#define CHASSIS_ODOM_SCALE_Y            (0.43617f)
 
 /* ======================================================================

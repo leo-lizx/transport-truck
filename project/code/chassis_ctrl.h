@@ -141,6 +141,21 @@ void chassis_ctrl_set_move_yaw_cmd(float vx_body_mps, float vy_body_mps, float t
 void chassis_ctrl_hold_yaw(float target_yaw_deg);
 
 /**
+ * @brief  原地旋转到指定角度（不改变 x/y 坐标）
+ *         旋转完成后 chassis_ctrl_is_arrived() 返回 1.
+ *         到达判据: |yaw_err| < CHASSIS_YAW_INPOS_ENTER_DEG 且车体已稳定.
+ * @param  target_yaw_deg  目标航向角（度，[-180, +180]）
+ */
+void chassis_ctrl_rotate_to_deg(float target_yaw_deg);
+
+/**
+ * @brief  以当前航向为基准原地相对旋转指定角度（不改变 x/y 坐标）
+ *         旋转完成后 chassis_ctrl_is_arrived() 返回 1.
+ * @param  delta_yaw_deg  相对旋转角度（度，正值逆时针/按当前 yaw 正方向）
+ */
+void chassis_ctrl_rotate_by_deg(float delta_yaw_deg);
+
+/**
  * @brief  启动单轮 PID 调试模式
  *         仅指定轮子参与速度闭环，其余轮子目标速度固定为 0。
  * @param  wheel_index      调试轮子索引（0:LF 1:RF 2:LB 3:RB）
