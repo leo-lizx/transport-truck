@@ -104,10 +104,10 @@ ROWS, COLS = 12, 16                    # 赛道逻辑网格规模：12行x16列
 # 四个点均为外圈 4 个格子中心的像素坐标，而不是屏幕物理边框角点。
 # 调试时只需把白色采样点调到四个角落格子的中心，内部 16x12 点会自动双线性展开。
 GRID_CORNERS = {
-    "tl": (37.5, 43.5), #左上
-    "tr": (276.4, 41.6), #右上
-    "bl": (46.4, 233.8), #左下
-    "br": (276.8, 221.9), #右下
+    "tl": (39.5, 40.5), #左上
+    "tr": (274.5, 35.0), #右上
+    "bl": (53.0, 225.8), #左下
+    "br": (275.8, 208.0), #右下
 }
 
 GRID_K1 = +0.000000                    # 径向畸变系数；无畸变镜头可设为 0
@@ -375,14 +375,27 @@ def find_car_pair(map_list):
 
     return None
 
-def merge_car_symbols(map_list):
-    """输出与传输阶段把车头/车尾统一为@。"""
+def find_car_single(map_list):
+    """回退策略：当H/T未能成对时，使用单个H或T作为车辆坐标。"""
+    for y in range(ROWS):
+        for x in range(COLS):
+            ch = map_list[y * COLS + x]
+            if ch == "H" or ch == "T":
+                return (x, y)
+    return None
+
+def build_map_with_single_car(map_list, car_found, car_x, car_y):
+    """输出阶段统一只保留一个@，并与发送坐标严格一致。"""
     merged = []
     for ch in map_list:
         if ch == "H" or ch == "T":
-            merged.append("@")
+            merged.append("-")
         else:
             merged.append(ch)
+
+    if car_found and 0 <= car_x < COLS and 0 <= car_y < ROWS:
+        merged[car_y * COLS + car_x] = "@"
+
     return merged
 
 def classify_cell(img, x, y, img_w, img_h):
@@ -425,14 +438,21 @@ while(True):
         car_x, car_y = car_pair[0], car_pair[1]  # 发送车头坐标
         car_found = True
 
-    # 识别阶段保留H/T，输出与传输阶段统一为@。
-    map_list_out = merge_car_symbols(map_list)
+    # 若H/T未成对，回退到单符号坐标，避免地图有车而坐标仍为(0,0)。
+    if not car_found:
+        car_single = find_car_single(map_list)
+        if car_single is not None:
+            car_x, car_y = car_single
+            car_found = True
 
     if CALIB_SHOW_CORNERS:
         tl_pt, tr_pt, bl_pt, br_pt = draw_calibration_overlay(img, img_w, img_h)
 
     # 对车辆坐标做短窗口多数投票，避免单帧色值波动导致坐标跳动
     car_x, car_y = vote_car_position(car_found, car_x, car_y)
+
+    # 输出阶段统一为单一@，并与投票后的发送坐标严格一致。
+    map_list_out = build_map_with_single_car(map_list, car_found, car_x, car_y)
 
     # --- 阶段 B：数据打包与发送 (194 字节完整协议帧) ---
     # 包内容：192个字节的赛道字符 + 1个字节的车辆坐标X + 1个字节的车辆坐标Y
