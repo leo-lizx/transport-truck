@@ -187,27 +187,39 @@ def vote_car_position(found, x, y):
 CAR_HEAD_RGB = (25, 182, 0)           # 车头颜色（H）
 CAR_TAIL_RGB = (0, 182, 239)          # 车尾颜色（T）
 
-
 WALL_DARK_RGB = (78, 96, 118)         # 暗墙颜色（#-dark）
 WALL_BRIGHT_RGB = (132, 150, 172)     # 亮墙颜色（#-bright）
 
+FLOOR_DARK_RGB = (36, 58, 214)        # 暗空地颜色（--dark）
+FLOOR_BRIGHT_RGB = (58, 92, 255)      # 亮空地颜色（--bright）
+
+GOAL_DARK_RGB = (194, 0, 214)         # 暗目的地颜色（.-dark）
+GOAL_BRIGHT_RGB = (245, 14, 255)      # 亮目的地颜色（.-bright）
+
+BOX_DARK_RGB = (114, 140, 0)          # 暗箱子颜色（$-dark）
+BOX_BRIGHT_RGB = (170, 204, 10)       # 亮箱子颜色（$-bright）
+
+BOMB_DARK_RGB = (215, 12, 56)         # 暗炸弹颜色（*-dark）
+BOMB_BRIGHT_RGB = (255, 36, 92)       # 亮炸弹颜色（*-bright）
+
 SYMBOL_MAP_RGB = {
     "#": (WALL_DARK_RGB, WALL_BRIGHT_RGB),  # 墙体双模板：暗墙/亮墙
-    "-": (49, 77, 255),   # 空地
-    ".": (231, 0, 255),   # 目的地
-    "$": (148, 178, 0),   # 箱子
-    "*": (255, 24, 74),   # 炸弹
+    "-": (FLOOR_DARK_RGB, FLOOR_BRIGHT_RGB),# 空地双模板：暗空地/亮空地
+    ".": (GOAL_DARK_RGB, GOAL_BRIGHT_RGB),  # 目的地双模板：暗目的地/亮目的地
+    "$": (BOX_DARK_RGB, BOX_BRIGHT_RGB),    # 箱子双模板：暗箱子/亮箱子
+    "*": (BOMB_DARK_RGB, BOMB_BRIGHT_RGB),  # 炸弹双模板：暗炸弹/亮炸弹
     "H": CAR_HEAD_RGB,    # 车头
     "T": CAR_TAIL_RGB,    # 车尾
 }
 
-# RGB 距离上限采用分类别阈值：墙体纹理最复杂，允许略大；高饱和色块更严格。
+# 推荐阈值：先做双模板距离判定，再走全局最近邻兜底。
+# 阈值单位为 RGB 加权欧氏距离平方（dist^2），建议实地标定时在此基础上微调 ±15%。
 SYMBOL_MAX_DIST_SQ = {
-    "#": 5000,
-    "-": 3200,
-    ".": 2500,
-    "$": 3000,
-    "*": 3400,
+    "#": (5600, 7000),
+    "-": (2500, 4300),
+    ".": (2600, 3500),
+    "$": (2900, 4200),
+    "*": (2800, 4300),
     "H": 3200,
     "T": 3200,
 }
@@ -225,8 +237,8 @@ WALL_RGB_MAX = 170
 WALL_CENTER_RGB_MIN_RELAX = 8
 WALL_CENTER_RGB_MAX_BOOST = 70
 WALL_CENTER_SPREAD_BOOST = 12
-WALL_DARK_MAX_DIST_SQ = 5600
-WALL_BRIGHT_MAX_DIST_SQ = 7000
+WALL_DARK_MAX_DIST_SQ = SYMBOL_MAX_DIST_SQ["#"][0]
+WALL_BRIGHT_MAX_DIST_SQ = SYMBOL_MAX_DIST_SQ["#"][1]
 
 def wall_thresholds_at(x, y, img_w, img_h):
     """按采样点位置给墙体阈值做轻量补偿，降低中心区域漏检。"""
@@ -302,19 +314,49 @@ def find_best_symbol(rgb, x=None, y=None, img_w=None, img_h=None):
     if dark_wall_dist <= WALL_DARK_MAX_DIST_SQ or bright_wall_dist <= WALL_BRIGHT_MAX_DIST_SQ:
         return "#"
 
-    min_dist, matched = 999999, "-"
+    min_dist, matched = 999999, None
+    nearest_sym, nearest_dist, nearest_limit = "-", 999999, SYMBOL_MAX_DIST_SQ["-"][1]
     for sym, std_rgb in SYMBOL_MAP_RGB.items():
         if sym == "#":
             continue
-        dist_sq = rgb_dist_sq(rgb, std_rgb)
-        if dist_sq < min_dist:
-            min_dist = dist_sq
-            matched = sym
+        if isinstance(std_rgb, tuple) and len(std_rgb) > 0 and isinstance(std_rgb[0], tuple):
+            templates = std_rgb
+        else:
+            templates = (std_rgb,)
 
-    if min_dist > SYMBOL_MAX_DIST_SQ[matched]:
-        return "-"
+        max_dist_cfg = SYMBOL_MAX_DIST_SQ[sym]
+        if isinstance(max_dist_cfg, tuple):
+            limits = max_dist_cfg
+        else:
+            limits = (max_dist_cfg,)
 
-    return matched
+        if len(limits) < len(templates):
+            limits = limits + (limits[-1],) * (len(templates) - len(limits))
+
+        best_dist_for_sym = 999999
+        for i in range(len(templates)):
+            dist_sq = rgb_dist_sq(rgb, templates[i])
+            if dist_sq < best_dist_for_sym:
+                best_dist_for_sym = dist_sq
+            if dist_sq <= limits[i] and dist_sq < min_dist:
+                min_dist = dist_sq
+                matched = sym
+
+        sym_limit = limits[0]
+        if len(limits) > 1 and limits[1] > sym_limit:
+            sym_limit = limits[1]
+        if best_dist_for_sym < nearest_dist:
+            nearest_dist = best_dist_for_sym
+            nearest_sym = sym
+            nearest_limit = sym_limit
+
+    if matched is not None:
+        return matched
+
+    if nearest_dist <= nearest_limit:
+        return nearest_sym
+
+    return "-"
 
 def find_car_pair(map_list):
     """在16x12网格中寻找相邻的H/T，返回车头坐标和车尾坐标。"""
