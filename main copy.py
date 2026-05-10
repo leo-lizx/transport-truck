@@ -107,7 +107,7 @@ GRID_CORNERS = {
     "tl": (37.5, 43.5), #左上
     "tr": (276.4, 41.6), #右上
     "bl": (46.4, 233.8), #左下
-    "br": (273.8, 220.9), #右下
+    "br": (276.8, 221.9), #右下
 }
 
 GRID_K1 = +0.000000                    # 径向畸变系数；无畸变镜头可设为 0
@@ -187,8 +187,12 @@ def vote_car_position(found, x, y):
 CAR_HEAD_RGB = (25, 182, 0)           # 车头颜色（H）
 CAR_TAIL_RGB = (0, 182, 239)          # 车尾颜色（T）
 
+
+WALL_DARK_RGB = (78, 96, 118)         # 暗墙颜色（#-dark）
+WALL_BRIGHT_RGB = (132, 150, 172)     # 亮墙颜色（#-bright）
+
 SYMBOL_MAP_RGB = {
-    "#": (90, 109, 132),    # 墙体
+    "#": (WALL_DARK_RGB, WALL_BRIGHT_RGB),  # 墙体双模板：暗墙/亮墙
     "-": (49, 77, 255),   # 空地
     ".": (231, 0, 255),   # 目的地
     "$": (148, 178, 0),   # 箱子
@@ -216,8 +220,31 @@ RGB_R_WEIGHT = 1.00
 RGB_G_WEIGHT = 1.00
 RGB_B_WEIGHT = 1.00
 WALL_GRAY_SPREAD_MAX = 42
-WALL_RGB_MIN = 45
+WALL_RGB_MIN = 42
 WALL_RGB_MAX = 170
+WALL_CENTER_RGB_MIN_RELAX = 8
+WALL_CENTER_RGB_MAX_BOOST = 70
+WALL_CENTER_SPREAD_BOOST = 12
+WALL_DARK_MAX_DIST_SQ = 5600
+WALL_BRIGHT_MAX_DIST_SQ = 7000
+
+def wall_thresholds_at(x, y, img_w, img_h):
+    """按采样点位置给墙体阈值做轻量补偿，降低中心区域漏检。"""
+    if img_w <= 1 or img_h <= 1:
+        return WALL_RGB_MIN, WALL_RGB_MAX, WALL_GRAY_SPREAD_MAX
+
+    cx = (img_w - 1) // 2
+    cy = (img_h - 1) // 2
+    nx = abs(x - cx) * 100 // (cx if cx > 0 else 1)
+    ny = abs(y - cy) * 100 // (cy if cy > 0 else 1)
+    center_ratio = 100 - ((nx + ny) // 2)
+    if center_ratio < 0:
+        center_ratio = 0
+
+    rgb_min = WALL_RGB_MIN - (WALL_CENTER_RGB_MIN_RELAX * center_ratio) // 100
+    rgb_max = WALL_RGB_MAX + (WALL_CENTER_RGB_MAX_BOOST * center_ratio) // 100
+    gray_spread = WALL_GRAY_SPREAD_MAX + (WALL_CENTER_SPREAD_BOOST * center_ratio) // 100
+    return rgb_min, rgb_max, gray_spread
 
 def robust_rgb_at(img, x, y, img_w, img_h):
     samples = []
@@ -256,16 +283,29 @@ def rgb_dist_sq(meas_rgb, std_rgb):
     db = (meas_rgb[2] - std_rgb[2]) * RGB_B_WEIGHT
     return dr * dr + dg * dg + db * db
 
-def find_best_symbol(rgb):
-    # 灰色墙体先用 RGB 低色差特征兜底，抗纹理和局部光斑干扰。
+def find_best_symbol(rgb, x=None, y=None, img_w=None, img_h=None):
+    # 墙体采用双模板并行判定：暗墙/亮墙任一命中即判墙。
     c_max = max(rgb[0], rgb[1], rgb[2])
     c_min = min(rgb[0], rgb[1], rgb[2])
     c_avg = (rgb[0] + rgb[1] + rgb[2]) // 3
-    if (c_max - c_min) <= WALL_GRAY_SPREAD_MAX and WALL_RGB_MIN <= c_avg <= WALL_RGB_MAX:
+    if x is not None and y is not None and img_w is not None and img_h is not None:
+        wall_rgb_min, wall_rgb_max, wall_gray_spread = wall_thresholds_at(x, y, img_w, img_h)
+    else:
+        wall_rgb_min, wall_rgb_max, wall_gray_spread = WALL_RGB_MIN, WALL_RGB_MAX, WALL_GRAY_SPREAD_MAX
+
+    if (c_max - c_min) <= wall_gray_spread and wall_rgb_min <= c_avg <= wall_rgb_max:
+        return "#"
+
+    wall_dark_rgb, wall_bright_rgb = SYMBOL_MAP_RGB["#"]
+    dark_wall_dist = rgb_dist_sq(rgb, wall_dark_rgb)
+    bright_wall_dist = rgb_dist_sq(rgb, wall_bright_rgb)
+    if dark_wall_dist <= WALL_DARK_MAX_DIST_SQ or bright_wall_dist <= WALL_BRIGHT_MAX_DIST_SQ:
         return "#"
 
     min_dist, matched = 999999, "-"
     for sym, std_rgb in SYMBOL_MAP_RGB.items():
+        if sym == "#":
+            continue
         dist_sq = rgb_dist_sq(rgb, std_rgb)
         if dist_sq < min_dist:
             min_dist = dist_sq
@@ -304,7 +344,8 @@ def merge_car_symbols(map_list):
     return merged
 
 def classify_cell(img, x, y, img_w, img_h):
-    return find_best_symbol(avg_rgb_at(img, x, y, img_w, img_h))
+    rgb = avg_rgb_at(img, x, y, img_w, img_h)
+    return find_best_symbol(rgb, x, y, img_w, img_h)
 
 # ----------------------------------------------------------------------
 # 3. 核心逻辑主循环 (图像识别 -> 位置锁定 -> 打包发送)
