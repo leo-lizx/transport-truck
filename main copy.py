@@ -6,7 +6,7 @@
 #   3. 通过自定义二进制协议帧，将 194 字节数据（地图+坐标）传给主控。
 # 【核心原理】：
 #   - 坐标计算：线性斜率补偿（修正由于摄像头安装倾斜导致的近大远小）。
-#   - 元素匹配：多点采样后转 LAB 空间，降低亮度波动与单像素噪声影响。
+#   - 元素匹配：多点采样后做 RGB 距离匹配，降低亮度波动与单像素噪声影响。
 #   - 链路安全：CRC8 循环冗余校验（防止串口通信中产生的噪点导致误码）。
 # ======================================================================
 #
@@ -104,10 +104,10 @@ ROWS, COLS = 12, 16                    # 赛道逻辑网格规模：12行x16列
 # 四个点均为外圈 4 个格子中心的像素坐标，而不是屏幕物理边框角点。
 # 调试时只需把白色采样点调到四个角落格子的中心，内部 16x12 点会自动双线性展开。
 GRID_CORNERS = {
-    "tl": (33.0, 40.5),
-    "tr": (276.4, 40.0),
-    "bl": (40.4, 215.8),
-    "br": (275.8, 205.9),
+    "tl": (37.5, 43.5), #左上
+    "tr": (276.4, 41.6), #右上
+    "bl": (46.4, 233.8), #左下
+    "br": (273.8, 220.9), #右下
 }
 
 GRID_K1 = +0.000000                    # 径向畸变系数；无畸变镜头可设为 0
@@ -181,52 +181,43 @@ def vote_car_position(found, x, y):
     return car_vote_hist[-1]
 
 # ----------------------------------------------------------------------
-# 3. 元素颜色特征库 (RGB 实测标定 -> LAB 空间匹配)
+# 3. 元素颜色特征库 (RGB 实测标定 -> RGB 空间匹配)
 # ----------------------------------------------------------------------
-# 只需在现场重新读取这一组 RGB 值；程序启动时会自动转换到 LAB 再匹配。
-# 虚拟车为绿+青双色块：不要求朝向时合并双 LAB 原型判 @（与赛规「合并阈值」一致）。
-CAR_RGB_PROTOTYPES = (
-    (16, 154, 0),      # 绿色半块（规则表典型值）
-    (0, 210, 230),     # 青色半块：请按实机全局图采样微调
-)
+# 只需在现场重新读取这一组 RGB 值。
+CAR_HEAD_RGB = (25, 182, 0)           # 车头颜色（H）
+CAR_TAIL_RGB = (0, 182, 239)          # 车尾颜色（T）
 
 SYMBOL_MAP_RGB = {
-    "#": (57, 65, 82),    # 墙体
-    "-": (33, 12, 255),   # 空地
+    "#": (90, 109, 132),    # 墙体
+    "-": (49, 77, 255),   # 空地
     ".": (231, 0, 255),   # 目的地
     "$": (148, 178, 0),   # 箱子
     "*": (255, 24, 74),   # 炸弹
+    "H": CAR_HEAD_RGB,    # 车头
+    "T": CAR_TAIL_RGB,    # 车尾
 }
 
-# LAB 距离上限采用分类别阈值：墙体纹理最复杂，允许略大；高饱和色块更严格。
-# 「@」对应双原型中取 min(dist²)，阈值略宽于单色以覆盖两半色差。
+# RGB 距离上限采用分类别阈值：墙体纹理最复杂，允许略大；高饱和色块更严格。
 SYMBOL_MAX_DIST_SQ = {
-    "#": 1300,
-    "-": 900,
-    ".": 900,
-    "$": 1000,
-    "*": 1000,
-    "@": 1100,
+    "#": 5000,
+    "-": 3200,
+    ".": 2500,
+    "$": 3000,
+    "*": 3400,
+    "H": 3200,
+    "T": 3200,
 }
 
 SAMPLE_OFFSETS = ((-1, -1), (0, -1), (1, -1),
                   (-1,  0), (0,  0), (1,  0),
                   (-1,  1), (0,  1), (1,  1))
 SAMPLE_TRIM = 1
-LAB_L_WEIGHT = 0.35
-WALL_CHROMA_MAX_SQ = 900
-WALL_L_MIN = 18
-WALL_L_MAX = 78
-
-def build_symbol_map_lab():
-    lab_map = {}
-    for sym, rgb in SYMBOL_MAP_RGB.items():
-        lab_map[sym] = image.rgb_to_lab(rgb)
-    return lab_map
-
-SYMBOL_MAP_LAB = build_symbol_map_lab()
-
-CAR_LAB_PROTOTYPES = tuple(image.rgb_to_lab(rgb) for rgb in CAR_RGB_PROTOTYPES)
+RGB_R_WEIGHT = 1.00
+RGB_G_WEIGHT = 1.00
+RGB_B_WEIGHT = 1.00
+WALL_GRAY_SPREAD_MAX = 42
+WALL_RGB_MIN = 45
+WALL_RGB_MAX = 170
 
 def robust_rgb_at(img, x, y, img_w, img_h):
     samples = []
@@ -259,41 +250,58 @@ def robust_rgb_at(img, x, y, img_w, img_h):
 def avg_rgb_at(img, x, y, img_w, img_h):
     return robust_rgb_at(img, x, y, img_w, img_h)
 
-def lab_dist_sq(meas_lab, std_lab):
-    dl = (meas_lab[0] - std_lab[0]) * LAB_L_WEIGHT
-    da = meas_lab[1] - std_lab[1]
-    db = meas_lab[2] - std_lab[2]
-    return dl * dl + da * da + db * db
-
-def car_lab_dist_sq_min(meas_lab):
-    """双原型：取与绿/青 LAB 原型距离的较小值（平方）。"""
-    d0 = lab_dist_sq(meas_lab, CAR_LAB_PROTOTYPES[0])
-    d1 = lab_dist_sq(meas_lab, CAR_LAB_PROTOTYPES[1])
-    return d0 if d0 <= d1 else d1
+def rgb_dist_sq(meas_rgb, std_rgb):
+    dr = (meas_rgb[0] - std_rgb[0]) * RGB_R_WEIGHT
+    dg = (meas_rgb[1] - std_rgb[1]) * RGB_G_WEIGHT
+    db = (meas_rgb[2] - std_rgb[2]) * RGB_B_WEIGHT
+    return dr * dr + dg * dg + db * db
 
 def find_best_symbol(rgb):
-    meas_lab = image.rgb_to_lab(rgb)
-
-    # 灰色墙体受纹理和屏幕反光影响最大，先用低色度特征兜底。
-    chroma_sq = meas_lab[1] * meas_lab[1] + meas_lab[2] * meas_lab[2]
-    if WALL_L_MIN <= meas_lab[0] <= WALL_L_MAX and chroma_sq <= WALL_CHROMA_MAX_SQ:
+    # 灰色墙体先用 RGB 低色差特征兜底，抗纹理和局部光斑干扰。
+    c_max = max(rgb[0], rgb[1], rgb[2])
+    c_min = min(rgb[0], rgb[1], rgb[2])
+    c_avg = (rgb[0] + rgb[1] + rgb[2]) // 3
+    if (c_max - c_min) <= WALL_GRAY_SPREAD_MAX and WALL_RGB_MIN <= c_avg <= WALL_RGB_MAX:
         return "#"
 
     min_dist, matched = 999999, "-"
-    for sym, std_lab in SYMBOL_MAP_LAB.items():
-        dist_sq = lab_dist_sq(meas_lab, std_lab)
+    for sym, std_rgb in SYMBOL_MAP_RGB.items():
+        dist_sq = rgb_dist_sq(rgb, std_rgb)
         if dist_sq < min_dist:
             min_dist = dist_sq
             matched = sym
-
-    car_dist_sq = car_lab_dist_sq_min(meas_lab)
-    if car_dist_sq < min_dist:
-        min_dist, matched = car_dist_sq, "@"
 
     if min_dist > SYMBOL_MAX_DIST_SQ[matched]:
         return "-"
 
     return matched
+
+def find_car_pair(map_list):
+    """在16x12网格中寻找相邻的H/T，返回车头坐标和车尾坐标。"""
+    grid = [map_list[r * COLS:(r + 1) * COLS] for r in range(ROWS)]
+    neighbors = ((1, 0), (-1, 0), (0, 1), (0, -1))
+
+    for y in range(ROWS):
+        for x in range(COLS):
+            if grid[y][x] != "H":
+                continue
+
+            for dx, dy in neighbors:
+                nx, ny = x + dx, y + dy
+                if 0 <= nx < COLS and 0 <= ny < ROWS and grid[ny][nx] == "T":
+                    return (x, y, nx, ny)
+
+    return None
+
+def merge_car_symbols(map_list):
+    """输出与传输阶段把车头/车尾统一为@。"""
+    merged = []
+    for ch in map_list:
+        if ch == "H" or ch == "T":
+            merged.append("@")
+        else:
+            merged.append(ch)
+    return merged
 
 def classify_cell(img, x, y, img_w, img_h):
     return find_best_symbol(avg_rgb_at(img, x, y, img_w, img_h))
@@ -309,7 +317,7 @@ while(True):
     img_w, img_h = img.width(), img.height()
     map_list = []                      # 临时容器：存放本帧识别出的 192 个地图字符
     car_x, car_y = 0, 0                # 默认车辆坐标 (0, 0)
-    car_found = False                  # 本帧是否确实识别到车辆颜色
+    car_found = False                  # 本帧是否确实识别到车辆（H/T配对）
     tl_pt = tr_pt = bl_pt = br_pt = None
 
     # --- 阶段 A：双层嵌套循环：解析 16x12 赛道地图 ---
@@ -324,16 +332,18 @@ while(True):
                 char = classify_cell(img, tx, ty, img_w, img_h)
                 map_list.append(char)
 
-                # 【核心任务】：实时检索并锁定车辆
-                # 一旦在任意格点发现车辆颜色(@)，立刻记录其网格索引(X, Y)
-                if char == "@":
-                    car_x, car_y = x_idx, y_idx
-                    car_found = True
-
                 # 在可视化缓冲区画出实心白点，用于调试对位情况
                 img.draw_circle(tx, ty, 2, color=(255, 255, 255), fill=True)
             else:
                 map_list.append("?")   # 若采样出界，记为问号补位
+
+    car_pair = find_car_pair(map_list)
+    if car_pair is not None:
+        car_x, car_y = car_pair[0], car_pair[1]  # 发送车头坐标
+        car_found = True
+
+    # 识别阶段保留H/T，输出与传输阶段统一为@。
+    map_list_out = merge_car_symbols(map_list)
 
     if CALIB_SHOW_CORNERS:
         tl_pt, tr_pt, bl_pt, br_pt = draw_calibration_overlay(img, img_w, img_h)
@@ -345,7 +355,7 @@ while(True):
     # 包内容：192个字节的赛道字符 + 1个字节的车辆坐标X + 1个字节的车辆坐标Y
     try:
         # 将 [#, -, @...] 列表转换为连续的 ASCII 字节流
-        map_bytes = "".join(map_list).encode("ascii")
+        map_bytes = "".join(map_list_out).encode("ascii")
         # 拼接地图数据与坐标字节
         payload = map_bytes + bytes([car_x, car_y])
 
@@ -366,4 +376,4 @@ while(True):
             print("TL=%s TR=%s BL=%s BR=%s" % (tl_pt, tr_pt, bl_pt, br_pt))
         # 打印 ASCII 预览图，检查视觉逻辑是否与实际场地一致
         for r in range(ROWS):
-            print("".join(map_list[r*COLS : (r+1)*COLS]))
+            print("".join(map_list_out[r*COLS : (r+1)*COLS]))
