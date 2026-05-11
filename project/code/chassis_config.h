@@ -439,7 +439,7 @@
  * 只有 2.7cm 内是线性段, 稍远就切 sqrt 段大速度, 车高速冲入 EPSILON
  * 后 brake_cap 来不及刹停, 穿越后反弹. 恢复 4.5 使 linear_dist≈0.15m,
  * 近场仍保持 P 线性响应, 配合 BRAKE_DIST=0.25 可以平滑停车. */
-#define CHASSIS_POS_KP                  (4.80f)
+#define CHASSIS_POS_KP                  (4.20f)
 
 /**
  * 位置环横向增益 Kp_cross（Cross-Track Error 修正增益）
@@ -467,7 +467,7 @@
  *   D 项 = 0.01 × v_lpf ≈ 0, 车以全速冲入 EPSILON 后只靠 ramp/brake_cap
  *   制动, 穿越目标反弹, 来回振荡. 恢复 KD=1.00 (≈KP/3) 提供实质阻尼.
  * 起调建议: KD ≈ 0.3~0.5 × KP; KD=0 等于无阻尼, 必超调. */
-#define CHASSIS_POS_KD                  (1.0f)
+#define CHASSIS_POS_KD                  (1.10f)
 
 /** 位置环沿程方向积分增益 (m/s per m·s).
  * 消除静摩擦/坡面等引起的稳态位置残差.
@@ -954,7 +954,7 @@
  *   3.0 m/s²: 0→2.35 m/s 仅 0.78s, 2m 行程可短暂跑满速
  * 麦轮横向移动靠滚轮分力, 不依赖轮端抓地, 比纵向更耐高加速.
  * P0-调参 2026-05-08 (收敛太慢): 3.00 → 5.00, 加快速度命令爬坡/刹车响应. */
-#define CHASSIS_CMD_ACCEL_LIMIT_MPS2    (2.0f)
+#define CHASSIS_CMD_ACCEL_LIMIT_MPS2    (2.50f)
 
 /** 角速度最大加速度（°/s²）
  *  P0-调参 2026-05-02 (大角度阶跃响应慢):
