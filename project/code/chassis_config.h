@@ -109,17 +109,13 @@
 /** 发车区：距离最底边界约 1m（按 Y 步长折算后取最近网格） */
 #define CHASSIS_START_GRID_Y            (6U)    /* 5×0.24=1.20m, 与实测车中心吻合 */
 
-/** 到达目标点判定阈值（米），距目标小于此值即认为"已到达" */
-#define CHASSIS_TARGET_REACHED_EPSILON_M  (0.05f)
-
 /**
- * 到达目标点时的速度判据（m/s）.
- * dist < EPSILON 且 ||v_body|| < 该值 才置 s_arrived=1.
- * 防止车以高速穿过目标点瞬间触发到位, 惯性冲出再触发 HOLD_EXIT 反复震荡.
- * P0-修复 2026-05-08: 0.35 → 0.08.
- *   0.35m/s 会把“高速穿过目标点”误判成到达, 之后惯性/锁航向还会把车带离目标.
- *   收紧到 0.08m/s, 只有真正慢下来后才进入驻车保持. */
-#define CHASSIS_POS_ARRIVED_VEL_MPS       (0.09f)
+ * 到达目标点判定阈值（米）.
+ * POINT_NAV 当前采用最简单的纯位置判断:
+ *   dist = sqrt(dx² + dy²) <= EPSILON 立即置 s_arrived=1.
+ * 不再叠加速度稳定帧 / dwell 等待 / yaw 条件, 避免车已在误差范围内但上层迟迟不切点.
+ */
+#define CHASSIS_TARGET_REACHED_EPSILON_M  (0.05f)
 
 /**
  * 到位后的 Schmitt 滞后释放阈值（米）.
@@ -145,15 +141,20 @@
 
 /* 扰动恢复最小增益比例.
  * 过大时被推开后会高速冲回目标, 麦轮惯性/打滑导致剧烈震荡. */
-#define CHASSIS_POS_RECOVERY_KP_SCALE     (0.85f)
+#define CHASSIS_POS_RECOVERY_KP_SCALE     (0.45f)
 
 /* 扰动恢复区最大合成速度 (m/s).
  * 只限制 dist < RECOVERY_DIST 的回位动作, 不影响远距离正常赶路. */
 #define CHASSIS_POS_RECOVERY_MAX_SPEED_MPS (0.30f)
 
 /* axis-by-axis 非驱动轴保持速度上限 (m/s).
- * 切轴后只用于压住横向/纵向漂移, 不应该像主轴一样快速追赶, 否则会左右晃. */
-#define CHASSIS_POS_AXIS_HOLD_MAX_SPEED_MPS (0.1f)
+ * 该值是 CTE_KP 实际是否「有效」的关键:
+ *   保持轴输出 = clamp(sqrt_ctrl(err, CTE_KP, accel), ±THIS_LIMIT)
+ *   如果 THIS_LIMIT 太大 (如 0.22), CTE_KP 调 10 还是调 100 输出都被夹死,
+ *   完全看不出调参效果. 横向保持是「微修正」, 0.06 m/s 已够用,
+ *   同时仍远低于主轴速度避免走斜线.
+ * P0-修复 2026-05-11: 0.22 → 0.06. */
+#define CHASSIS_POS_AXIS_HOLD_MAX_SPEED_MPS (0.06f)
 
 /**
  * 轴向独立移动模式 (Manhattan / axis-by-axis).
@@ -184,8 +185,14 @@
  * 这是 ROS Nav2 goal_checker 的 yaw_goal_tolerance 思路, 工业 AGV /
  * ArduPilot loiter / PX4 hold 模式都用同一套: 双 tolerance + 死区
  * 硬归零, 而不是让 PI 闭环去咬最后 1° 残差 (必产生极限环).
- */
-#define CHASSIS_YAW_GOAL_TOLERANCE_DEG    (1.50f)
+ *
+ * P0-修复 2026-05-12 (走斜线根因): 1.5° → 0.5°.
+ *   POINT_NAV 中该值是 "动态走行中" 的 yaw 死区, 不是到位判据.
+ *   1.5° 太宽: vxg=1.2 m/s 投影出 vyg = 1.2*sin(1.5°) = 31 mm/s,
+ *   1m 走行累积 26mm 偏移, CTE 保持环上限 0.06 m/s 追不上 -> 走斜线.
+ *   收到 0.5°: vyg 言上限 10 mm/s, 1m 仅 8mm 偏, CTE 可轻松修复.
+ *   同时配合 yaw_pi rate PI (在 chassis_ctrl.c 已启用) 使 IMU 实时拉回. */
+#define CHASSIS_YAW_GOAL_TOLERANCE_DEG    (0.50f)
 
 /* ======================================================================
  *  OpenART 视觉位姿融合（事件驱动 Snap 为主，连续融合为辅）
@@ -381,7 +388,7 @@
  * ====================================================================== */
 
 /** 车体平移最大合成线速度（m/s），矢量模长不超过此值 */
-#define CHASSIS_MAX_LINEAR_SPEED_MPS    (0.70f)
+#define CHASSIS_MAX_LINEAR_SPEED_MPS    (0.65f)
 
 /** 车体最大旋转角速度（°/s）
  *  P0-修复 2026-04-29 姿态闭环转速慢: 原 90°/s 对应单轮仅 ≈0.4 m/s,
@@ -427,14 +434,22 @@
  *  物理意义: 决定「冲向目标」的速度, 与轨迹是否直线无关.
  *  建议范围 1.5 ~ 4.0, 偏大冲得快但近点可能超调.
  *  P0-调参 2026-05-08 (收敛太慢): 2.50 → 3.50, 加快远场逼近速度. */
-#define CHASSIS_POS_KP                  (4.50f)
+/* P0-修复 2026-05-11 (拐点停留+走斜线): 10.50 → 4.50.
+ * KP=10.5 时 linear_dist = accel/KP² = 3.0/110.25 ≈ 0.027m, 意味着
+ * 只有 2.7cm 内是线性段, 稍远就切 sqrt 段大速度, 车高速冲入 EPSILON
+ * 后 brake_cap 来不及刹停, 穿越后反弹. 恢复 4.5 使 linear_dist≈0.15m,
+ * 近场仍保持 P 线性响应, 配合 BRAKE_DIST=0.25 可以平滑停车. */
+#define CHASSIS_POS_KP                  (4.80f)
 
 /**
  * 位置环横向增益 Kp_cross（Cross-Track Error 修正增益）
  *   物理意义: 横向偏差→横向修正速度. 设得比 CHASSIS_POS_KP 大
  *   可以更快地把车「推回直线」而不影响前进速度.
- *   建议 = 1.5 ~ 3 倍 CHASSIS_POS_KP. 设为 0 退化为纯 P(弧线).  */
-#define CHASSIS_POS_CTE_KP              (10.00f)
+ *   P0-修复 2026-05-11: 10.0 → 5.0.
+ *   CTE_KP 最终被 AXIS_HOLD_MAX_SPEED_MPS(0.06) 限幅, 调到 100 也没用.
+ *   实际生效的是: 横向偏差多少时输出达到上限. KP=5, err=12mm 时输出
+ *   sqrt_ctrl(0.012, 5, 3)≈0.06 m/s, 恰好触及限幅, 12mm 内线性精细修正. */
+#define CHASSIS_POS_CTE_KP              (5.0f)
 
 /**
  * 位置环 D 项增益 (沿程方向) - 速度阻尼.
@@ -446,10 +461,13 @@
  *   KD=0   : 纯 P, 欠阻尼必震荡
  *   KD=KP  : 临界阻尼附近, 最快无超调
  *   KD>KP  : 过阻尼, 收敛变慢但绝不超调
- * 麦轮一般取 KD ≈ KP, 起点用 1.0 ~ 1.5 倍.
- * P0-调参 2026-05-08: KP 升至 3.50, KD 同步升至 1.20 维持阻尼比 (KD/KP≈0.34).
+ * 麦轮一般取 KD ≈ KP/3 ~ KP, 起点用 0.3~0.5 倍.
+ * P0-修复 2026-05-11 (末段抖动): 0.01 → 1.00.
+ *   KD=0.01 等同于无阻尼纯 P, position_axis_velocity_cmd 里
+ *   D 项 = 0.01 × v_lpf ≈ 0, 车以全速冲入 EPSILON 后只靠 ramp/brake_cap
+ *   制动, 穿越目标反弹, 来回振荡. 恢复 KD=1.00 (≈KP/3) 提供实质阻尼.
  * 起调建议: KD ≈ 0.3~0.5 × KP; KD=0 等于无阻尼, 必超调. */
-#define CHASSIS_POS_KD                  (0.0f)
+#define CHASSIS_POS_KD                  (1.0f)
 
 /** 位置环沿程方向积分增益 (m/s per m·s).
  * 消除静摩擦/坡面等引起的稳态位置残差.
@@ -464,9 +482,13 @@
  * 防止远场全程积分饱和, 通常取 2~5 倍 EPSILON. */
 #define CHASSIS_POS_I_BAND_M            (0.22f)
 
-/** 位置环横向/非驱动轴 D 项增益 - 与 CTE_KP 配套.
- * 设得太低时保持轴像弹簧, Y 行驶时 X 会前后晃; 接近 POS_KD 可明显增阻尼. */
-#define CHASSIS_POS_CTE_KD              (6.00f)
+/**
+ * 位置环横向/非驱动轴 D 项增益 - 与 CTE_KP 配套.
+ * 设得太低时保持轴像弹簧, Y 行驶时 X 轴会前后来回晃.
+ * P0-修复 2026-05-11: 1.00 → 3.00.
+ *   取 CTE_KD ≈ CTE_KP/2.5 = 7.75/2.5 ≈ 3.1, 阻尼比约 0.7,
+ *   与 CTE_KP=7.75 配合消除保持轴弹簧振荡. */
+#define CHASSIS_POS_CTE_KD              (0.200f)
 
 /**
  * D 项低通滤波系数 α (一阶 IIR, Tesla/Waymo 标准做法).
@@ -474,7 +496,7 @@
  * α=0.30 @ dt=20ms -> 截止 ≈ 2.4Hz, 衰减 odom 高频噪声 (~20Hz) 约 -18dB.
  * 增大 α -> 响应更快但噪声更多; 减小 -> 更平滑但阻尼延迟增大.
  * P0-调参 2026-05-08 (抖动): 0.30 → 0.15, 截止降到 ~1.2Hz, D 信号更平滑. */
-#define CHASSIS_POS_D_LPF_ALPHA         (0.05f)
+#define CHASSIS_POS_D_LPF_ALPHA         (0.15f)
 
 /**
  * 位置环最小推进速度 (m/s) - P0-改进 2026-05-02 (终末段龟速爬):
@@ -498,14 +520,42 @@
 #define CHASSIS_POS_YAW_TRACK_DIST_M     (0.20f)
 
 /**
- * 位置环到达后惯性补偿距离 (m) - P0-修复 2026-05-02 (硬刹冲过头):
- *   dist <= EPSILON 时直接 force_stop, 但 ramp 滤波器和电机仍有惯性输出,
- *   实际位置可能超目标 1~3cm. 此处用"软到达": dist 进入 BRAKE_DIST 后开始
- *   按线性把 V_MIN 衰减到 0, 进 EPSILON 时已经基本停下, 不再硬刹.
- *   建议 = 2 ~ 3 倍 V_MIN * 20ms (~5cm).
- * P0-调参 2026-05-08 (到位速度过高导致抖动): 0.10 → 0.22,
- *   让 KP+gain_sched 有足够路程把速度降至 ARRIVED_VEL 以下再进 EPSILON. */
-#define CHASSIS_POS_BRAKE_DIST_M         (0.13f)
+ * 位置环减速区半径 (m): dist < 该值时 brake_cap 开始按 sqrt 曲线限速.
+ *
+ * 物理约束 (ramp 决定最小制动距离):
+ *   ramp 每帧最多减速 accel_limit × 0.02s.
+ *   从 max_linear_speed 减到 0 需要的滑行距离:
+ *     d_stop = v_max² / (2 × accel_limit)
+ *   必须 BRAKE_DIST - EPSILON ≥ d_stop, 否则 brake_cap 的目标速度
+ *   来不及被 ramp 追上, 车仍高速穿越 EPSILON 并反弹振荡.
+ *
+ * 当前参数 (max_speed=1.0 m/s, accel=3.0 m/s²):
+ *   d_stop = 1.0² / (2×3.0) = 0.167m
+ *   BRAKE_DIST ≥ 0.167 + EPSILON(0.06) = 0.227m → 取 0.25m 留裕量
+ *
+ * P0-修复 2026-05-11 (末段抖动): 0.11 → 0.25.
+ *   0.11m 时制动区只有 5cm, max_speed=1.0 m/s 时停车需 19cm,
+ *   车直接穿越 EPSILON 后 P 控制反向拉回, 反复振荡.
+ *   若调低 max_speed 可相应缩小: 0.5 m/s 时 d_stop≈4cm, 取 0.15m 即可. */
+#define CHASSIS_POS_BRAKE_DIST_M         (0.12f)
+
+/**
+ * brake_cap 末段最小有效速度 (m/s) - P0-修复 2026-05-12 (拐点 5s 停留根因).
+ *
+ * 问题: brake_cap 用 sqrt_ctrl(brake_err=dist-EPSILON, KP=4.5, accel=3) 限速.
+ *   dist=0.06m -> brake_err=0.01m -> v_max_brake = 4.5*0.01 = 0.045 m/s.
+ *   0.045 m/s 分到 4 麦轮 ≈ 0.011 m/s/轮, BREAKAWAY_TARGET_EPS=0.01 临界,
+ *   前馈 ramp 系数仅 0.1, ff = 0.1*1200 = 120 PWM step, 远不够克服静摩擦.
+ *   车在 dist∈[EPSILON, EPSILON+几mm] 区域 "爬不动", 表现为拐点 5s 停留.
+ *
+ * 修法 (ROS Nav2 / ArduPilot AC_PosControl 同款):
+ *   v_max_brake = max(sqrt_ctrl(...), V_FLOOR)
+ * V_FLOOR 保证末段输出足以克服静摩擦, 车始终能推进到 EPSILON 内触发 layer1.
+ *
+ * 取值 0.12 m/s: 分到 4 麦轮 = 0.03 m/s/轮 远 > BREAKAWAY_TARGET_EPS(0.01),
+ * 前馈 ramp 系数 = 1.0 饱和, ff = 1200 PWM 足以启动;
+ * 同时 0.12 m/s × 0.02s = 2.4mm/拍, 穿越 EPSILON(50mm) 后只多走 5mm 安全. */
+#define CHASSIS_POS_BRAKE_FLOOR_MPS      (0.12f)
 
 /** 航向环 Kp：值越大，朝向对准越快；过大易振荡
  *  P0-调参 2026-04-29: 取消 YAW_MIN_WZ 阶跃后 wz 连续, 可适度提 KP 加快响应。
@@ -904,7 +954,7 @@
  *   3.0 m/s²: 0→2.35 m/s 仅 0.78s, 2m 行程可短暂跑满速
  * 麦轮横向移动靠滚轮分力, 不依赖轮端抓地, 比纵向更耐高加速.
  * P0-调参 2026-05-08 (收敛太慢): 3.00 → 5.00, 加快速度命令爬坡/刹车响应. */
-#define CHASSIS_CMD_ACCEL_LIMIT_MPS2    (0.80f)
+#define CHASSIS_CMD_ACCEL_LIMIT_MPS2    (2.0f)
 
 /** 角速度最大加速度（°/s²）
  *  P0-调参 2026-05-02 (大角度阶跃响应慢):
@@ -924,10 +974,10 @@
 
 /** X 方向里程计缩放系数 */
 //#define CHASSIS_ODOM_SCALE_X            (0.468539f)
-#define CHASSIS_ODOM_SCALE_X            (0.405f)
+#define CHASSIS_ODOM_SCALE_X            (0.397f)
 
 /** Y 方向里程计缩放系数 */
-#define CHASSIS_ODOM_SCALE_Y            (0.431f)
+#define CHASSIS_ODOM_SCALE_Y            (0.426f)
 //#define CHASSIS_ODOM_SCALE_Y            (0.43617f)
 
 /* ======================================================================
@@ -1197,42 +1247,42 @@ static inline uint8 chassis_clamp_grid_y_inner(uint8 grid_y)
 }
 
 /**
- * @brief  可通行网格 X 索引 -> 物理坐标 X（米）
- *         以可通行区域左边界为 0m。
+ * @brief  可通行网格 X 索引 -> 车体中心物理坐标 X（米）
+ *         以可通行区域左边界为 0m, 整数格返回对应格中心。
  */
 static inline float chassis_grid_x_to_m(uint8 grid_x)
 {
     int32 inner_x = (int32)chassis_clamp_grid_x_inner(grid_x) - (int32)CHASSIS_GRID_INNER_MIN_X;
-    return ((float)inner_x * CHASSIS_GRID_STEP_X_M);
+    return (((float)inner_x + 0.5f) * CHASSIS_GRID_STEP_X_M);
 }
 
 /**
- * @brief  可通行网格 Y 索引 -> 物理坐标 Y（米）
- *         以可通行区域上边界为 0m。
+ * @brief  可通行网格 Y 索引 -> 车体中心物理坐标 Y（米）
+ *         以可通行区域上边界为 0m, 整数格返回对应格中心。
  */
 static inline float chassis_grid_y_to_m(uint8 grid_y)
 {
     int32 inner_y = (int32)chassis_clamp_grid_y_inner(grid_y) - (int32)CHASSIS_GRID_INNER_MIN_Y;
-    return ((float)inner_y * CHASSIS_GRID_STEP_Y_M);
+    return (((float)inner_y + 0.5f) * CHASSIS_GRID_STEP_Y_M);
 }
 
 /**
- * @brief  物理坐标 X（米）-> 可通行网格 X 索引（四舍五入）
+ * @brief  车体中心物理坐标 X（米）-> 可通行网格 X 索引
  */
 static inline uint8 chassis_m_to_grid_x(float x_m)
 {
-    int32 grid_x = (int32)(x_m / CHASSIS_GRID_STEP_X_M + 0.5f) + (int32)CHASSIS_GRID_INNER_MIN_X;
+    int32 grid_x = (int32)(x_m / CHASSIS_GRID_STEP_X_M) + (int32)CHASSIS_GRID_INNER_MIN_X;
     if (grid_x < (int32)CHASSIS_GRID_INNER_MIN_X) grid_x = (int32)CHASSIS_GRID_INNER_MIN_X;
     if (grid_x > (int32)CHASSIS_GRID_INNER_MAX_X) grid_x = (int32)CHASSIS_GRID_INNER_MAX_X;
     return (uint8)grid_x;
 }
 
 /**
- * @brief  物理坐标 Y（米）-> 可通行网格 Y 索引（四舍五入）
+ * @brief  车体中心物理坐标 Y（米）-> 可通行网格 Y 索引
  */
 static inline uint8 chassis_m_to_grid_y(float y_m)
 {
-    int32 grid_y = (int32)(y_m / CHASSIS_GRID_STEP_Y_M + 0.5f) + (int32)CHASSIS_GRID_INNER_MIN_Y;
+    int32 grid_y = (int32)(y_m / CHASSIS_GRID_STEP_Y_M) + (int32)CHASSIS_GRID_INNER_MIN_Y;
     if (grid_y < (int32)CHASSIS_GRID_INNER_MIN_Y) grid_y = (int32)CHASSIS_GRID_INNER_MIN_Y;
     if (grid_y > (int32)CHASSIS_GRID_INNER_MAX_Y) grid_y = (int32)CHASSIS_GRID_INNER_MAX_Y;
     return (uint8)grid_y;

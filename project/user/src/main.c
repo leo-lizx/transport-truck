@@ -408,11 +408,9 @@ main(void)
     chassis_ctrl_hold_yaw(MAIN_HOLD_YAW_TARGET_DEG);
 #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_POINT_NAV)
     /* 四角遍历: 从发车位依次跨走 左上→右上→右下→左下 四个内场角落, 只跑一圈.
-     * 用 MAIN_POS_GRID_TO_M_X/Y (含 -0.5 偏移) 定位格中心, 与 chassis_ctrl_set_pose
-     * 的初始位姿坐标系保持一致. chassis_grid_x_to_m 不含 0.5 偏移(格边缘), 不能用. */
-    chassis_ctrl_move_to_m(MAIN_POS_GRID_TO_M_X(CHASSIS_GRID_INNER_MIN_X),
-                           MAIN_POS_GRID_TO_M_Y(CHASSIS_GRID_INNER_MIN_Y),
-                           MAIN_POS_NAV_HOLD_YAW_DEG);  /* 第1角: 左上格中心 */
+     * chassis_grid_x/y_to_m 已统一为格中心坐标, 这里使用 move_to_grid 避免 move_to_m
+     * 强制锁航导致轴向平移时持续微转, 影响直线度和定位精度. */
+    chassis_ctrl_move_to_grid(CHASSIS_GRID_INNER_MIN_X, CHASSIS_GRID_INNER_MIN_Y);  /* 第1角: 左上格中心 */
 #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_SOKO_SELFTEST)
     /* 推箱求解自测: 不驱动车体, 仅保留底层初始化和 DAP 串口输出. */
     uart_init(UART_1, 115200, UART1_TX_B12, UART1_RX_B13);
@@ -460,7 +458,7 @@ main(void)
         /* ✅ 姿态闭环调试打印走这里: 50ms 打印 12 通道, 用于画角度曲线 */
         chassis_ctrl_attitude_debug_task_5ms();
     #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_POINT_NAV)
-        /* 四角驷審状态机: 到位后自动切到下一个角, 全部跨完即停. */
+        /* 四角遍历状态机: 到位后自动切到下一个角, 全部跑完即停. */
         {
             /* 内场四角坐标 (格): 左上 → 右上 → 右下 → 左下 */
             static const uint8 s_nav_corners[4][2] = {
@@ -476,11 +474,8 @@ main(void)
             if (chassis_ctrl_is_arrived() && (s_corner_step < 4U)) {
                 s_corner_step++;
                 if (s_corner_step < 4U) {
-                    /* 用格中心坐标 (MAIN_POS_GRID_TO_M 含 -0.5 偏移), 与初始位姿统一 */
-                    chassis_ctrl_move_to_m(
-                        MAIN_POS_GRID_TO_M_X(s_nav_corners[s_corner_step][0]),
-                        MAIN_POS_GRID_TO_M_Y(s_nav_corners[s_corner_step][1]),
-                        MAIN_POS_NAV_HOLD_YAW_DEG);
+                    chassis_ctrl_move_to_grid(s_nav_corners[s_corner_step][0],
+                                              s_nav_corners[s_corner_step][1]);
                 }
             }
 
