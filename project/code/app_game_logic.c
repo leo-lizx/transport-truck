@@ -66,6 +66,10 @@ static uint8                 g_box_to_target[SOKOBAN_MAX_BOXES] = {0};
 static uint8                 g_current_level = 1;
 static ExecMode_e            g_exec_mode = EXEC_NONE;
 
+/* ==========================================================================
+ *  § 1. 执行上下文 / stage 跳转 / 地图查询工具 (全部需主循环单线程调用)
+ * ========================================================================== */
+
 static void reset_exec_context(void)
 {
     g_soko_solution.is_solved = 0;
@@ -169,6 +173,10 @@ static void sync_player_pos(void)
  *        - 状态 == PENDING / IDLE 视为继续等待。
  *   3) 关闭 Snap → 直接 odom 到位即放行。
  */
+/* ==========================================================================
+ *  § 2. 航点执行公用逻辑 (chassis_nav_arrived / exec_waypoints_common)
+ * ========================================================================== */
+
 static uint8 chassis_nav_arrived_for_waypoint(void)
 {
     if (chassis_ctrl_is_arrived() == 0U)
@@ -246,6 +254,10 @@ static uint8 exec_push_box_solution(void)
 
     return exec_waypoints_common(&g_soko_waypoints, &g_soko_wp_idx);
 }
+
+/* ==========================================================================
+ *  § 3. 规划层 — 炸弹计划 / 推箱计划 / 关卡推进判定
+ * ========================================================================== */
 
 static uint8 find_first_unreachable_target(Point_t *blocked_target)
 {
@@ -342,6 +354,11 @@ static uint8 should_enter_next_level(void)
      * 当前默认仅跑单关，返回 0。 */
     return 0;
 }
+
+/* ==========================================================================
+ *  § 4. Stage 处理器 — WAIT_START / RECOGNIZE / PLAN / EXECUTE / JUDGE
+ *                       / DEADLOCK_RESET / DONE / PAUSE_ON_LINK_LOSS
+ * ========================================================================== */
 
 static void stage_wait_start_handler(void)
 {
@@ -516,6 +533,10 @@ static void stage_done_handler(void)
  *   (chassis_ctrl_stop 已是幂等, 但为避免反复清 PID 积分, 这里只在
  *    LOSS 触发瞬间调用一次, handler 内不再重复调.)
  * ================================================================== */
+
+/* ==========================================================================
+ *  § 5. 外部查询 API + 链路守护 + 越界检测 + 任务主入口
+ * ========================================================================== */
 
 uint8 Game_Link_Is_Alive(void)
 {

@@ -31,6 +31,10 @@
  *=================================================================================================================*/
 static app_vision_fusion_stats_t s_stats = {0U, 0U, 0U, 0U};
 
+/* ==========================================================================
+ *  § 1. 诊断统计读取 (g_link_stats 镜像, 外部可读)
+ * ========================================================================== */
+
 void app_vision_fusion_get_stats(app_vision_fusion_stats_t *out)
 {
     if (out == NULL) { return; }
@@ -164,6 +168,10 @@ static uint32   s_snap_last_seen_fid    = 0U;       /* 已计票的 frame_id (0=
 static snap_vote_bin_t s_snap_bins[SNAP_VOTE_FRAMES_C];
 static uint8    s_snap_bin_used         = 0U;
 static uint8    s_snap_total_votes      = 0U;
+
+/* ==========================================================================
+ *  § 2. 到站 Snap 状态机 (snap_reset/begin/vote_add_and_top + request/state/cancel)
+ * ========================================================================== */
 
 static void snap_reset_to_idle(void)
 {
@@ -367,6 +375,10 @@ void app_vision_fusion_snap_cancel(void)
  *       若 ≥ GAP_CELLS 持续 ≥ HOLD_MS 内不收敛, 视为 odom 大幅打滑或被搬动,
  *       直接 chassis_ctrl_set_pose 到视觉格中心 (yaw 不动) 并进入 COOLDOWN_MS 冷却。
  *=================================================================================================================*/
+
+/* ==========================================================================
+ *  § 3. 一致性监控 (连续偏差 / R 自适应 / consistency_tick)
+ * ========================================================================== */
 #if CHASSIS_VISION_CONSISTENCY_ENABLE
 
 static uint16 s_cons_period_accum_ms = 0U;

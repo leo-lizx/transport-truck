@@ -17,7 +17,8 @@
 | UART 中断喂字节 | `project/user/src/isr.c`（`LPUART1_IRQHandler` → `app_link_isr_feed_byte`） |
 | 链路 tick（5ms） | `app_link_tick()`，由 PIT_CH0 调用 |
 | 游戏状态机、200ms 超时、PAUSE | `project/code/app_game_logic.c` |
-| 底盘闭环、里程计、导航、`move_to_grid`、几何区域 | `project/code/chassis_ctrl.c` |
+| 底盘闭环、里程计、导航、`move_to_grid` | `project/code/chassis_ctrl.c` |
+| 几何区域判定（发车区/越界/静止/软限位） | `project/code/chassis_zone.c`、`project/code/chassis_zone.h` |
 | 位姿快照读 | `chassis_ctrl_get_pose()`（P0-3 seq-lock） |
 | IMU、航向积分 | `project/code/chassis_imu.c` |
 | 电机 PWM/DIR、编码器、麦轮、PID | `chassis_motor.c`、`chassis_encoder.c`、`chassis_mecanum.c`、`chassis_pid.c` |
@@ -127,7 +128,8 @@ visual-group/
 | 编码器 | `chassis_encoder.c/.h` | 正交脉冲 → 轮速 |
 | IMU | `chassis_imu.c/.h` | IMU660RB SPI，零偏标定 + 航向积分 |
 | 麦轮运动学 | `chassis_mecanum.c/.h` | 正/逆运动学 + 等比例限速 |
-| 顶层底盘 | `chassis_ctrl.c/.h` | 5/20ms 闭环 + 网格定点 + 航向保持 + **几何区域判定** + `chassis_ctrl_move_to_grid()` |
+| 顶层底盘 | `chassis_ctrl.c/.h` | 5/20ms 闭环 + 网格定点 + 航向保持 + `chassis_ctrl_move_to_grid()` |
+| 几何判定 | `chassis_zone.c/.h` | 发车区 / 越界 / 静止判定 + 软限位预测保护（与 chassis_ctrl 解耦，仅消费 `chassis_ctrl_get_pose()` seq-lock 快照） |
 | 调参菜单 | `chassis_menu.c/.h` | IPS + 4 按键 + Flash 持久化 |
 | 推箱求解 | `algo_sokoban_solver.c/.h` | 地图分解 + 单箱位图 BFS + 炸弹策略 + 导航 BFS |
 | 游戏状态机 | `app_game_logic.c/.h` | 主流程 + 链路守护 |

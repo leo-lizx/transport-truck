@@ -1,0 +1,1302 @@
+"""
+sokoban_validator.py — 推箱子算法 PC 端验证器
+=================================================
+完整复现 algo_sokoban_solver.c 的 Python 版本，用于在 PC 上验证
+地图求解、动画模拟、通关判断。
+
+运行方式:
+    python sokoban_validator.py
+
+功能:
+  - 自动生成随机地图（可指定种子）
+  - 支持三阶段模式（Stage1 贪心 / Stage2 指定映射 / Stage3 炸弹）
+  - 调用 BFS 求解器，输出完整方向指令字符串
+  - 逐步动画模拟，区分"行走"与"推箱"动作
+  - 对每步路径进行合法性校验
+  - 通关条件实时判断
+"""
+
+import os
+import sys
+import time
+import random
+import copy
+from collections import deque
+from typing import Optional, List, Tuple, Dict
+
+# ============================================================
+# 地图常量（与 C 代码一致）
+# ============================================================
+MAP_ROWS = 12
+MAP_COLS = 16
+
+INNER_R_MIN = 1
+INNER_R_MAX = 10   # CHASSIS_GRID_MAX_Y - 1
+INNER_C_MIN = 1
+INNER_C_MAX = 14   # CHASSIS_GRID_MAX_X - 1
+
+EMPTY  = 0
+WALL   = 1
+TARGET = 2
+BOX    = 3
+BOMB   = 4
+
+MAX_BOXES = 8
+
+# 方向偏移：UP=0, DOWN=1, LEFT=2, RIGHT=3
+DR = (-1,  1,  0,  0)   # row 偏移
+DC = ( 0,  0, -1,  1)   # col 偏移
+
+DIR_ARROW  = ('↑', '↓', '←', '→')
+DIR_LETTER = ('U', 'D', 'L', 'R')   # 大写=推箱，小写=行走
+
+# 地图字符（Unicode 模式）
+CELL_UNICODE = {
+    EMPTY:  '·',   # 空地
+    WALL:   '█',   # 墙
+    TARGET: '◎',   # 目标点
+    BOX:    '□',   # 箱子
+    BOMB:   '◆',   # 炸弹
+}
+BOX_ON_TARGET_CHAR  = '■'   # 箱子已在目标上
+PLAYER_CHAR         = '@'
+PLAYER_ON_TARGET    = '⊕'
+
+# ASCII 回退
+CELL_ASCII = {
+    EMPTY:  '.',
+    WALL:   '#',
+    TARGET: 'O',
+    BOX:    'B',
+    BOMB:   'X',
+}
+BOX_ON_TARGET_ASCII  = '*'
+PLAYER_ASCII         = '@'
+PLAYER_ON_TARGET_ASCII = '+'
+
+USE_UNICODE = True  # 运行时自动探测
+
+
+def _detect_unicode() -> bool:
+    """探测终端是否支持 Unicode 输出。"""
+    try:
+        sys.stdout.write('█')
+        sys.stdout.flush()
+        sys.stdout.write('\r \r')
+        sys.stdout.flush()
+        return True
+    except Exception:
+        return False
+
+
+# ============================================================
+# 内场边界检查
+# ============================================================
+
+def is_inner(r: int, c: int) -> bool:
+    return INNER_R_MIN <= r <= INNER_R_MAX and INNER_C_MIN <= c <= INNER_C_MAX
+
+
+def is_free(the_map: list, r: int, c: int) -> bool:
+    """可通行：内场且为空地/目标点。"""
+    if not is_inner(r, c):
+        return False
+    return the_map[r][c] in (EMPTY, TARGET)
+
+
+# ============================================================
+# 元素提取
+# ============================================================
+
+def extract_elements(the_map: list, elem_type: int) -> list:
+    """提取地图中所有指定类型元素的坐标列表 [(row, col), ...]。"""
+    result = []
+    for r in range(INNER_R_MIN, INNER_R_MAX + 1):
+        for c in range(INNER_C_MIN, INNER_C_MAX + 1):
+            if the_map[r][c] == elem_type:
+                result.append((r, c))
+    return result
+
+
+# ============================================================
+# 点到点 BFS 导航
+# ============================================================
+
+def nav_bfs(the_map: list, start: tuple, end: tuple) -> Optional[list]:
+    """
+    点到点 BFS 寻路（不推箱）。
+    返回路径坐标列表（含起终点），无解返回 None。
+    对应 C 代码 Algo_Nav_BFS()。
+    """
+    if not (is_inner(*start) and is_inner(*end)):
+        return None
+    if not (is_free(the_map, *start) and is_free(the_map, *end)):
+        return None
+    if start == end:
+        return [start]
+
+    parent: Dict[tuple, Optional[tuple]] = {start: None}
+    queue = deque([start])
+
+    while queue:
+        pos = queue.popleft()
+        if pos == end:
+            # 回溯路径
+            path = []
+            cur = pos
+            while cur is not None:
+                path.append(cur)
+                cur = parent[cur]
+            return list(reversed(path))
+        r, c = pos
+        for d in range(4):
+            nr, nc = r + DR[d], c + DC[d]
+            npos = (nr, nc)
+            if is_free(the_map, nr, nc) and npos not in parent:
+                parent[npos] = pos
+                queue.append(npos)
+
+    return None
+
+
+# ============================================================
+# 单箱 BFS 推箱求解器
+# ============================================================
+
+def sokoban_bfs_single(sub_map: list, player: tuple, box: tuple,
+                       target: tuple) -> Optional[list]:
+    """
+    单箱推箱 BFS 求解。
+    状态 = (player_r, player_c, box_r, box_c)。
+    返回动作序列 [0..3]，无解返回 None。
+    对应 C 代码 sokoban_bfs_single()。
+    """
+    if not (is_inner(*player) and is_inner(*box) and is_inner(*target)):
+        return None
+    if box == target:
+        return []
+
+    start = (player[0], player[1], box[0], box[1])
+    # parent: state -> (prev_state, action)
+    parent: Dict[tuple, Optional[tuple]] = {start: None}
+    queue = deque([start])
+
+    found_state = None
+
+    while queue and found_state is None:
+        pr, pc, br, bc = state = queue.popleft()
+        for d in range(4):
+            npr = pr + DR[d]
+            npc = pc + DC[d]
+            nbr, nbc = br, bc
+
+            if npr == br and npc == bc:
+                # 推箱：箱子前方必须可通行
+                nbr = br + DR[d]
+                nbc = bc + DC[d]
+                if not is_free(sub_map, nbr, nbc):
+                    continue
+            else:
+                # 行走：目标格可通行且不是箱子所在格
+                if not is_free(sub_map, npr, npc):
+                    continue
+
+            new_state = (npr, npc, nbr, nbc)
+            if new_state in parent:
+                continue
+
+            parent[new_state] = (state, d)
+
+            if nbr == target[0] and nbc == target[1]:
+                found_state = new_state
+                break
+
+            queue.append(new_state)
+
+    if found_state is None:
+        return None
+
+    # 回溯动作
+    actions = []
+    state = found_state
+    while parent[state] is not None:
+        prev_state, act = parent[state]
+        actions.append(act)
+        state = prev_state
+
+    return list(reversed(actions))
+
+
+# ============================================================
+# 动作模拟 — 得到玩家和箱子的最终坐标
+# ============================================================
+
+def simulate_actions(actions: list, player: tuple, box: tuple) -> tuple:
+    """
+    模拟动作序列，返回 (player_final, box_final)。
+    对应 C 代码 simulate_actions()。
+    """
+    pr, pc = player
+    br, bc = box
+    for d in actions:
+        npr = pr + DR[d]
+        npc = pc + DC[d]
+        if npr == br and npc == bc:
+            br += DR[d]
+            bc += DC[d]
+        pr, pc = npr, npc
+    return (pr, pc), (br, bc)
+
+
+# ============================================================
+# 子地图构建
+# ============================================================
+
+def build_sub_map(base_map: list, boxes: list, targets: list,
+                  solved: list, cur_box_idx: int, cur_target_idx: int) -> list:
+    """
+    构建单箱子问题的子地图：
+      - 当前箱子：从地图移除（BFS 状态跟踪）
+      - 已完成箱子：空地
+      - 其余未完成箱子：墙壁
+      - 非当前目标点：改为空地
+    对应 C 代码 build_sub_map()。
+    """
+    sub = [row[:] for row in base_map]
+    for i, (br, bc) in enumerate(boxes):
+        if i == cur_box_idx:
+            sub[br][bc] = EMPTY
+        elif solved[i]:
+            sub[br][bc] = EMPTY
+        else:
+            sub[br][bc] = WALL
+
+    for i, (tr, tc) in enumerate(targets):
+        if i == cur_target_idx:
+            continue
+        if sub[tr][tc] == TARGET:
+            sub[tr][tc] = EMPTY
+
+    return sub
+
+
+# ============================================================
+# Stage 1 求解 — 贪心（任意箱→任意目标）
+# ============================================================
+
+def solve_stage1(the_map: list, player_pos: tuple) -> Optional[dict]:
+    """
+    贪心求解：每轮选最近未完成箱子，为其匹配最近未使用目标。
+    返回解算结果字典，无解返回 None。
+    对应 C 代码 Sokoban_Solve_Stage1()。
+    """
+    boxes   = extract_elements(the_map, BOX)
+    targets = extract_elements(the_map, TARGET)
+
+    if not boxes or len(boxes) != len(targets):
+        return None
+
+    n = len(boxes)
+    solved = [False] * n
+    t_used = [False] * n
+    sub_solutions = []
+    cur_player = player_pos
+
+    for _ in range(n):
+        # 选最近未完成箱子
+        best_b = min(
+            (i for i in range(n) if not solved[i]),
+            key=lambda i: abs(boxes[i][0] - cur_player[0]) + abs(boxes[i][1] - cur_player[1]),
+            default=None
+        )
+        if best_b is None:
+            return None
+
+        # 选最近未使用目标
+        best_t = min(
+            (i for i in range(n) if not t_used[i]),
+            key=lambda i: abs(targets[i][0] - boxes[best_b][0]) + abs(targets[i][1] - boxes[best_b][1]),
+            default=None
+        )
+        if best_t is None:
+            return None
+
+        sub = build_sub_map(the_map, boxes, targets, solved, best_b, best_t)
+        sol = sokoban_bfs_single(sub, cur_player, boxes[best_b], targets[best_t])
+        if sol is None:
+            return None
+
+        cur_player, _ = simulate_actions(sol, cur_player, boxes[best_b])
+        sub_solutions.append({
+            'actions':    sol,
+            'box_idx':    best_b,
+            'target_idx': best_t,
+            'player_end': cur_player,
+        })
+        solved[best_b] = True
+        t_used[best_t] = True
+
+    return {
+        'sub_solutions': sub_solutions,
+        'boxes':         boxes,
+        'targets':       targets,
+        'total_steps':   sum(len(s['actions']) for s in sub_solutions),
+    }
+
+
+# ============================================================
+# Stage 2 求解 — 指定箱→目标映射
+# ============================================================
+
+def solve_stage2(the_map: list, player_pos: tuple,
+                 box_to_target_idx: list) -> Optional[dict]:
+    """
+    指定映射求解：box_to_target_idx[i] 表示第 i 个箱子→第几号目标。
+    对应 C 代码 Sokoban_Solve_Stage2()。
+    """
+    boxes   = extract_elements(the_map, BOX)
+    targets = extract_elements(the_map, TARGET)
+
+    n = len(boxes)
+    if n == 0 or len(box_to_target_idx) != n:
+        return None
+
+    solved = [False] * n
+    sub_solutions = []
+    cur_player = player_pos
+
+    for _ in range(n):
+        best_b = min(
+            (i for i in range(n) if not solved[i]),
+            key=lambda i: abs(boxes[i][0] - cur_player[0]) + abs(boxes[i][1] - cur_player[1]),
+            default=None
+        )
+        if best_b is None:
+            return None
+
+        ti = box_to_target_idx[best_b]
+        if ti >= len(targets):
+            return None
+
+        sub = build_sub_map(the_map, boxes, targets, solved, best_b, ti)
+        sol = sokoban_bfs_single(sub, cur_player, boxes[best_b], targets[ti])
+        if sol is None:
+            return None
+
+        cur_player, _ = simulate_actions(sol, cur_player, boxes[best_b])
+        sub_solutions.append({
+            'actions':    sol,
+            'box_idx':    best_b,
+            'target_idx': ti,
+            'player_end': cur_player,
+        })
+        solved[best_b] = True
+
+    return {
+        'sub_solutions': sub_solutions,
+        'boxes':         boxes,
+        'targets':       targets,
+        'total_steps':   sum(len(s['actions']) for s in sub_solutions),
+    }
+
+
+# ============================================================
+# Stage 3 辅助 — 死局检测
+# ============================================================
+
+def is_blocker(the_map: list, r: int, c: int) -> bool:
+    if not is_inner(r, c):
+        return True
+    return the_map[r][c] in (WALL, BOX, BOMB)
+
+
+def check_deadlock(the_map: list) -> Tuple[bool, Optional[tuple]]:
+    """
+    检测角落死局。对应 C 代码 Sokoban_Is_Deadlock()。
+    返回 (is_dead, dead_box_pos)。
+    """
+    for r in range(INNER_R_MIN, INNER_R_MAX + 1):
+        for c in range(INNER_C_MIN, INNER_C_MAX + 1):
+            if the_map[r][c] != BOX:
+                continue
+            up    = is_blocker(the_map, r - 1, c)
+            down  = is_blocker(the_map, r + 1, c)
+            left  = is_blocker(the_map, r, c - 1)
+            right = is_blocker(the_map, r, c + 1)
+            if (up and left) or (up and right) or (down and left) or (down and right):
+                return True, (r, c)
+    return False, None
+
+
+# ============================================================
+# Stage 3 辅助 — 炸弹爆炸 / 墙体搜索
+# ============================================================
+
+def apply_bomb_explosion(the_map: list, wall_pos: tuple) -> None:
+    """3×3 范围清除内墙。对应 C 代码 Sokoban_Apply_Bomb_Explosion()。"""
+    wr, wc = wall_pos
+    for dr in range(-1, 2):
+        for dc in range(-1, 2):
+            r, c = wr + dr, wc + dc
+            if 1 <= r < MAP_ROWS - 1 and 1 <= c < MAP_COLS - 1:
+                if the_map[r][c] == WALL:
+                    the_map[r][c] = EMPTY
+
+
+def find_bomb_wall(the_map: list, player_pos: tuple,
+                   blocked_target: Optional[tuple] = None) -> Optional[tuple]:
+    """
+    寻找最优炸弹目标墙体。对应 C 代码 Sokoban_Find_Bomb_Wall()。
+    """
+    best_score = float('-inf')
+    best_wall  = None
+
+    for r in range(1, MAP_ROWS - 1):
+        for c in range(1, MAP_COLS - 1):
+            if the_map[r][c] != WALL:
+                continue
+
+            tmp = [row[:] for row in the_map]
+            cleared = 0
+            for dr in range(-1, 2):
+                for dc in range(-1, 2):
+                    rr, cc = r + dr, c + dc
+                    if 1 <= rr < MAP_ROWS - 1 and 1 <= cc < MAP_COLS - 1:
+                        if tmp[rr][cc] == WALL:
+                            tmp[rr][cc] = EMPTY
+                            cleared += 1
+
+            # 若指定了被卡目标，要求此墙能解锁该目标
+            if blocked_target is not None:
+                if nav_bfs(tmp, player_pos, blocked_target) is None:
+                    continue
+                path = nav_bfs(tmp, player_pos, blocked_target)
+                blocked_len = len(path) if path else 999
+            else:
+                blocked_len = 0
+
+            reachable = sum(
+                1 for tr in range(INNER_R_MIN, INNER_R_MAX + 1)
+                for tc in range(INNER_C_MIN, INNER_C_MAX + 1)
+                if tmp[tr][tc] == TARGET and nav_bfs(tmp, player_pos, (tr, tc)) is not None
+            )
+
+            score = reachable * 1000 + cleared * 20 - blocked_len
+            if score > best_score:
+                best_score = score
+                best_wall  = (r, c)
+
+    return best_wall
+
+
+# ============================================================
+# Stage 3 完整求解
+# ============================================================
+
+def solve_stage3(the_map: list, player_pos: tuple) -> Optional[dict]:
+    """
+    Stage3 完整流程：
+      1. 找炸弹位置
+      2. 找不可达目标（可选）
+      3. 寻找最优爆破墙体
+      4. BFS 求解推炸弹路径
+      5. 模拟爆炸，更新地图
+      6. 用 Stage1 继续推剩余箱子
+    """
+    bombs = extract_elements(the_map, BOMB)
+    if not bombs:
+        return None
+
+    bomb_pos = bombs[0]
+
+    # 找不可达目标
+    blocked_target = None
+    for t in extract_elements(the_map, TARGET):
+        if nav_bfs(the_map, player_pos, t) is None:
+            blocked_target = t
+            break
+
+    wall_pos = find_bomb_wall(the_map, player_pos, blocked_target)
+    if wall_pos is None:
+        return None
+
+    # 构建推炸弹用的子地图（炸弹格清空，目标墙设为 TARGET）
+    tmp = [row[:] for row in the_map]
+    tmp[bomb_pos[0]][bomb_pos[1]] = EMPTY
+    tmp[wall_pos[0]][wall_pos[1]] = TARGET
+
+    bomb_actions = sokoban_bfs_single(tmp, player_pos, bomb_pos, wall_pos)
+    if bomb_actions is None:
+        return None
+
+    # 模拟推炸弹后的玩家位置
+    cur_player, _ = simulate_actions(bomb_actions, player_pos, bomb_pos)
+
+    # 应用爆炸
+    new_map = [row[:] for row in the_map]
+    new_map[bomb_pos[0]][bomb_pos[1]] = EMPTY
+    apply_bomb_explosion(new_map, wall_pos)
+
+    # 继续用 Stage1 推剩余箱子
+    stage1_result = solve_stage1(new_map, cur_player)
+
+    return {
+        'bomb_actions':    bomb_actions,
+        'bomb_pos':        bomb_pos,
+        'wall_pos':        wall_pos,
+        'cur_player_after_bomb': cur_player,
+        'map_after_bomb':  new_map,
+        'stage1_result':   stage1_result,
+    }
+
+
+# ============================================================
+# 动作序列 → 方向字符串
+# ============================================================
+
+def actions_to_string(actions: list, player_start: tuple,
+                      box_start: tuple, use_unicode: bool = True) -> str:
+    """
+    生成方向字符串：推箱动作用大写，行走动作用小写。
+    使用 Unicode 箭头或 ASCII 字母。
+    """
+    pr, pc = player_start
+    br, bc = box_start
+    chars = []
+    arrows = DIR_ARROW if use_unicode else DIR_LETTER
+
+    for d in actions:
+        npr = pr + DR[d]
+        npc = pc + DC[d]
+        is_push = (npr == br and npc == bc)
+
+        if use_unicode:
+            # 推箱用【箭头】区别，行走直接用箭头
+            chars.append(f'[{arrows[d]}]' if is_push else arrows[d])
+        else:
+            letter = DIR_LETTER[d]
+            chars.append(letter.upper() if is_push else letter.lower())
+
+        if is_push:
+            br += DR[d]
+            bc += DC[d]
+        pr, pc = npr, npc
+
+    return ''.join(chars)
+
+
+def actions_to_waypoints(actions: list, start_pos: tuple) -> list:
+    """转弯点压缩。对应 C 代码 Sokoban_Actions_To_Waypoints()。"""
+    waypoints = []
+    r, c = start_pos
+    for i, d in enumerate(actions):
+        r += DR[d]
+        c += DC[d]
+        if i == len(actions) - 1 or actions[i] != actions[i + 1]:
+            waypoints.append((r, c))
+    return waypoints
+
+
+# ============================================================
+# 路径合法性校验
+# ============================================================
+
+def validate_path(the_map: list, actions: list, player_start: tuple,
+                  box_start: tuple) -> Tuple[bool, str]:
+    """
+    逐步校验路径合法性：
+      - 玩家不走出边界或进入墙壁
+      - 推箱时箱子前方可通行
+    返回 (is_valid, error_message)。
+    """
+    pr, pc = player_start
+    br, bc = box_start
+
+    for step, d in enumerate(actions):
+        npr = pr + DR[d]
+        npc = pc + DC[d]
+
+        if not is_inner(npr, npc):
+            return False, f"步骤 {step+1}: 玩家越界 ({npc},{npr})"
+
+        cell = the_map[npr][npc]
+
+        if npr == br and npc == bc:
+            # 推箱
+            nbr = br + DR[d]
+            nbc = bc + DC[d]
+            if not is_inner(nbr, nbc):
+                return False, f"步骤 {step+1}: 推箱越界 ({nbc},{nbr})"
+            dest_cell = the_map[nbr][nbc]
+            if dest_cell not in (EMPTY, TARGET):
+                return False, f"步骤 {step+1}: 推箱目标格被阻挡 ({nbc},{nbr}) cell={dest_cell}"
+            br, bc = nbr, nbc
+        else:
+            if cell not in (EMPTY, TARGET):
+                return False, f"步骤 {step+1}: 行走进入非空格 ({npc},{npr}) cell={cell}"
+
+        pr, pc = npr, npc
+
+    return True, "路径合法"
+
+
+def check_win(the_map: list, boxes_current: list) -> bool:
+    """判断所有箱子是否到达目标点（通关条件）。"""
+    return all(the_map[r][c] == TARGET for r, c in boxes_current)
+
+
+# ============================================================
+# 地图渲染
+# ============================================================
+
+def render_map(the_map: list, player_pos: tuple,
+               boxes: list, use_unicode: bool = True) -> str:
+    """渲染当前地图状态为字符串。"""
+    pr, pc = player_pos
+    box_set = set(boxes)
+    cell_chars = CELL_UNICODE if use_unicode else CELL_ASCII
+    boc = BOX_ON_TARGET_CHAR if use_unicode else BOX_ON_TARGET_ASCII
+    pl_ch = PLAYER_CHAR
+    pl_tgt = PLAYER_ON_TARGET if use_unicode else PLAYER_ON_TARGET_ASCII
+
+    lines = []
+    # 列号标尺
+    header = '  ' + ''.join(f'{c%10}' for c in range(MAP_COLS))
+    lines.append(header)
+
+    for r in range(MAP_ROWS):
+        row_str = f'{r:2d}'
+        for c in range(MAP_COLS):
+            cell = the_map[r][c]
+            pos  = (r, c)
+
+            if pos == (pr, pc):
+                row_str += (pl_tgt if cell == TARGET else pl_ch)
+            elif pos in box_set:
+                row_str += (boc if cell == TARGET else cell_chars.get(BOX, 'B'))
+            else:
+                row_str += cell_chars.get(cell, '?')
+        lines.append(row_str)
+
+    return '\n'.join(lines)
+
+
+def clear_screen() -> None:
+    os.system('cls' if os.name == 'nt' else 'clear')
+
+
+# ============================================================
+# 地图自动生成
+# ============================================================
+
+def _inner_cells() -> list:
+    return [(r, c) for r in range(INNER_R_MIN, INNER_R_MAX + 1)
+            for c in range(INNER_C_MIN, INNER_C_MAX + 1)]
+
+
+def _make_empty_map() -> list:
+    m = [[EMPTY] * MAP_COLS for _ in range(MAP_ROWS)]
+    for r in range(MAP_ROWS):
+        for c in range(MAP_COLS):
+            if r == 0 or r == MAP_ROWS - 1 or c == 0 or c == MAP_COLS - 1:
+                m[r][c] = WALL
+    return m
+
+
+def _is_solvable(the_map: list, player_pos: tuple, box_count: int,
+                 stage: int = 1) -> bool:
+    """可解性检测。Stage3 使用 solve_stage3，其余用 Stage1 BFS。"""
+    boxes   = extract_elements(the_map, BOX)
+    targets = extract_elements(the_map, TARGET)
+    if len(boxes) != box_count or len(targets) != box_count:
+        return False
+    if stage == 3:
+        return solve_stage3(the_map, player_pos) is not None
+    dl, _ = check_deadlock(the_map)
+    if dl:
+        return False
+    return solve_stage1(the_map, player_pos) is not None
+
+
+def _gen_stage3_map(box_count: int, wall_density: float,
+                    rng) -> Tuple[Optional[list], Optional[tuple]]:
+    """
+    专用 Stage3 地图生成：
+      - 用一条横墙将内场分为上下两半，使目标完全不可直达
+      - 玩家、箱子、炸弹在上半部；目标在下半部
+      - 炸弹紧贴墙上方，可被推入墙体触发 3×3 爆炸
+      - 用 solve_stage3 验证可解
+    """
+    for _ in range(120):
+        m = _make_empty_map()
+
+        # 选墙行（内场中段 row 3~8）
+        wall_r = rng.randint(INNER_R_MIN + 2, INNER_R_MAX - 2)
+
+        # 填充整行横墙（内场全宽）
+        for c in range(INNER_C_MIN, INNER_C_MAX + 1):
+            m[wall_r][c] = WALL
+
+        # 上半 / 下半可用空格
+        top_cells = [(r, c) for r in range(INNER_R_MIN, wall_r)
+                     for c in range(INNER_C_MIN, INNER_C_MAX + 1)
+                     if m[r][c] == EMPTY]
+        bot_cells = [(r, c) for r in range(wall_r + 1, INNER_R_MAX + 1)
+                     for c in range(INNER_C_MIN, INNER_C_MAX + 1)
+                     if m[r][c] == EMPTY]
+
+        # 上半需要：1 玩家 + box_count 箱子 + 1 炸弹
+        if len(top_cells) < 2 + box_count or len(bot_cells) < box_count:
+            continue
+
+        rng.shuffle(top_cells)
+        rng.shuffle(bot_cells)
+
+        idx = 0
+        player_pos = top_cells[idx]; idx += 1
+
+        boxes = []
+        for _ in range(box_count):
+            br, bc = top_cells[idx]; idx += 1
+            m[br][bc] = BOX
+            boxes.append((br, bc))
+
+        # 炸弹优先放在紧贴横墙上方一行（便于向下推入墙体）
+        bomb_row = wall_r - 1
+        bomb_cands = [
+            (bomb_row, c) for c in range(INNER_C_MIN + 1, INNER_C_MAX)
+            if m[bomb_row][c] == EMPTY
+            and (bomb_row, c) != player_pos
+            and (bomb_row, c) not in boxes
+        ]
+        if bomb_cands:
+            bomb_pos = rng.choice(bomb_cands)
+        else:
+            remaining = [p for p in top_cells[idx:]
+                         if p not in boxes and p != player_pos]
+            if not remaining:
+                continue
+            bomb_pos = remaining[0]
+
+        m[bomb_pos[0]][bomb_pos[1]] = BOMB
+
+        # 目标放在下半
+        for tr, tc in bot_cells[:box_count]:
+            m[tr][tc] = TARGET
+
+        # 可选：上半随机少量内墙增加趣味性
+        extra_n = max(0, int(len(top_cells) * wall_density * 0.4))
+        extra_pool = [
+            p for p in top_cells[idx + 1:]
+            if p not in boxes and p != player_pos and p != bomb_pos
+        ]
+        rng.shuffle(extra_pool)
+        for p in extra_pool[:extra_n]:
+            m[p[0]][p[1]] = WALL
+
+        try:
+            sol = solve_stage3(m, player_pos)
+            if sol is not None:
+                # 要求爆炸后 Stage1 也可解（有箱子时必须验证）
+                s1 = sol.get('stage1_result')
+                boxes_left = extract_elements(m, BOX)
+                if s1 is not None or len(boxes_left) == 0:
+                    return m, player_pos
+        except Exception:
+            continue
+
+    return None, None
+
+
+def generate_map(stage: int = 1, box_count: int = 2,
+                 wall_density: float = 0.10, seed: Optional[int] = None) -> Tuple[list, tuple]:
+    """
+    自动生成地图。返回 (map, player_pos)。
+    stage=3 时使用专用横墙+炸弹生成器。
+    """
+    rng = random.Random(seed)
+    if seed is not None:
+        random.seed(seed)  # 同步全局随机以兼容旧调用
+
+    # Stage3 专用生成器
+    if stage == 3:
+        m, p = _gen_stage3_map(box_count, wall_density, rng)
+        if m is not None:
+            return m, p
+        return _make_simple_map(stage, box_count), (INNER_R_MIN + 1, INNER_C_MIN + 1)
+
+    max_attempts = 50
+    for _ in range(max_attempts):
+        m = _make_empty_map()
+        cells = _inner_cells()
+        random.shuffle(cells)
+
+        # 随机内墙（边缘两格内不放，避免完全堵死）
+        wall_n = int(len(cells) * wall_density)
+        wall_idx = 0
+        placed_walls = 0
+        taken = set()
+
+        while placed_walls < wall_n and wall_idx < len(cells):
+            r, c = cells[wall_idx]
+            wall_idx += 1
+            if r <= INNER_R_MIN + 1 or r >= INNER_R_MAX - 1:
+                continue
+            if c <= INNER_C_MIN + 1 or c >= INNER_C_MAX - 1:
+                continue
+            m[r][c] = WALL
+            taken.add((r, c))
+            placed_walls += 1
+
+        avail = [p for p in cells if p not in taken]
+        if len(avail) < 1 + box_count * 2:
+            continue
+
+        random.shuffle(avail)
+        idx = 0
+
+        player_pos = avail[idx]; idx += 1
+
+        boxes_placed = []
+        for _ in range(box_count):
+            boxes_placed.append(avail[idx]); idx += 1
+            m[avail[idx - 1][0]][avail[idx - 1][1]] = BOX
+
+        targets_placed = []
+        for _ in range(box_count):
+            targets_placed.append(avail[idx]); idx += 1
+            m[avail[idx - 1][0]][avail[idx - 1][1]] = TARGET
+
+        if _is_solvable(m, player_pos, box_count, stage):
+            return m, player_pos
+
+    # 回退：简单安全地图
+    return _make_simple_map(stage, box_count), (INNER_R_MIN + 1, INNER_C_MIN + 1)
+
+
+def _make_simple_map(stage: int, box_count: int) -> list:
+    """生成简单无障碍地图。"""
+    m = _make_empty_map()
+    cells = _inner_cells()
+    random.shuffle(cells)
+    idx = 0
+    for _ in range(box_count):
+        r, c = cells[idx]; idx += 1
+        m[r][c] = BOX
+    for _ in range(box_count):
+        r, c = cells[idx]; idx += 1
+        m[r][c] = TARGET
+    if stage == 3 and idx < len(cells):
+        r, c = cells[idx]; idx += 1
+        m[r][c] = BOMB
+    return m
+
+
+# ============================================================
+# 动画模拟引擎
+# ============================================================
+
+class Simulator:
+    """逐步动画模拟器。"""
+
+    def __init__(self, initial_map: list, player_pos: tuple, use_unicode: bool = True):
+        self.initial_map = [row[:] for row in initial_map]
+        # 工作地图：剥离 BOX 标记，箱子位置改用 self.boxes 列表独立跟踪
+        # 这样 self.map 只含 WALL/EMPTY/TARGET/BOMB，渲染无歧义
+        self.map = [row[:] for row in initial_map]
+        for r in range(MAP_ROWS):
+            for c in range(MAP_COLS):
+                if self.map[r][c] == BOX:
+                    self.map[r][c] = EMPTY
+        self.player      = player_pos
+        self.use_unicode = use_unicode
+        self.boxes       = extract_elements(initial_map, BOX)  # [(row,col), ...]
+        self.step_count  = 0
+        self.push_count  = 0
+
+    def _render(self, extra_info: str = '') -> None:
+        clear_screen()
+        print("=" * 50)
+        print(" 推箱子算法验证器 — 动态模拟")
+        print("=" * 50)
+        print(render_map(self.map, self.player, self.boxes, self.use_unicode))
+        print(f"\n 步数: {self.step_count}  推箱: {self.push_count}")
+        if extra_info:
+            print(f" {extra_info}")
+        # 通关检测
+        if check_win(self.map, self.boxes):
+            print("\n ★ 通关！所有箱子已到达目标位置 ★")
+
+    def run_phase(self, actions: list, box_start: tuple, box_idx: int,
+                  target_pos: tuple, phase_label: str,
+                  delay: float = 0.25, step_mode: bool = False) -> None:
+        """
+        执行一个子任务的动画。
+        """
+        dir_str = actions_to_string(actions, self.player, box_start, self.use_unicode)
+        waypoints = actions_to_waypoints(actions, self.player)
+
+        print(f"\n{'='*50}")
+        print(f" {phase_label}")
+        print(f" 方向指令串: {dir_str}")
+        print(f" 总步数: {len(actions)}  转弯路点: {len(waypoints)}")
+        print(f" 路点序列: {waypoints}")
+
+        # 路径合法性校验
+        valid, msg = validate_path(self.map, actions, self.player, box_start)
+        status = "✓ 路径合法" if valid else f"✗ {msg}"
+        print(f" 校验结果: {status}")
+
+        print(f"\n 按 Enter 开始动画，输入 's' 跳过，'q' 退出: ", end='', flush=True)
+        choice = input().strip().lower()
+        if choice == 'q':
+            sys.exit(0)
+        if choice == 's':
+            # 快速跳过：逐步模拟以正确统计推箱次数
+            pr2, pc2 = self.player
+            br2, bc2 = box_start
+            push_n = 0
+            for d in actions:
+                npr2 = pr2 + DR[d]
+                npc2 = pc2 + DC[d]
+                if npr2 == br2 and npc2 == bc2:
+                    br2 += DR[d]
+                    bc2 += DC[d]
+                    push_n += 1
+                pr2, pc2 = npr2, npc2
+            if box_idx < len(self.boxes):
+                self.boxes[box_idx] = (br2, bc2)
+            self.player = (pr2, pc2)
+            self.step_count += len(actions)
+            self.push_count += push_n
+            return
+
+        # 逐步动画
+        pr, pc = self.player
+        br, bc = box_start
+
+        for i, d in enumerate(actions):
+            npr = pr + DR[d]
+            npc = pc + DC[d]
+            is_push = (npr == br and npc == bc)
+            info_parts = []
+
+            if is_push:
+                nbr = br + DR[d]
+                nbc = bc + DC[d]
+                # self.map 中没有 BOX 标记，直接更新 boxes 列表即可
+                if box_idx < len(self.boxes):
+                    self.boxes[box_idx] = (nbr, nbc)
+                br, bc = nbr, nbc
+                self.push_count += 1
+                action_label = f"[推箱] {DIR_ARROW[d] if self.use_unicode else DIR_LETTER[d].upper()}"
+                info_parts.append(action_label)
+            else:
+                action_label = f"[行走] {DIR_ARROW[d] if self.use_unicode else DIR_LETTER[d]}"
+                info_parts.append(action_label)
+
+            pr, pc = npr, npc
+            self.player = (pr, pc)
+            self.step_count += 1
+
+            info_parts.append(f"步 {i+1}/{len(actions)}")
+            self._render(' | '.join(info_parts))
+
+            if step_mode:
+                input(" 按 Enter 下一步...")
+            else:
+                time.sleep(delay)
+
+        # 最终同步箱子位置（循环正常结束时 br,bc 即最终位置）
+        if box_idx < len(self.boxes):
+            self.boxes[box_idx] = (br, bc)
+
+    def show_final(self) -> None:
+        """显示最终结果。"""
+        self._render()
+        won = check_win(self.map, self.boxes)
+        print("\n" + "=" * 50)
+        if won:
+            print(" ★★★ 通关验证成功！所有箱子均在目标位置 ★★★")
+        else:
+            on_target = sum(1 for r, c in self.boxes if self.map[r][c] == TARGET)
+            print(f" 未完全通关：{on_target}/{len(self.boxes)} 个箱子到位")
+        print(f" 总步数: {self.step_count}  推箱次数: {self.push_count}")
+        print("=" * 50)
+
+
+# ============================================================
+# 主交互流程
+# ============================================================
+
+def print_header() -> None:
+    print("=" * 60)
+    print("   推箱子算法验证器 (对应 algo_sokoban_solver.c)")
+    print("   地图: 12×16  内场: 行[1-10] 列[1-14]")
+    print("=" * 60)
+
+
+def prompt_int(msg: str, lo: int, hi: int, default: int) -> int:
+    while True:
+        s = input(f"{msg} [{lo}-{hi}, 默认{default}]: ").strip()
+        if s == '':
+            return default
+        try:
+            v = int(s)
+            if lo <= v <= hi:
+                return v
+        except ValueError:
+            pass
+        print(f"  请输入 {lo}~{hi} 之间的整数。")
+
+
+def stage1_flow(the_map: list, player_pos: tuple, use_unicode: bool) -> None:
+    print("\n[Stage1] 贪心分配模式：最近箱子→最近目标")
+    print("  正在求解...", end='', flush=True)
+    t0 = time.time()
+    result = solve_stage1(the_map, player_pos)
+    elapsed = time.time() - t0
+    if result is None:
+        print("\n  ✗ 无解（地图可能存在死局或不连通）")
+        return
+    print(f" 完成 ({elapsed:.3f}s)")
+    print(f"  箱子数: {len(result['boxes'])}  总步数: {result['total_steps']}")
+    print(f"  子任务数: {len(result['sub_solutions'])}")
+
+    # 打印全局方向字符串（按子任务拼接）
+    full_dir = []
+    cur_p = player_pos
+    boxes = result['boxes']
+    for sub in result['sub_solutions']:
+        b_start = boxes[sub['box_idx']]
+        ds = actions_to_string(sub['actions'], cur_p, b_start, use_unicode)
+        full_dir.append(ds)
+        cur_p = sub['player_end']
+    print("\n  全局方向指令串（各子任务以 | 分隔）:")
+    print("  " + " | ".join(full_dir))
+
+    # 动画
+    sim = Simulator(the_map, player_pos, use_unicode)
+    for i, sub in enumerate(result['sub_solutions']):
+        b_start = boxes[sub['box_idx']]
+        t_pos   = result['targets'][sub['target_idx']]
+        label   = (f"子任务 {i+1}/{len(result['sub_solutions'])}: "
+                   f"箱子#{sub['box_idx']+1}({b_start[1]},{b_start[0]}) "
+                   f"→ 目标#{sub['target_idx']+1}({t_pos[1]},{t_pos[0]})")
+        sim.run_phase(sub['actions'], b_start, sub['box_idx'], t_pos, label)
+    sim.show_final()
+
+
+def stage2_flow(the_map: list, player_pos: tuple, use_unicode: bool) -> None:
+    print("\n[Stage2] 指定映射模式：手动分配箱子→目标")
+    boxes   = extract_elements(the_map, BOX)
+    targets = extract_elements(the_map, TARGET)
+    n = len(boxes)
+
+    if n == 0:
+        print("  地图中无箱子。")
+        return
+
+    print(f"  箱子列表 (列,行):")
+    for i, (r, c) in enumerate(boxes):
+        print(f"    箱子#{i+1}: ({c},{r})")
+    print(f"  目标列表 (列,行):")
+    for i, (r, c) in enumerate(targets):
+        print(f"    目标#{i+1}: ({c},{r})")
+
+    box_to_target = []
+    for i in range(n):
+        ti = prompt_int(f"  箱子#{i+1} 推到目标#", 1, len(targets), i + 1)
+        box_to_target.append(ti - 1)
+
+    print("  正在求解...", end='', flush=True)
+    t0 = time.time()
+    result = solve_stage2(the_map, player_pos, box_to_target)
+    elapsed = time.time() - t0
+    if result is None:
+        print("\n  ✗ 无解（映射不合法或存在死局）")
+        return
+    print(f" 完成 ({elapsed:.3f}s)  总步数: {result['total_steps']}")
+
+    full_dir = []
+    cur_p = player_pos
+    boxes_list = result['boxes']
+    for sub in result['sub_solutions']:
+        b_start = boxes_list[sub['box_idx']]
+        ds = actions_to_string(sub['actions'], cur_p, b_start, use_unicode)
+        full_dir.append(ds)
+        cur_p = sub['player_end']
+    print("\n  全局方向指令串:")
+    print("  " + " | ".join(full_dir))
+
+    sim = Simulator(the_map, player_pos, use_unicode)
+    for i, sub in enumerate(result['sub_solutions']):
+        b_start = boxes_list[sub['box_idx']]
+        t_pos   = result['targets'][sub['target_idx']]
+        label   = (f"子任务 {i+1}: 箱子#{sub['box_idx']+1} → 目标#{sub['target_idx']+1}")
+        sim.run_phase(sub['actions'], b_start, sub['box_idx'], t_pos, label)
+    sim.show_final()
+
+
+def stage3_flow(the_map: list, player_pos: tuple, use_unicode: bool) -> None:
+    print("\n[Stage3] 炸弹辅助模式：先推炸弹，再推箱子")
+
+    bombs = extract_elements(the_map, BOMB)
+    if not bombs:
+        print("  地图中无炸弹，Stage3 不适用。")
+        return
+
+    print(f"  炸弹位置: {[(c,r) for r,c in bombs]}")
+
+    print("  正在搜索最优爆破点...", end='', flush=True)
+    t0 = time.time()
+    result = solve_stage3(the_map, player_pos)
+    elapsed = time.time() - t0
+
+    if result is None:
+        print("\n  ✗ 无解（无法为炸弹找到有效目标墙体）")
+        return
+
+    print(f" 完成 ({elapsed:.3f}s)")
+    wr, wc = result['wall_pos']
+    print(f"  最优爆破墙体: ({wc},{wr})")
+    print(f"  推炸弹步数: {len(result['bomb_actions'])}")
+
+    # 推炸弹方向串
+    bomb_dir = actions_to_string(result['bomb_actions'], player_pos,
+                                 result['bomb_pos'], use_unicode)
+    print(f"  推炸弹指令串: {bomb_dir}")
+
+    # Stage1 结果
+    s1 = result['stage1_result']
+    if s1:
+        print(f"  爆炸后 Stage1 总步数: {s1['total_steps']}")
+        full_dir = []
+        cur_p = result['cur_player_after_bomb']
+        boxes_list = s1['boxes']
+        for sub in s1['sub_solutions']:
+            b_start = boxes_list[sub['box_idx']]
+            ds = actions_to_string(sub['actions'], cur_p, b_start, use_unicode)
+            full_dir.append(ds)
+            cur_p = sub['player_end']
+        print("  Stage1 指令串: " + " | ".join(full_dir))
+    else:
+        print("  爆炸后无需推箱或无法求解后续。")
+
+    # 动画：推炸弹阶段
+    # 为动画目的，把炸弹当成"特殊箱子"添加到 simulator
+    sim = Simulator(the_map, player_pos, use_unicode)
+    # 将炸弹临时加入 boxes 列表中（用于渲染追踪）
+    bomb_pos = result['bomb_pos']
+    sim.boxes.append(bomb_pos)  # 添加炸弹追踪
+    sim.map[bomb_pos[0]][bomb_pos[1]] = BOMB
+
+    bom_idx = len(sim.boxes) - 1
+    label_bomb = f"推炸弹 ({bomb_pos[1]},{bomb_pos[0]}) → 墙体 ({wc},{wr})"
+    sim.run_phase(result['bomb_actions'], bomb_pos, bom_idx, result['wall_pos'], label_bomb)
+
+    # 应用爆炸效果
+    sim.boxes.pop()  # 移除炸弹追踪
+    apply_bomb_explosion(sim.map, result['wall_pos'])
+    sim.map[result['wall_pos'][0]][result['wall_pos'][1]] = EMPTY
+    print("\n  ★ 爆炸！墙壁已清除。")
+    print(render_map(sim.map, sim.player, sim.boxes, use_unicode))
+    input("\n  按 Enter 继续 Stage1 求解...")
+
+    # Stage1 动画
+    if s1:
+        boxes_list = s1['boxes']
+        # 同步 sim.boxes 到 Stage1 的初始箱子列表
+        sim.boxes = list(boxes_list)
+        for i, sub in enumerate(s1['sub_solutions']):
+            b_start = boxes_list[sub['box_idx']]
+            t_pos   = s1['targets'][sub['target_idx']]
+            label   = f"Stage1 子任务 {i+1}: 箱子#{sub['box_idx']+1} → 目标#{sub['target_idx']+1}"
+            sim.run_phase(sub['actions'], b_start, sub['box_idx'], t_pos, label)
+    sim.show_final()
+
+
+def print_map_info(the_map: list, player_pos: tuple, use_unicode: bool) -> None:
+    boxes   = extract_elements(the_map, BOX)
+    targets = extract_elements(the_map, TARGET)
+    bombs   = extract_elements(the_map, BOMB)
+    walls   = sum(the_map[r][c] == WALL for r in range(MAP_ROWS) for c in range(MAP_COLS))
+    print(render_map(the_map, player_pos, boxes, use_unicode))
+    print(f"\n  玩家: ({player_pos[1]},{player_pos[0]})  "
+          f"箱子: {len(boxes)}  目标: {len(targets)}  "
+          f"炸弹: {len(bombs)}  墙体: {walls}")
+
+    dead, dp = check_deadlock(the_map)
+    if dead:
+        print(f"  ⚠ 初始死局检测：箱子 ({dp[1]},{dp[0]}) 被卡住！")
+
+
+def main() -> None:
+    global USE_UNICODE
+    USE_UNICODE = _detect_unicode()
+
+    print_header()
+
+    while True:
+        print("\n========== 主菜单 ==========")
+        print(" 1. 自动生成地图并求解")
+        print(" 2. 使用预置地图")
+        print(" 0. 退出")
+        choice = input("请选择: ").strip()
+
+        if choice == '0':
+            print("再见！")
+            break
+
+        elif choice == '1':
+            stage     = prompt_int("  游戏阶段 (1=贪心/2=指定映射/3=炸弹)", 1, 3, 1)
+            box_count = prompt_int("  箱子数量", 1, MAX_BOXES, 2)
+            seed_s    = input("  随机种子 (直接 Enter = 随机): ").strip()
+            seed      = int(seed_s) if seed_s.isdigit() else None
+            wall_d_s  = input("  内墙密度 [0.0-0.3, 默认0.10]: ").strip()
+            try:
+                wall_d = float(wall_d_s)
+                wall_d = max(0.0, min(0.3, wall_d))
+            except ValueError:
+                wall_d = 0.10
+
+            print("  正在生成地图...", end='', flush=True)
+            the_map, player_pos = generate_map(stage, box_count, wall_d, seed)
+            print(" 完成")
+            print_map_info(the_map, player_pos, USE_UNICODE)
+
+            if stage == 1:
+                stage1_flow(the_map, player_pos, USE_UNICODE)
+            elif stage == 2:
+                stage2_flow(the_map, player_pos, USE_UNICODE)
+            elif stage == 3:
+                bombs = extract_elements(the_map, BOMB)
+                if not bombs:
+                    print("  当前地图无炸弹，自动降级到 Stage1。")
+                    stage1_flow(the_map, player_pos, USE_UNICODE)
+                else:
+                    stage3_flow(the_map, player_pos, USE_UNICODE)
+
+        elif choice == '2':
+            # 预置测试地图（1 个箱子的简单关卡）
+            the_map = _make_empty_map()
+            # 布置一个 1 箱 1 目标的简单场景
+            the_map[3][3] = BOX
+            the_map[3][10] = TARGET
+            the_map[5][5] = WALL
+            the_map[5][6] = WALL
+            the_map[4][4] = WALL
+            player_pos = (5, 2)
+            stage = prompt_int("  选择阶段 (1=贪心/2=指定映射)", 1, 2, 1)
+            print_map_info(the_map, player_pos, USE_UNICODE)
+            if stage == 1:
+                stage1_flow(the_map, player_pos, USE_UNICODE)
+            else:
+                stage2_flow(the_map, player_pos, USE_UNICODE)
+
+        else:
+            print("  无效选项，请重试。")
+
+
+if __name__ == '__main__':
+    main()
