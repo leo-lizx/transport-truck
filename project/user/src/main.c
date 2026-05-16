@@ -101,7 +101,7 @@ static uint32 wait_for_tick(void)
 #define MAIN_RUN_MODE_OPENART1_TEST   (5)
 
 /* >>>>>>>>>>>> 改这里切换调试模式 <<<<<<<<<<<< */
-#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_POINT_NAV)     /* OpenART1 地图链路: UART4 接收 194B MAP */
+#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_POINT_NAV)  /* 电机低速验证 */
 /* <<<<<<<<<<<< 改这里切换调试模式 >>>>>>>>>>>> */
 
 /* OpenART1 地图链路硬件口: 若实测 UART4 走 D0/D1, 只改下面两行宏. */
@@ -313,8 +313,8 @@ static void main_run_soko_selftest_periodic_5ms(void)
  *   FORCE_PID   : 1=用下面 KP/KI/KD 覆盖 menu 参数 (仅覆盖被调试那一轮)
  *                 0=沿用 menu/Flash 中的 PID
  *-------------------------------------------------------------------------*/
-#define MAIN_PID_DEBUG_WHEEL_INDEX    (CHASSIS_WHEEL_RB)
-#define MAIN_PID_DEBUG_TARGET_MPS     (3.0f)   /* 单轮 PID 调试目标; 上限 12 m/s */
+#define MAIN_PID_DEBUG_WHEEL_INDEX    (CHASSIS_WHEEL_LF)  /* 左前轮, 最容易观察 */
+#define MAIN_PID_DEBUG_TARGET_MPS     (3.3f)   /* 极小速度验证: 约 18 rpm, 肉眼可见缓转 */
 
 #define MAIN_PID_DEBUG_FORCE_PID      (1)
 #define MAIN_PID_DEBUG_KP             (40.0f)
