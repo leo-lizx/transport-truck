@@ -146,6 +146,10 @@ static const menu_page_meta_t s_pages[] =
 #define MENU_PAGE_COUNT ((uint8)(sizeof(s_pages) / sizeof(s_pages[0]))) /* 一级菜单页数 */
 
 /* 根据参数ID读取当前参数值。 */
+/* ==========================================================================
+ *  § 1. 参数读写 (param_id ↔ g_chassis_tune_params 字段映射)
+ * ========================================================================== */
+
 static float menu_get_param_value(menu_param_id_enum id)
 {
     /* 按参数 ID 路由到当前参数结构中的实际字段。 */
@@ -202,6 +206,10 @@ static void menu_set_param_value(menu_param_id_enum id, float value)
 }
 
 /* 简单加和校验：对除 checksum 之外的全部 32bit 字做累加。 */
+/* ==========================================================================
+ *  § 2. Flash 持久化 (校验和 + 读/写 + 状态提示)
+ * ========================================================================== */
+
 static uint32 menu_flash_checksum(const uint32 *words, uint16 word_count)
 {
     uint16 i;        /* 循环下标：遍历每个 32bit 数据字 */
@@ -309,6 +317,10 @@ static uint8 menu_save_params_to_flash(void)
 }
 
 /* 获取当前二级菜单项对应的参数ID。 */
+/* ==========================================================================
+ *  § 3. 按键与菜单状态机 (root list / param edit / 长按加速)
+ * ========================================================================== */
+
 static menu_param_id_enum menu_get_current_param_id(void)
 {
     const menu_page_meta_t *page = &s_pages[s_root_index]; /* 当前一级页面元信息 */
@@ -463,6 +475,10 @@ static void menu_clear_long_press_flags(void)
 }
 
 /* 公共头部绘制。 */
+/* ==========================================================================
+ *  § 4. UI 渲染 (标题 / 根列表 / 参数列表 / 位姿调试面板)
+ * ========================================================================== */
+
 static void menu_draw_header(void)
 {
     ips200_set_color(RGB565_GREEN, RGB565_BLACK);       /* 设置标题颜色：绿字黑底 */
@@ -572,6 +588,10 @@ static void menu_draw_pose(uint8 force_refresh)
 //          chassis_menu_init();
 // 备注信息：会尝试从 Flash 加载参数，校验失败则回退默认参数
 //-------------------------------------------------------------------------
+
+/* ==========================================================================
+ *  § 5. 对外 API — init / 10ms tick / 100ms render
+ * ========================================================================== */
 
 void chassis_menu_init(void)
 {

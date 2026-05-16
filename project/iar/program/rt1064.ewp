@@ -1165,6 +1165,12 @@
             <name>$PROJ_DIR$\..\..\code\chassis_ctrl.h</name>
         </file>
         <file>
+            <name>$PROJ_DIR$\..\..\code\chassis_zone.c</name>
+        </file>
+        <file>
+            <name>$PROJ_DIR$\..\..\code\chassis_zone.h</name>
+        </file>
+        <file>
             <name>$PROJ_DIR$\..\..\code\chassis_encoder.c</name>
         </file>
         <file>
