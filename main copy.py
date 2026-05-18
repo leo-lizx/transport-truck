@@ -106,7 +106,7 @@ ROWS, COLS = 12, 16                    # 赛道逻辑网格规模：12行x16列
 GRID_CORNERS = {
     "tl": (36.5, 44.0), #左上
     "tr": (282.0, 34.5), #右上
-    "bl": (50.0, 226.2), #左下
+    "bl": (47.0, 224.2), #左下
     "br": (280.8, 221.5), #右下
 }
 
@@ -184,10 +184,10 @@ def vote_car_position(found, x, y):
 # 3. 元素颜色特征库 (RGB 实测标定 -> LAB 直方图指纹匹配)
 # ----------------------------------------------------------------------
 # 只需在现场重新读取这一组 RGB 值。
-CAR_HEAD_DARK_RGB = (25, 152, 0)      # 暗车头颜色（H-dark）
-CAR_HEAD_BRIGHT_RGB = (74, 225, 239)    # 亮车头颜色（H-bright）
-CAR_TAIL_DARK_RGB = (0, 152, 195)     # 暗车尾颜色（T-dark）
-CAR_TAIL_BRIGHT_RGB = (107, 255, 33)   # 亮车尾颜色（T-bright）
+CAR_HEAD_DARK_RGB = (0, 142, 173)      # 暗车头颜色（H-dark）
+CAR_HEAD_BRIGHT_RGB = (0, 235, 255)    # 亮车头颜色（H-bright）
+CAR_TAIL_DARK_RGB = (8, 138, 8)     # 暗车尾颜色（T-dark）
+CAR_TAIL_BRIGHT_RGB = (33, 210, 49)   # 亮车尾颜色（T-bright）
 
 WALL_DARK_RGB = (78, 96, 118)         # 暗墙颜色（#-dark）
 WALL_BRIGHT_RGB = (132, 150, 172)     # 亮墙颜色（#-bright）
@@ -198,8 +198,8 @@ FLOOR_BRIGHT_RGB = (58, 92, 255)      # 亮空地颜色（--bright）
 GOAL_DARK_RGB = (194, 0, 214)         # 暗目的地颜色（.-dark）
 GOAL_BRIGHT_RGB = (245, 14, 255)      # 亮目的地颜色（.-bright）
 
-BOX_DARK_RGB = (114, 140, 0)          # 暗箱子颜色（$-dark）
-BOX_BRIGHT_RGB = (170, 204, 10)       # 亮箱子颜色（$-bright）
+BOX_DARK_RGB = (132, 198, 0)          # 暗箱子颜色（$-dark）
+BOX_BRIGHT_RGB = (247, 255, 41)       # 亮箱子颜色（$-bright）
 
 BOMB_DARK_RGB = (215, 12, 56)         # 暗炸弹颜色（*-dark）
 BOMB_BRIGHT_RGB = (255, 36, 92)       # 亮炸弹颜色（*-bright）
@@ -704,8 +704,8 @@ while(True):
     # 定时维护通讯心跳包
     send_heartbeat_if_due()
 
-    # --- 阶段 C：调试信息交互 (每 20 帧稳定更新一次打印) ---
-    if frame_cnt % 20 == 0:
+    # --- 阶段 C：调试信息交互 (每 2 帧稳定更新一次打印) ---
+    if frame_cnt % 2 == 0:
         print("\033[H", end="")        # 终端光标归零（清屏效果）
         print("系统帧率: %0.1f | 小车实时坐标: (%d, %d)" % (clock.fps(), car_x, car_y))
         if CALIB_SHOW_CORNERS and tl_pt is not None:
