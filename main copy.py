@@ -6,7 +6,7 @@
 #   3. 通过自定义二进制协议帧，将 194 字节数据（地图+坐标）传给主控。
 # 【核心原理】：
 #   - 坐标计算：线性斜率补偿（修正由于摄像头安装倾斜导致的近大远小）。
-#   - 元素匹配：多点采样后做 RGB 距离匹配，降低亮度波动与单像素噪声影响。
+#   - 元素匹配：提取 7x7 区域 LAB 三通道直方图，并做巴氏距离匹配。
 #   - 链路安全：CRC8 循环冗余校验（防止串口通信中产生的噪点导致误码）。
 # ======================================================================
 #
@@ -104,9 +104,9 @@ ROWS, COLS = 12, 16                    # 赛道逻辑网格规模：12行x16列
 # 四个点均为外圈 4 个格子中心的像素坐标，而不是屏幕物理边框角点。
 # 调试时只需把白色采样点调到四个角落格子的中心，内部 16x12 点会自动双线性展开。
 GRID_CORNERS = {
-    "tl": (37.0, 44.5), #左上
-    "tr": (282.5, 34.5), #右上
-    "bl": (50.5, 226.8), #左下
+    "tl": (36.5, 44.0), #左上
+    "tr": (282.0, 34.5), #右上
+    "bl": (50.0, 226.8), #左下
     "br": (280.8, 221.5), #右下
 }
 
@@ -181,7 +181,7 @@ def vote_car_position(found, x, y):
     return car_vote_hist[-1]
 
 # ----------------------------------------------------------------------
-# 3. 元素颜色特征库 (RGB 实测标定 -> RGB 空间匹配)
+# 3. 元素颜色特征库 (RGB 实测标定 -> LAB 直方图指纹匹配)
 # ----------------------------------------------------------------------
 # 只需在现场重新读取这一组 RGB 值。
 CAR_HEAD_DARK_RGB = (25, 152, 0)      # 暗车头颜色（H-dark）
@@ -214,134 +214,233 @@ SYMBOL_MAP_RGB = {
     "T": (CAR_TAIL_DARK_RGB, CAR_TAIL_BRIGHT_RGB),  # 车尾双模板：暗车尾/亮车尾
 }
 
-# 推荐阈值：先做双模板距离判定，再走全局最近邻兜底。
-# 阈值单位为 RGB 加权欧氏距离平方（dist^2），建议实地标定时在此基础上微调 ±15%。
-SYMBOL_MAX_DIST_SQ = {
-    "#": (5600, 10000),
-    "-": (2500, 4300),
-    ".": (2600, 3500),
-    "$": (2900, 4200),
-    "*": (2800, 4300),
-    "H": (3200, 4200),
-    "T": (3200, 4200),
+LAB_REGION_RADIUS = 3      # 7x7 区域：半径 3 表示中心点左右上下各取 3 像素
+LAB_L_BINS = 8             # L 通道直方图桶数（0~100）
+LAB_A_BINS = 8             # a 通道直方图桶数（-128~127）
+LAB_B_BINS = 8             # b 通道直方图桶数（-128~127）
+LAB_SOFT_SIGMA = 0.95      # 模板指纹软分布扩散系数，越小越尖锐
+
+# 巴氏距离阈值（0 表示完全一致，越接近 1 差异越大）
+# 每个元素保留暗/亮双模板阈值；先做阈值命中，再走最近邻兜底。
+SYMBOL_MAX_BHATT = {
+    "#": (0.60, 0.60),
+    "-": (0.56, 0.56),
+    ".": (0.56, 0.56),
+    "$": (0.56, 0.56),
+    "*": (0.56, 0.56),
+    "H": (0.58, 0.58),
+    "T": (0.58, 0.58),
 }
 
-SAMPLE_OFFSETS = ((-1, -1), (0, -1), (1, -1),
-                  (-1,  0), (0,  0), (1,  0),
-                  (-1,  1), (0,  1), (1,  1))
-SAMPLE_TRIM = 1
-RGB_R_WEIGHT = 1.00
-RGB_G_WEIGHT = 1.00
-RGB_B_WEIGHT = 1.00
-WALL_GRAY_SPREAD_MAX = 42
-WALL_RGB_MIN = 42
-WALL_RGB_MAX = 195
-WALL_CENTER_RGB_MIN_RELAX = 8
-WALL_CENTER_RGB_MAX_BOOST = 90
-WALL_CENTER_SPREAD_BOOST = 12
-WALL_DARK_MAX_DIST_SQ = SYMBOL_MAX_DIST_SQ["#"][0]
-WALL_BRIGHT_MAX_DIST_SQ = SYMBOL_MAX_DIST_SQ["#"][1]
+def _pivot_rgb_to_linear(c):
+    """sRGB 分段逆伽马，输入 [0,1]，输出线性光强。"""
+    if c <= 0.04045:
+        return c / 12.92
+    return ((c + 0.055) / 1.055) ** 2.4
 
-def wall_thresholds_at(x, y, img_w, img_h):
-    """按采样点位置给墙体阈值做轻量补偿，降低中心区域漏检。"""
-    if img_w <= 1 or img_h <= 1:
-        return WALL_RGB_MIN, WALL_RGB_MAX, WALL_GRAY_SPREAD_MAX
+def rgb_to_lab(rgb):
+    """
+    将 RGB888 转换为 CIE LAB。
+    说明：
+    1) 先做 sRGB -> 线性 RGB。
+    2) 线性 RGB 乘以 D65 矩阵得到 XYZ。
+    3) XYZ 再转 LAB。
+    """
+    r = _pivot_rgb_to_linear(rgb[0] / 255.0)
+    g = _pivot_rgb_to_linear(rgb[1] / 255.0)
+    b = _pivot_rgb_to_linear(rgb[2] / 255.0)
 
-    cx = (img_w - 1) // 2
-    cy = (img_h - 1) // 2
-    nx = abs(x - cx) * 100 // (cx if cx > 0 else 1)
-    ny = abs(y - cy) * 100 // (cy if cy > 0 else 1)
-    center_ratio = 100 - ((nx + ny) // 2)
-    if center_ratio < 0:
-        center_ratio = 0
+    x = r * 0.4124564 + g * 0.3575761 + b * 0.1804375
+    y = r * 0.2126729 + g * 0.7151522 + b * 0.0721750
+    z = r * 0.0193339 + g * 0.1191920 + b * 0.9503041
 
-    rgb_min = WALL_RGB_MIN - (WALL_CENTER_RGB_MIN_RELAX * center_ratio) // 100
-    rgb_max = WALL_RGB_MAX + (WALL_CENTER_RGB_MAX_BOOST * center_ratio) // 100
-    gray_spread = WALL_GRAY_SPREAD_MAX + (WALL_CENTER_SPREAD_BOOST * center_ratio) // 100
-    return rgb_min, rgb_max, gray_spread
+    xr = x / 0.95047
+    yr = y / 1.00000
+    zr = z / 1.08883
 
-def robust_rgb_at(img, x, y, img_w, img_h):
-    samples = []
-    for ox, oy in SAMPLE_OFFSETS:
-        sx, sy = x + ox, y + oy
-        if 0 <= sx < img_w and 0 <= sy < img_h:
-            rgb = img.get_pixel(sx, sy)
-            lum = rgb[0] * 3 + rgb[1] * 6 + rgb[2]
-            samples.append((lum, rgb[0], rgb[1], rgb[2]))
+    eps = 0.008856
+    kappa = 903.3
 
-    samples.sort()
-    start, end = 0, len(samples)
-    if len(samples) > SAMPLE_TRIM * 2 + 2:
-        start = SAMPLE_TRIM
-        end = len(samples) - SAMPLE_TRIM
+    def _f(t):
+        if t > eps:
+            return t ** (1.0 / 3.0)
+        return (kappa * t + 16.0) / 116.0
 
-    r_sum, g_sum, b_sum, count = 0, 0, 0, 0
-    for sample in samples[start:end]:
-        r_sum += sample[1]
-        g_sum += sample[2]
-        b_sum += sample[3]
-        count += 1
+    fx = _f(xr)
+    fy = _f(yr)
+    fz = _f(zr)
 
-    if count == 0:
-        rgb = img.get_pixel(x, y)
-        return (rgb[0], rgb[1], rgb[2])
+    l = 116.0 * fy - 16.0
+    a = 500.0 * (fx - fy)
+    bb = 200.0 * (fy - fz)
+    return (l, a, bb)
 
-    return (r_sum // count, g_sum // count, b_sum // count)
+def _lab_bin_index(l, a, bb):
+    """将 LAB 值映射到三个通道各自的桶索引。"""
+    if l < 0.0:
+        l = 0.0
+    if l > 100.0:
+        l = 100.0
+    if a < -128.0:
+        a = -128.0
+    if a > 127.0:
+        a = 127.0
+    if bb < -128.0:
+        bb = -128.0
+    if bb > 127.0:
+        bb = 127.0
 
-def avg_rgb_at(img, x, y, img_w, img_h):
-    return robust_rgb_at(img, x, y, img_w, img_h)
+    l_idx = int(l * LAB_L_BINS / 101.0)
+    a_idx = int((a + 128.0) * LAB_A_BINS / 256.0)
+    b_idx = int((bb + 128.0) * LAB_B_BINS / 256.0)
 
-def rgb_dist_sq(meas_rgb, std_rgb):
-    dr = (meas_rgb[0] - std_rgb[0]) * RGB_R_WEIGHT
-    dg = (meas_rgb[1] - std_rgb[1]) * RGB_G_WEIGHT
-    db = (meas_rgb[2] - std_rgb[2]) * RGB_B_WEIGHT
-    return dr * dr + dg * dg + db * db
+    if l_idx >= LAB_L_BINS:
+        l_idx = LAB_L_BINS - 1
+    if a_idx >= LAB_A_BINS:
+        a_idx = LAB_A_BINS - 1
+    if b_idx >= LAB_B_BINS:
+        b_idx = LAB_B_BINS - 1
+    return l_idx, a_idx, b_idx
 
-def find_best_symbol(rgb, x=None, y=None, img_w=None, img_h=None):
-    # 墙体采用双模板并行判定：暗墙/亮墙任一命中即判墙。
-    c_max = max(rgb[0], rgb[1], rgb[2])
-    c_min = min(rgb[0], rgb[1], rgb[2])
-    c_avg = (rgb[0] + rgb[1] + rgb[2]) // 3
-    if x is not None and y is not None and img_w is not None and img_h is not None:
-        wall_rgb_min, wall_rgb_max, wall_gray_spread = wall_thresholds_at(x, y, img_w, img_h)
-    else:
-        wall_rgb_min, wall_rgb_max, wall_gray_spread = WALL_RGB_MIN, WALL_RGB_MAX, WALL_GRAY_SPREAD_MAX
+def lab_histogram_at(img, x, y, img_w, img_h):
+    """
+    在 (x,y) 周围提取 7x7 区域 LAB 三通道直方图。
+    返回 (hist_l, hist_a, hist_b)，三个列表均做了归一化，总和为 1。
+    """
+    hist_l = [0.0] * LAB_L_BINS
+    hist_a = [0.0] * LAB_A_BINS
+    hist_b = [0.0] * LAB_B_BINS
 
-    if (c_max - c_min) <= wall_gray_spread and wall_rgb_min <= c_avg <= wall_rgb_max:
-        return "#"
-
-    wall_dark_rgb, wall_bright_rgb = SYMBOL_MAP_RGB["#"]
-    dark_wall_dist = rgb_dist_sq(rgb, wall_dark_rgb)
-    bright_wall_dist = rgb_dist_sq(rgb, wall_bright_rgb)
-    if dark_wall_dist <= WALL_DARK_MAX_DIST_SQ or bright_wall_dist <= WALL_BRIGHT_MAX_DIST_SQ:
-        return "#"
-
-    min_dist, matched = 999999, None
-    nearest_sym, nearest_dist, nearest_limit = "-", 999999, SYMBOL_MAX_DIST_SQ["-"][1]
-    for sym, std_rgb in SYMBOL_MAP_RGB.items():
-        if sym == "#":
+    count = 0
+    for oy in range(-LAB_REGION_RADIUS, LAB_REGION_RADIUS + 1):
+        sy = y + oy
+        if sy < 0 or sy >= img_h:
             continue
-        if isinstance(std_rgb, tuple) and len(std_rgb) > 0 and isinstance(std_rgb[0], tuple):
-            templates = std_rgb
-        else:
-            templates = (std_rgb,)
+        for ox in range(-LAB_REGION_RADIUS, LAB_REGION_RADIUS + 1):
+            sx = x + ox
+            if sx < 0 or sx >= img_w:
+                continue
 
-        max_dist_cfg = SYMBOL_MAX_DIST_SQ[sym]
+            rgb = img.get_pixel(sx, sy)
+            l, a, bb = rgb_to_lab((rgb[0], rgb[1], rgb[2]))
+            l_idx, a_idx, b_idx = _lab_bin_index(l, a, bb)
+            hist_l[l_idx] += 1.0
+            hist_a[a_idx] += 1.0
+            hist_b[b_idx] += 1.0
+            count += 1
+
+    if count <= 0:
+        # 理论上中心点在边界内时不会发生；兜底避免除零。
+        hist_l[0] = 1.0
+        hist_a[0] = 1.0
+        hist_b[0] = 1.0
+        return hist_l, hist_a, hist_b
+
+    inv = 1.0 / count
+    for i in range(LAB_L_BINS):
+        hist_l[i] *= inv
+    for i in range(LAB_A_BINS):
+        hist_a[i] *= inv
+    for i in range(LAB_B_BINS):
+        hist_b[i] *= inv
+    return hist_l, hist_a, hist_b
+
+def _soft_hist(length, center_idx, sigma):
+    """基于中心桶构造一维高斯软直方图，作为模板指纹的单通道原型。"""
+    out = [0.0] * length
+    s = 0.0
+    two_sigma_sq = 2.0 * sigma * sigma
+    for i in range(length):
+        d = i - center_idx
+        v = math.exp(-(d * d) / two_sigma_sq)
+        out[i] = v
+        s += v
+    if s > 0:
+        inv = 1.0 / s
+        for i in range(length):
+            out[i] *= inv
+    return out
+
+def build_template_hist_from_rgb(rgb):
+    """
+    将单个 RGB 模板颜色转为 LAB 后，构建三通道软直方图模板。
+    作用：把“单点颜色模板”升级为“可容忍轻微偏色的分布模板”。
+    """
+    l, a, bb = rgb_to_lab(rgb)
+    l_idx, a_idx, b_idx = _lab_bin_index(l, a, bb)
+    return (
+        _soft_hist(LAB_L_BINS, l_idx, LAB_SOFT_SIGMA),
+        _soft_hist(LAB_A_BINS, a_idx, LAB_SOFT_SIGMA),
+        _soft_hist(LAB_B_BINS, b_idx, LAB_SOFT_SIGMA),
+    )
+
+def build_symbol_hist_library():
+    """将每个符号的暗/亮 RGB 模板预生成 LAB 直方图指纹，避免逐帧重复计算。"""
+    library = {}
+    for sym, rgb_templates in SYMBOL_MAP_RGB.items():
+        if isinstance(rgb_templates, tuple) and len(rgb_templates) > 0 and isinstance(rgb_templates[0], tuple):
+            tpls = rgb_templates
+        else:
+            tpls = (rgb_templates,)
+        library[sym] = tuple(build_template_hist_from_rgb(rgb) for rgb in tpls)
+    return library
+
+SYMBOL_MAP_HIST = build_symbol_hist_library()
+
+def bhattacharyya_distance(hist_p, hist_q):
+    """计算两个一维概率直方图的巴氏距离，范围约为 [0,1]。"""
+    bc = 0.0
+    length = len(hist_p)
+    for i in range(length):
+        p = hist_p[i]
+        q = hist_q[i]
+        if p > 0.0 and q > 0.0:
+            bc += math.sqrt(p * q)
+
+    if bc > 1.0:
+        bc = 1.0
+    if bc < 0.0:
+        bc = 0.0
+    return math.sqrt(1.0 - bc)
+
+def hist_distance_3ch(meas_hist, ref_hist):
+    """三通道巴氏距离融合：分别比较 L/a/b 后取均值。"""
+    d_l = bhattacharyya_distance(meas_hist[0], ref_hist[0])
+    d_a = bhattacharyya_distance(meas_hist[1], ref_hist[1])
+    d_b = bhattacharyya_distance(meas_hist[2], ref_hist[2])
+    return (d_l + d_a + d_b) / 3.0
+
+def find_best_symbol(hist_3ch):
+    """
+    使用 LAB 三通道直方图与模板库做匹配。
+    判定策略：
+    1) 逐模板计算巴氏距离，若低于该模板阈值则记为有效命中。
+    2) 所有有效命中中取最小距离。
+    3) 若无有效命中，则用“最近邻 + 最近邻阈值”兜底。
+    """
+    min_dist = 999999.0
+    matched = None
+    nearest_sym = "-"
+    nearest_dist = 999999.0
+    nearest_limit = SYMBOL_MAX_BHATT["-"][1]
+
+    for sym, hist_templates in SYMBOL_MAP_HIST.items():
+        max_dist_cfg = SYMBOL_MAX_BHATT[sym]
         if isinstance(max_dist_cfg, tuple):
             limits = max_dist_cfg
         else:
             limits = (max_dist_cfg,)
 
-        if len(limits) < len(templates):
-            limits = limits + (limits[-1],) * (len(templates) - len(limits))
+        if len(limits) < len(hist_templates):
+            limits = limits + (limits[-1],) * (len(hist_templates) - len(limits))
 
-        best_dist_for_sym = 999999
-        for i in range(len(templates)):
-            dist_sq = rgb_dist_sq(rgb, templates[i])
-            if dist_sq < best_dist_for_sym:
-                best_dist_for_sym = dist_sq
-            if dist_sq <= limits[i] and dist_sq < min_dist:
-                min_dist = dist_sq
+        best_dist_for_sym = 999999.0
+        for i in range(len(hist_templates)):
+            dist = hist_distance_3ch(hist_3ch, hist_templates[i])
+            if dist < best_dist_for_sym:
+                best_dist_for_sym = dist
+            if dist <= limits[i] and dist < min_dist:
+                min_dist = dist
                 matched = sym
 
         sym_limit = limits[0]
@@ -354,10 +453,8 @@ def find_best_symbol(rgb, x=None, y=None, img_w=None, img_h=None):
 
     if matched is not None:
         return matched
-
     if nearest_dist <= nearest_limit:
         return nearest_sym
-
     return "-"
 
 def find_car_pair(map_list):
@@ -401,8 +498,13 @@ def build_map_with_single_car(map_list, car_found, car_x, car_y):
     return merged
 
 def classify_cell(img, x, y, img_w, img_h):
-    rgb = avg_rgb_at(img, x, y, img_w, img_h)
-    return find_best_symbol(rgb, x, y, img_w, img_h)
+    """
+    单格分类入口：
+    1) 从格子中心提取 7x7 区域 LAB 三通道直方图。
+    2) 与各元素模板指纹计算巴氏距离并输出最匹配符号。
+    """
+    hist_3ch = lab_histogram_at(img, x, y, img_w, img_h)
+    return find_best_symbol(hist_3ch)
 
 # ----------------------------------------------------------------------
 # 3. 核心逻辑主循环 (图像识别 -> 位置锁定 -> 打包发送)
