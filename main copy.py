@@ -106,7 +106,7 @@ ROWS, COLS = 12, 16                    # 赛道逻辑网格规模：12行x16列
 GRID_CORNERS = {
     "tl": (36.5, 44.0), #左上
     "tr": (282.0, 34.5), #右上
-    "bl": (50.0, 226.8), #左下
+    "bl": (50.0, 226.2), #左下
     "br": (280.8, 221.5), #右下
 }
 
@@ -231,6 +231,91 @@ SYMBOL_MAX_BHATT = {
     "H": (0.58, 0.58),
     "T": (0.58, 0.58),
 }
+
+# ----------------------------------------------------------------------
+# 4. 位置先验约束 + 时域平滑参数
+# ----------------------------------------------------------------------
+# 语义类别索引：严格对应 prob_map[y][x][cls]
+CLS_WALL = 0
+CLS_FLOOR = 1
+CLS_BOX = 2
+CLS_GOAL = 3
+CLS_BOMB = 4
+CLS_CAR = 5
+
+# 符号到语义类别的映射。车头/车尾都归并到“车”语义类别。
+SYMBOL_TO_CLASS = {
+    "#": CLS_WALL,
+    "-": CLS_FLOOR,
+    "$": CLS_BOX,
+    ".": CLS_GOAL,
+    "*": CLS_BOMB,
+    "H": CLS_CAR,
+    "T": CLS_CAR,
+}
+
+POSITION_PRIOR_WEIGHT = 0.22      # 位置先验惩罚权重，越大越依赖位置逻辑
+BHATT_FALLBACK_MARGIN = 0.06      # 兜底余量：允许最优距离略高于阈值仍保留结果
+CELL_STATE_CONFIRM_FRAMES = 5     # 单格状态切换需连续一致帧数
+
+def _normalize_prob(vec):
+    """将一组非负权重归一化为概率分布。"""
+    s = 0.0
+    for v in vec:
+        if v > 0.0:
+            s += v
+    if s <= 0.0:
+        # 极端情况下回退为“空地主导”的安全分布
+        return [0.10, 0.70, 0.05, 0.05, 0.00, 0.10]
+
+    out = [0.0] * len(vec)
+    inv = 1.0 / s
+    for i in range(len(vec)):
+        v = vec[i]
+        if v < 0.0:
+            v = 0.0
+        out[i] = v * inv
+    return out
+
+def build_position_prob_map():
+    """
+    构建 prob_map[12][16][6]：位置先验概率。
+    先验设计原则：
+    1) 最外圈更偏向墙体，炸弹先验压低（可设为 0）。
+    2) 内圈以地板为主，箱子/目的地/车辆给适中概率。
+    3) 先验只“轻拉回”识别结果，不直接替代颜色匹配。
+    """
+    table = []
+    for y in range(ROWS):
+        row = []
+        for x in range(COLS):
+            is_outer = (x == 0 or x == COLS - 1 or y == 0 or y == ROWS - 1)
+            is_near_outer = (x <= 1 or x >= COLS - 2 or y <= 1 or y >= ROWS - 2)
+
+            # 基础先验（墙, 地, 箱, 目标, 炸弹, 车）
+            p = [0.22, 0.40, 0.12, 0.12, 0.06, 0.08]
+
+            if is_outer:
+                p = [0.62, 0.30, 0.03, 0.03, 0.00, 0.02]
+            elif is_near_outer:
+                p = [0.38, 0.42, 0.08, 0.08, 0.01, 0.03]
+            else:
+                # 中心区域更容易出现可移动元素
+                p = [0.16, 0.44, 0.16, 0.14, 0.03, 0.07]
+
+            row.append(_normalize_prob(p))
+        table.append(row)
+    return table
+
+# 对外暴露为用户提出的命名：prob_map[12][16][6]
+prob_map = build_position_prob_map()
+
+# 时域平滑状态：
+# last_grid_states 存放“已确认输出”的稳定语义；
+# pending_grid_states/pending_grid_counts 存放“候选切换态”的连续计数。
+last_grid_states = [["-" for _ in range(COLS)] for _ in range(ROWS)]
+pending_grid_states = [[None for _ in range(COLS)] for _ in range(ROWS)]
+pending_grid_counts = [[0 for _ in range(COLS)] for _ in range(ROWS)]
 
 def _pivot_rgb_to_linear(c):
     """sRGB 分段逆伽马，输入 [0,1]，输出线性光强。"""
@@ -410,7 +495,7 @@ def hist_distance_3ch(meas_hist, ref_hist):
     d_b = bhattacharyya_distance(meas_hist[2], ref_hist[2])
     return (d_l + d_a + d_b) / 3.0
 
-def find_best_symbol(hist_3ch):
+def find_best_symbol(hist_3ch, grid_x, grid_y):
     """
     使用 LAB 三通道直方图与模板库做匹配。
     判定策略：
@@ -418,7 +503,7 @@ def find_best_symbol(hist_3ch):
     2) 所有有效命中中取最小距离。
     3) 若无有效命中，则用“最近邻 + 最近邻阈值”兜底。
     """
-    min_dist = 999999.0
+    min_score = 999999.0
     matched = None
     nearest_sym = "-"
     nearest_dist = 999999.0
@@ -439,9 +524,20 @@ def find_best_symbol(hist_3ch):
             dist = hist_distance_3ch(hist_3ch, hist_templates[i])
             if dist < best_dist_for_sym:
                 best_dist_for_sym = dist
-            if dist <= limits[i] and dist < min_dist:
-                min_dist = dist
-                matched = sym
+
+        # 颜色距离 + 位置先验惩罚融合评分。
+        # 先验概率越低，(1-prior) 越大，得分越差。
+        cls = SYMBOL_TO_CLASS[sym]
+        prior = prob_map[grid_y][grid_x][cls]
+        score = best_dist_for_sym + POSITION_PRIOR_WEIGHT * (1.0 - prior)
+
+        # 仅对“颜色距离在阈值内”的类别参与主命中竞争，避免先验压倒颜色证据。
+        sym_limit_for_match = limits[0]
+        if len(limits) > 1 and limits[1] < sym_limit_for_match:
+            sym_limit_for_match = limits[1]
+        if best_dist_for_sym <= sym_limit_for_match and score < min_score:
+            min_score = score
+            matched = sym
 
         sym_limit = limits[0]
         if len(limits) > 1 and limits[1] > sym_limit:
@@ -453,9 +549,40 @@ def find_best_symbol(hist_3ch):
 
     if matched is not None:
         return matched
-    if nearest_dist <= nearest_limit:
+    # 若没有阈值内命中，使用最近邻兜底，但仍受阈值+余量约束。
+    if nearest_dist <= (nearest_limit + BHATT_FALLBACK_MARGIN):
         return nearest_sym
     return "-"
+
+def temporal_smooth_cell(grid_x, grid_y, curr_sym):
+    """
+    每格语义时域滤波：
+    1) 若当前识别与稳定态相同，直接维持稳定态。
+    2) 若发生跳变，不立刻切换；只有连续 CELL_STATE_CONFIRM_FRAMES 帧一致才更新。
+    3) 这样可抑制单帧反光、噪声、瞬态曝光导致的误判跳变。
+    """
+    if curr_sym == "?":
+        return last_grid_states[grid_y][grid_x]
+
+    stable = last_grid_states[grid_y][grid_x]
+    if curr_sym == stable:
+        pending_grid_states[grid_y][grid_x] = None
+        pending_grid_counts[grid_y][grid_x] = 0
+        return stable
+
+    pending = pending_grid_states[grid_y][grid_x]
+    if pending == curr_sym:
+        pending_grid_counts[grid_y][grid_x] += 1
+    else:
+        pending_grid_states[grid_y][grid_x] = curr_sym
+        pending_grid_counts[grid_y][grid_x] = 1
+
+    if pending_grid_counts[grid_y][grid_x] >= CELL_STATE_CONFIRM_FRAMES:
+        last_grid_states[grid_y][grid_x] = curr_sym
+        pending_grid_states[grid_y][grid_x] = None
+        pending_grid_counts[grid_y][grid_x] = 0
+
+    return last_grid_states[grid_y][grid_x]
 
 def find_car_pair(map_list):
     """在16x12网格中寻找相邻的H/T，返回车头坐标和车尾坐标。"""
@@ -497,14 +624,16 @@ def build_map_with_single_car(map_list, car_found, car_x, car_y):
 
     return merged
 
-def classify_cell(img, x, y, img_w, img_h):
+def classify_cell(img, x, y, img_w, img_h, grid_x, grid_y):
     """
     单格分类入口：
     1) 从格子中心提取 7x7 区域 LAB 三通道直方图。
-    2) 与各元素模板指纹计算巴氏距离并输出最匹配符号。
+    2) 结合 prob_map 的位置先验做颜色-位置联合判定。
+    3) 对该格执行连续 5 帧一致的时域平滑后输出稳定符号。
     """
     hist_3ch = lab_histogram_at(img, x, y, img_w, img_h)
-    return find_best_symbol(hist_3ch)
+    raw_sym = find_best_symbol(hist_3ch, grid_x, grid_y)
+    return temporal_smooth_cell(grid_x, grid_y, raw_sym)
 
 # ----------------------------------------------------------------------
 # 3. 核心逻辑主循环 (图像识别 -> 位置锁定 -> 打包发送)
@@ -528,8 +657,8 @@ while(True):
 
             # --- 安全检查与元素分类 ---
             if 0 <= tx < img_w and 0 <= ty < img_h:
-                # 提取采样点周围颜色均值并在 LAB 空间分类
-                char = classify_cell(img, tx, ty, img_w, img_h)
+                # 先做 LAB 直方图匹配，再叠加位置先验与时域平滑
+                char = classify_cell(img, tx, ty, img_w, img_h, x_idx, y_idx)
                 map_list.append(char)
 
                 # 在可视化缓冲区画出实心白点，用于调试对位情况
