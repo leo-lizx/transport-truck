@@ -104,18 +104,36 @@ ROWS, COLS = 12, 16                    # 赛道逻辑网格规模：12行x16列
 # 四个点均为外圈 4 个格子中心的像素坐标，而不是屏幕物理边框角点。
 # 调试时只需把白色采样点调到四个角落格子的中心，内部 16x12 点会自动双线性展开。
 GRID_CORNERS = {
-    "tl": (36.5, 44.0), #左上
-    "tr": (282.0, 34.5), #右上
-    "bl": (47.0, 224.2), #左下
+    "tl": (37.0, 42.0), #左上
+    "tr": (282.0, 35.5), #右上
+    "bl": (47.5, 223.2), #左下
     "br": (280.8, 221.5), #右下
 }
 
 GRID_K1 = +0.000000                    # 径向畸变系数；无畸变镜头可设为 0
 CALIB_SHOW_CORNERS = True              # 四角标定模式：高亮四角与外框，便于精准调参
-CAR_VOTE_FRAMES = 5                    # 车辆坐标最近 N 帧多数投票
+CAR_VOTE_FRAMES = 4                    # 车辆坐标最近 N 帧多数投票
 CAR_VOTE_MIN = 2                       # 至少出现 N 次才认为是稳定坐标
+CAR_SEARCH_LOCAL_RADIUS = 1            # 锁定区域搜索：以 last_pos 为中心先搜 3x3
+CAR_WEAK_BHATT_MARGIN = 0.15           # H/T 弱命中区间：阈值到阈值+0.10
+CAR_WEAK_GATE_RADIUS_GRID = 2.2        # 弱命中轨迹门控半径（网格单位）
+
+# 卡尔曼参数（二维常速度模型）
+# 按“降低一点参数”要求，采用较温和参数，减少跳变与过度跟随。
+KF_DT = 1.0
+KF_Q_POS = 0.05
+KF_Q_VEL = 0.03
+KF_R_MEAS = 2.0
 
 car_vote_hist = []
+car_last_pos_grid = None               # 上一帧稳定网格坐标
+kf_inited = False
+kf_state = {
+    "x": 0.0, "vx": 0.0,
+    "y": 0.0, "vy": 0.0,
+    "px00": 8.0, "px01": 0.0, "px10": 0.0, "px11": 2.0,
+    "py00": 8.0, "py01": 0.0, "py10": 0.0, "py11": 2.0,
+}
 
 def calc_grid_point(x_idx, y_idx, img_w, img_h):
     u = x_idx / (COLS - 1)
@@ -179,6 +197,45 @@ def vote_car_position(found, x, y):
     if best_count >= CAR_VOTE_MIN:
         return best_pos
     return car_vote_hist[-1]
+
+def _kalman_predict_1d(pos, vel, p00, p01, p10, p11):
+    pos = pos + KF_DT * vel
+    n00 = p00 + KF_DT * (p10 + p01) + (KF_DT * KF_DT) * p11 + KF_Q_POS
+    n01 = p01 + KF_DT * p11
+    n10 = p10 + KF_DT * p11
+    n11 = p11 + KF_Q_VEL
+    return pos, vel, n00, n01, n10, n11
+
+def _kalman_update_1d(pos, vel, p00, p01, p10, p11, meas):
+    y = meas - pos
+    s = p00 + KF_R_MEAS
+    if s <= 1e-6:
+        return pos, vel, p00, p01, p10, p11
+    k0 = p00 / s
+    k1 = p10 / s
+    pos = pos + k0 * y
+    vel = vel + k1 * y
+    u00 = (1.0 - k0) * p00
+    u01 = (1.0 - k0) * p01
+    u10 = p10 - k1 * p00
+    u11 = p11 - k1 * p01
+    return pos, vel, u00, u01, u10, u11
+
+def kalman_predict_grid():
+    global kf_state
+    x = _kalman_predict_1d(kf_state["x"], kf_state["vx"], kf_state["px00"], kf_state["px01"], kf_state["px10"], kf_state["px11"])
+    y = _kalman_predict_1d(kf_state["y"], kf_state["vy"], kf_state["py00"], kf_state["py01"], kf_state["py10"], kf_state["py11"])
+    kf_state["x"], kf_state["vx"], kf_state["px00"], kf_state["px01"], kf_state["px10"], kf_state["px11"] = x
+    kf_state["y"], kf_state["vy"], kf_state["py00"], kf_state["py01"], kf_state["py10"], kf_state["py11"] = y
+    return kf_state["x"], kf_state["y"]
+
+def kalman_update_grid(meas_x, meas_y):
+    global kf_state
+    x = _kalman_update_1d(kf_state["x"], kf_state["vx"], kf_state["px00"], kf_state["px01"], kf_state["px10"], kf_state["px11"], meas_x)
+    y = _kalman_update_1d(kf_state["y"], kf_state["vy"], kf_state["py00"], kf_state["py01"], kf_state["py10"], kf_state["py11"], meas_y)
+    kf_state["x"], kf_state["vx"], kf_state["px00"], kf_state["px01"], kf_state["px10"], kf_state["px11"] = x
+    kf_state["y"], kf_state["vy"], kf_state["py00"], kf_state["py01"], kf_state["py10"], kf_state["py11"] = y
+    return kf_state["x"], kf_state["y"]
 
 # ----------------------------------------------------------------------
 # 3. 元素颜色特征库 (RGB 实测标定 -> LAB 直方图指纹匹配)
@@ -503,11 +560,14 @@ def find_best_symbol(hist_3ch, grid_x, grid_y):
     2) 所有有效命中中取最小距离。
     3) 若无有效命中，则用“最近邻 + 最近邻阈值”兜底。
     """
+    global kf_inited, kf_state, car_last_pos_grid
     min_score = 999999.0
     matched = None
     nearest_sym = "-"
     nearest_dist = 999999.0
     nearest_limit = SYMBOL_MAX_BHATT["-"][1]
+    weak_car_sym = None
+    weak_car_dist = 999999.0
 
     for sym, hist_templates in SYMBOL_MAP_HIST.items():
         max_dist_cfg = SYMBOL_MAX_BHATT[sym]
@@ -539,6 +599,13 @@ def find_best_symbol(hist_3ch, grid_x, grid_y):
             min_score = score
             matched = sym
 
+        # 对 H/T 保留“弱命中”候选：阈值到阈值+0.10。
+        if (sym == "H" or sym == "T") and best_dist_for_sym > sym_limit_for_match:
+            if best_dist_for_sym <= (sym_limit_for_match + CAR_WEAK_BHATT_MARGIN):
+                if best_dist_for_sym < weak_car_dist:
+                    weak_car_dist = best_dist_for_sym
+                    weak_car_sym = sym
+
         sym_limit = limits[0]
         if len(limits) > 1 and limits[1] > sym_limit:
             sym_limit = limits[1]
@@ -549,6 +616,24 @@ def find_best_symbol(hist_3ch, grid_x, grid_y):
 
     if matched is not None:
         return matched
+
+    # 弱命中轨迹门控：若在卡尔曼预测轨迹半径内，则强制判为小车。
+    if weak_car_sym is not None:
+        gate_cx = None
+        gate_cy = None
+        if kf_inited:
+            gate_cx = kf_state["x"]
+            gate_cy = kf_state["y"]
+        elif car_last_pos_grid is not None:
+            gate_cx = car_last_pos_grid[0]
+            gate_cy = car_last_pos_grid[1]
+
+        if gate_cx is not None and gate_cy is not None:
+            dx = grid_x - gate_cx
+            dy = grid_y - gate_cy
+            if (dx * dx + dy * dy) <= (CAR_WEAK_GATE_RADIUS_GRID * CAR_WEAK_GATE_RADIUS_GRID):
+                return weak_car_sym
+
     # 若没有阈值内命中，使用最近邻兜底，但仍受阈值+余量约束。
     if nearest_dist <= (nearest_limit + BHATT_FALLBACK_MARGIN):
         return nearest_sym
@@ -584,10 +669,35 @@ def temporal_smooth_cell(grid_x, grid_y, curr_sym):
 
     return last_grid_states[grid_y][grid_x]
 
-def find_car_pair(map_list):
+def find_car_pair(map_list, center_pos=None):
     """在16x12网格中寻找相邻的H/T，返回车头坐标和车尾坐标。"""
     grid = [map_list[r * COLS:(r + 1) * COLS] for r in range(ROWS)]
     neighbors = ((1, 0), (-1, 0), (0, 1), (0, -1))
+
+    def _scan_cells(cells):
+        for x, y in cells:
+            if grid[y][x] != "H":
+                continue
+            for dx, dy in neighbors:
+                nx, ny = x + dx, y + dy
+                if 0 <= nx < COLS and 0 <= ny < ROWS and grid[ny][nx] == "T":
+                    return (x, y, nx, ny)
+        return None
+
+    # 先在上一帧附近 3x3 搜索。
+    if center_pos is not None:
+        cx, cy = center_pos
+        local_cells = []
+        for yy in range(cy - CAR_SEARCH_LOCAL_RADIUS, cy + CAR_SEARCH_LOCAL_RADIUS + 1):
+            if yy < 0 or yy >= ROWS:
+                continue
+            for xx in range(cx - CAR_SEARCH_LOCAL_RADIUS, cx + CAR_SEARCH_LOCAL_RADIUS + 1):
+                if xx < 0 or xx >= COLS:
+                    continue
+                local_cells.append((xx, yy))
+        found = _scan_cells(local_cells)
+        if found is not None:
+            return found
 
     for y in range(ROWS):
         for x in range(COLS):
@@ -601,8 +711,20 @@ def find_car_pair(map_list):
 
     return None
 
-def find_car_single(map_list):
+def find_car_single(map_list, center_pos=None):
     """回退策略：当H/T未能成对时，使用单个H或T作为车辆坐标。"""
+    if center_pos is not None:
+        cx, cy = center_pos
+        for yy in range(cy - CAR_SEARCH_LOCAL_RADIUS, cy + CAR_SEARCH_LOCAL_RADIUS + 1):
+            if yy < 0 or yy >= ROWS:
+                continue
+            for xx in range(cx - CAR_SEARCH_LOCAL_RADIUS, cx + CAR_SEARCH_LOCAL_RADIUS + 1):
+                if xx < 0 or xx >= COLS:
+                    continue
+                ch = map_list[yy * COLS + xx]
+                if ch == "H" or ch == "T":
+                    return (xx, yy)
+
     for y in range(ROWS):
         for x in range(COLS):
             ch = map_list[y * COLS + x]
@@ -666,23 +788,72 @@ while(True):
             else:
                 map_list.append("?")   # 若采样出界，记为问号补位
 
-    car_pair = find_car_pair(map_list)
+    # 卡尔曼预测位置 + 3x3 局部优先搜索
+    pred_center = car_last_pos_grid
+    if kf_inited:
+        pred_xf, pred_yf = kalman_predict_grid()
+        pred_x = int(pred_xf + 0.5)
+        pred_y = int(pred_yf + 0.5)
+        if pred_x < 0:
+            pred_x = 0
+        if pred_x >= COLS:
+            pred_x = COLS - 1
+        if pred_y < 0:
+            pred_y = 0
+        if pred_y >= ROWS:
+            pred_y = ROWS - 1
+        pred_center = (pred_x, pred_y)
+
+    car_pair = find_car_pair(map_list, pred_center)
     if car_pair is not None:
-        car_x, car_y = car_pair[0], car_pair[1]  # 发送车头坐标
+        meas_x, meas_y = car_pair[0], car_pair[1]  # 发送车头坐标
+        if not kf_inited:
+            kf_state["x"] = meas_x
+            kf_state["y"] = meas_y
+            kf_state["vx"] = 0.0
+            kf_state["vy"] = 0.0
+            kf_inited = True
+        car_xf, car_yf = kalman_update_grid(meas_x, meas_y)
+        car_x, car_y = int(car_xf + 0.5), int(car_yf + 0.5)
         car_found = True
 
     # 若H/T未成对，回退到单符号坐标，避免地图有车而坐标仍为(0,0)。
     if not car_found:
-        car_single = find_car_single(map_list)
+        car_single = find_car_single(map_list, pred_center)
         if car_single is not None:
-            car_x, car_y = car_single
+            meas_x, meas_y = car_single
+            if not kf_inited:
+                kf_state["x"] = meas_x
+                kf_state["y"] = meas_y
+                kf_state["vx"] = 0.0
+                kf_state["vy"] = 0.0
+                kf_inited = True
+            car_xf, car_yf = kalman_update_grid(meas_x, meas_y)
+            car_x, car_y = int(car_xf + 0.5), int(car_yf + 0.5)
             car_found = True
+
+    # 本帧没观测到小车时，使用卡尔曼预测值保持轨迹连续。
+    if not car_found and kf_inited:
+        car_xf = kf_state["x"]
+        car_yf = kf_state["y"]
+        car_x = int(car_xf + 0.5)
+        car_y = int(car_yf + 0.5)
+        if car_x < 0:
+            car_x = 0
+        if car_x >= COLS:
+            car_x = COLS - 1
+        if car_y < 0:
+            car_y = 0
+        if car_y >= ROWS:
+            car_y = ROWS - 1
+        car_found = True
 
     if CALIB_SHOW_CORNERS:
         tl_pt, tr_pt, bl_pt, br_pt = draw_calibration_overlay(img, img_w, img_h)
 
-    # 对车辆坐标做短窗口多数投票，避免单帧色值波动导致坐标跳动
-    car_x, car_y = vote_car_position(car_found, car_x, car_y)
+    # 记录 last_pos，供下一帧 ROI 锁定搜索使用。
+    if car_found:
+        car_last_pos_grid = (car_x, car_y)
 
     # 输出阶段统一为单一@，并与投票后的发送坐标严格一致。
     map_list_out = build_map_with_single_car(map_list, car_found, car_x, car_y)
