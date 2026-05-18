@@ -104,10 +104,10 @@ ROWS, COLS = 12, 16                    # 赛道逻辑网格规模：12行x16列
 # 四个点均为外圈 4 个格子中心的像素坐标，而不是屏幕物理边框角点。
 # 调试时只需把白色采样点调到四个角落格子的中心，内部 16x12 点会自动双线性展开。
 GRID_CORNERS = {
-    "tl": (39.5, 40.5), #左上
-    "tr": (274.5, 35.0), #右上
-    "bl": (53.0, 225.8), #左下
-    "br": (275.8, 208.0), #右下
+    "tl": (37.0, 44.5), #左上
+    "tr": (282.5, 34.5), #右上
+    "bl": (50.5, 226.8), #左下
+    "br": (280.8, 221.5), #右下
 }
 
 GRID_K1 = +0.000000                    # 径向畸变系数；无畸变镜头可设为 0
@@ -184,8 +184,10 @@ def vote_car_position(found, x, y):
 # 3. 元素颜色特征库 (RGB 实测标定 -> RGB 空间匹配)
 # ----------------------------------------------------------------------
 # 只需在现场重新读取这一组 RGB 值。
-CAR_HEAD_RGB = (25, 182, 0)           # 车头颜色（H）
-CAR_TAIL_RGB = (0, 182, 239)          # 车尾颜色（T）
+CAR_HEAD_DARK_RGB = (25, 152, 0)      # 暗车头颜色（H-dark）
+CAR_HEAD_BRIGHT_RGB = (74, 225, 239)    # 亮车头颜色（H-bright）
+CAR_TAIL_DARK_RGB = (0, 152, 195)     # 暗车尾颜色（T-dark）
+CAR_TAIL_BRIGHT_RGB = (107, 255, 33)   # 亮车尾颜色（T-bright）
 
 WALL_DARK_RGB = (78, 96, 118)         # 暗墙颜色（#-dark）
 WALL_BRIGHT_RGB = (132, 150, 172)     # 亮墙颜色（#-bright）
@@ -208,20 +210,20 @@ SYMBOL_MAP_RGB = {
     ".": (GOAL_DARK_RGB, GOAL_BRIGHT_RGB),  # 目的地双模板：暗目的地/亮目的地
     "$": (BOX_DARK_RGB, BOX_BRIGHT_RGB),    # 箱子双模板：暗箱子/亮箱子
     "*": (BOMB_DARK_RGB, BOMB_BRIGHT_RGB),  # 炸弹双模板：暗炸弹/亮炸弹
-    "H": CAR_HEAD_RGB,    # 车头
-    "T": CAR_TAIL_RGB,    # 车尾
+    "H": (CAR_HEAD_DARK_RGB, CAR_HEAD_BRIGHT_RGB),  # 车头双模板：暗车头/亮车头
+    "T": (CAR_TAIL_DARK_RGB, CAR_TAIL_BRIGHT_RGB),  # 车尾双模板：暗车尾/亮车尾
 }
 
 # 推荐阈值：先做双模板距离判定，再走全局最近邻兜底。
 # 阈值单位为 RGB 加权欧氏距离平方（dist^2），建议实地标定时在此基础上微调 ±15%。
 SYMBOL_MAX_DIST_SQ = {
-    "#": (5600, 7000),
+    "#": (5600, 10000),
     "-": (2500, 4300),
     ".": (2600, 3500),
     "$": (2900, 4200),
     "*": (2800, 4300),
-    "H": 3200,
-    "T": 3200,
+    "H": (3200, 4200),
+    "T": (3200, 4200),
 }
 
 SAMPLE_OFFSETS = ((-1, -1), (0, -1), (1, -1),
@@ -233,9 +235,9 @@ RGB_G_WEIGHT = 1.00
 RGB_B_WEIGHT = 1.00
 WALL_GRAY_SPREAD_MAX = 42
 WALL_RGB_MIN = 42
-WALL_RGB_MAX = 170
+WALL_RGB_MAX = 195
 WALL_CENTER_RGB_MIN_RELAX = 8
-WALL_CENTER_RGB_MAX_BOOST = 70
+WALL_CENTER_RGB_MAX_BOOST = 90
 WALL_CENTER_SPREAD_BOOST = 12
 WALL_DARK_MAX_DIST_SQ = SYMBOL_MAX_DIST_SQ["#"][0]
 WALL_BRIGHT_MAX_DIST_SQ = SYMBOL_MAX_DIST_SQ["#"][1]
