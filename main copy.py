@@ -6,7 +6,7 @@
 #   3. 通过自定义二进制协议帧，将 194 字节数据（地图+坐标）传给主控。
 # 【核心原理】：
 #   - 坐标计算：线性斜率补偿（修正由于摄像头安装倾斜导致的近大远小）。
-#   - 元素匹配：多点采样后做 RGB 距离匹配，降低亮度波动与单像素噪声影响。
+#   - 元素匹配：提取 7x7 区域 LAB 三通道直方图，并做巴氏距离匹配。
 #   - 链路安全：CRC8 循环冗余校验（防止串口通信中产生的噪点导致误码）。
 # ======================================================================
 #
@@ -104,18 +104,36 @@ ROWS, COLS = 12, 16                    # 赛道逻辑网格规模：12行x16列
 # 四个点均为外圈 4 个格子中心的像素坐标，而不是屏幕物理边框角点。
 # 调试时只需把白色采样点调到四个角落格子的中心，内部 16x12 点会自动双线性展开。
 GRID_CORNERS = {
-    "tl": (39.5, 40.5), #左上
-    "tr": (274.5, 35.0), #右上
-    "bl": (53.0, 225.8), #左下
-    "br": (275.8, 208.0), #右下
+    "tl": (37.0, 42.0), #左上
+    "tr": (282.0, 35.5), #右上
+    "bl": (47.5, 223.2), #左下
+    "br": (280.8, 221.5), #右下
 }
 
 GRID_K1 = +0.000000                    # 径向畸变系数；无畸变镜头可设为 0
 CALIB_SHOW_CORNERS = True              # 四角标定模式：高亮四角与外框，便于精准调参
-CAR_VOTE_FRAMES = 5                    # 车辆坐标最近 N 帧多数投票
+CAR_VOTE_FRAMES = 4                    # 车辆坐标最近 N 帧多数投票
 CAR_VOTE_MIN = 2                       # 至少出现 N 次才认为是稳定坐标
+CAR_SEARCH_LOCAL_RADIUS = 1            # 锁定区域搜索：以 last_pos 为中心先搜 3x3
+CAR_WEAK_BHATT_MARGIN = 0.15           # H/T 弱命中区间：阈值到阈值+0.10
+CAR_WEAK_GATE_RADIUS_GRID = 2.2        # 弱命中轨迹门控半径（网格单位）
+
+# 卡尔曼参数（二维常速度模型）
+# 按“降低一点参数”要求，采用较温和参数，减少跳变与过度跟随。
+KF_DT = 1.0
+KF_Q_POS = 0.05
+KF_Q_VEL = 0.03
+KF_R_MEAS = 2.0
 
 car_vote_hist = []
+car_last_pos_grid = None               # 上一帧稳定网格坐标
+kf_inited = False
+kf_state = {
+    "x": 0.0, "vx": 0.0,
+    "y": 0.0, "vy": 0.0,
+    "px00": 8.0, "px01": 0.0, "px10": 0.0, "px11": 2.0,
+    "py00": 8.0, "py01": 0.0, "py10": 0.0, "py11": 2.0,
+}
 
 def calc_grid_point(x_idx, y_idx, img_w, img_h):
     u = x_idx / (COLS - 1)
@@ -180,12 +198,53 @@ def vote_car_position(found, x, y):
         return best_pos
     return car_vote_hist[-1]
 
+def _kalman_predict_1d(pos, vel, p00, p01, p10, p11):
+    pos = pos + KF_DT * vel
+    n00 = p00 + KF_DT * (p10 + p01) + (KF_DT * KF_DT) * p11 + KF_Q_POS
+    n01 = p01 + KF_DT * p11
+    n10 = p10 + KF_DT * p11
+    n11 = p11 + KF_Q_VEL
+    return pos, vel, n00, n01, n10, n11
+
+def _kalman_update_1d(pos, vel, p00, p01, p10, p11, meas):
+    y = meas - pos
+    s = p00 + KF_R_MEAS
+    if s <= 1e-6:
+        return pos, vel, p00, p01, p10, p11
+    k0 = p00 / s
+    k1 = p10 / s
+    pos = pos + k0 * y
+    vel = vel + k1 * y
+    u00 = (1.0 - k0) * p00
+    u01 = (1.0 - k0) * p01
+    u10 = p10 - k1 * p00
+    u11 = p11 - k1 * p01
+    return pos, vel, u00, u01, u10, u11
+
+def kalman_predict_grid():
+    global kf_state
+    x = _kalman_predict_1d(kf_state["x"], kf_state["vx"], kf_state["px00"], kf_state["px01"], kf_state["px10"], kf_state["px11"])
+    y = _kalman_predict_1d(kf_state["y"], kf_state["vy"], kf_state["py00"], kf_state["py01"], kf_state["py10"], kf_state["py11"])
+    kf_state["x"], kf_state["vx"], kf_state["px00"], kf_state["px01"], kf_state["px10"], kf_state["px11"] = x
+    kf_state["y"], kf_state["vy"], kf_state["py00"], kf_state["py01"], kf_state["py10"], kf_state["py11"] = y
+    return kf_state["x"], kf_state["y"]
+
+def kalman_update_grid(meas_x, meas_y):
+    global kf_state
+    x = _kalman_update_1d(kf_state["x"], kf_state["vx"], kf_state["px00"], kf_state["px01"], kf_state["px10"], kf_state["px11"], meas_x)
+    y = _kalman_update_1d(kf_state["y"], kf_state["vy"], kf_state["py00"], kf_state["py01"], kf_state["py10"], kf_state["py11"], meas_y)
+    kf_state["x"], kf_state["vx"], kf_state["px00"], kf_state["px01"], kf_state["px10"], kf_state["px11"] = x
+    kf_state["y"], kf_state["vy"], kf_state["py00"], kf_state["py01"], kf_state["py10"], kf_state["py11"] = y
+    return kf_state["x"], kf_state["y"]
+
 # ----------------------------------------------------------------------
-# 3. 元素颜色特征库 (RGB 实测标定 -> RGB 空间匹配)
+# 3. 元素颜色特征库 (RGB 实测标定 -> LAB 直方图指纹匹配)
 # ----------------------------------------------------------------------
 # 只需在现场重新读取这一组 RGB 值。
-CAR_HEAD_RGB = (25, 182, 0)           # 车头颜色（H）
-CAR_TAIL_RGB = (0, 182, 239)          # 车尾颜色（T）
+CAR_HEAD_DARK_RGB = (0, 142, 173)      # 暗车头颜色（H-dark）
+CAR_HEAD_BRIGHT_RGB = (0, 235, 255)    # 亮车头颜色（H-bright）
+CAR_TAIL_DARK_RGB = (8, 138, 8)     # 暗车尾颜色（T-dark）
+CAR_TAIL_BRIGHT_RGB = (33, 210, 49)   # 亮车尾颜色（T-bright）
 
 WALL_DARK_RGB = (78, 96, 118)         # 暗墙颜色（#-dark）
 WALL_BRIGHT_RGB = (132, 150, 172)     # 亮墙颜色（#-bright）
@@ -196,8 +255,8 @@ FLOOR_BRIGHT_RGB = (58, 92, 255)      # 亮空地颜色（--bright）
 GOAL_DARK_RGB = (194, 0, 214)         # 暗目的地颜色（.-dark）
 GOAL_BRIGHT_RGB = (245, 14, 255)      # 亮目的地颜色（.-bright）
 
-BOX_DARK_RGB = (114, 140, 0)          # 暗箱子颜色（$-dark）
-BOX_BRIGHT_RGB = (170, 204, 10)       # 亮箱子颜色（$-bright）
+BOX_DARK_RGB = (132, 198, 0)          # 暗箱子颜色（$-dark）
+BOX_BRIGHT_RGB = (247, 255, 41)       # 亮箱子颜色（$-bright）
 
 BOMB_DARK_RGB = (215, 12, 56)         # 暗炸弹颜色（*-dark）
 BOMB_BRIGHT_RGB = (255, 36, 92)       # 亮炸弹颜色（*-bright）
@@ -208,139 +267,344 @@ SYMBOL_MAP_RGB = {
     ".": (GOAL_DARK_RGB, GOAL_BRIGHT_RGB),  # 目的地双模板：暗目的地/亮目的地
     "$": (BOX_DARK_RGB, BOX_BRIGHT_RGB),    # 箱子双模板：暗箱子/亮箱子
     "*": (BOMB_DARK_RGB, BOMB_BRIGHT_RGB),  # 炸弹双模板：暗炸弹/亮炸弹
-    "H": CAR_HEAD_RGB,    # 车头
-    "T": CAR_TAIL_RGB,    # 车尾
+    "H": (CAR_HEAD_DARK_RGB, CAR_HEAD_BRIGHT_RGB),  # 车头双模板：暗车头/亮车头
+    "T": (CAR_TAIL_DARK_RGB, CAR_TAIL_BRIGHT_RGB),  # 车尾双模板：暗车尾/亮车尾
 }
 
-# 推荐阈值：先做双模板距离判定，再走全局最近邻兜底。
-# 阈值单位为 RGB 加权欧氏距离平方（dist^2），建议实地标定时在此基础上微调 ±15%。
-SYMBOL_MAX_DIST_SQ = {
-    "#": (5600, 7000),
-    "-": (2500, 4300),
-    ".": (2600, 3500),
-    "$": (2900, 4200),
-    "*": (2800, 4300),
-    "H": 3200,
-    "T": 3200,
+LAB_REGION_RADIUS = 3      # 7x7 区域：半径 3 表示中心点左右上下各取 3 像素
+LAB_L_BINS = 8             # L 通道直方图桶数（0~100）
+LAB_A_BINS = 8             # a 通道直方图桶数（-128~127）
+LAB_B_BINS = 8             # b 通道直方图桶数（-128~127）
+LAB_SOFT_SIGMA = 0.95      # 模板指纹软分布扩散系数，越小越尖锐
+
+# 巴氏距离阈值（0 表示完全一致，越接近 1 差异越大）
+# 每个元素保留暗/亮双模板阈值；先做阈值命中，再走最近邻兜底。
+SYMBOL_MAX_BHATT = {
+    "#": (0.60, 0.60),
+    "-": (0.56, 0.56),
+    ".": (0.56, 0.56),
+    "$": (0.56, 0.56),
+    "*": (0.56, 0.56),
+    "H": (0.58, 0.58),
+    "T": (0.58, 0.58),
 }
 
-SAMPLE_OFFSETS = ((-1, -1), (0, -1), (1, -1),
-                  (-1,  0), (0,  0), (1,  0),
-                  (-1,  1), (0,  1), (1,  1))
-SAMPLE_TRIM = 1
-RGB_R_WEIGHT = 1.00
-RGB_G_WEIGHT = 1.00
-RGB_B_WEIGHT = 1.00
-WALL_GRAY_SPREAD_MAX = 42
-WALL_RGB_MIN = 42
-WALL_RGB_MAX = 170
-WALL_CENTER_RGB_MIN_RELAX = 8
-WALL_CENTER_RGB_MAX_BOOST = 70
-WALL_CENTER_SPREAD_BOOST = 12
-WALL_DARK_MAX_DIST_SQ = SYMBOL_MAX_DIST_SQ["#"][0]
-WALL_BRIGHT_MAX_DIST_SQ = SYMBOL_MAX_DIST_SQ["#"][1]
+# ----------------------------------------------------------------------
+# 4. 位置先验约束 + 时域平滑参数
+# ----------------------------------------------------------------------
+# 语义类别索引：严格对应 prob_map[y][x][cls]
+CLS_WALL = 0
+CLS_FLOOR = 1
+CLS_BOX = 2
+CLS_GOAL = 3
+CLS_BOMB = 4
+CLS_CAR = 5
 
-def wall_thresholds_at(x, y, img_w, img_h):
-    """按采样点位置给墙体阈值做轻量补偿，降低中心区域漏检。"""
-    if img_w <= 1 or img_h <= 1:
-        return WALL_RGB_MIN, WALL_RGB_MAX, WALL_GRAY_SPREAD_MAX
+# 符号到语义类别的映射。车头/车尾都归并到“车”语义类别。
+SYMBOL_TO_CLASS = {
+    "#": CLS_WALL,
+    "-": CLS_FLOOR,
+    "$": CLS_BOX,
+    ".": CLS_GOAL,
+    "*": CLS_BOMB,
+    "H": CLS_CAR,
+    "T": CLS_CAR,
+}
 
-    cx = (img_w - 1) // 2
-    cy = (img_h - 1) // 2
-    nx = abs(x - cx) * 100 // (cx if cx > 0 else 1)
-    ny = abs(y - cy) * 100 // (cy if cy > 0 else 1)
-    center_ratio = 100 - ((nx + ny) // 2)
-    if center_ratio < 0:
-        center_ratio = 0
+POSITION_PRIOR_WEIGHT = 0.22      # 位置先验惩罚权重，越大越依赖位置逻辑
+BHATT_FALLBACK_MARGIN = 0.06      # 兜底余量：允许最优距离略高于阈值仍保留结果
+CELL_STATE_CONFIRM_FRAMES = 5     # 单格状态切换需连续一致帧数
 
-    rgb_min = WALL_RGB_MIN - (WALL_CENTER_RGB_MIN_RELAX * center_ratio) // 100
-    rgb_max = WALL_RGB_MAX + (WALL_CENTER_RGB_MAX_BOOST * center_ratio) // 100
-    gray_spread = WALL_GRAY_SPREAD_MAX + (WALL_CENTER_SPREAD_BOOST * center_ratio) // 100
-    return rgb_min, rgb_max, gray_spread
+def _normalize_prob(vec):
+    """将一组非负权重归一化为概率分布。"""
+    s = 0.0
+    for v in vec:
+        if v > 0.0:
+            s += v
+    if s <= 0.0:
+        # 极端情况下回退为“空地主导”的安全分布
+        return [0.10, 0.70, 0.05, 0.05, 0.00, 0.10]
 
-def robust_rgb_at(img, x, y, img_w, img_h):
-    samples = []
-    for ox, oy in SAMPLE_OFFSETS:
-        sx, sy = x + ox, y + oy
-        if 0 <= sx < img_w and 0 <= sy < img_h:
-            rgb = img.get_pixel(sx, sy)
-            lum = rgb[0] * 3 + rgb[1] * 6 + rgb[2]
-            samples.append((lum, rgb[0], rgb[1], rgb[2]))
+    out = [0.0] * len(vec)
+    inv = 1.0 / s
+    for i in range(len(vec)):
+        v = vec[i]
+        if v < 0.0:
+            v = 0.0
+        out[i] = v * inv
+    return out
 
-    samples.sort()
-    start, end = 0, len(samples)
-    if len(samples) > SAMPLE_TRIM * 2 + 2:
-        start = SAMPLE_TRIM
-        end = len(samples) - SAMPLE_TRIM
+def build_position_prob_map():
+    """
+    构建 prob_map[12][16][6]：位置先验概率。
+    先验设计原则：
+    1) 最外圈更偏向墙体，炸弹先验压低（可设为 0）。
+    2) 内圈以地板为主，箱子/目的地/车辆给适中概率。
+    3) 先验只“轻拉回”识别结果，不直接替代颜色匹配。
+    """
+    table = []
+    for y in range(ROWS):
+        row = []
+        for x in range(COLS):
+            is_outer = (x == 0 or x == COLS - 1 or y == 0 or y == ROWS - 1)
+            is_near_outer = (x <= 1 or x >= COLS - 2 or y <= 1 or y >= ROWS - 2)
 
-    r_sum, g_sum, b_sum, count = 0, 0, 0, 0
-    for sample in samples[start:end]:
-        r_sum += sample[1]
-        g_sum += sample[2]
-        b_sum += sample[3]
-        count += 1
+            # 基础先验（墙, 地, 箱, 目标, 炸弹, 车）
+            p = [0.22, 0.40, 0.12, 0.12, 0.06, 0.08]
 
-    if count == 0:
-        rgb = img.get_pixel(x, y)
-        return (rgb[0], rgb[1], rgb[2])
+            if is_outer:
+                p = [0.62, 0.30, 0.03, 0.03, 0.00, 0.02]
+            elif is_near_outer:
+                p = [0.38, 0.42, 0.08, 0.08, 0.01, 0.03]
+            else:
+                # 中心区域更容易出现可移动元素
+                p = [0.16, 0.44, 0.16, 0.14, 0.03, 0.07]
 
-    return (r_sum // count, g_sum // count, b_sum // count)
+            row.append(_normalize_prob(p))
+        table.append(row)
+    return table
 
-def avg_rgb_at(img, x, y, img_w, img_h):
-    return robust_rgb_at(img, x, y, img_w, img_h)
+# 对外暴露为用户提出的命名：prob_map[12][16][6]
+prob_map = build_position_prob_map()
 
-def rgb_dist_sq(meas_rgb, std_rgb):
-    dr = (meas_rgb[0] - std_rgb[0]) * RGB_R_WEIGHT
-    dg = (meas_rgb[1] - std_rgb[1]) * RGB_G_WEIGHT
-    db = (meas_rgb[2] - std_rgb[2]) * RGB_B_WEIGHT
-    return dr * dr + dg * dg + db * db
+# 时域平滑状态：
+# last_grid_states 存放“已确认输出”的稳定语义；
+# pending_grid_states/pending_grid_counts 存放“候选切换态”的连续计数。
+last_grid_states = [["-" for _ in range(COLS)] for _ in range(ROWS)]
+pending_grid_states = [[None for _ in range(COLS)] for _ in range(ROWS)]
+pending_grid_counts = [[0 for _ in range(COLS)] for _ in range(ROWS)]
 
-def find_best_symbol(rgb, x=None, y=None, img_w=None, img_h=None):
-    # 墙体采用双模板并行判定：暗墙/亮墙任一命中即判墙。
-    c_max = max(rgb[0], rgb[1], rgb[2])
-    c_min = min(rgb[0], rgb[1], rgb[2])
-    c_avg = (rgb[0] + rgb[1] + rgb[2]) // 3
-    if x is not None and y is not None and img_w is not None and img_h is not None:
-        wall_rgb_min, wall_rgb_max, wall_gray_spread = wall_thresholds_at(x, y, img_w, img_h)
-    else:
-        wall_rgb_min, wall_rgb_max, wall_gray_spread = WALL_RGB_MIN, WALL_RGB_MAX, WALL_GRAY_SPREAD_MAX
+def _pivot_rgb_to_linear(c):
+    """sRGB 分段逆伽马，输入 [0,1]，输出线性光强。"""
+    if c <= 0.04045:
+        return c / 12.92
+    return ((c + 0.055) / 1.055) ** 2.4
 
-    if (c_max - c_min) <= wall_gray_spread and wall_rgb_min <= c_avg <= wall_rgb_max:
-        return "#"
+def rgb_to_lab(rgb):
+    """
+    将 RGB888 转换为 CIE LAB。
+    说明：
+    1) 先做 sRGB -> 线性 RGB。
+    2) 线性 RGB 乘以 D65 矩阵得到 XYZ。
+    3) XYZ 再转 LAB。
+    """
+    r = _pivot_rgb_to_linear(rgb[0] / 255.0)
+    g = _pivot_rgb_to_linear(rgb[1] / 255.0)
+    b = _pivot_rgb_to_linear(rgb[2] / 255.0)
 
-    wall_dark_rgb, wall_bright_rgb = SYMBOL_MAP_RGB["#"]
-    dark_wall_dist = rgb_dist_sq(rgb, wall_dark_rgb)
-    bright_wall_dist = rgb_dist_sq(rgb, wall_bright_rgb)
-    if dark_wall_dist <= WALL_DARK_MAX_DIST_SQ or bright_wall_dist <= WALL_BRIGHT_MAX_DIST_SQ:
-        return "#"
+    x = r * 0.4124564 + g * 0.3575761 + b * 0.1804375
+    y = r * 0.2126729 + g * 0.7151522 + b * 0.0721750
+    z = r * 0.0193339 + g * 0.1191920 + b * 0.9503041
 
-    min_dist, matched = 999999, None
-    nearest_sym, nearest_dist, nearest_limit = "-", 999999, SYMBOL_MAX_DIST_SQ["-"][1]
-    for sym, std_rgb in SYMBOL_MAP_RGB.items():
-        if sym == "#":
+    xr = x / 0.95047
+    yr = y / 1.00000
+    zr = z / 1.08883
+
+    eps = 0.008856
+    kappa = 903.3
+
+    def _f(t):
+        if t > eps:
+            return t ** (1.0 / 3.0)
+        return (kappa * t + 16.0) / 116.0
+
+    fx = _f(xr)
+    fy = _f(yr)
+    fz = _f(zr)
+
+    l = 116.0 * fy - 16.0
+    a = 500.0 * (fx - fy)
+    bb = 200.0 * (fy - fz)
+    return (l, a, bb)
+
+def _lab_bin_index(l, a, bb):
+    """将 LAB 值映射到三个通道各自的桶索引。"""
+    if l < 0.0:
+        l = 0.0
+    if l > 100.0:
+        l = 100.0
+    if a < -128.0:
+        a = -128.0
+    if a > 127.0:
+        a = 127.0
+    if bb < -128.0:
+        bb = -128.0
+    if bb > 127.0:
+        bb = 127.0
+
+    l_idx = int(l * LAB_L_BINS / 101.0)
+    a_idx = int((a + 128.0) * LAB_A_BINS / 256.0)
+    b_idx = int((bb + 128.0) * LAB_B_BINS / 256.0)
+
+    if l_idx >= LAB_L_BINS:
+        l_idx = LAB_L_BINS - 1
+    if a_idx >= LAB_A_BINS:
+        a_idx = LAB_A_BINS - 1
+    if b_idx >= LAB_B_BINS:
+        b_idx = LAB_B_BINS - 1
+    return l_idx, a_idx, b_idx
+
+def lab_histogram_at(img, x, y, img_w, img_h):
+    """
+    在 (x,y) 周围提取 7x7 区域 LAB 三通道直方图。
+    返回 (hist_l, hist_a, hist_b)，三个列表均做了归一化，总和为 1。
+    """
+    hist_l = [0.0] * LAB_L_BINS
+    hist_a = [0.0] * LAB_A_BINS
+    hist_b = [0.0] * LAB_B_BINS
+
+    count = 0
+    for oy in range(-LAB_REGION_RADIUS, LAB_REGION_RADIUS + 1):
+        sy = y + oy
+        if sy < 0 or sy >= img_h:
             continue
-        if isinstance(std_rgb, tuple) and len(std_rgb) > 0 and isinstance(std_rgb[0], tuple):
-            templates = std_rgb
-        else:
-            templates = (std_rgb,)
+        for ox in range(-LAB_REGION_RADIUS, LAB_REGION_RADIUS + 1):
+            sx = x + ox
+            if sx < 0 or sx >= img_w:
+                continue
 
-        max_dist_cfg = SYMBOL_MAX_DIST_SQ[sym]
+            rgb = img.get_pixel(sx, sy)
+            l, a, bb = rgb_to_lab((rgb[0], rgb[1], rgb[2]))
+            l_idx, a_idx, b_idx = _lab_bin_index(l, a, bb)
+            hist_l[l_idx] += 1.0
+            hist_a[a_idx] += 1.0
+            hist_b[b_idx] += 1.0
+            count += 1
+
+    if count <= 0:
+        # 理论上中心点在边界内时不会发生；兜底避免除零。
+        hist_l[0] = 1.0
+        hist_a[0] = 1.0
+        hist_b[0] = 1.0
+        return hist_l, hist_a, hist_b
+
+    inv = 1.0 / count
+    for i in range(LAB_L_BINS):
+        hist_l[i] *= inv
+    for i in range(LAB_A_BINS):
+        hist_a[i] *= inv
+    for i in range(LAB_B_BINS):
+        hist_b[i] *= inv
+    return hist_l, hist_a, hist_b
+
+def _soft_hist(length, center_idx, sigma):
+    """基于中心桶构造一维高斯软直方图，作为模板指纹的单通道原型。"""
+    out = [0.0] * length
+    s = 0.0
+    two_sigma_sq = 2.0 * sigma * sigma
+    for i in range(length):
+        d = i - center_idx
+        v = math.exp(-(d * d) / two_sigma_sq)
+        out[i] = v
+        s += v
+    if s > 0:
+        inv = 1.0 / s
+        for i in range(length):
+            out[i] *= inv
+    return out
+
+def build_template_hist_from_rgb(rgb):
+    """
+    将单个 RGB 模板颜色转为 LAB 后，构建三通道软直方图模板。
+    作用：把“单点颜色模板”升级为“可容忍轻微偏色的分布模板”。
+    """
+    l, a, bb = rgb_to_lab(rgb)
+    l_idx, a_idx, b_idx = _lab_bin_index(l, a, bb)
+    return (
+        _soft_hist(LAB_L_BINS, l_idx, LAB_SOFT_SIGMA),
+        _soft_hist(LAB_A_BINS, a_idx, LAB_SOFT_SIGMA),
+        _soft_hist(LAB_B_BINS, b_idx, LAB_SOFT_SIGMA),
+    )
+
+def build_symbol_hist_library():
+    """将每个符号的暗/亮 RGB 模板预生成 LAB 直方图指纹，避免逐帧重复计算。"""
+    library = {}
+    for sym, rgb_templates in SYMBOL_MAP_RGB.items():
+        if isinstance(rgb_templates, tuple) and len(rgb_templates) > 0 and isinstance(rgb_templates[0], tuple):
+            tpls = rgb_templates
+        else:
+            tpls = (rgb_templates,)
+        library[sym] = tuple(build_template_hist_from_rgb(rgb) for rgb in tpls)
+    return library
+
+SYMBOL_MAP_HIST = build_symbol_hist_library()
+
+def bhattacharyya_distance(hist_p, hist_q):
+    """计算两个一维概率直方图的巴氏距离，范围约为 [0,1]。"""
+    bc = 0.0
+    length = len(hist_p)
+    for i in range(length):
+        p = hist_p[i]
+        q = hist_q[i]
+        if p > 0.0 and q > 0.0:
+            bc += math.sqrt(p * q)
+
+    if bc > 1.0:
+        bc = 1.0
+    if bc < 0.0:
+        bc = 0.0
+    return math.sqrt(1.0 - bc)
+
+def hist_distance_3ch(meas_hist, ref_hist):
+    """三通道巴氏距离融合：分别比较 L/a/b 后取均值。"""
+    d_l = bhattacharyya_distance(meas_hist[0], ref_hist[0])
+    d_a = bhattacharyya_distance(meas_hist[1], ref_hist[1])
+    d_b = bhattacharyya_distance(meas_hist[2], ref_hist[2])
+    return (d_l + d_a + d_b) / 3.0
+
+def find_best_symbol(hist_3ch, grid_x, grid_y):
+    """
+    使用 LAB 三通道直方图与模板库做匹配。
+    判定策略：
+    1) 逐模板计算巴氏距离，若低于该模板阈值则记为有效命中。
+    2) 所有有效命中中取最小距离。
+    3) 若无有效命中，则用“最近邻 + 最近邻阈值”兜底。
+    """
+    global kf_inited, kf_state, car_last_pos_grid
+    min_score = 999999.0
+    matched = None
+    nearest_sym = "-"
+    nearest_dist = 999999.0
+    nearest_limit = SYMBOL_MAX_BHATT["-"][1]
+    weak_car_sym = None
+    weak_car_dist = 999999.0
+
+    for sym, hist_templates in SYMBOL_MAP_HIST.items():
+        max_dist_cfg = SYMBOL_MAX_BHATT[sym]
         if isinstance(max_dist_cfg, tuple):
             limits = max_dist_cfg
         else:
             limits = (max_dist_cfg,)
 
-        if len(limits) < len(templates):
-            limits = limits + (limits[-1],) * (len(templates) - len(limits))
+        if len(limits) < len(hist_templates):
+            limits = limits + (limits[-1],) * (len(hist_templates) - len(limits))
 
-        best_dist_for_sym = 999999
-        for i in range(len(templates)):
-            dist_sq = rgb_dist_sq(rgb, templates[i])
-            if dist_sq < best_dist_for_sym:
-                best_dist_for_sym = dist_sq
-            if dist_sq <= limits[i] and dist_sq < min_dist:
-                min_dist = dist_sq
-                matched = sym
+        best_dist_for_sym = 999999.0
+        for i in range(len(hist_templates)):
+            dist = hist_distance_3ch(hist_3ch, hist_templates[i])
+            if dist < best_dist_for_sym:
+                best_dist_for_sym = dist
+
+        # 颜色距离 + 位置先验惩罚融合评分。
+        # 先验概率越低，(1-prior) 越大，得分越差。
+        cls = SYMBOL_TO_CLASS[sym]
+        prior = prob_map[grid_y][grid_x][cls]
+        score = best_dist_for_sym + POSITION_PRIOR_WEIGHT * (1.0 - prior)
+
+        # 仅对“颜色距离在阈值内”的类别参与主命中竞争，避免先验压倒颜色证据。
+        sym_limit_for_match = limits[0]
+        if len(limits) > 1 and limits[1] < sym_limit_for_match:
+            sym_limit_for_match = limits[1]
+        if best_dist_for_sym <= sym_limit_for_match and score < min_score:
+            min_score = score
+            matched = sym
+
+        # 对 H/T 保留“弱命中”候选：阈值到阈值+0.10。
+        if (sym == "H" or sym == "T") and best_dist_for_sym > sym_limit_for_match:
+            if best_dist_for_sym <= (sym_limit_for_match + CAR_WEAK_BHATT_MARGIN):
+                if best_dist_for_sym < weak_car_dist:
+                    weak_car_dist = best_dist_for_sym
+                    weak_car_sym = sym
 
         sym_limit = limits[0]
         if len(limits) > 1 and limits[1] > sym_limit:
@@ -353,15 +617,87 @@ def find_best_symbol(rgb, x=None, y=None, img_w=None, img_h=None):
     if matched is not None:
         return matched
 
-    if nearest_dist <= nearest_limit:
-        return nearest_sym
+    # 弱命中轨迹门控：若在卡尔曼预测轨迹半径内，则强制判为小车。
+    if weak_car_sym is not None:
+        gate_cx = None
+        gate_cy = None
+        if kf_inited:
+            gate_cx = kf_state["x"]
+            gate_cy = kf_state["y"]
+        elif car_last_pos_grid is not None:
+            gate_cx = car_last_pos_grid[0]
+            gate_cy = car_last_pos_grid[1]
 
+        if gate_cx is not None and gate_cy is not None:
+            dx = grid_x - gate_cx
+            dy = grid_y - gate_cy
+            if (dx * dx + dy * dy) <= (CAR_WEAK_GATE_RADIUS_GRID * CAR_WEAK_GATE_RADIUS_GRID):
+                return weak_car_sym
+
+    # 若没有阈值内命中，使用最近邻兜底，但仍受阈值+余量约束。
+    if nearest_dist <= (nearest_limit + BHATT_FALLBACK_MARGIN):
+        return nearest_sym
     return "-"
 
-def find_car_pair(map_list):
+def temporal_smooth_cell(grid_x, grid_y, curr_sym):
+    """
+    每格语义时域滤波：
+    1) 若当前识别与稳定态相同，直接维持稳定态。
+    2) 若发生跳变，不立刻切换；只有连续 CELL_STATE_CONFIRM_FRAMES 帧一致才更新。
+    3) 这样可抑制单帧反光、噪声、瞬态曝光导致的误判跳变。
+    """
+    if curr_sym == "?":
+        return last_grid_states[grid_y][grid_x]
+
+    stable = last_grid_states[grid_y][grid_x]
+    if curr_sym == stable:
+        pending_grid_states[grid_y][grid_x] = None
+        pending_grid_counts[grid_y][grid_x] = 0
+        return stable
+
+    pending = pending_grid_states[grid_y][grid_x]
+    if pending == curr_sym:
+        pending_grid_counts[grid_y][grid_x] += 1
+    else:
+        pending_grid_states[grid_y][grid_x] = curr_sym
+        pending_grid_counts[grid_y][grid_x] = 1
+
+    if pending_grid_counts[grid_y][grid_x] >= CELL_STATE_CONFIRM_FRAMES:
+        last_grid_states[grid_y][grid_x] = curr_sym
+        pending_grid_states[grid_y][grid_x] = None
+        pending_grid_counts[grid_y][grid_x] = 0
+
+    return last_grid_states[grid_y][grid_x]
+
+def find_car_pair(map_list, center_pos=None):
     """在16x12网格中寻找相邻的H/T，返回车头坐标和车尾坐标。"""
     grid = [map_list[r * COLS:(r + 1) * COLS] for r in range(ROWS)]
     neighbors = ((1, 0), (-1, 0), (0, 1), (0, -1))
+
+    def _scan_cells(cells):
+        for x, y in cells:
+            if grid[y][x] != "H":
+                continue
+            for dx, dy in neighbors:
+                nx, ny = x + dx, y + dy
+                if 0 <= nx < COLS and 0 <= ny < ROWS and grid[ny][nx] == "T":
+                    return (x, y, nx, ny)
+        return None
+
+    # 先在上一帧附近 3x3 搜索。
+    if center_pos is not None:
+        cx, cy = center_pos
+        local_cells = []
+        for yy in range(cy - CAR_SEARCH_LOCAL_RADIUS, cy + CAR_SEARCH_LOCAL_RADIUS + 1):
+            if yy < 0 or yy >= ROWS:
+                continue
+            for xx in range(cx - CAR_SEARCH_LOCAL_RADIUS, cx + CAR_SEARCH_LOCAL_RADIUS + 1):
+                if xx < 0 or xx >= COLS:
+                    continue
+                local_cells.append((xx, yy))
+        found = _scan_cells(local_cells)
+        if found is not None:
+            return found
 
     for y in range(ROWS):
         for x in range(COLS):
@@ -375,8 +711,20 @@ def find_car_pair(map_list):
 
     return None
 
-def find_car_single(map_list):
+def find_car_single(map_list, center_pos=None):
     """回退策略：当H/T未能成对时，使用单个H或T作为车辆坐标。"""
+    if center_pos is not None:
+        cx, cy = center_pos
+        for yy in range(cy - CAR_SEARCH_LOCAL_RADIUS, cy + CAR_SEARCH_LOCAL_RADIUS + 1):
+            if yy < 0 or yy >= ROWS:
+                continue
+            for xx in range(cx - CAR_SEARCH_LOCAL_RADIUS, cx + CAR_SEARCH_LOCAL_RADIUS + 1):
+                if xx < 0 or xx >= COLS:
+                    continue
+                ch = map_list[yy * COLS + xx]
+                if ch == "H" or ch == "T":
+                    return (xx, yy)
+
     for y in range(ROWS):
         for x in range(COLS):
             ch = map_list[y * COLS + x]
@@ -398,9 +746,16 @@ def build_map_with_single_car(map_list, car_found, car_x, car_y):
 
     return merged
 
-def classify_cell(img, x, y, img_w, img_h):
-    rgb = avg_rgb_at(img, x, y, img_w, img_h)
-    return find_best_symbol(rgb, x, y, img_w, img_h)
+def classify_cell(img, x, y, img_w, img_h, grid_x, grid_y):
+    """
+    单格分类入口：
+    1) 从格子中心提取 7x7 区域 LAB 三通道直方图。
+    2) 结合 prob_map 的位置先验做颜色-位置联合判定。
+    3) 对该格执行连续 5 帧一致的时域平滑后输出稳定符号。
+    """
+    hist_3ch = lab_histogram_at(img, x, y, img_w, img_h)
+    raw_sym = find_best_symbol(hist_3ch, grid_x, grid_y)
+    return temporal_smooth_cell(grid_x, grid_y, raw_sym)
 
 # ----------------------------------------------------------------------
 # 3. 核心逻辑主循环 (图像识别 -> 位置锁定 -> 打包发送)
@@ -424,8 +779,8 @@ while(True):
 
             # --- 安全检查与元素分类 ---
             if 0 <= tx < img_w and 0 <= ty < img_h:
-                # 提取采样点周围颜色均值并在 LAB 空间分类
-                char = classify_cell(img, tx, ty, img_w, img_h)
+                # 先做 LAB 直方图匹配，再叠加位置先验与时域平滑
+                char = classify_cell(img, tx, ty, img_w, img_h, x_idx, y_idx)
                 map_list.append(char)
 
                 # 在可视化缓冲区画出实心白点，用于调试对位情况
@@ -433,23 +788,72 @@ while(True):
             else:
                 map_list.append("?")   # 若采样出界，记为问号补位
 
-    car_pair = find_car_pair(map_list)
+    # 卡尔曼预测位置 + 3x3 局部优先搜索
+    pred_center = car_last_pos_grid
+    if kf_inited:
+        pred_xf, pred_yf = kalman_predict_grid()
+        pred_x = int(pred_xf + 0.5)
+        pred_y = int(pred_yf + 0.5)
+        if pred_x < 0:
+            pred_x = 0
+        if pred_x >= COLS:
+            pred_x = COLS - 1
+        if pred_y < 0:
+            pred_y = 0
+        if pred_y >= ROWS:
+            pred_y = ROWS - 1
+        pred_center = (pred_x, pred_y)
+
+    car_pair = find_car_pair(map_list, pred_center)
     if car_pair is not None:
-        car_x, car_y = car_pair[0], car_pair[1]  # 发送车头坐标
+        meas_x, meas_y = car_pair[0], car_pair[1]  # 发送车头坐标
+        if not kf_inited:
+            kf_state["x"] = meas_x
+            kf_state["y"] = meas_y
+            kf_state["vx"] = 0.0
+            kf_state["vy"] = 0.0
+            kf_inited = True
+        car_xf, car_yf = kalman_update_grid(meas_x, meas_y)
+        car_x, car_y = int(car_xf + 0.5), int(car_yf + 0.5)
         car_found = True
 
     # 若H/T未成对，回退到单符号坐标，避免地图有车而坐标仍为(0,0)。
     if not car_found:
-        car_single = find_car_single(map_list)
+        car_single = find_car_single(map_list, pred_center)
         if car_single is not None:
-            car_x, car_y = car_single
+            meas_x, meas_y = car_single
+            if not kf_inited:
+                kf_state["x"] = meas_x
+                kf_state["y"] = meas_y
+                kf_state["vx"] = 0.0
+                kf_state["vy"] = 0.0
+                kf_inited = True
+            car_xf, car_yf = kalman_update_grid(meas_x, meas_y)
+            car_x, car_y = int(car_xf + 0.5), int(car_yf + 0.5)
             car_found = True
+
+    # 本帧没观测到小车时，使用卡尔曼预测值保持轨迹连续。
+    if not car_found and kf_inited:
+        car_xf = kf_state["x"]
+        car_yf = kf_state["y"]
+        car_x = int(car_xf + 0.5)
+        car_y = int(car_yf + 0.5)
+        if car_x < 0:
+            car_x = 0
+        if car_x >= COLS:
+            car_x = COLS - 1
+        if car_y < 0:
+            car_y = 0
+        if car_y >= ROWS:
+            car_y = ROWS - 1
+        car_found = True
 
     if CALIB_SHOW_CORNERS:
         tl_pt, tr_pt, bl_pt, br_pt = draw_calibration_overlay(img, img_w, img_h)
 
-    # 对车辆坐标做短窗口多数投票，避免单帧色值波动导致坐标跳动
-    car_x, car_y = vote_car_position(car_found, car_x, car_y)
+    # 记录 last_pos，供下一帧 ROI 锁定搜索使用。
+    if car_found:
+        car_last_pos_grid = (car_x, car_y)
 
     # 输出阶段统一为单一@，并与投票后的发送坐标严格一致。
     map_list_out = build_map_with_single_car(map_list, car_found, car_x, car_y)
@@ -471,8 +875,8 @@ while(True):
     # 定时维护通讯心跳包
     send_heartbeat_if_due()
 
-    # --- 阶段 C：调试信息交互 (每 20 帧稳定更新一次打印) ---
-    if frame_cnt % 20 == 0:
+    # --- 阶段 C：调试信息交互 (每 2 帧稳定更新一次打印) ---
+    if frame_cnt % 2 == 0:
         print("\033[H", end="")        # 终端光标归零（清屏效果）
         print("系统帧率: %0.1f | 小车实时坐标: (%d, %d)" % (clock.fps(), car_x, car_y))
         if CALIB_SHOW_CORNERS and tl_pt is not None:
