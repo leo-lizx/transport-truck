@@ -136,8 +136,9 @@
  * 若 RECOVERY_DIST < HOLD_EXIT, 恢复全程在 RECOVERY_DIST 外 → 全量 KP → 必震荡.
  */
 /* P0-修复 2026-05-08 (快到目标停下然后慢爬抖动):
- * RECOVERY_DIST 需覆盖 BRAKE_DIST 与 HOLD_EXIT, 让末段全程进入温和增益区. */
-#define CHASSIS_POS_RECOVERY_DIST_M       (0.150f)
+ * RECOVERY_DIST 需覆盖 BRAKE_DIST 与 HOLD_EXIT, 让末段全程进入温和增益区.
+ * 2026-05-19: 随 BRAKE_DIST 同步扩大至 0.30f (≥ BRAKE_DIST=0.25). */
+#define CHASSIS_POS_RECOVERY_DIST_M       (0.30f)
 
 /* 扰动恢复最小增益比例.
  * 过大时被推开后会高速冲回目标, 麦轮惯性/打滑导致剧烈震荡. */
@@ -154,7 +155,7 @@
  *   完全看不出调参效果. 横向保持是「微修正」, 0.16 m/s 已够用,
  *   同时仍远低于主轴速度避免走斜线.
  * P0-修复 2026-05-11: 0.22 → 0.16. */
-#define CHASSIS_POS_AXIS_HOLD_MAX_SPEED_MPS (0.25f)
+#define CHASSIS_POS_AXIS_HOLD_MAX_SPEED_MPS (0.16f)
 
 /**
  * 轴向独立移动模式 (Manhattan / axis-by-axis).
@@ -388,7 +389,11 @@
  * ====================================================================== */
 
 /** 车体平移最大合成线速度（m/s），矢量模长不超过此值 */
-#define CHASSIS_MAX_LINEAR_SPEED_MPS    (1.50f)
+/* P0-修复 2026-05-19 (轮子停转): 1.20 → 0.70.
+ *   1.20 m/s 时单轮峰值电流超 TB6612 过流阈值 → 驱动器关断 → 轮停.
+ *   麦轮斜走单轮最坏 = 1.20×√2≈1.70 m/s, 冲击更大.
+ *   0.70 m/s: d_stop=0.70²/(2×2.10)=0.117m, BRAKE_DIST=0.25m ✓ 有裕量. */
+#define CHASSIS_MAX_LINEAR_SPEED_MPS    (0.70f)
 
 /** 车体最大旋转角速度（°/s）
  *  P0-修复 2026-04-29 姿态闭环转速慢: 原 90°/s 对应单轮仅 ≈0.4 m/s,
@@ -439,7 +444,7 @@
  * 只有 2.7cm 内是线性段, 稍远就切 sqrt 段大速度, 车高速冲入 EPSILON
  * 后 brake_cap 来不及刹停, 穿越后反弹. 恢复 4.5 使 linear_dist≈0.15m,
  * 近场仍保持 P 线性响应, 配合 BRAKE_DIST=0.25 可以平滑停车. */
-#define CHASSIS_POS_KP                  (3.7f)
+#define CHASSIS_POS_KP                  (4.6f)
 
 /**
  * 位置环横向增益 Kp_cross（Cross-Track Error 修正增益）
@@ -467,7 +472,7 @@
  *   D 项 = 0.01 × v_lpf ≈ 0, 车以全速冲入 EPSILON 后只靠 ramp/brake_cap
  *   制动, 穿越目标反弹, 来回振荡. 恢复 KD=1.00 (≈KP/3) 提供实质阻尼.
  * 起调建议: KD ≈ 0.3~0.5 × KP; KD=0 等于无阻尼, 必超调. */
-#define CHASSIS_POS_KD                  (1.20f)
+#define CHASSIS_POS_KD                  (1.50f)
 
 /** 位置环沿程方向积分增益 (m/s per m·s).
  * 消除静摩擦/坡面等引起的稳态位置残差.
@@ -534,10 +539,10 @@
  *   BRAKE_DIST ≥ 0.167 + EPSILON(0.06) = 0.227m → 取 0.25m 留裕量
  *
  * P0-修复 2026-05-11 (末段抖动): 0.11 → 0.25.
- *   0.11m 时制动区只有 5cm, max_speed=1.0 m/s 时停车需 19cm,
- *   车直接穿越 EPSILON 后 P 控制反向拉回, 反复振荡.
+ *   0.14m 时制动区仅 9cm, v_max=0.9 m/s 停车需 13.5cm, 仍然穿越 EPSILON 振荡.
+ *   v_max=0.90 m/s, accel=3.0 m/s²: d_stop=0.135m → BRAKE_DIST≥0.185m → 取 0.25m.
  *   若调低 max_speed 可相应缩小: 0.5 m/s 时 d_stop≈4cm, 取 0.15m 即可. */
-#define CHASSIS_POS_BRAKE_DIST_M         (0.12f)
+#define CHASSIS_POS_BRAKE_DIST_M         (0.25f)
 
 /**
  * brake_cap 末段最小有效速度 (m/s) - P0-修复 2026-05-12 (拐点 5s 停留根因).
@@ -555,7 +560,7 @@
  * 取值 0.12 m/s: 分到 4 麦轮 = 0.03 m/s/轮 远 > BREAKAWAY_TARGET_EPS(0.01),
  * 前馈 ramp 系数 = 1.0 饱和, ff = 1200 PWM 足以启动;
  * 同时 0.12 m/s × 0.02s = 2.4mm/拍, 穿越 EPSILON(50mm) 后只多走 5mm 安全. */
-#define CHASSIS_POS_BRAKE_FLOOR_MPS      (0.12f)
+#define CHASSIS_POS_BRAKE_FLOOR_MPS      (0.15f)
 
 /** 航向环 Kp：值越大，朝向对准越快；过大易振荡
  *  P0-调参 2026-04-29: 取消 YAW_MIN_WZ 阶跃后 wz 连续, 可适度提 KP 加快响应。
@@ -856,7 +861,7 @@
  *  -> 温漂导致 yaw 越走越偏. 放宽到 0.050: 完全静止仍能稳定 ZUPT, 同时
  *  车停在地面手没碰时也能算静止 (典型方差 ~0.01~0.03), bias 持续刷新.
  *  KF 对污染的容忍度高 (Q_BIAS 也提高), 阈值放宽风险可控. */
-#define CHASSIS_IMU_STILL_VAR_TH_DPS2    (0.050f)
+#define CHASSIS_IMU_STILL_VAR_TH_DPS2    (0.020f)
 
 /** 静止确认时, bias 快速更新系数 (EMA 拉向窗口均值, 比慢通道快 50 倍)
  *  0.10 -> 时间常数 ~10 拍 = 50ms 完成一次 bias 校准 */
@@ -927,7 +932,7 @@
 
 /** odom yaw 与 IMU yaw 偏差超过此值视为打滑 / 重定位事件,
  *  本拍跳过这次观测 (避免单次大跳跃污染 KF) */
-#define CHASSIS_ODOM_YAW_OUTLIER_DEG     (15.0f)
+#define CHASSIS_ODOM_YAW_OUTLIER_DEG     (9.0f)
 
 /** Innovation Gating: |wz_odom - wz_imu| 超过此值视为编码器异常 (°/s),
  *  本拍跳过 KF 注入. (P0-修复 2026-05-02 抬车空转污染 KF):
@@ -941,7 +946,7 @@
  *  设小 (10): 严苛, 高速转向时也可能误拒 (轮胎打滑常见 wz_odom 偏 5~10°/s)
  *  设大 (50): 宽松, 但抬车空转判别迟钝
  *  20°/s 是工程平衡点, 正常打滑差 < 10, 抬车差 > 50, 留 2x 余量. */
-#define CHASSIS_ODOM_YAW_INNOV_GATE_DPS  (20.0f)
+#define CHASSIS_ODOM_YAW_INNOV_GATE_DPS  (10.0f)
 
 /* ======================================================================
  *  缓加速参数 — 防止目标速度突变导致轮胎打滑
@@ -954,7 +959,7 @@
  *   3.0 m/s²: 0→2.35 m/s 仅 0.78s, 2m 行程可短暂跑满速
  * 麦轮横向移动靠滚轮分力, 不依赖轮端抓地, 比纵向更耐高加速.
  * P0-调参 2026-05-08 (收敛太慢): 3.00 → 5.00, 加快速度命令爬坡/刹车响应. */
-#define CHASSIS_CMD_ACCEL_LIMIT_MPS2    (3.0f)
+#define CHASSIS_CMD_ACCEL_LIMIT_MPS2    (1.10f)
 
 /** 角速度最大加速度（°/s²）
  *  P0-调参 2026-05-02 (大角度阶跃响应慢):
@@ -978,6 +983,7 @@
 
 /** Y 方向里程计缩放系数 */
 #define CHASSIS_ODOM_SCALE_Y            (0.426f)
+
 //#define CHASSIS_ODOM_SCALE_Y            (0.43617f)
 
 /* ======================================================================

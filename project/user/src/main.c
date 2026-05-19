@@ -290,6 +290,17 @@ static void main_run_soko_selftest_periodic_5ms(void)
 
 #define MAIN_POS_NAV_HOLD_YAW_DEG     (0.0f)   /* 全程锁住 0° 航向 */
 
+/*
+ * 上电暖机等待时长 (5ms tick 数). 200 × 5ms = 1s.
+ * 等待以下子系统稳定后, 主循环才下发第1个导航目标:
+ *   1. IMU KF 收敛 (~500ms): Kalman P 压缩到稳态, 零偏估计准确;
+ *      未收敛时 yaw 漂移 1~5°, 里程计误差随时间线性累积.
+ *   2. 编码器 LPF 稳定 (~100ms): 前几拍速度反馈偏大, odometry 的 vx/vy 有初始误差.
+ *   3. 静止检测滑窗填满 (STILL_WINDOW_LEN × 5ms): 窗口未满时在线零偏自适应不工作.
+ * 暖机期 chassis_ctrl 保持 YAW_HOLD, 位置积分 s_pos_i 不运行, 无积分超调风险.
+ */
+#define MAIN_POINT_NAV_WARMUP_TICKS   (200U)   /* 200 × 5ms = 1s 暖机 */
+
 /* 格 → 米换算 (POINT_NAV 专用, 不影响 BFS 的内场索引体系).
  * 约定: 整数 n = 第 n 格中心 (1-based), 公式为 (n - 0.5) × STEP.
  *   n=1  → 0.5 × STEP (第1格中心, 距左/上墙半格)
@@ -407,10 +418,10 @@ main(void)
     /* ✅ 姿态闭环调试走这里: 只设一次目标角, 后续 PIT_CH1 20ms 中断中持续闭环. */
     chassis_ctrl_hold_yaw(MAIN_HOLD_YAW_TARGET_DEG);
 #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_POINT_NAV)
-    /* 四角遍历: 从发车位依次跨走 左上→右上→右下→左下 四个内场角落, 只跑一圈.
-     * chassis_grid_x/y_to_m 已统一为格中心坐标, 这里使用 move_to_grid 避免 move_to_m
-     * 强制锁航导致轴向平移时持续微转, 影响直线度和定位精度. */
-    chassis_ctrl_move_to_grid(CHASSIS_GRID_INNER_MIN_X, CHASSIS_GRID_INNER_MIN_Y);  /* 第1角: 左上格中心 */
+    /* 四角遍历: 首目标由主循环在暖机完成后下发 (MAIN_POINT_NAV_WARMUP_TICKS).
+     * 此处只保持 YAW_HOLD, 让 IMU KF / 编码器 LPF 先稳定,
+     * 避免位置积分在系统未就绪时提前累积导致起步超调. */
+    chassis_ctrl_hold_yaw(0.0f);
 #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_SOKO_SELFTEST)
     /* 推箱求解自测: 不驱动车体, 仅保留底层初始化和 DAP 串口输出. */
     uart_init(UART_1, 115200, UART1_TX_B12, UART1_RX_B13);
@@ -458,28 +469,82 @@ main(void)
         /* ✅ 姿态闭环调试打印走这里: 50ms 打印 12 通道, 用于画角度曲线 */
         chassis_ctrl_attitude_debug_task_5ms();
     #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_POINT_NAV)
-        /* 四角遍历状态机: 到位后自动切到下一个角, 全部跑完即停. */
+        /* 路径航点遍历状态机:
+         *   暖机 1s → 依次下发航点 → 全程结束后驻停于终点.
+         *
+         *   标志位: chassis_ctrl_is_arrived() (chassis 内部 s_arrived)
+         *     == 0: 行驶中 / 旋转中 (发车时由 move_to_grid / rotate_to_deg 内部清零)
+         *     == 1: 已到达当前目标
+         *   到达后立即更新索引并派发下一个航点, 自动将标志位清零; 全程结束驻停. */
         {
-            /* 内场四角坐标 (格): 左上 → 右上 → 右下 → 左下 */
-            static const uint8 s_nav_corners[4][2] = {
-                { CHASSIS_GRID_INNER_MIN_X, CHASSIS_GRID_INNER_MIN_Y },  /* 左上 */
-                { CHASSIS_GRID_INNER_MAX_X, CHASSIS_GRID_INNER_MIN_Y },  /* 右上 */
-                { CHASSIS_GRID_INNER_MAX_X, CHASSIS_GRID_INNER_MAX_Y },  /* 右下 */
-                { CHASSIS_GRID_INNER_MIN_X, CHASSIS_GRID_INNER_MAX_Y },  /* 左下 */
-            };
-            /* 当前目标角索引: 0-3 = 尚未完成, 4 = 全部跨完 */
-            static uint8 s_corner_step = 0U;
+            /* 航点动作类型 */
+            #define S_NAV_MOVE_GRID  (0U)   /* chassis_ctrl_move_to_grid(x格, y格) */
+            #define S_NAV_MOVE_M     (2U)   /* chassis_ctrl_move_to_m (用于半格精度) */
 
-            /* 检测到位后切下一个目标; 到达最后一角后不再下发新指令, 车停在左下角 */
-            if (chassis_ctrl_is_arrived() && (s_corner_step < 4U)) {
-                s_corner_step++;
-                if (s_corner_step < 4U) {
-                    chassis_ctrl_move_to_grid(s_nav_corners[s_corner_step][0],
-                                              s_nav_corners[s_corner_step][1]);
+            /* 航点描述: { 动作, a, b }
+             *   S_NAV_MOVE_GRID: a=x(格), b=y(格)
+             *   S_NAV_MOVE_M:    a=x(格,运行时换算为米), b=y(格,运行时换算为米)
+             *
+             * 注意: 不再使用 S_NAV_ROTATE 原地旋转指令.
+             * 根因: 麦轮原地旋转时滚子滑动 → 里程计 X/Y 积分偏差 → 旋转后
+             *       move_to_grid 的 yaw_snap 锁住非 0° 航向 → 后续平移变成侧向
+             *       strafing (精度低) → "走斜线". 去掉旋转后车辆全程锁 0° 航向,
+             *       与之前可靠运行的四角遍历逻辑保持一致. */
+            typedef struct { uint8 act; float a; float b; } s_nav_wp_t;
+            /* ────────────────────────────────────────────────────────────
+             * 当前路线总行程约 25.4m，麦轮里程计漂移 2~5% → 位置误差 50cm~1.3m.
+             * 【优化建议】去掉⑥⑦⑧三个重复角落，改为5步直接回起点，
+             * 可将行程缩短到 ~15m，漂移减半。若赛规要求重复访问则保留。
+             * ──────────────────────────────────────────────────────────── */
+            static const s_nav_wp_t s_wps[] = {
+                { S_NAV_MOVE_GRID,  1.0f,  1.0f  },  /* ① 左上角 (1,1)   */
+                { S_NAV_MOVE_GRID,  14.0f, 1.0f  },  /* ② 右上角 (14,1)  */
+                { S_NAV_MOVE_GRID,  14.0f, 10.0f },  /* ③ 右下角 (14,10) */
+                { S_NAV_MOVE_GRID,  1.0f,  10.0f },  /* ④ 左下角 (1,10)  */
+                { S_NAV_MOVE_GRID,  7.0f,  5.0f  },  /* ⑤ 中心  (7,5)    */
+                { S_NAV_MOVE_GRID,  1.0f,  1.0f  },  /* ⑥ 左上角 (1,1) 再次经过 */
+                { S_NAV_MOVE_GRID,  14.0f, 10.0f },  /* ⑦ 右下角 (14,10) 再次经过 */
+                { S_NAV_MOVE_GRID,  1.0f,  1.0f  },  /* ⑧ 左上角 (1,1)  作为回程中转 */
+                { S_NAV_MOVE_M,     1.0f,  5.5f  },  /* ⑨ 回起点 (1,5.5) */
+            };
+
+            static uint8  s_wp_idx       = 0U;   /* 当前航点索引 (0 起, 到 count 停止) */
+            static uint16 s_warmup_ticks = 0U;   /* 暖机计数 (5ms tick) */
+            static uint8  s_nav_started  = 0U;   /* 0=暖机中, 1=遍历进行中 */
+
+/* 航点派发辅助宏: wp 为 const s_nav_wp_t * */
+#define S_NAV_DISPATCH(wp)                                                   \
+    do {                                                                     \
+        if (S_NAV_MOVE_GRID == (wp)->act) {                                  \
+            chassis_ctrl_move_to_grid((uint8)(wp)->a, (uint8)(wp)->b);       \
+        } else {                                                             \
+            chassis_ctrl_move_to_m(MAIN_POS_GRID_TO_M_X((wp)->a),           \
+                                   MAIN_POS_GRID_TO_M_Y((wp)->b), 0.0f);    \
+        }                                                                    \
+    } while (0)
+
+            if (!s_nav_started) {
+                /* 暖机: 等待 IMU KF + 编码器 LPF + 静止窗口全部就绪 */
+                if (++s_warmup_ticks >= MAIN_POINT_NAV_WARMUP_TICKS) {
+                    s_nav_started = 1U;
+                    /* 派发首个航点; chassis 内部置 s_arrived=0 → 标志位: 未到 */
+                    S_NAV_DISPATCH(&s_wps[0]);
+                }
+            } else if (s_wp_idx < (uint8)(sizeof(s_wps) / sizeof(s_wps[0]))) {
+                /* chassis_ctrl_is_arrived() == 1 → 标志位: 已到 → 遍历下一个 */
+                if (chassis_ctrl_is_arrived()) {
+                    s_wp_idx++;   /* 更新索引 */
+                    if (s_wp_idx < (uint8)(sizeof(s_wps) / sizeof(s_wps[0]))) {
+                        /* 派发下一航点; chassis 内部清零 s_arrived → 标志位: 未到 */
+                        S_NAV_DISPATCH(&s_wps[s_wp_idx]);
+                    }
+                    /* s_wp_idx == count: 全程结束, 车驻停于终点 (1,5.5) */
                 }
             }
 
-            /* 50ms 打印: 当前位姿 / 当前目标 / 到位标志 / 当前步骤 */
+#undef S_NAV_DISPATCH
+
+            /* 50ms 打印: 位姿 / 目标点 / 到达标志 / 当前航点索引 */
             {
                 static uint8 s_pos_div = 0U;
                 if (++s_pos_div >= 10U) {
@@ -497,7 +562,7 @@ main(void)
                            dist_sq,
                            pose.yaw_deg,
                            (int)chassis_ctrl_is_arrived(),
-                           (int)s_corner_step);
+                           (int)s_wp_idx);
                 }
             }
         }
