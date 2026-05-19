@@ -141,7 +141,7 @@
 
 /* 扰动恢复最小增益比例.
  * 过大时被推开后会高速冲回目标, 麦轮惯性/打滑导致剧烈震荡. */
-#define CHASSIS_POS_RECOVERY_KP_SCALE     (0.45f)
+#define CHASSIS_POS_RECOVERY_KP_SCALE     (0.85f)
 
 /* 扰动恢复区最大合成速度 (m/s).
  * 只限制 dist < RECOVERY_DIST 的回位动作, 不影响远距离正常赶路. */
@@ -151,10 +151,10 @@
  * 该值是 CTE_KP 实际是否「有效」的关键:
  *   保持轴输出 = clamp(sqrt_ctrl(err, CTE_KP, accel), ±THIS_LIMIT)
  *   如果 THIS_LIMIT 太大 (如 0.22), CTE_KP 调 10 还是调 100 输出都被夹死,
- *   完全看不出调参效果. 横向保持是「微修正」, 0.06 m/s 已够用,
+ *   完全看不出调参效果. 横向保持是「微修正」, 0.16 m/s 已够用,
  *   同时仍远低于主轴速度避免走斜线.
- * P0-修复 2026-05-11: 0.22 → 0.06. */
-#define CHASSIS_POS_AXIS_HOLD_MAX_SPEED_MPS (0.06f)
+ * P0-修复 2026-05-11: 0.22 → 0.16. */
+#define CHASSIS_POS_AXIS_HOLD_MAX_SPEED_MPS (0.25f)
 
 /**
  * 轴向独立移动模式 (Manhattan / axis-by-axis).
@@ -388,7 +388,7 @@
  * ====================================================================== */
 
 /** 车体平移最大合成线速度（m/s），矢量模长不超过此值 */
-#define CHASSIS_MAX_LINEAR_SPEED_MPS    (0.65f)
+#define CHASSIS_MAX_LINEAR_SPEED_MPS    (1.50f)
 
 /** 车体最大旋转角速度（°/s）
  *  P0-修复 2026-04-29 姿态闭环转速慢: 原 90°/s 对应单轮仅 ≈0.4 m/s,
@@ -439,7 +439,7 @@
  * 只有 2.7cm 内是线性段, 稍远就切 sqrt 段大速度, 车高速冲入 EPSILON
  * 后 brake_cap 来不及刹停, 穿越后反弹. 恢复 4.5 使 linear_dist≈0.15m,
  * 近场仍保持 P 线性响应, 配合 BRAKE_DIST=0.25 可以平滑停车. */
-#define CHASSIS_POS_KP                  (4.20f)
+#define CHASSIS_POS_KP                  (3.7f)
 
 /**
  * 位置环横向增益 Kp_cross（Cross-Track Error 修正增益）
@@ -449,7 +449,7 @@
  *   CTE_KP 最终被 AXIS_HOLD_MAX_SPEED_MPS(0.06) 限幅, 调到 100 也没用.
  *   实际生效的是: 横向偏差多少时输出达到上限. KP=5, err=12mm 时输出
  *   sqrt_ctrl(0.012, 5, 3)≈0.06 m/s, 恰好触及限幅, 12mm 内线性精细修正. */
-#define CHASSIS_POS_CTE_KP              (5.0f)
+#define CHASSIS_POS_CTE_KP              (4.0f)
 
 /**
  * 位置环 D 项增益 (沿程方向) - 速度阻尼.
@@ -467,12 +467,12 @@
  *   D 项 = 0.01 × v_lpf ≈ 0, 车以全速冲入 EPSILON 后只靠 ramp/brake_cap
  *   制动, 穿越目标反弹, 来回振荡. 恢复 KD=1.00 (≈KP/3) 提供实质阻尼.
  * 起调建议: KD ≈ 0.3~0.5 × KP; KD=0 等于无阻尼, 必超调. */
-#define CHASSIS_POS_KD                  (1.10f)
+#define CHASSIS_POS_KD                  (1.20f)
 
 /** 位置环沿程方向积分增益 (m/s per m·s).
  * 消除静摩擦/坡面等引起的稳态位置残差.
  * 建议从 0 开始调, 每次 +0.05; 过大时车到位后缓慢漂移/越界. */
-#define CHASSIS_POS_KI                  (0.00f)
+#define CHASSIS_POS_KI                  (0.05f)
 
 /** 位置环积分输出上限 (m/s).
  * 限制积分最大能贡献的速度, 防止卷绕后冲. */
@@ -954,7 +954,7 @@
  *   3.0 m/s²: 0→2.35 m/s 仅 0.78s, 2m 行程可短暂跑满速
  * 麦轮横向移动靠滚轮分力, 不依赖轮端抓地, 比纵向更耐高加速.
  * P0-调参 2026-05-08 (收敛太慢): 3.00 → 5.00, 加快速度命令爬坡/刹车响应. */
-#define CHASSIS_CMD_ACCEL_LIMIT_MPS2    (2.50f)
+#define CHASSIS_CMD_ACCEL_LIMIT_MPS2    (3.0f)
 
 /** 角速度最大加速度（°/s²）
  *  P0-调参 2026-05-02 (大角度阶跃响应慢):
