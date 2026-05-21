@@ -3,24 +3,28 @@ sokoban_gui.py — 推箱子算法验证器（Tkinter GUI）
 ================================================
 依赖：仅 Python 标准库（tkinter 内置）
 运行：python sokoban_gui.py
+
+功能：随机/导入地图、三阶段求解、Stage2/3 侦查、炸弹爆炸、指令验证
 """
 
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 import threading
 import time
 from typing import Optional
 
 from sokoban_validator import (
     MAP_ROWS, MAP_COLS,
-    INNER_R_MIN, INNER_R_MAX, INNER_C_MIN, INNER_C_MAX,
     EMPTY, WALL, TARGET, BOX, BOMB,
     DR, DC,
     extract_elements, is_inner,
-    solve_stage1, solve_stage2, solve_stage3,
+    solve_level,
     actions_to_string, actions_to_waypoints,
     check_win, check_deadlock,
-    generate_map,
+    generate_map, default_box_mapping,
+    parse_map_text, export_map_text,
+    verify_run_script, build_script_from_solution,
+    apply_bomb_explosion,
 )
 
 # ── 配色 ────────────────────────────────────────────────────────────
@@ -48,8 +52,10 @@ CELL = {
     "box_ok":    "#50fa7b",
     "player":    "#bd93f9",
     "pl_tgt":    "#ff79c6",
+    "scout":     "#8be9fd",
     "grid":      "#2d2f3f",
     "frame":     "#6272a4",
+    "visit":     "#45475a",
 }
 
 CELL_PX  = 38
@@ -64,8 +70,9 @@ F_H2     = ("Segoe UI", 11, "bold")
 class SokobanApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("推箱子算法验证器")
+        self.title("推箱子算法验证器 · PC")
         self.configure(bg=THEME["bg"])
+        self.minsize(900, 720)
         self.resizable(True, True)
 
         self.cur_map:    Optional[list]  = None
@@ -76,7 +83,10 @@ class SokobanApp(tk.Tk):
         self.solution:   Optional[dict]  = None
         self._actions:   list  = []
         self._box_seq:   list  = []
+        self._phase_seq: list  = []
         self._subtask_ends: list  = []
+        self._scout_visits: list = []
+        self._box_mapping: list = []
         self._anim_map:  Optional[list]  = None
         self._wall_pos:  Optional[tuple] = None
         self.step_idx:   int   = 0
@@ -99,8 +109,10 @@ class SokobanApp(tk.Tk):
         hdr.pack(fill="x", padx=16, pady=(12, 4))
         tk.Label(hdr, text="推箱子算法验证器",
                  font=F_H1, bg=THEME["bg"], fg=THEME["accent"]).pack(side="left")
-        tk.Label(hdr, text="algo_sokoban_solver.c  ·  PC验证",
+        tk.Label(hdr, text="12×16 · 侦查/推箱/炸弹 · 指令验证",
                  font=F_UI, bg=THEME["bg"], fg=THEME["dim"]).pack(side="left", padx=10)
+        _btn(hdr, "📂 导入", self._import_map, THEME["btn"], side="right", padx=4)
+        _btn(hdr, "💾 导出", self._export_map, THEME["btn"], side="right", padx=4)
         _sep(self)
 
         body = tk.Frame(self, bg=THEME["bg"])
@@ -138,9 +150,24 @@ class SokobanApp(tk.Tk):
         self.lbl_steps  = _stat(sf, "步数",  "0",  THEME["accent"])
         self.lbl_pushes = _stat(sf, "推箱",  "0",  THEME["orange"])
         self.lbl_status = _stat(sf, "状态",  "就绪", THEME["green"])
+        self.lbl_phase  = _stat(sf, "阶段",  "—",   THEME["dim"])
+
+        leg = tk.Frame(left, bg=THEME["panel"], padx=8, pady=4)
+        leg.pack(fill="x", pady=(4, 0))
+        for sym, txt, col in [
+            ("@", "玩家", CELL["player"]),
+            ("□", "箱子", CELL["box"]),
+            ("◎", "目标", THEME["green"]),
+            ("◆", "炸弹", CELL["bomb"]),
+            ("◇", "侦查点", CELL["scout"]),
+        ]:
+            tk.Label(leg, text=sym, font=F_CELL, bg=THEME["panel"],
+                     fg=col).pack(side="left", padx=(0, 2))
+            tk.Label(leg, text=txt, font=("Segoe UI", 8),
+                     bg=THEME["panel"], fg=THEME["dim"]).pack(side="left", padx=(0, 8))
 
     def _build_right(self, parent):
-        right = tk.Frame(parent, bg=THEME["bg"], width=310)
+        right = tk.Frame(parent, bg=THEME["bg"], width=380)
         right.pack(side="left", fill="both", expand=True, padx=(14, 0), anchor="n")
         right.pack_propagate(False)
 
@@ -181,7 +208,10 @@ class SokobanApp(tk.Tk):
                  highlightthickness=0,
                  activebackground=THEME["accent"]).pack(side="left", padx=4)
 
-        _btn(right, "⟳  生成地图并求解", self._auto_gen, THEME["accent"], pady=6)
+        bf = tk.Frame(right, bg=THEME["bg"])
+        bf.pack(fill="x", pady=4)
+        _btn(bf, "⟳ 生成并求解", self._auto_gen, THEME["accent"], side="left", padx=(0, 6))
+        _btn(bf, "仅求解", self._solve_only, THEME["btn"], side="left")
 
         # 分阶段预览开关
         prev_f = tk.Frame(right, bg=THEME["bg"])
@@ -227,7 +257,21 @@ class SokobanApp(tk.Tk):
         self.txt_cmd = _txt(right, height=4, fg=THEME["green"])
 
         _sec(right, "转弯路点序列")
-        self.txt_wp = _txt(right, height=3, fg=THEME["orange"])
+        self.txt_wp = _txt(right, height=2, fg=THEME["orange"])
+
+        _sec(right, "运行指令验证  (SCOUT / PUSH / BOMB)")
+        hint = ("# SCOUT: 侦查(小写/路点W列,行)  PUSH: 推箱  BOMB: 炸弹\n"
+                "# 例: SCOUT: W7,5;W9,4\nPUSH: rrrUddd")
+        tk.Label(right, text=hint, font=("Segoe UI", 8), justify="left",
+                 bg=THEME["bg"], fg=THEME["dim"]).pack(anchor="w")
+        self.txt_script = tk.Text(right, height=5, wrap="word", font=F_MONO,
+                                  bg=THEME["panel"], fg=THEME["text"],
+                                  insertbackground=THEME["text"], relief="flat")
+        self.txt_script.pack(fill="x", pady=2)
+        vf = tk.Frame(right, bg=THEME["bg"])
+        vf.pack(fill="x", pady=2)
+        _btn(vf, "✓ 验证指令", self._verify_script, THEME["green"], side="left", padx=(0, 6))
+        _btn(vf, "↻ 从求解填充", self._fill_script, THEME["btn"], side="left")
 
     def _build_log(self):
         lf = tk.Frame(self, bg=THEME["bg"])
@@ -250,6 +294,43 @@ class SokobanApp(tk.Tk):
         else:
             self.s2_frame.pack_forget()
 
+    def _import_map(self):
+        path = filedialog.askopenfilename(
+            title="导入地图",
+            filetypes=[("文本", "*.txt"), ("所有", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                text = f.read()
+            m, p, err = parse_map_text(text)
+            if m is None:
+                messagebox.showerror("导入失败", err)
+                return
+            self._log(f"已导入: {path}", "ok")
+            self._load_map(m, p, self.stage_var.get())
+        except Exception as e:
+            messagebox.showerror("导入失败", str(e))
+
+    def _export_map(self):
+        if not self.cur_map:
+            messagebox.showwarning("导出", "请先生成或导入地图")
+            return
+        path = filedialog.asksaveasfilename(
+            title="导出地图", defaultextension=".txt",
+            filetypes=[("文本", "*.txt")])
+        if not path:
+            return
+        text = export_map_text(self.cur_map, self._i_player)
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(text + '\n')
+        self._log(f"已导出: {path}", "ok")
+
+    def _load_map(self, m, p, stage):
+        if self.anim_run:
+            self._pause()
+        self._map_ready(m, p, stage)
+
     def _auto_gen(self):
         if self.anim_run:
             self._pause()
@@ -270,6 +351,12 @@ class SokobanApp(tk.Tk):
                 self.after(0, self._log, f"生成失败: {e}", "err")
         threading.Thread(target=worker, daemon=True).start()
 
+    def _solve_only(self):
+        if not self.cur_map:
+            self._log("请先生成或导入地图", "warn")
+            return
+        self._run_solve(self.cur_map, self._i_player, self.stage_var.get())
+
     def _map_ready(self, m, p, stage):
         self.cur_map       = m
         self.player        = p
@@ -282,6 +369,7 @@ class SokobanApp(tk.Tk):
         self._subtask_ends = []
         self._anim_map     = None
         self._wall_pos     = None
+        self._scout_visits = []
         self.step_idx      = 0
         self.push_count    = 0
 
@@ -291,50 +379,24 @@ class SokobanApp(tk.Tk):
 
         self._redraw()
         self._update_stats(0, 0)
+        self._run_solve(m, p, stage)
+
+    def _run_solve(self, m, p, stage):
         self._set_status("求解中…", THEME["orange"])
-        self._log("地图就绪，开始BFS求解…")
+        self._log("BFS 求解中…")
 
         def solve():
             try:
-                if stage == 1:
-                    sol = solve_stage1(m, p)
-                elif stage == 2:
-                    sol = solve_stage1(m, p)
-                else:
-                    raw = solve_stage3(m, p)
-                    sol = self._flatten3(raw)
+                mapping = None
+                if stage == 2:
+                    boxes = extract_elements(m, BOX)
+                    targets = extract_elements(m, TARGET)
+                    mapping = default_box_mapping(boxes, targets)
+                sol = solve_level(stage, m, p, mapping, require_scout=(stage >= 2))
                 self.after(0, self._solve_done, sol, stage)
             except Exception as e:
                 self.after(0, self._log, f"求解异常: {e}", "err")
         threading.Thread(target=solve, daemon=True).start()
-
-    def _flatten3(self, raw) -> Optional[dict]:
-        if raw is None:
-            return None
-        subs = []
-        subs.append({
-            'actions':    raw['bomb_actions'],
-            'box_idx':    -1,
-            'target_idx': -1,
-            'player_end': raw['cur_player_after_bomb'],
-            'box_start':  raw['bomb_pos'],
-        })
-        s1       = raw.get('stage1_result')
-        wall_pos = raw.get('wall_pos')
-        if s1:
-            for item in s1['sub_solutions']:
-                d = dict(item)
-                d['box_start'] = s1['boxes'][item['box_idx']]
-                subs.append(d)
-            return {'sub_solutions': subs, 'boxes': s1['boxes'],
-                    'targets': s1['targets'],
-                    'total_steps': sum(len(x['actions']) for x in subs),
-                    '_wall_pos': wall_pos}
-        return {'sub_solutions': subs,
-                'boxes':   extract_elements(self.cur_map, BOX),
-                'targets': extract_elements(self.cur_map, TARGET),
-                'total_steps': len(raw['bomb_actions']),
-                '_wall_pos': wall_pos}
 
     def _solve_done(self, sol, stage):
         if sol is None:
@@ -343,9 +405,14 @@ class SokobanApp(tk.Tk):
             return
         self.solution  = sol
         self._wall_pos = sol.get('_wall_pos')
+        scout = sol.get('scout')
+        if scout:
+            self._scout_visits = [v['observe'] for v in scout.get('visits', [])]
+            self._log(f"侦查: 访问 {len(self._scout_visits)} 个观察点", "info")
         self._log(f"✓ 求解完成  总步数: {sol['total_steps']}", "ok")
         self._expand(sol)
         self._fill_cmd(sol)
+        self._fill_script()
         self._update_progress(0)
         self._set_status("就绪", THEME["green"])
         if stage == 2:
@@ -354,24 +421,34 @@ class SokobanApp(tk.Tk):
     def _expand(self, sol):
         self._actions      = []
         self._box_seq      = []
+        self._phase_seq    = []
         self._subtask_ends = []
         cur_p = self._i_player
         boxes = list(sol.get('boxes', self.boxes))
 
         for sub in sol['sub_solutions']:
+            phase = sub.get('phase', 'push')
             bi = sub['box_idx']
             if bi >= 0:
                 br, bc = sub.get('box_start', boxes[bi])
-            else:
+            elif bi == -1:
                 br, bc = sub['box_start']
+            else:
+                br, bc = 0, 0
+
             for act in sub['actions']:
                 self._actions.append(act)
                 self._box_seq.append((bi, br, bc))
-                npr = cur_p[0] + DR[act]
-                npc = cur_p[1] + DC[act]
-                if npr == br and npc == bc:
-                    br += DR[act]
-                    bc += DC[act]
+                self._phase_seq.append(phase)
+                if phase != 'scout':
+                    npr = cur_p[0] + DR[act]
+                    npc = cur_p[1] + DC[act]
+                    if npr == br and npc == bc:
+                        br += DR[act]
+                        bc += DC[act]
+                else:
+                    npr = cur_p[0] + DR[act]
+                    npc = cur_p[1] + DC[act]
                 cur_p = (npr, npc)
             if self._actions:
                 self._subtask_ends.append(len(self._actions) - 1)
@@ -380,15 +457,58 @@ class SokobanApp(tk.Tk):
         cmd_parts, wp_parts = [], []
         cur_p = self._i_player
         for sub in sol['sub_solutions']:
+            phase = sub.get('phase', 'push')
             bi = sub['box_idx']
-            b_start = sub.get('box_start', sol['boxes'][bi]) if bi >= 0 else sub['box_start']
-            cmd_parts.append(
-                actions_to_string(sub['actions'], cur_p, b_start, use_unicode=False))
+            if phase == 'scout':
+                cmd_parts.append('[侦查] ' + ''.join(
+                    'udlr'[a] for a in sub['actions']))
+            elif bi == -1:
+                b_start = sub['box_start']
+                cmd_parts.append('[炸弹] ' + actions_to_string(
+                    sub['actions'], cur_p, b_start, use_unicode=False))
+            else:
+                b_start = sub.get('box_start', sol['boxes'][bi])
+                cmd_parts.append(actions_to_string(
+                    sub['actions'], cur_p, b_start, use_unicode=False))
             wp_parts.append(str(
                 [(c, r) for r, c in actions_to_waypoints(sub['actions'], cur_p)]))
             cur_p = sub['player_end']
         _txt_set(self.txt_cmd, ' | '.join(cmd_parts))
         _txt_set(self.txt_wp,  '\n'.join(wp_parts))
+
+    def _fill_script(self):
+        if not self.solution:
+            return
+        self.txt_script.delete("1.0", "end")
+        self.txt_script.insert("end", build_script_from_solution(self.solution))
+
+    def _verify_script(self):
+        if not self.cur_map:
+            self._log("请先生成或导入地图", "warn")
+            return
+        text = self.txt_script.get("1.0", "end").strip()
+        if not text:
+            self._log("指令为空", "warn")
+            return
+        stage = self.stage_var.get()
+        self._log("验证运行指令…", "info")
+
+        def work():
+            r = verify_run_script(
+                self.cur_map, self._i_player, text, stage,
+                expect_scout=(stage >= 2))
+            self.after(0, self._verify_done, r)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _verify_done(self, r):
+        if r['ok']:
+            self._log(r['message'], "ok")
+            self._set_status("指令验证通过", THEME["green"])
+            messagebox.showinfo("验证通过", r['message'] + "\n阶段: " + ', '.join(r['phases_done']))
+        else:
+            self._log("✗ " + r['message'], "err")
+            self._set_status("验证失败", THEME["red"])
+            messagebox.showerror("验证失败", r['message'])
 
     def _build_s2_ui(self, boxes, targets):
         for w in self.s2_frame.winfo_children():
@@ -410,10 +530,10 @@ class SokobanApp(tk.Tk):
         self.s2_frame.pack(fill="x", pady=4)
 
     def _apply_s2(self):
-        if not self.cur_map or not self.solution:
+        if not self.cur_map:
             return
         mapping = [v.get() - 1 for v in self.s2_vars]
-        sol = solve_stage2(self.cur_map, self._i_player, mapping)
+        sol = solve_level(2, self.cur_map, self._i_player, mapping, require_scout=True)
         self._solve_done(sol, 2)
         if sol:
             self._log(f"Stage2 重算  步数: {sol['total_steps']}", "ok")
@@ -425,6 +545,7 @@ class SokobanApp(tk.Tk):
             return
         cv.delete("all")
         box_set = set(self.boxes)
+        visit_set = set(self._scout_visits)
 
         for row in range(MAP_ROWS):
             for col in range(MAP_COLS):
@@ -445,7 +566,11 @@ class SokobanApp(tk.Tk):
                 cx, cy = x0 + CELL_PX//2, y0 + CELL_PX//2
 
                 if pos == self.player:
-                    fill = CELL["pl_tgt"] if cell == TARGET else CELL["player"]
+                    phase = (self._phase_seq[self.step_idx - 1]
+                             if self.step_idx > 0 and self.step_idx <= len(self._phase_seq)
+                             else "")
+                    fill = (CELL["scout"] if phase == 'scout'
+                            else CELL["pl_tgt"] if cell == TARGET else CELL["player"])
                     cv.create_oval(x0+5, y0+5, x1-5, y1-5, fill=fill, outline="")
                     cv.create_text(cx, cy, text="@", font=F_CELL, fill=THEME["bg"])
 
@@ -470,6 +595,11 @@ class SokobanApp(tk.Tk):
                     cv.create_rectangle(x0+2, y0+2, x1-2, y1-2,
                                         fill=CELL["wall"],
                                         outline=THEME["border"], width=1)
+
+                elif pos in visit_set:
+                    cv.create_rectangle(x0+3, y0+3, x1-3, y1-3,
+                                        outline=CELL["scout"], width=2)
+                    cv.create_text(cx, cy, text="◇", font=F_CELL, fill=CELL["scout"])
 
         cv.create_rectangle(1, 1, MAP_COLS*CELL_PX-1, MAP_ROWS*CELL_PX-1,
                             outline=CELL["frame"], width=2, fill="")
@@ -520,6 +650,9 @@ class SokobanApp(tk.Tk):
         self.player    = self._i_player
         self.boxes     = list(self._i_boxes)
         self._anim_map = None
+        self._phase_seq = []
+        self._scout_visits = []
+        self.lbl_phase.config(text="—")
         self._redraw()
         self._update_stats(0, 0)
         self._update_progress(0)
@@ -547,11 +680,21 @@ class SokobanApp(tk.Tk):
         self._update_stats(self.step_idx, self.push_count)
         self._update_progress(self.step_idx)
 
+    def _current_phase_label(self, idx):
+        if idx < len(self._phase_seq):
+            ph = self._phase_seq[idx]
+            return {'scout': '侦查', 'bomb': '炸弹', 'push': '推箱'}.get(ph, '—')
+        return '—'
+
     def _apply(self, idx):
         act = self._actions[idx]
         bi, br, bc = self._box_seq[idx]
+        phase = self._phase_seq[idx] if idx < len(self._phase_seq) else 'push'
         pr, pc = self.player
         npr, npc = pr + DR[act], pc + DC[act]
+        if phase == 'scout':
+            self.player = (npr, npc)
+            return
         if bi == -1:
             # 炸弹步骤：更新 _anim_map
             if self._anim_map is None:
@@ -581,8 +724,18 @@ class SokobanApp(tk.Tk):
             return
         act = self._actions[idx]
         bi, br, bc = self._box_seq[idx]
+        phase = self._phase_seq[idx] if idx < len(self._phase_seq) else 'push'
         pr, pc = self.player
         npr, npc = pr + DR[act], pc + DC[act]
+
+        self.lbl_phase.config(text=self._current_phase_label(idx))
+
+        if phase == 'scout':
+            self.player = (npr, npc)
+            self._redraw()
+            self._update_stats(idx + 1, self.push_count)
+            self._update_progress(idx + 1)
+            return
 
         if bi == -1:
             # ── 炸弹步骤 ──

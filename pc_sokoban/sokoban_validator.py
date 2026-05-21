@@ -160,6 +160,216 @@ def nav_bfs(the_map: list, start: tuple, end: tuple) -> Optional[list]:
 
 
 # ============================================================
+# 地图 ASCII 导入/导出（与 app_link.c / 主控一致）
+#   # 墙  - 空地  . 目标  $ 箱子  * 炸弹  @ 玩家起点
+# ============================================================
+
+MAP_CHAR_TO_CELL = {
+    '#': WALL, '-': EMPTY, '.': TARGET, '$': BOX, '*': BOMB,
+    ' ': EMPTY,
+}
+MAP_CELL_TO_CHAR = {
+    WALL: '#', EMPTY: '-', TARGET: '.', BOX: '$', BOMB: '*',
+}
+
+
+def parse_map_text(text: str) -> Tuple[Optional[list], Optional[tuple], str]:
+    """
+    解析 12×16 字符地图文本。
+    返回 (map, player_pos, error_msg)；成功时 error_msg 为空串。
+    """
+    lines = [ln.rstrip('\r\n') for ln in text.strip().splitlines() if ln.strip()]
+    if not lines:
+        return None, None, "地图为空"
+
+    if len(lines) != MAP_ROWS:
+        return None, None, f"需要 {MAP_ROWS} 行，实际 {len(lines)} 行"
+
+    the_map = [[EMPTY] * MAP_COLS for _ in range(MAP_ROWS)]
+    player_pos = None
+
+    for r, line in enumerate(lines):
+        if len(line) != MAP_COLS:
+            return None, None, f"第 {r} 行需要 {MAP_COLS} 列，实际 {len(line)} 列"
+        for c, ch in enumerate(line):
+            if ch == '@':
+                if player_pos is not None:
+                    return None, None, "地图中不能有多个 @"
+                player_pos = (r, c)
+                the_map[r][c] = EMPTY
+                continue
+            if ch not in MAP_CHAR_TO_CELL:
+                return None, None, f"非法字符 '{ch}' 于 ({c},{r})"
+            the_map[r][c] = MAP_CHAR_TO_CELL[ch]
+
+    if player_pos is None:
+        return None, None, "地图中缺少玩家标记 @"
+
+    return the_map, player_pos, ""
+
+
+def export_map_text(the_map: list, player_pos: tuple) -> str:
+    """导出为可再次导入的 ASCII 地图（@ 覆盖玩家格）。"""
+    lines = []
+    for r in range(MAP_ROWS):
+        row = []
+        for c in range(MAP_COLS):
+            if (r, c) == player_pos:
+                row.append('@')
+            else:
+                row.append(MAP_CELL_TO_CHAR.get(the_map[r][c], '?'))
+        lines.append(''.join(row))
+    return '\n'.join(lines)
+
+
+def default_box_mapping(boxes: list, targets: list) -> list:
+    """按坐标排序后一一对应（Stage2 自动生成用）。"""
+    order_b = sorted(range(len(boxes)), key=lambda i: (boxes[i][0], boxes[i][1]))
+    order_t = sorted(range(len(targets)), key=lambda i: (targets[i][0], targets[i][1]))
+    mapping = [0] * len(boxes)
+    for rank, bi in enumerate(order_b):
+        mapping[bi] = order_t[rank] if rank < len(order_t) else 0
+    return mapping
+
+
+# ============================================================
+# 侦查阶段 — 复现 Algo_Find_Nearest_Box_Observe_Point + 全箱访问
+# ============================================================
+
+def find_nearest_box_observe_point(the_map: list, player_pos: tuple) -> Tuple[Optional[tuple], Optional[tuple]]:
+    """
+    BFS 找最近箱子的侧面观察点（玩家可站立、与箱子相邻）。
+    返回 (observe_point, box_pos)，无解返回 (None, None)。
+    """
+    if not is_inner(*player_pos):
+        return None, None
+
+    parent: Dict[tuple, Optional[tuple]] = {player_pos: None}
+    queue = deque([player_pos])
+
+    while queue:
+        r, c = pos = queue.popleft()
+        for d in range(4):
+            nr, nc = r + DR[d], c + DC[d]
+            if is_inner(nr, nc) and the_map[nr][nc] == BOX:
+                return pos, (nr, nc)
+        for d in range(4):
+            nr, nc = r + DR[d], c + DC[d]
+            npos = (nr, nc)
+            if is_free(the_map, nr, nc) and npos not in parent:
+                parent[npos] = pos
+                queue.append(npos)
+
+    return None, None
+
+
+def find_observe_point_for_box(the_map: list, player_pos: tuple,
+                               box_pos: tuple) -> Optional[tuple]:
+    """BFS 找到可观察指定箱子的站立格（与箱子四邻）。"""
+    if not is_inner(*player_pos) or not is_inner(*box_pos):
+        return None
+
+    parent: Dict[tuple, Optional[tuple]] = {player_pos: None}
+    queue = deque([player_pos])
+
+    while queue:
+        r, c = pos = queue.popleft()
+        for d in range(4):
+            nr, nc = r + DR[d], c + DC[d]
+            if (nr, nc) == box_pos:
+                return pos
+        for d in range(4):
+            nr, nc = r + DR[d], c + DC[d]
+            npos = (nr, nc)
+            if is_free(the_map, nr, nc) and npos not in parent:
+                parent[npos] = pos
+                queue.append(npos)
+
+    return None
+
+
+def path_to_actions(path: list) -> list:
+    """将 nav_bfs 路径 [(row,col),...] 转为方向动作（跳过起点）。"""
+    if not path or len(path) < 2:
+        return []
+    actions = []
+    for i in range(1, len(path)):
+        r0, c0 = path[i - 1]
+        r1, c1 = path[i]
+        dr, dc = r1 - r0, c1 - c0
+        for d in range(4):
+            if DR[d] == dr and DC[d] == dc:
+                actions.append(d)
+                break
+    return actions
+
+
+def plan_scout_phase(the_map: list, player_start: tuple,
+                     boxes: Optional[list] = None) -> dict:
+    """
+    Stage2/3：贪心访问每个箱子的观察点（先侦查再推箱）。
+    返回 scout_actions, visits, player_after_scout, scout_waypoints。
+    """
+    if boxes is None:
+        boxes = extract_elements(the_map, BOX)
+
+    remaining = list(range(len(boxes)))
+    cur = player_start
+    scout_actions: list = []
+    visits: list = []
+    waypoints_flat: list = []
+
+    while remaining:
+        best_i = None
+        best_obs = None
+        best_box = None
+        best_cost = 10 ** 9
+
+        for i in remaining:
+            box = boxes[i]
+            obs = find_observe_point_for_box(the_map, cur, box)
+            if obs is None:
+                continue
+            path = nav_bfs(the_map, cur, obs)
+            if path is None:
+                continue
+            cost = len(path)
+            if cost < best_cost:
+                best_cost = cost
+                best_i = i
+                best_obs = obs
+                best_box = box
+
+        if best_i is None or best_obs is None:
+            break
+
+        path = nav_bfs(the_map, cur, best_obs)
+        if path is None:
+            remaining.remove(best_i)
+            continue
+
+        acts = path_to_actions(path)
+        scout_actions.extend(acts)
+        waypoints_flat.extend(path[1:])
+        visits.append({
+            'box_idx': best_i,
+            'box_pos': boxes[best_i],
+            'observe': best_obs,
+            'path_len': len(acts),
+        })
+        cur = best_obs
+        remaining.remove(best_i)
+
+    return {
+        'scout_actions': scout_actions,
+        'visits': visits,
+        'player_after_scout': cur,
+        'scout_waypoints': waypoints_flat,
+        'all_visited': len(visits) == len(boxes),
+    }
+
+
+# ============================================================
 # 单箱 BFS 推箱求解器
 # ============================================================
 
@@ -550,6 +760,451 @@ def solve_stage3(the_map: list, player_pos: tuple) -> Optional[dict]:
     }
 
 
+def flatten_stage3(raw: Optional[dict], base_map: list) -> Optional[dict]:
+    """将 solve_stage3 结果展平为 GUI/脚本 统一的 sub_solutions 列表。"""
+    if raw is None:
+        return None
+    subs = [{
+        'phase':      'bomb',
+        'actions':    raw['bomb_actions'],
+        'box_idx':    -1,
+        'target_idx': -1,
+        'player_end': raw['cur_player_after_bomb'],
+        'box_start':  raw['bomb_pos'],
+    }]
+    s1 = raw.get('stage1_result')
+    wall_pos = raw.get('wall_pos')
+    if s1:
+        for item in s1['sub_solutions']:
+            d = dict(item)
+            d['phase'] = 'push'
+            d['box_start'] = s1['boxes'][item['box_idx']]
+            subs.append(d)
+        return {
+            'sub_solutions': subs,
+            'boxes': s1['boxes'],
+            'targets': s1['targets'],
+            'total_steps': sum(len(x['actions']) for x in subs),
+            '_wall_pos': wall_pos,
+            'stage': 3,
+        }
+    return {
+        'sub_solutions': subs,
+        'boxes': extract_elements(base_map, BOX),
+        'targets': extract_elements(base_map, TARGET),
+        'total_steps': len(raw['bomb_actions']),
+        '_wall_pos': wall_pos,
+        'stage': 3,
+    }
+
+
+def solve_level(stage: int, the_map: list, player_pos: tuple,
+                box_to_target: Optional[list] = None,
+                require_scout: bool = True) -> Optional[dict]:
+    """
+    统一关卡求解（含 Stage2/3 侦查阶段）。
+    stage: 1/2/3
+    require_scout: Stage2/3 是否先跑侦查再推箱/炸弹
+    """
+    boxes = extract_elements(the_map, BOX)
+    targets = extract_elements(the_map, TARGET)
+    scout = None
+    work_player = player_pos
+
+    if stage >= 2 and require_scout and boxes:
+        scout = plan_scout_phase(the_map, player_pos, boxes)
+        if not scout['all_visited']:
+            return None
+        work_player = scout['player_after_scout']
+
+    push_result = None
+    if stage == 1:
+        push_result = solve_stage1(the_map, work_player)
+    elif stage == 2:
+        if box_to_target is None:
+            box_to_target = default_box_mapping(boxes, targets)
+        push_result = solve_stage2(the_map, work_player, box_to_target)
+    elif stage == 3:
+        raw3 = solve_stage3(the_map, work_player)
+        push_result = flatten_stage3(raw3, the_map)
+    else:
+        return None
+
+    if push_result is None:
+        return None
+
+    subs = []
+    if scout and scout['scout_actions']:
+        subs.append({
+            'phase':      'scout',
+            'actions':    scout['scout_actions'],
+            'box_idx':    -2,
+            'target_idx': -1,
+            'player_end': scout['player_after_scout'],
+            'box_start':  None,
+            'visits':     scout['visits'],
+        })
+
+    for sub in push_result.get('sub_solutions', []):
+        s = dict(sub)
+        if 'phase' not in s:
+            s['phase'] = 'bomb' if s.get('box_idx') == -1 else 'push'
+        subs.append(s)
+
+    total = sum(len(s['actions']) for s in subs)
+    out = {
+        'sub_solutions': subs,
+        'boxes':         push_result.get('boxes', boxes),
+        'targets':       push_result.get('targets', targets),
+        'total_steps':   total,
+        'scout':         scout,
+        'stage':         stage,
+        '_player_start': player_pos,
+        '_scout_start':  player_pos,
+    }
+    if push_result.get('_wall_pos'):
+        out['_wall_pos'] = push_result['_wall_pos']
+    return out
+
+
+# ============================================================
+# 运行指令解析与验证
+# 格式说明:
+#   SCOUT: <路点或方向>   — 侦查（仅行走，不可推箱）
+#   PUSH:  <UDLR串>       — 推箱阶段（小写走 大写推）
+#   BOMB:  <UDLR串>       — 推炸弹（Stage3）
+#   路点: W列,行 或 W列 行，多个用 ; 或空格分隔
+#   无标签时整段视为 PUSH
+#   多段用空行或 --- 分隔
+# ============================================================
+
+def _parse_waypoints_token(tok: str) -> Optional[tuple]:
+    tok = tok.strip().upper()
+    if not tok.startswith('W'):
+        return None
+    body = tok[1:].strip()
+    for sep in (',', ' '):
+        if sep in body:
+            parts = [p.strip() for p in body.replace(',', ' ').split() if p.strip()]
+            if len(parts) >= 2:
+                c, r = int(parts[0]), int(parts[1])
+                return (r, c)
+    return None
+
+
+def parse_run_script(text: str) -> dict:
+    """解析用户输入的运行脚本，返回 {scout, push, bomb} 各段。"""
+    result = {'scout': None, 'push': None, 'bomb': None, 'raw_lines': []}
+    current = None
+    buf: list = []
+
+    def flush():
+        nonlocal current, buf
+        if current and buf:
+            result[current] = '\n'.join(buf).strip()
+        buf = []
+
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or s.startswith('#'):
+            continue
+        if s == '---':
+            flush()
+            current = None
+            continue
+        upper = s.upper()
+        if upper.startswith('SCOUT:'):
+            flush()
+            current = 'scout'
+            rest = s.split(':', 1)[1].strip()
+            if rest:
+                buf.append(rest)
+            continue
+        if upper.startswith('PUSH:'):
+            flush()
+            current = 'push'
+            rest = s.split(':', 1)[1].strip()
+            if rest:
+                buf.append(rest)
+            continue
+        if upper.startswith('BOMB:'):
+            flush()
+            current = 'bomb'
+            rest = s.split(':', 1)[1].strip()
+            if rest:
+                buf.append(rest)
+            continue
+        if current is None:
+            current = 'push'
+        buf.append(s)
+
+    flush()
+    if result['scout'] is None and result['push'] is None and result['bomb'] is None:
+        joined = '\n'.join(l for l in text.splitlines() if l.strip() and not l.strip().startswith('#'))
+        if joined:
+            result['push'] = joined.replace('|', '\n')
+    return result
+
+
+def _script_scout_to_actions(the_map: list, player: tuple, scout_text: str) -> Tuple[list, tuple, str]:
+    """将 SCOUT 段转为动作序列。"""
+    scout_text = scout_text.strip()
+    if not scout_text:
+        return [], player, ""
+
+    if scout_text.upper().startswith('W') or ';' in scout_text or ',' in scout_text:
+        tokens = scout_text.replace(';', ' ').split()
+        actions_all = []
+        cur = player
+        for tok in tokens:
+            wp = _parse_waypoints_token(tok)
+            if wp is None:
+                return [], player, f"无法解析路点: {tok}"
+            path = nav_bfs(the_map, cur, wp)
+            if path is None:
+                return [], player, f"无法到达路点 {tok}"
+            actions_all.extend(path_to_actions(path))
+            cur = wp
+        return actions_all, cur, ""
+
+    actions, err = parse_direction_script(scout_text, allow_push=False)
+    if err:
+        return [], player, err
+    ok, msg, end_p, _ = simulate_player_only(the_map, player, actions)
+    if not ok:
+        return [], player, f"侦查段: {msg}"
+    return actions, end_p, ""
+
+
+def parse_direction_script(script: str, allow_push: bool = True) -> Tuple[list, str]:
+    """
+    解析 UDLR 方向串。小写=行走，大写=推箱/推炸弹。
+    allow_push=False 时拒绝大写字母。
+    """
+    actions = []
+    for i, ch in enumerate(script):
+        if ch in ' \t\r\n|':
+            continue
+        if ch in 'udlr':
+            actions.append('UDLR'.index(ch.upper()))
+        elif ch in 'UDLR':
+            if not allow_push:
+                return [], f"位置 {i+1}: 侦查段不允许大写推箱 '{ch}'"
+            actions.append('UDLR'.index(ch))
+        else:
+            return [], f"位置 {i+1}: 非法字符 '{ch}'"
+    return actions, ""
+
+
+def simulate_player_only(the_map: list, player: tuple,
+                         actions: list) -> Tuple[bool, str, tuple, list]:
+    """仅移动玩家（不推箱），用于侦查段校验。"""
+    pr, pc = player
+    for step, d in enumerate(actions):
+        npr, npc = pr + DR[d], pc + DC[d]
+        if not is_inner(npr, npc):
+            return False, f"步骤 {step+1}: 越界", (pr, pc), []
+        cell = the_map[npr][npc]
+        if cell not in (EMPTY, TARGET):
+            return False, f"步骤 {step+1}: 不可进入 ({npc},{npr}) cell={cell}", (pr, pc), []
+        pr, pc = npr, npc
+    return True, "OK", (pr, pc), actions
+
+
+class LevelSimulator:
+    """完整关卡模拟：侦查 / 推炸弹+爆炸 / 推箱。"""
+
+    def __init__(self, initial_map: list, player_pos: tuple):
+        self.map = [row[:] for row in initial_map]
+        self.player = player_pos
+        self.boxes = extract_elements(initial_map, BOX)
+        self.bomb_pos = None
+        bombs = extract_elements(initial_map, BOMB)
+        if bombs:
+            self.bomb_pos = bombs[0]
+        self.wall_pos = None
+        self.step_log: list = []
+
+    def _log(self, msg: str):
+        self.step_log.append(msg)
+
+    def run_scout(self, actions: list) -> Tuple[bool, str]:
+        ok, msg, end, _ = simulate_player_only(self.map, self.player, actions)
+        if ok:
+            self.player = end
+            self._log(f"侦查完成 → ({end[1]},{end[0]})")
+        return ok, msg
+
+    def run_push_phase(self, actions: list) -> Tuple[bool, str]:
+        """推箱段：支持地图上所有箱子的逐步推动。"""
+        pr, pc = self.player
+        for step, d in enumerate(actions):
+            npr, npc = pr + DR[d], pc + DC[d]
+            if not is_inner(npr, npc):
+                return False, f"步骤 {step+1}: 玩家越界"
+
+            pushed = False
+            for bi, (br, bc) in enumerate(self.boxes):
+                if npr == br and npc == bc:
+                    nbr, nbc = br + DR[d], bc + DC[d]
+                    if not is_inner(nbr, nbc):
+                        return False, f"步骤 {step+1}: 推箱越界"
+                    dest = self.map[nbr][nbc]
+                    if dest not in (EMPTY, TARGET):
+                        return False, f"步骤 {step+1}: 推箱目标被挡 cell={dest}"
+                    self.map[br][bc] = EMPTY
+                    self.map[nbr][nbc] = TARGET if dest == TARGET else BOX
+                    self.boxes[bi] = (nbr, nbc)
+                    pushed = True
+                    break
+
+            if not pushed:
+                cell = self.map[npr][npc]
+                if cell not in (EMPTY, TARGET):
+                    return False, f"步骤 {step+1}: 行走受阻 ({npc},{npr}) cell={cell}"
+
+            pr, pc = npr, npc
+
+        self.player = (pr, pc)
+        return True, "OK"
+
+    def run_bomb_phase(self, actions: list) -> Tuple[bool, str]:
+        if self.bomb_pos is None:
+            return False, "地图无炸弹"
+        valid, msg = validate_path(self.map, actions, self.player, self.bomb_pos)
+        if not valid:
+            return False, msg
+
+        pr, pc = self.player
+        br, bc = self.bomb_pos
+        wall_hit = None
+
+        for step, d in enumerate(actions):
+            npr, npc = pr + DR[d], pc + DC[d]
+            if npr == br and npc == bc:
+                nbr, nbc = br + DR[d], bc + DC[d]
+                if self.map[nbr][nbc] == WALL:
+                    wall_hit = (nbr, nbc)
+                self.map[br][bc] = EMPTY
+                self.map[nbr][nbc] = BOMB
+                br, bc = nbr, nbc
+                self.bomb_pos = (br, bc)
+            pr, pc = npr, npc
+
+        self.player = (pr, pc)
+        if wall_hit is None:
+            return False, "炸弹未推到墙体，无法爆炸"
+
+        self.wall_pos = wall_hit
+        apply_bomb_explosion(self.map, wall_hit)
+        self.map[self.bomb_pos[0]][self.bomb_pos[1]] = EMPTY
+        self.bomb_pos = None
+        self._log(f"爆炸于 ({wall_hit[1]},{wall_hit[0]})，3×3 清墙")
+        return True, "OK"
+
+    def is_win(self) -> bool:
+        return all(self.map[r][c] == TARGET for r, c in self.boxes)
+
+
+def verify_run_script(the_map: list, player_pos: tuple, script_text: str,
+                      stage: int = 1,
+                      expect_scout: bool = False) -> dict:
+    """
+    验证用户输入的运行指令能否完成关卡。
+    返回 {ok, message, simulator, parsed, phases_done}
+    """
+    parsed = parse_run_script(script_text)
+    sim = LevelSimulator(the_map, player_pos)
+    phases_done = []
+
+    if parsed.get('scout'):
+        acts, _, err = _script_scout_to_actions(the_map, sim.player, parsed['scout'])
+        if err:
+            return {'ok': False, 'message': err, 'simulator': sim, 'parsed': parsed,
+                    'phases_done': phases_done}
+        ok, msg = sim.run_scout(acts)
+        phases_done.append('scout')
+        if not ok:
+            return {'ok': False, 'message': msg, 'simulator': sim, 'parsed': parsed,
+                    'phases_done': phases_done}
+
+    elif expect_scout and stage >= 2:
+        boxes = extract_elements(the_map, BOX)
+        if boxes:
+            return {'ok': False,
+                    'message': 'Stage2/3 需要 SCOUT 段（先访问所有箱子）',
+                    'simulator': sim, 'parsed': parsed, 'phases_done': phases_done}
+
+    if parsed.get('bomb'):
+        acts, err = parse_direction_script(parsed['bomb'], allow_push=True)
+        if err:
+            return {'ok': False, 'message': err, 'simulator': sim, 'parsed': parsed,
+                    'phases_done': phases_done}
+        ok, msg = sim.run_bomb_phase(acts)
+        phases_done.append('bomb')
+        if not ok:
+            return {'ok': False, 'message': msg, 'simulator': sim, 'parsed': parsed,
+                    'phases_done': phases_done}
+
+    if parsed.get('push'):
+        push_text = parsed['push'].replace('\n', '').replace('|', '')
+        acts, err = parse_direction_script(push_text, allow_push=True)
+        if err:
+            return {'ok': False, 'message': err, 'simulator': sim, 'parsed': parsed,
+                    'phases_done': phases_done}
+        if not sim.boxes:
+            return {'ok': False, 'message': '推箱段：地图上无箱子',
+                    'simulator': sim, 'parsed': parsed, 'phases_done': phases_done}
+        ok, msg = sim.run_push_phase(acts)
+        phases_done.append('push')
+        if not ok:
+            return {'ok': False, 'message': msg, 'simulator': sim, 'parsed': parsed,
+                    'phases_done': phases_done}
+
+    elif stage >= 1 and not parsed.get('bomb'):
+        return {'ok': False, 'message': '缺少 PUSH 推箱指令',
+                'simulator': sim, 'parsed': parsed, 'phases_done': phases_done}
+
+    if sim.is_win():
+        return {'ok': True, 'message': '★ 通关验证成功',
+                'simulator': sim, 'parsed': parsed, 'phases_done': phases_done}
+
+    on_t = sum(1 for r, c in sim.boxes if sim.map[r][c] == TARGET)
+    return {'ok': False,
+            'message': f'未完成：{on_t}/{len(sim.boxes)} 箱在目标上',
+            'simulator': sim, 'parsed': parsed, 'phases_done': phases_done}
+
+
+def build_script_from_solution(sol: dict, use_unicode: bool = False) -> str:
+    """从求解结果生成可粘贴的运行脚本。"""
+    lines = ['# 自动生成运行脚本 — 小写行走 大写推箱/炸弹']
+    cur_p = sol.get('_player_start', (0, 0))
+    push_parts = []
+
+    for sub in sol.get('sub_solutions', []):
+        phase = sub.get('phase', 'push')
+        acts = sub['actions']
+        if phase == 'scout':
+            lines.append('SCOUT: ' + ''.join(
+                ch.lower() for ch in actions_to_string(
+                    acts, cur_p, cur_p, use_unicode=False)))
+            cur_p = sub['player_end']
+            continue
+        if phase == 'bomb':
+            lines.append('BOMB: ' + actions_to_string(
+                acts, cur_p, sub['box_start'], use_unicode=False))
+            cur_p = sub['player_end']
+        else:
+            bi = sub['box_idx']
+            b0 = sub.get('box_start', sol['boxes'][bi] if bi >= 0 else cur_p)
+            push_parts.append(actions_to_string(acts, cur_p, b0, use_unicode=False))
+            cur_p = sub['player_end']
+
+    if push_parts:
+        lines.append('PUSH: ' + ''.join(push_parts))
+    return '\n'.join(lines)
+
+
 # ============================================================
 # 动作序列 → 方向字符串
 # ============================================================
@@ -642,6 +1297,8 @@ def validate_path(the_map: list, actions: list, player_start: tuple,
 
 def check_win(the_map: list, boxes_current: list) -> bool:
     """判断所有箱子是否到达目标点（通关条件）。"""
+    if not boxes_current:
+        return True
     return all(the_map[r][c] == TARGET for r, c in boxes_current)
 
 
@@ -711,7 +1368,12 @@ def _is_solvable(the_map: list, player_pos: tuple, box_count: int,
     if len(boxes) != box_count or len(targets) != box_count:
         return False
     if stage == 3:
-        return solve_stage3(the_map, player_pos) is not None
+        return solve_level(3, the_map, player_pos) is not None
+    if stage == 2:
+        boxes = extract_elements(the_map, BOX)
+        targets = extract_elements(the_map, TARGET)
+        mapping = default_box_mapping(boxes, targets)
+        return solve_level(2, the_map, player_pos, mapping) is not None
     dl, _ = check_deadlock(the_map)
     if dl:
         return False
