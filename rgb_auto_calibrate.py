@@ -1,27 +1,42 @@
 # ======================================================================
-# OpenART RGB 自动标定脚本
+# OpenART RGB/LAB 自动标定脚本 (配套地图: map_calibrate.txt)
 #
 # 用途：
 #   1. 在固定摄像头、固定屏幕亮度后，自动采样各地图元素 RGB。
-#   2. 连续多帧求平均，降低单帧噪声。
-#   3. 将结果打印到串口终端，并保存到 SD 卡 rgb_calibration.txt。
+#   2. 分两阶段采样：第一阶段采静态元素+暗色车辆，第二阶段采亮色车辆。
+#   3. 将结果打印到串口终端，并保存到 SD 卡（文件名含当前时间戳）。
+#   4. 输出格式可直接复制粘贴到 main copy.py 中。
 #
-# 使用方法：
-#   1. 先在正式识别脚本里把四角 GRID_CORNERS 调准，再把同样的值同步到本文件。
-#   2. 在 SAMPLE_SPECS 里填写每个颜色样本所在的格子坐标。
-#   3. 复制本文件到 OpenART SD 卡根目录，改名为 main.py 后运行。
-#   4. 观察预览里的白色十字/黄色圆圈是否压在目标颜色内部。
-#   5. 读取终端或 rgb_calibration.txt，把结果填回正式识别脚本。
+# 配套标定地图 (map_calibrate.txt)：
+#   ################
+#   #$.*-----------#
+#   #--------------#
+#   #-------.------#
+#   #------$-$-----#
+#   #------*-------#
+#   #--------------#
+#   #------.-*-----#
+#   #------$-------#
+#   #--------------#
+#   #-----------.$*#
+#   ################
 #
-# 调试顺序建议：
-#   A. 先只保留 2~4 个样本做试跑，例如车绿、车青、暗墙、暗空地。
-#   B. 确认采样点没有落到格线或相邻格后，再把其它元素逐个加回。
-#   C. 如果某个采样点落到错误格，优先改格子坐标 x/y；
-#      如果落在正确格但没有压中目标颜色中心，再改像素偏移 dx/dy。
-#   D. 本脚本测的是 16x12 地图里的“格子坐标”，不是摄像头像素坐标。
+# 配套虚拟车脚本 (fake_car_for_calibration.py)：
+#   在 PC 上运行，模拟 camera_opencv.exe 的 TCP 服务器，
+#   自动把虚拟车放到暗色位置(1.5, 6)和亮色位置(8, 6)。
+#   默认每个位置停留 15 秒，与本脚本时序匹配。
+#
+# 完整使用流程：
+#   1. PC 上运行 close_ports.bat
+#   2. PC 上运行 python fake_car_for_calibration.py
+#   3. 启动游戏，加载 map_calibrate.txt
+#   4. 用键盘方向键把车移出发车区（触发地图生成）
+#   5. 把本脚本复制到 OpenART SD 卡根目录，改名 main.py
+#   6. 启动 OpenART，等待自动完成两阶段采样
+#   7. 从终端或 SD 卡读取结果，粘贴到 main copy.py
 # ======================================================================
 
-import sensor, image, time
+import sensor, image, time, math
 
 # ----------------------------------------------------------------------
 # 1. 摄像头初始化：保持和正式识别脚本一致
@@ -37,75 +52,80 @@ clock = time.clock()
 
 # ----------------------------------------------------------------------
 # 2. 网格参数：请从正式 main.py / main copy.py 复制最终标定值
-#
-# 调试说明：
-#   1. 如果四角还没调准，不要直接测 RGB。
-#   2. RGB 测色依赖 calc_grid_point 把格子索引映射到画面像素点。
-#   3. 四角一旦有误，后面的自动测色会混入格线或邻格颜色。
 # ----------------------------------------------------------------------
 ROWS, COLS = 12, 16
 
 GRID_CORNERS = {
-    "tl": (33.5, 37.5),
-    "tr": (274.5, 35.0),
-    "bl": (44.0, 209.8),
-    "br": (273.8, 196.0),
+    "tl": (37.0, 42.0),
+    "tr": (282.0, 35.5),
+    "bl": (47.5, 223.2),
+    "br": (280.8, 221.5),
 }
 
 GRID_K1 = +0.000000
 
 # ----------------------------------------------------------------------
-# 3. 自动采样配置
+# 3. 采样配置 —— 分两阶段
 # ----------------------------------------------------------------------
-# 坐标说明：
-#   (变量名, 格子x, 格子y, 像素偏移x, 像素偏移y)
+# 第一阶段：静态元素 + 暗色车辆（车在左边缘 (1,6)）
+# 第二阶段：亮色车辆（车在中心 (8,6)）
 #
-# 格子坐标：左上角为 (0,0)，右下角为 (15,11)。
-# 像素偏移：以该格中心为原点，向右为 +x，向下为 +y。
-#
-# 对普通元素，偏移填 0,0 即可。
-# 对双色车辆，如果绿/青在同一格内，请把偏移改到对应半块中心，
-# 例如绿色在左半块可填 -4,0，青色在右半块可填 +4,0。
-# 如果车辆半块方向不同，请按预览里的采样十字位置调整偏移。
-#
-# 调试说明：
-#   1. 先数格子，再填坐标。程序坐标从 0 开始：
-#      第 1 列是 x=0，第 1 行是 y=0。
-#   2. 如果预览圆圈明显跑到旁边格子，说明 x/y 填错。
-#   3. 如果圆圈在正确格里，但压到双色分界线、反光边缘或格线，
-#      说明 dx/dy 需要继续调小步长，通常每次改 1~2 像素。
-#   4. 车辆绿/青在同一格时，x/y 通常相同，只改最后两个偏移量。
-#   5. 不确定某类元素位置时，先临时删掉这一行，避免错误样本污染结果。
-SAMPLE_SPECS = (
-    # 车辆：不区分车头车尾时，这两个就是车辆绿/青两个颜色原型。
-    ("CAR_HEAD_RGB",       1,  6,  0,  -4),
-    ("CAR_TAIL_RGB",       1,  6,  0,  4),
+# 格式：(变量名, 格子x, 格子y, 像素偏移x, 像素偏移y)
 
-    # 地图元素：请把 x/y 改成当前画面里对应元素所在格。
-    ("WALL_DARK_RGB",      0,  0,  0,  0),
-    ("WALL_BRIGHT_RGB",    7,  0,  0,  0),
-    ("FLOOR_DARK_RGB",     1,  1,  0,  0),
-    ("FLOOR_BRIGHT_RGB",   7,  1,  0,  0),
-    ("GOAL_DARK_RGB",      9,  4,  0,  0),
-    ("GOAL_BRIGHT_RGB",    9,  4,  0,  0),
-    ("BOX_DARK_RGB",       7,  4,  0,  0),
-    ("BOX_BRIGHT_RGB",     7,  4,  0,  0),
-    # ("BOMB_DARK_RGB",      0,  0,  0,  0),
-    # ("BOMB_BRIGHT_RGB",    0,  0,  0,  0),
+# 第一阶段采样点（车在暗色位置 + 所有静态元素）
+PHASE1_SPECS = (
+    # 暗色车辆：车在左侧 (2,6)
+    ("CAR_HEAD_DARK_RGB",    2,  6,  0,  -4),   # 车头绿色半块（上半）
+    ("CAR_TAIL_DARK_RGB",    2,  6,  0,   4),   # 车尾青色半块（下半）
+
+    # 墙体
+    ("WALL_DARK_RGB",        0,  0,  0,  0),    # 左上角墙
+    ("WALL_BRIGHT_RGB",      7,  0,  0,  0),    # 顶部中间墙
+
+    # 空地
+    ("FLOOR_DARK_RGB",       1,  2,  0,  0),    # 左侧边缘空地
+    ("FLOOR_BRIGHT_RGB",     7,  6,  0,  0),    # 正中心空地
+
+    # 目的地
+    ("GOAL_DARK_RGB",        2,  1,  0,  0),    # 左上角附近目的地
+    ("GOAL_BRIGHT_RGB",      8,  3,  0,  0),    # 中心区域目的地
+
+    # 箱子
+    ("BOX_DARK_RGB",         1,  1,  0,  0),    # 左上角附近箱子
+    ("BOX_BRIGHT_RGB",       7,  4,  0,  0),    # 中心区域箱子
+
+    # 炸弹
+    ("BOMB_DARK_RGB",        3,  1,  0,  0),    # 左上角附近炸弹
+    ("BOMB_BRIGHT_RGB",      7,  5,  0,  0),    # 中心区域炸弹
 )
 
-START_DELAY_MS = 3000        # 启动后等待画面稳定时间
-CALIB_FRAMES = 50            # 连续采样帧数；越大越稳，耗时越长
+# 第二阶段采样点（车在亮色位置）
+PHASE2_SPECS = (
+    # 亮色车辆：车在中心 (8,6)
+    ("CAR_HEAD_BRIGHT_RGB",  8,  6,  0,  -4),   # 车头绿色半块（上半）
+    ("CAR_TAIL_BRIGHT_RGB",  8,  6,  0,   4),   # 车尾青色半块（下半）
+)
+
+# 时序参数
+# 与 fake_car_for_calibration.py 的 HOLD_SECONDS=15 配合：
+#   0s: 两个脚本同时启动，车在暗色位置
+#   ~4s: Phase1 采样完成（3s等待 + ~1s采样）
+#   15s: fake_car 自动切换到亮色位置
+#   ~16s: Phase2 开始采样（等待12s后）
+PHASE1_DELAY_MS = 3000       # 第一阶段启动前等待（让画面稳定）
+PHASE1_FRAMES = 50           # 第一阶段采样帧数
+PHASE2_WAIT_MS = 12000       # 第一阶段结束后等待车辆切换到亮色位置
+PHASE2_FRAMES = 50           # 第二阶段采样帧数
+
 SAMPLE_RADIUS = 2            # 采样半径 2 表示 5x5 像素
 TRIM_COUNT = 3               # 按亮度排序后，去掉最暗/最亮各 N 个点
-OUTPUT_FILE = "/sd/rgb_calibration.txt"
 DRAW_PREVIEW = True
 
-# 调试建议：
-#   1. 初次调试时，建议把 CALIB_FRAMES 先降到 10，确认坐标没问题后再升回 50。
-#   2. 如果画面抖动或有反光，可把 CALIB_FRAMES 提到 80~100。
-#   3. 如果目标颜色块很小，可把 SAMPLE_RADIUS 先降到 1，避免采到边界。
-#   4. 如果预览太乱，可暂时减少 SAMPLE_SPECS 条目数量，不建议先关 DRAW_PREVIEW。
+# 输出文件名使用当前时间戳
+def make_output_filename():
+    t = time.localtime()
+    return "/sd/calib_%04d%02d%02d_%02d%02d%02d.txt" % (
+        t[0], t[1], t[2], t[3], t[4], t[5])
 
 # ----------------------------------------------------------------------
 # 4. 网格投影与鲁棒取色
@@ -167,8 +187,8 @@ def robust_rgb_at(img, x, y, img_w, img_h):
         return (0, 0, 0)
     return (r_sum // count, g_sum // count, b_sum // count)
 
-def draw_sample_points(img, img_w, img_h):
-    for spec in SAMPLE_SPECS:
+def draw_sample_points(img, img_w, img_h, specs):
+    for spec in specs:
         name, grid_x, grid_y, pix_dx, pix_dy = spec
         cx, cy = calc_grid_point(grid_x, grid_y, img_w, img_h)
         sx = cx + pix_dx
@@ -176,33 +196,54 @@ def draw_sample_points(img, img_w, img_h):
         if 0 <= sx < img_w and 0 <= sy < img_h:
             img.draw_cross(sx, sy, color=(255, 255, 255), size=5, thickness=1)
             img.draw_circle(sx, sy, SAMPLE_RADIUS + 2, color=(255, 220, 0), thickness=1)
-            # 名称只画前 4 个字符，避免屏幕过乱；调试时用它确认当前点对应哪一类样本。
             img.draw_string(sx + 4, sy - 6, name[:4], color=(255, 220, 0), mono_space=False)
 
 # ----------------------------------------------------------------------
-# 5. 采样主流程
+# 5. RGB -> LAB 转换（与正式脚本一致）
 # ----------------------------------------------------------------------
-def format_rgb_line(name, rgb):
-    return "%s = (%d, %d, %d)" % (name, rgb[0], rgb[1], rgb[2])
+def _pivot_rgb_to_linear(c):
+    if c <= 0.04045:
+        return c / 12.92
+    return ((c + 0.055) / 1.055) ** 2.4
 
-def save_results(results):
-    try:
-        f = open(OUTPUT_FILE, "w")
-        f.write("# RGB calibration result\n")
-        f.write("# Copy these lines back to main.py / main copy.py\n\n")
-        for spec in SAMPLE_SPECS:
-            name = spec[0]
-            if name in results:
-                f.write(format_rgb_line(name, results[name]) + "\n")
-        f.close()
-        print("Saved to %s" % OUTPUT_FILE)
-    except Exception as e:
-        print("Save failed:", e)
+def rgb_to_lab(rgb):
+    r = _pivot_rgb_to_linear(rgb[0] / 255.0)
+    g = _pivot_rgb_to_linear(rgb[1] / 255.0)
+    b = _pivot_rgb_to_linear(rgb[2] / 255.0)
 
-def run_calibration():
+    x = r * 0.4124564 + g * 0.3575761 + b * 0.1804375
+    y = r * 0.2126729 + g * 0.7151522 + b * 0.0721750
+    z = r * 0.0193339 + g * 0.1191920 + b * 0.9503041
+
+    xr = x / 0.95047
+    yr = y / 1.00000
+    zr = z / 1.08883
+
+    eps = 0.008856
+    kappa = 903.3
+
+    def _f(t):
+        if t > eps:
+            return t ** (1.0 / 3.0)
+        return (kappa * t + 16.0) / 116.0
+
+    fx = _f(xr)
+    fy = _f(yr)
+    fz = _f(zr)
+
+    l = 116.0 * fy - 16.0
+    a = 500.0 * (fx - fy)
+    bb = 200.0 * (fy - fz)
+    return (l, a, bb)
+
+# ----------------------------------------------------------------------
+# 6. 采样单阶段
+# ----------------------------------------------------------------------
+def sample_phase(specs, delay_ms, num_frames, phase_name):
+    """对一组采样点执行多帧平均采样，返回 {name: (r,g,b)} 字典"""
     sums = {}
     counts = {}
-    for spec in SAMPLE_SPECS:
+    for spec in specs:
         name = spec[0]
         sums[name] = [0, 0, 0]
         counts[name] = 0
@@ -210,72 +251,188 @@ def run_calibration():
     start_ms = time.ticks_ms()
     frame_index = 0
     sample_count = 0
-    done = False
 
-    while not done:
+    print("\n--- %s ---" % phase_name)
+    print("等待 %d ms 后开始采样 %d 帧..." % (delay_ms, num_frames))
+
+    while sample_count < num_frames:
         clock.tick()
         img = sensor.snapshot()
         img_w = img.width()
         img_h = img.height()
 
         if DRAW_PREVIEW:
-            draw_sample_points(img, img_w, img_h)
-
-        # 调试说明：
-        #   1. 启动后的等待阶段用来让画面和自动曝光后的残余波动稳定下来。
-        #   2. 这段时间只看预览，不采样，适合检查十字是否压在正确位置。
-        #   3. 如果此时发现坐标不对，直接停机改 SAMPLE_SPECS，不要继续记录错误结果。
+            draw_sample_points(img, img_w, img_h, specs)
 
         elapsed = time.ticks_diff(time.ticks_ms(), start_ms)
-        if elapsed < START_DELAY_MS:
-            if frame_index % 10 == 0:
-                remain = (START_DELAY_MS - elapsed + 999) // 1000
-                print("Prepare sampling... %d s" % remain)
+        if elapsed < delay_ms:
+            if frame_index % 15 == 0:
+                remain = (delay_ms - elapsed + 999) // 1000
+                print("[%s] 等待稳定... %d s" % (phase_name, remain))
             frame_index += 1
             continue
 
-        if sample_count < CALIB_FRAMES:
-            for spec in SAMPLE_SPECS:
-                name, grid_x, grid_y, pix_dx, pix_dy = spec
-                cx, cy = calc_grid_point(grid_x, grid_y, img_w, img_h)
-                sx = cx + pix_dx
-                sy = cy + pix_dy
-                rgb = robust_rgb_at(img, sx, sy, img_w, img_h)
-                sums[name][0] += rgb[0]
-                sums[name][1] += rgb[1]
-                sums[name][2] += rgb[2]
-                counts[name] += 1
+        for spec in specs:
+            name, grid_x, grid_y, pix_dx, pix_dy = spec
+            cx, cy = calc_grid_point(grid_x, grid_y, img_w, img_h)
+            sx = cx + pix_dx
+            sy = cy + pix_dy
+            rgb = robust_rgb_at(img, sx, sy, img_w, img_h)
+            sums[name][0] += rgb[0]
+            sums[name][1] += rgb[1]
+            sums[name][2] += rgb[2]
+            counts[name] += 1
 
-            sample_count += 1
-            if sample_count % 10 == 0 or sample_count == 1:
-                print("Sampling %d/%d | FPS %0.1f" % (sample_count, CALIB_FRAMES, clock.fps()))
-        else:
-            results = {}
-            print("\n===== RGB Calibration Result =====")
-            print("# 如果某项数值明显异常，先回头检查该项的格子坐标和偏移，而不是直接照抄。\n")
-            for spec in SAMPLE_SPECS:
-                name = spec[0]
-                count = counts[name]
-                if count > 0:
-                    rgb = (sums[name][0] // count,
-                           sums[name][1] // count,
-                           sums[name][2] // count)
-                    results[name] = rgb
-                    print(format_rgb_line(name, rgb))
-            print("==================================\n")
-            save_results(results)
-            done = True
+        sample_count += 1
+        if sample_count % 10 == 0 or sample_count == 1:
+            print("[%s] 采样 %d/%d | FPS %0.1f" % (phase_name, sample_count, num_frames, clock.fps()))
+
+    # 计算平均值
+    results = {}
+    for spec in specs:
+        name = spec[0]
+        count = counts[name]
+        if count > 0:
+            results[name] = (sums[name][0] // count,
+                             sums[name][1] // count,
+                             sums[name][2] // count)
+    return results
+
+# ----------------------------------------------------------------------
+# 7. 输出与保存
+# ----------------------------------------------------------------------
+def format_rgb_line(name, rgb):
+    return "%s = (%d, %d, %d)" % (name, rgb[0], rgb[1], rgb[2])
+
+def format_lab_line(name, lab):
+    return "# LAB: %s = (%.1f, %.1f, %.1f)" % (name, lab[0], lab[1], lab[2])
+
+# 正式脚本中的变量顺序
+PASTE_ORDER = [
+    "CAR_HEAD_DARK_RGB",
+    "CAR_HEAD_BRIGHT_RGB",
+    "CAR_TAIL_DARK_RGB",
+    "CAR_TAIL_BRIGHT_RGB",
+    "WALL_DARK_RGB",
+    "WALL_BRIGHT_RGB",
+    "FLOOR_DARK_RGB",
+    "FLOOR_BRIGHT_RGB",
+    "GOAL_DARK_RGB",
+    "GOAL_BRIGHT_RGB",
+    "BOX_DARK_RGB",
+    "BOX_BRIGHT_RGB",
+    "BOMB_DARK_RGB",
+    "BOMB_BRIGHT_RGB",
+]
+
+def save_results(results):
+    output_file = make_output_filename()
+    try:
+        f = open(output_file, "w")
+        f.write("# ============================================\n")
+        f.write("# RGB/LAB Calibration Result\n")
+        f.write("# Generated by rgb_auto_calibrate.py\n")
+        f.write("# Map: map_calibrate.txt\n")
+        f.write("# ============================================\n")
+        f.write("# Copy the block below directly into main copy.py\n\n")
+
+        # 详细输出（含 LAB 参考）
+        for name in PASTE_ORDER:
+            if name in results:
+                rgb = results[name]
+                lab = rgb_to_lab(rgb)
+                f.write(format_rgb_line(name, rgb) + "\n")
+                f.write(format_lab_line(name, lab) + "\n")
+
+        f.write("\n# ============================================\n")
+        f.write("# Quick paste block (copy below to main copy.py):\n")
+        f.write("# ============================================\n\n")
+
+        for name in PASTE_ORDER:
+            if name in results:
+                f.write(format_rgb_line(name, results[name]) + "\n")
+
+        f.close()
+        print("\nSaved to %s" % output_file)
+    except Exception as e:
+        print("Save failed:", e)
+
+# ----------------------------------------------------------------------
+# 8. 主流程：两阶段自动采样
+# ----------------------------------------------------------------------
+def run_calibration():
+    print("=" * 40)
+    print(" RGB/LAB 两阶段自动标定")
+    print(" 配套: map_calibrate.txt")
+    print("       fake_car_for_calibration.py")
+    print("=" * 40)
+
+    # 第一阶段：采静态元素 + 暗色车辆
+    phase1_results = sample_phase(
+        PHASE1_SPECS,
+        PHASE1_DELAY_MS,
+        PHASE1_FRAMES,
+        "Phase1: 静态+暗色车"
+    )
+
+    # 等待车辆移动到亮色位置
+    print("\n[等待] 车辆正在移动到亮色位置...")
+    print("[等待] 请确保 fake_car_for_calibration.py 已自动切换")
+    wait_start = time.ticks_ms()
+    while time.ticks_diff(time.ticks_ms(), wait_start) < PHASE2_WAIT_MS:
+        clock.tick()
+        img = sensor.snapshot()
+        if DRAW_PREVIEW:
+            draw_sample_points(img, img.width(), img.height(), PHASE2_SPECS)
+        elapsed = time.ticks_diff(time.ticks_ms(), wait_start)
+        if elapsed % 2000 < 50:
+            remain = (PHASE2_WAIT_MS - elapsed + 999) // 1000
+            print("[等待] 剩余 %d s" % remain)
+
+    # 第二阶段：采亮色车辆
+    phase2_results = sample_phase(
+        PHASE2_SPECS,
+        1000,            # 短暂等待 1s 让画面稳定
+        PHASE2_FRAMES,
+        "Phase2: 亮色车"
+    )
+
+    # 合并结果
+    all_results = {}
+    all_results.update(phase1_results)
+    all_results.update(phase2_results)
+
+    # 打印结果
+    print("\n" + "=" * 40)
+    print(" RGB/LAB Calibration Result")
+    print(" Map: map_calibrate.txt")
+    print("=" * 40 + "\n")
+
+    for name in PASTE_ORDER:
+        if name in all_results:
+            rgb = all_results[name]
+            lab = rgb_to_lab(rgb)
+            print(format_rgb_line(name, rgb))
+            print(format_lab_line(name, lab))
+
+    print("\n# ---- Quick paste block ----")
+    for name in PASTE_ORDER:
+        if name in all_results:
+            print(format_rgb_line(name, all_results[name]))
+    print("# ---------------------------\n")
+
+    # 保存到文件
+    save_results(all_results)
 
 run_calibration()
 
-# 保持画面预览，避免脚本结束后立即黑屏。
-# 调试说明：
-#   1. 结果打印并保存后，屏幕仍保留采样点，方便你对照检查最后一次配置。
-#   2. 确认无误后再断电或替换回正式 main.py。
+# 保持画面预览，避免脚本结束后立即黑屏
+print("\n[完成] 标定结束，保持预览中...")
+all_specs = PHASE1_SPECS + PHASE2_SPECS
 while True:
     clock.tick()
     img = sensor.snapshot()
     if DRAW_PREVIEW:
-        draw_sample_points(img, img.width(), img.height())
+        draw_sample_points(img, img.width(), img.height(), all_specs)
     if int(clock.fps()) > 0:
         pass

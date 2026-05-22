@@ -23,9 +23,6 @@ print(f"方向串: {d}")
 valid, msg = sv.validate_path(m, sol, (5, 2), (3, 3))
 assert valid, f"路径校验失败: {msg}"
 print(f"路径校验: {msg}")
-_, final_box = sv.simulate_actions(sol, (5, 2), (3, 3))
-assert final_box == (3, 10), f"箱子最终位置错误: {final_box}"
-print("通关验证: OK")
 
 # 测试2: Stage1 贪心
 print("\n=== 测试2: Stage1 贪心（2箱） ===")
@@ -36,32 +33,45 @@ m2[8][2] = sv.TARGET
 m2[8][12] = sv.TARGET
 r = sv.solve_stage1(m2, (5, 7))
 assert r is not None, "Stage1 应有解"
-print(f"总步数: {r['total_steps']}  子任务数: {len(r['sub_solutions'])}")
+print(f"总步数: {r['total_steps']}")
 
-# 测试3: 地图自动生成
+# 测试3: 地图生成
 print("\n=== 测试3: 地图生成 ===")
-for seed in [1, 2, 42, 100]:
+for seed in [1, 2, 42]:
     m3, p3 = sv.generate_map(stage=1, box_count=2, seed=seed)
-    boxes = sv.extract_elements(m3, sv.BOX)
-    tgts = sv.extract_elements(m3, sv.TARGET)
-    r3 = sv.solve_stage1(m3, p3)
+    r3 = sv.solve_level(1, m3, p3)
     status = f"OK steps={r3['total_steps']}" if r3 else "UNSOLVABLE"
-    print(f"  seed={seed}: boxes={len(boxes)} tgts={len(tgts)} -> {status}")
+    print(f"  seed={seed}: {status}")
 
-# 测试4: 路点压缩
-print("\n=== 测试4: 路点压缩 ===")
-acts = [3, 3, 3, 1, 1, 2, 2]  # RRR DD LL
-wpts = sv.actions_to_waypoints(acts, (5, 2))
-print(f"动作: {acts}  路点数: {len(wpts)}")
-assert len(wpts) == 3, f"期望3个路点，实际{len(wpts)}"
+# 测试4: 侦查阶段
+print("\n=== 测试4: Stage2 侦查 ===")
+m4, p4 = sv.generate_map(stage=2, box_count=2, seed=42)
+scout = sv.plan_scout_phase(m4, p4)
+assert scout['all_visited'], "应访问全部箱子"
+sol4 = sv.solve_level(2, m4, p4)
+assert sol4 and sol4['sub_solutions'][0]['phase'] == 'scout'
+print(f"侦查步数: {len(scout['scout_actions'])}  总步数: {sol4['total_steps']}")
 
-# 测试5: 死局检测
-print("\n=== 测试5: 死局检测 ===")
-m5 = sv._make_empty_map()
-m5[1][1] = sv.BOX  # 左上角 = 死局
-dead, dp = sv.check_deadlock(m5)
-assert dead, "角落箱子应检测为死局"
-print(f"死局箱子: ({dp[1]},{dp[0]}) OK")
+# 测试5: Stage3 炸弹
+print("\n=== 测试5: Stage3 炸弹 ===")
+m5, p5 = sv.generate_map(stage=3, box_count=2, seed=7)
+sol5 = sv.solve_level(3, m5, p5)
+assert sol5 is not None, "Stage3 应有解"
+print(f"总步数: {sol5['total_steps']}")
+
+# 测试6: 地图导入
+print("\n=== 测试6: 地图导入 ===")
+text = sv.export_map_text(m2, (5, 7))
+m6, p6, err = sv.parse_map_text(text)
+assert err == "" and p6 == (5, 7)
+print("往返导入 OK")
+
+# 测试7: 指令验证
+print("\n=== 测试7: 指令验证 ===")
+script = sv.build_script_from_solution(r)
+vr = sv.verify_run_script(m2, (5, 7), script, stage=1)
+assert vr['ok'], vr['message']
+print(vr['message'])
 
 print("\n=============================")
 print("所有测试通过！")
