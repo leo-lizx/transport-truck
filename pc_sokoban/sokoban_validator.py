@@ -309,6 +309,9 @@ def plan_scout_phase(the_map: list, player_start: tuple,
     """
     Stage2/3：贪心访问每个箱子的观察点（先侦查再推箱）。
     返回 scout_actions, visits, player_after_scout, scout_waypoints。
+
+    注意: 这是旧版"全量遍历"实现, 仅访问 BOX 不访问 TARGET; 主要用作历史比对.
+    新版逻辑请使用 plan_scout_phase_v2 (访问 box+target, 含排除法).
     """
     if boxes is None:
         boxes = extract_elements(the_map, BOX)
@@ -366,6 +369,273 @@ def plan_scout_phase(the_map: list, player_start: tuple,
         'player_after_scout': cur,
         'scout_waypoints': waypoints_flat,
         'all_visited': len(visits) == len(boxes),
+    }
+
+
+# ============================================================
+# 侦查 V2 — 同时访问 BOX 和 TARGET, 支持排除法 (与 C 端 app_recognize 对齐)
+# 赛题约定: 箱子 class_id ∈ {1..N}, 目标 class_id ∈ {1..N}, 集合相同;
+#           箱-目一一对应 (相同 class_id 互推).
+# 推断条件:
+#   1) 同类内 (N-1 推 1):
+#        某一类(box 或 target)只剩 1 个未识别, 缺失的 class_id 唯一 → 推断
+#   2) 跨类反推:
+#        一类全部已识别, 另一类剩余项可由 1..N 集合做差集反推 (剩 1 时唯一)
+# ============================================================
+
+def plan_scout_phase_v2(the_map: list, player_start: tuple,
+                         box_classes: Optional[list] = None,
+                         target_classes: Optional[list] = None,
+                         use_inference: bool = True) -> dict:
+    """
+    新版侦查规划 — 同时访问箱子和目标点.
+
+    参数:
+        box_classes / target_classes:
+            视觉端"真值": 第 i 个箱子/目标的 class_id (1..N).
+            模拟时由地图生成器或外部分配. 若为 None, 默认按 extract 顺序赋 1..N
+            (用于纯算法验证).
+        use_inference: 是否启用排除法 (N-1 推 1 + 跨类反推).
+
+    返回:
+        scout_actions     : 整段移动动作 (0..3 方向流, 仅行走). 仅作历史兼容,
+                            实际执行/动画请使用 visits 中每段的 path_actions
+        scout_waypoints   : 经过的网格坐标列表 (跳过起点)
+        visits            : 每段访问/推断记录, 按时序排列
+                            {
+                              'kind'         : 'box' / 'target',
+                              'item_idx'     : 该 kind 内部的索引 (与 extract 顺序对应),
+                              'pos'          : 物体网格坐标 (row, col),
+                              'observe'      : 观察点网格坐标 (推断项为 None),
+                              'class_id'     : 1..N,
+                              'inferred'     : True=排除法推断, False=实地观察,
+                              'path_actions' : 走到观察点的方向动作 (推断项为 []),
+                              'infer_chain'  : 本次实测后由排除法连锁推断出的 visit 引用列表
+                                               (按顺序; visit dict 已加入 visits 列表)
+                            }
+        player_after_scout: 侦查结束的玩家位置
+        all_visited       : 全部物体是否都已确定 class_id
+        box_classes       : 推断后的箱子 class_id 列表 (与 extract 顺序对应)
+        target_classes    : 推断后的目标 class_id 列表
+        box_to_target_idx : (用作 Sokoban_Solve_Stage2) box_to_target_idx[i]=j
+                            表示第 i 个箱子推到第 j 个目标
+        visited_real      : 实测访问数 (绕过去的)
+        visited_inferred  : 排除法推断数
+    """
+    boxes   = extract_elements(the_map, BOX)
+    targets = extract_elements(the_map, TARGET)
+    n_box = len(boxes)
+    n_tgt = len(targets)
+
+    # 默认真值: 按 extract 顺序赋 1..N (对应箱-目)
+    if box_classes is None:
+        box_classes = [(i + 1) for i in range(n_box)]
+    if target_classes is None:
+        target_classes = [(i + 1) for i in range(n_tgt)]
+
+    # 同时维护两个池子: BOX / TARGET
+    items: list = []
+    for i, p in enumerate(boxes):
+        items.append({
+            'kind': 'box', 'item_idx': i, 'pos': p,
+            'truth_class': box_classes[i] if i < len(box_classes) else 0,
+            'class_id': 0, 'visited': False, 'ok': False, 'inferred': False,
+            '_visit_dict': None,
+        })
+    for i, p in enumerate(targets):
+        items.append({
+            'kind': 'target', 'item_idx': i, 'pos': p,
+            'truth_class': target_classes[i] if i < len(target_classes) else 0,
+            'class_id': 0, 'visited': False, 'ok': False, 'inferred': False,
+            '_visit_dict': None,
+        })
+
+    cur = player_start
+    scout_actions: list = []
+    waypoints_flat: list = []
+    visits: list = []
+
+    def all_resolved() -> bool:
+        return all(it['ok'] for it in items)
+
+    def make_infer_visit(it) -> dict:
+        v = {
+            'kind':         it['kind'],
+            'item_idx':     it['item_idx'],
+            'pos':          it['pos'],
+            'observe':      None,
+            'class_id':     it['class_id'],
+            'inferred':     True,
+            'path_actions': [],
+            'infer_chain':  [],
+        }
+        it['_visit_dict'] = v
+        return v
+
+    def try_infer(carrier_visit: Optional[dict]) -> int:
+        """同类 N-1 推 1 + 跨类反推. 返回新推断数量.
+        新推断的 visit 被附加到 visits 列表; 同时记录到 carrier_visit['infer_chain']."""
+        if not use_inference:
+            return 0
+        new_n = 0
+        # 收集双方已识别集合
+        box_used = {it['class_id'] for it in items
+                    if it['kind'] == 'box' and it['ok']}
+        tgt_used = {it['class_id'] for it in items
+                    if it['kind'] == 'target' and it['ok']}
+        box_unknown = [it for it in items
+                        if it['kind'] == 'box' and not it['ok']]
+        tgt_unknown = [it for it in items
+                        if it['kind'] == 'target' and not it['ok']]
+
+        def commit_infer(it, cls):
+            it['class_id'] = cls
+            it['ok'] = True
+            it['inferred'] = True
+            it['visited'] = True
+            v = make_infer_visit(it)
+            visits.append(v)
+            if carrier_visit is not None:
+                carrier_visit['infer_chain'].append(v)
+
+        # 同类内: N-1 推 1
+        if len(box_unknown) == 1 and n_box >= 1:
+            missing = [c for c in range(1, n_box + 1) if c not in box_used]
+            if len(missing) == 1:
+                commit_infer(box_unknown[0], missing[0])
+                box_used.add(missing[0])
+                box_unknown = []
+                new_n += 1
+
+        if len(tgt_unknown) == 1 and n_tgt >= 1:
+            missing = [c for c in range(1, n_tgt + 1) if c not in tgt_used]
+            if len(missing) == 1:
+                commit_infer(tgt_unknown[0], missing[0])
+                tgt_used.add(missing[0])
+                tgt_unknown = []
+                new_n += 1
+
+        # 跨类反推: target 全识别 → 推 box 剩余项 (剩 1 时)
+        if len(tgt_unknown) == 0 and len(box_unknown) == 1 and n_box == n_tgt:
+            missing = [c for c in tgt_used if c not in box_used]
+            if len(missing) == 1:
+                commit_infer(box_unknown[0], missing[0])
+                box_unknown = []
+                new_n += 1
+
+        # 跨类反推: box 全识别 → 推 target 剩余项 (剩 1 时)
+        if len(box_unknown) == 0 and len(tgt_unknown) == 1 and n_box == n_tgt:
+            missing = [c for c in box_used if c not in tgt_used]
+            if len(missing) == 1:
+                commit_infer(tgt_unknown[0], missing[0])
+                tgt_unknown = []
+                new_n += 1
+
+        return new_n
+
+    # 初始尝试推断 (玩家未动时, 一般推不出来)
+    try_infer(None)
+
+    # 主循环: 选离 cur 最近的未访问物体, 走过去观察
+    while not all_resolved():
+        cand = [it for it in items if not it['visited'] and not it['ok']]
+        if not cand:
+            break
+
+        best_it = None
+        best_obs = None
+        best_cost = 10 ** 9
+        for it in cand:
+            obs = find_observe_point_for_box(the_map, cur, it['pos'])
+            if obs is None:
+                continue
+            path = nav_bfs(the_map, cur, obs)
+            if path is None:
+                continue
+            cost = len(path)
+            if cost < best_cost:
+                best_cost = cost
+                best_it = it
+                best_obs = obs
+
+        if best_it is None or best_obs is None:
+            break
+
+        path = nav_bfs(the_map, cur, best_obs)
+        if path is None:
+            best_it['visited'] = True
+            continue
+
+        acts = path_to_actions(path)
+        scout_actions.extend(acts)
+        waypoints_flat.extend(path[1:])
+
+        cls = best_it['truth_class']
+        best_it['class_id'] = cls
+        best_it['ok'] = (cls > 0)
+        best_it['visited'] = True
+        best_it['inferred'] = False
+
+        v = {
+            'kind':         best_it['kind'],
+            'item_idx':     best_it['item_idx'],
+            'pos':          best_it['pos'],
+            'observe':      best_obs,
+            'class_id':     cls,
+            'inferred':     False,
+            'path_actions': list(acts),
+            'infer_chain':  [],
+        }
+        best_it['_visit_dict'] = v
+        visits.append(v)
+        cur = best_obs
+
+        # 识别完该物体后立刻尝试连锁推断
+        try_infer(v)
+
+    # 提取最终 class_id 列表
+    out_box_classes    = [0] * n_box
+    out_target_classes = [0] * n_tgt
+    for it in items:
+        if it['kind'] == 'box':
+            out_box_classes[it['item_idx']] = it['class_id']
+        else:
+            out_target_classes[it['item_idx']] = it['class_id']
+
+    # 配对生成 box_to_target_idx
+    box_to_target_idx: list = [0] * n_box
+    if all_resolved() and n_box == n_tgt:
+        used = [False] * n_tgt
+        ok = True
+        for bi in range(n_box):
+            cls = out_box_classes[bi]
+            matched = False
+            for ti in range(n_tgt):
+                if used[ti]:
+                    continue
+                if out_target_classes[ti] == cls:
+                    box_to_target_idx[bi] = ti
+                    used[ti] = True
+                    matched = True
+                    break
+            if not matched:
+                ok = False
+                break
+        if not ok:
+            box_to_target_idx = []
+
+    return {
+        'scout_actions':       scout_actions,
+        'scout_waypoints':     waypoints_flat,
+        'visits':              visits,
+        'player_after_scout':  cur,
+        'all_visited':         all_resolved(),
+        'box_classes':         out_box_classes,
+        'target_classes':      out_target_classes,
+        'box_to_target_idx':   box_to_target_idx,
+        'visited_real':        sum(1 for it in items
+                                    if it['visited'] and not it['inferred']),
+        'visited_inferred':    sum(1 for it in items if it['inferred']),
     }
 
 
@@ -703,7 +973,8 @@ def find_bomb_wall(the_map: list, player_pos: tuple,
 # Stage 3 完整求解
 # ============================================================
 
-def solve_stage3(the_map: list, player_pos: tuple) -> Optional[dict]:
+def solve_stage3(the_map: list, player_pos: tuple,
+                 box_to_target_idx: Optional[list] = None) -> Optional[dict]:
     """
     Stage3 完整流程：
       1. 找炸弹位置
@@ -711,7 +982,10 @@ def solve_stage3(the_map: list, player_pos: tuple) -> Optional[dict]:
       3. 寻找最优爆破墙体
       4. BFS 求解推炸弹路径
       5. 模拟爆炸，更新地图
-      6. 用 Stage1 继续推剩余箱子
+      6. 用 Stage1 (任意映射) 或 Stage2 (固定映射) 继续推剩余箱子
+
+    box_to_target_idx: 若给定 → 爆炸后用 Stage2 (固定映射) 求解;
+                        否则走 Stage1 贪心.
     """
     bombs = extract_elements(the_map, BOMB)
     if not bombs:
@@ -747,8 +1021,14 @@ def solve_stage3(the_map: list, player_pos: tuple) -> Optional[dict]:
     new_map[bomb_pos[0]][bomb_pos[1]] = EMPTY
     apply_bomb_explosion(new_map, wall_pos)
 
-    # 继续用 Stage1 推剩余箱子
-    stage1_result = solve_stage1(new_map, cur_player)
+    # 继续推剩余箱子
+    if box_to_target_idx:
+        # 注意: 爆炸后 boxes 顺序不变, 但 targets 顺序可能变(原墙体上的 TARGET 是旧的)
+        # box_to_target_idx 是基于"爆炸前 extract" 的索引, 与爆炸后 extract 顺序保持
+        # 因为我们没有移除 boxes/targets, 仅清了内墙 → 顺序一致, 可直接复用
+        stage1_result = solve_stage2(new_map, cur_player, box_to_target_idx)
+    else:
+        stage1_result = solve_stage1(new_map, cur_player)
 
     return {
         'bomb_actions':    bomb_actions,
@@ -800,32 +1080,65 @@ def flatten_stage3(raw: Optional[dict], base_map: list) -> Optional[dict]:
 
 def solve_level(stage: int, the_map: list, player_pos: tuple,
                 box_to_target: Optional[list] = None,
-                require_scout: bool = True) -> Optional[dict]:
+                require_scout: bool = True,
+                box_classes: Optional[list] = None,
+                target_classes: Optional[list] = None,
+                use_inference: bool = True) -> Optional[dict]:
     """
     统一关卡求解（含 Stage2/3 侦查阶段）。
     stage: 1/2/3
     require_scout: Stage2/3 是否先跑侦查再推箱/炸弹
+    box_classes / target_classes: 视觉端真值 (1..N), 仅 Stage2/3 用
+        - 默认 None → 按 extract 顺序 1..N (一一对应)
+    use_inference: 启用排除法 (识别 N-1 即可推断剩余 1 个)
     """
     boxes = extract_elements(the_map, BOX)
     targets = extract_elements(the_map, TARGET)
     scout = None
     work_player = player_pos
+    inferred_mapping: Optional[list] = None
 
     if stage >= 2 and require_scout and boxes:
-        scout = plan_scout_phase(the_map, player_pos, boxes)
-        if not scout['all_visited']:
-            return None
-        work_player = scout['player_after_scout']
+        # Stage3 默认不强求侦查全部 box+target (横墙隔断时 target 暂不可达,
+        # 真实赛规是炸墙后再识别 target). 仅在用户显式传 box_classes/target_classes
+        # 时, Stage3 也启用 v2 (假设地图本身允许全部可达).
+        do_v2 = (stage == 2) or (
+            stage == 3 and (box_classes is not None or target_classes is not None)
+        )
+        if do_v2:
+            scout = plan_scout_phase_v2(the_map, player_pos,
+                                         box_classes=box_classes,
+                                         target_classes=target_classes,
+                                         use_inference=use_inference)
+            if not scout['all_visited']:
+                return None
+            work_player = scout['player_after_scout']
+            inferred_mapping = scout.get('box_to_target_idx') or None
+        elif stage == 3:
+            # 保持旧行为: Stage3 不做侦查, 直接进炸弹+stage1
+            scout = None
+            inferred_mapping = None
+        else:
+            scout = plan_scout_phase_v2(the_map, player_pos,
+                                         box_classes=box_classes,
+                                         target_classes=target_classes,
+                                         use_inference=use_inference)
+            if not scout['all_visited']:
+                return None
+            work_player = scout['player_after_scout']
+            inferred_mapping = scout.get('box_to_target_idx') or None
 
     push_result = None
     if stage == 1:
         push_result = solve_stage1(the_map, work_player)
     elif stage == 2:
+        # 优先用侦查推断出的映射; 外部显式传入则覆盖
         if box_to_target is None:
-            box_to_target = default_box_mapping(boxes, targets)
+            box_to_target = inferred_mapping or default_box_mapping(boxes, targets)
         push_result = solve_stage2(the_map, work_player, box_to_target)
     elif stage == 3:
-        raw3 = solve_stage3(the_map, work_player)
+        raw3 = solve_stage3(the_map, work_player,
+                             box_to_target_idx=(box_to_target or inferred_mapping))
         push_result = flatten_stage3(raw3, the_map)
     else:
         return None

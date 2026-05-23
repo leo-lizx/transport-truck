@@ -48,10 +48,21 @@ extern "C" {
 typedef enum
 {
     APP_LINK_TYPE_MAP        = 0x01,    /* 视觉 → 主控: 全局地图        */
-    APP_LINK_TYPE_BOX_CLASS  = 0x02,    /* 视觉 → 主控: 箱子分类 (P1)   */
+    APP_LINK_TYPE_BOX_CLASS  = 0x02,    /* 视觉 → 主控: 物体分类 (识别 tour) */
     APP_LINK_TYPE_POSE_HINT  = 0x03,    /* 主控 → 视觉: 位姿回灌 (后续) */
     APP_LINK_TYPE_HEARTBEAT  = 0x10     /* 视觉 → 主控: 心跳, 载荷 1B seq */
 } app_link_type_e;
+
+/*-- BOX_CLASS 帧载荷常量 (识别 tour) -----------------------------------------------------------------------------
+ * Payload 3 字节: [obj_kind][class_id][seq]
+ *   obj_kind : 0=BOX(图片箱子)  1=TARGET(数字目标)
+ *   class_id : 1..N 有效类别;  0 = 无识别 / 背景
+ *   seq      : 视觉端自增 seq, 用于丢包/防重统计 (主控不据此切流)
+ *--------------------------------------------------------------------------------------------------------------*/
+#define APP_LINK_BOX_CLASS_PAYLOAD_LEN  (3U)
+#define APP_LINK_OBJ_KIND_BOX           (0U)
+#define APP_LINK_OBJ_KIND_TARGET        (1U)
+#define APP_LINK_CLASS_ID_NONE          (0U)
 
 /*-- 解析器内部状态机 (调试用, 外部一般不需要查询) ----------------------------------------------------------------*/
 typedef enum
@@ -171,6 +182,29 @@ void app_link_get_map_snapshot(uint8 dst[APP_LINK_MAP_ROWS][APP_LINK_MAP_COLS]);
  * 返回: 无
  *-----------------------------------------------------------------------------------------------------------------*/
 void app_link_get_car_snapshot(app_link_car_snapshot_t *out);
+
+/*===================================================================================================================
+ * BOX_CLASS 帧 — 识别 tour 阶段视觉端持续广播的"当前视野中央物体类别"
+ *  - 主控按 1ms tick 维护一个 seq-lock 快照, 业务层 (app_recognize.c) 多数票投出最终类别
+ *  - 上电至首帧到达前, 快照内容 valid=0; 业务层据此决定是否进入 SAMPLE 阶段
+ *=================================================================================================================*/
+typedef struct
+{
+    uint8  obj_kind;    /* APP_LINK_OBJ_KIND_BOX / TARGET                       */
+    uint8  class_id;    /* 1..N (0 = 无识别)                                     */
+    uint8  vision_seq;  /* 视觉端自增 seq, 透传                                  */
+    uint32 stamp_ms;    /* 落地时间, 与 app_link_get_ms() 同源                   */
+    uint32 frame_id;    /* 主控侧帧号, 每收到一帧自增                            */
+    uint8  valid;       /* 至少收到过一帧合法 BOX_CLASS                          */
+} app_link_box_class_snapshot_t;
+
+/*-------------------------------------------------------------------------------------------------------------------
+ * 函数: app_link_get_box_class_snapshot
+ * 功能: seq-lock 拷贝最近一帧 BOX_CLASS 解析结果, 供 app_recognize 多数票采样
+ * 参数: out —— 输出, 可为 NULL (直接忽略)
+ * 备注: 业务层应配合 frame_id 变化和 stamp_ms 抗陈旧来判定 "新一帧已到"
+ *-----------------------------------------------------------------------------------------------------------------*/
+void app_link_get_box_class_snapshot(app_link_box_class_snapshot_t *out);
 
 #ifdef __cplusplus
 }

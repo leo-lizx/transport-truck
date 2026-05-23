@@ -1,6 +1,7 @@
 #include "app_game_logic.h"
 #include "app_link.h"      /* P0-2: 读取 g_link_last_hb_ms 判断链路是否在线; P0-3: 拷贝 seq-lock 地图快照 */
 #include "app_vision_fusion.h"
+#include "app_recognize.h"
 
 /*
  * P0-3 说明:
@@ -384,15 +385,39 @@ static void stage_wait_start_handler(void)
     if (chassis_zone_is_fully_outside_launch(s_default_launch_zone)) {
         s_wait_start_phase = 0U;     /* 重置子相位, 供后续 LEVEL_JUDGE 复用 */
         reset_exec_context();
+        App_Recognize_Reset();       /* 进入 RECOGNIZE 前清识别 tour 状态 */
         goto_stage(STAGE_RECOGNIZE_MAP);
     }
 }
 
 static void stage_recognize_handler(void)
 {
-    /* TODO: 在这里接入视觉识别与 box->target 映射更新。
-     * 当前框架下识别完成后直接进入规划状态。 */
-    goto_stage(STAGE_PLAN_PATH);
+    /* ============================================================
+     * 识别 tour 子状态机驱动 (app_recognize.c):
+     *   - Stage1 简单贪心模式 (level=1 且无炸弹) → DONE_NO_NEED 直接放行
+     *   - Stage2/3: 遍历每个箱子和目标的观察点, 多数票投出 class_id,
+     *               配对成 box→target 映射写入 g_box_to_target[]
+     *   - 不可达或视觉持续无识别 → DEADLOCK_RESET 复位重试
+     * ============================================================ */
+    AppRecognizeStatus_e r = App_Recognize_Tick(g_game_map, g_player_pos,
+                                                map_has_bomb(),
+                                                g_current_level,
+                                                g_box_to_target);
+    switch (r)
+    {
+        case APP_RECOG_RUNNING:
+            return;
+        case APP_RECOG_DONE_OK:
+        case APP_RECOG_DONE_NO_NEED:
+            reset_exec_context();
+            goto_stage(STAGE_PLAN_PATH);
+            return;
+        case APP_RECOG_FAIL:
+        default:
+            reset_exec_context();
+            goto_stage(STAGE_DEADLOCK_RESET);
+            return;
+    }
 }
 
 static void stage_plan_handler(void)
@@ -510,6 +535,7 @@ static void stage_deadlock_reset_handler(void)
 
     reset_exec_context();
     s_wait_start_phase = 0U;     /* 重置 WAIT_START 子相位, 下一关重新走 "复位→等离开" */
+    App_Recognize_Reset();       /* 死局重置后重新跑识别 tour */
     goto_stage(STAGE_WAIT_START);
 }
 
@@ -614,6 +640,7 @@ static void update_link_state(void)
             if (current_stage == STAGE_PAUSE_ON_LINK_LOSS) {
                 /* 安全策略: 链路恢复后强制重新识别地图, 避免基于陈旧地图直接执行  */
                 current_stage = STAGE_RECOGNIZE_MAP;
+                App_Recognize_Reset();          /* 链路恢复后重新跑一遍识别 tour */
                 /* s_stage_resume 已不再使用, 但保留供调试观察 */
                 (void)s_stage_resume;
             }

@@ -128,6 +128,10 @@ void LPUART4_IRQHandler(void)
     if(kLPUART_RxDataRegFullFlag & LPUART_GetStatusFlags(LPUART4))
     {
         uint8 rx_byte = uart_read_byte(UART_4);
+        /* STATIC_MAP_DRIVE 调试: 把 UART4 原始字节复制一份到环形缓冲, 主循环 drain 到 UART1.
+         * 该 hook 在 main.c 中实现, 非 STATIC_MAP_DRIVE 模式下为空体, 不影响其他业务. */
+        extern void main_uart4_tap_byte(uint8 b);
+        main_uart4_tap_byte(rx_byte);
         app_link_isr_feed_byte(rx_byte);
     }
         

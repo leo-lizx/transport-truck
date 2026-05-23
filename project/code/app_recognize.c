@@ -1,0 +1,843 @@
+/*********************************************************************************************************************
+ * 文件名称   : app_recognize.c
+ * 模块功能   : 推箱子识别 tour 子状态机 (STAGE_RECOGNIZE_MAP 的真正实现)
+ *--------------------------------------------------------------------------------------------------------------------
+ * 算法概述:
+ *   1. 从地图提取所有 BOX 和 TARGET 坐标 (Stage1 跳过本流程)
+ *   2. 贪心: 反复挑离当前位置最近 (BFS 步数最短) 的未访问物体
+ *   3. 对每个物体:
+ *        - 找观察点: 与物体 4-邻接的可立足空地, BFS 求最近
+ *        - 移动到观察点 (HAL_CHASSIS_MOVE_TO + chassis_ctrl_is_arrived)
+ *        - 旋转车头朝物体 (chassis_ctrl_rotate_to_deg + chassis_ctrl_is_arrived)
+ *        - 等多数票稳定: 在 SAMPLE_WINDOW_MS 内统计 BOX_CLASS 帧, 占比 ≥ MAJORITY_THRESH 即确认
+ *   4. 所有 box → class_id, target → class_id 收齐后, 按相同 class_id 配对生成 g_box_to_target[]
+ *
+ * 资源:
+ *   - 全部 static (BSS), 不可重入, 不可在 ISR 调用
+ *   - 复用 algo_sokoban_solver 内部 BFS (Algo_Nav_BFS) 找观察点路径长度
+ *********************************************************************************************************************/
+
+#include "app_recognize.h"
+#include "app_link.h"
+#include "chassis_ctrl.h"
+#include "chassis_config.h"
+#include <math.h>
+#include <string.h>
+#include <stdlib.h>     /* abs() */
+
+#ifndef PI_F
+#define PI_F (3.14159265358979323846f)
+#endif
+
+/*===================================================================================================================
+ * 调参 (集中, 后续可挪到 chassis_config.h)
+ *=================================================================================================================*/
+
+/** 单次采样窗口最长时长 (ms) — 超时仍未稳定则按当前最高票输出 */
+#define RECOG_SAMPLE_WINDOW_MS         (1500U)
+
+/** 多数票确认阈值: 同一 class_id 出现次数 / 总采样 ≥ 该比 → 立即确认 (0..100) */
+#define RECOG_MAJORITY_THRESH_PCT      (60U)
+
+/** 最少采样次数 — 不到这个数即使比例够也再等等 */
+#define RECOG_MIN_SAMPLES              (8U)
+
+/** 视觉端无识别 (class_id=0) 容忍上限: 累计达到则判此物体识别失败 */
+#define RECOG_MAX_NONE_SAMPLES         (40U)
+
+/** 5ms 周期 */
+#define RECOG_TICK_MS                  (5U)
+
+/** 单次 SAMPLE 阶段最大 tick 数 */
+#define RECOG_SAMPLE_MAX_TICKS         (RECOG_SAMPLE_WINDOW_MS / RECOG_TICK_MS)
+
+/** 从 SOKOBAN_MAX_BOXES 借用的目标列表上限 (理论上 boxes==targets) */
+#define RECOG_MAX_TARGETS              (SOKOBAN_MAX_BOXES)
+
+/** class_id 的有效编号上限 (1..N), 设为 8 满足赛规已知箱子类别数 */
+#define RECOG_CLASS_ID_MAX             (8U)
+
+/*===================================================================================================================
+ * 内部数据结构
+ *=================================================================================================================*/
+
+typedef struct
+{
+    Point_t pos;            /* 物体网格坐标                          */
+    Point_t observe;        /* 观察点 (与 pos 4-邻接的可立足格)      */
+    uint8   kind;           /* APP_LINK_OBJ_KIND_BOX / TARGET        */
+    uint8   class_id;       /* 多数票输出的类别; 0 = 未识别          */
+    uint8   visited;        /* 1 = 本轮已尝试访问 (实测 OR 推断, 不再选)*/
+    uint8   ok;             /* 1 = class_id 已确定 (≠0)              */
+    uint8   inferred;       /* 1 = 由排除法推断得到 (未实地访问)     */
+} RecogItem_t;
+
+static AppRecognizeSub_e s_sub_state    = RECOG_SUB_INIT;
+static RecogItem_t       s_items[2 * RECOG_MAX_TARGETS];
+static uint8             s_item_count   = 0U;
+static uint8             s_box_count    = 0U;
+static uint8             s_target_count = 0U;
+static uint8             s_cur_idx      = 0U;     /* s_items 中当前处理项 */
+
+/* 子阶段状态 */
+static uint8  s_nav_started     = 0U;
+static uint8  s_face_started    = 0U;
+
+/* 多数票统计 */
+static uint16 s_sample_ticks    = 0U;
+static uint16 s_sample_total    = 0U;
+static uint16 s_sample_none     = 0U;
+static uint16 s_class_hist[RECOG_CLASS_ID_MAX + 1U] = {0};
+static uint32 s_last_seen_frame_id = 0U;     /* 已采样过的最大 frame_id, 防重复计票 */
+
+/*===================================================================================================================
+ * 内部工具
+ *=================================================================================================================*/
+
+static inline uint8 recog_is_inner(int8 r, int8 c)
+{
+    if (c < (int8)CHASSIS_GRID_INNER_MIN_X || c > (int8)CHASSIS_GRID_INNER_MAX_X) return 0;
+    if (r < (int8)CHASSIS_GRID_INNER_MIN_Y || r > (int8)CHASSIS_GRID_INNER_MAX_Y) return 0;
+    return 1;
+}
+
+static inline uint8 recog_is_passable(const uint8 map[MAP_ROWS][MAP_COLS], int8 r, int8 c)
+{
+    if (!recog_is_inner(r, c)) return 0;
+    return (map[r][c] == MAP_EMPTY || map[r][c] == MAP_TARGET) ? 1 : 0;
+}
+
+/**
+ * 在地图上 BFS 找到与给定坐标 (target_pos) 4-邻接的最近可立足格.
+ * 复用 Algo_Nav_BFS 的能力: 对 4 个邻居分别尝试, 取路径最短者.
+ *
+ * @return 1 成功, 0 不可达 (4 邻居全是墙/箱)
+ */
+static uint8 find_observe_point(const uint8 map[MAP_ROWS][MAP_COLS],
+                                Point_t player_pos,
+                                Point_t target_pos,
+                                Point_t *out_obs)
+{
+    static const int8 dr[4] = { -1,  1,  0,  0 };
+    static const int8 dc[4] = {  0,  0, -1,  1 };
+
+    /* P0-4: NavPath_t (~402B) 太大不能放栈, 用 static 单实例;
+     * find_observe_point 仅在主循环 RECOGNIZE 阶段顺序调用, 与 Algo_Nav_BFS
+     * 内部的 bfs_queue/parent_map/bfs_visited 是同一条非可重入约束. */
+    static NavPath_t s_obs_path;
+
+    int16 best_len = 32767;
+    Point_t best_obs = {(int8)-1, (int8)-1};
+    uint8 found = 0U;
+
+    for (uint8 d = 0U; d < 4U; ++d)
+    {
+        int8 ny = (int8)(target_pos.y + dr[d]);
+        int8 nx = (int8)(target_pos.x + dc[d]);
+        if (!recog_is_passable(map, ny, nx)) { continue; }
+
+        Point_t cand = { nx, ny };
+        if (!Algo_Nav_BFS(map, player_pos, cand, &s_obs_path)) { continue; }
+
+        if ((int16)s_obs_path.step_count < best_len)
+        {
+            best_len = (int16)s_obs_path.step_count;
+            best_obs = cand;
+            found = 1U;
+        }
+    }
+
+    if (found && out_obs != NULL)
+    {
+        *out_obs = best_obs;
+    }
+    return found;
+}
+
+/**
+ * 计算"车头朝物体"的目标 yaw (度). 约定见文件头.
+ *  - 车体 +Y 为前进方向, +X 为右
+ *  - yaw 是车体相对全局坐标系 +X 的角度 (CCW 正)
+ *  - 朝物体 = 车体 +Y 指向物体 → 解得 yaw = atan2(-Δx, Δy)
+ */
+static float recog_calc_face_yaw_deg(Point_t observe, Point_t target)
+{
+    float ox_m = chassis_grid_x_to_m((uint8)observe.x);
+    float oy_m = chassis_grid_y_to_m((uint8)observe.y);
+    float tx_m = chassis_grid_x_to_m((uint8)target.x);
+    float ty_m = chassis_grid_y_to_m((uint8)target.y);
+    float dx   = tx_m - ox_m;
+    float dy   = ty_m - oy_m;
+    float yaw_rad;
+
+    /* 退化情形: 重合 (理论上不会发生, 观察点必与物体相邻); 留前向 0° 兜底 */
+    if ((dx == 0.0f) && (dy == 0.0f))
+    {
+        return 0.0f;
+    }
+    yaw_rad = atan2f(-dx, dy);
+    return yaw_rad * (180.0f / PI_F);
+}
+
+/*===================================================================================================================
+ * 多数票 — 采样统计与判定
+ *=================================================================================================================*/
+
+static void sample_state_reset(void)
+{
+    s_sample_ticks       = 0U;
+    s_sample_total       = 0U;
+    s_sample_none        = 0U;
+    s_last_seen_frame_id = 0U;
+    memset(s_class_hist, 0, sizeof(s_class_hist));
+}
+
+/**
+ * @return  >0 = 已确认的 class_id;
+ *           0 = 还在采样;
+ *          -1 = 视觉持续无识别 (class_id=0 累计过多), 判失败
+ *          -2 = 时间窗到了仍无明确多数, 取最高票兜底
+ */
+static int16 sample_majority_step(uint8 expect_kind)
+{
+    app_link_box_class_snapshot_t snap;
+    app_link_get_box_class_snapshot(&snap);
+
+    s_sample_ticks++;
+
+    /* 仅当新一帧到达时计票 */
+    if ((snap.valid != 0U) && (snap.frame_id != s_last_seen_frame_id))
+    {
+        s_last_seen_frame_id = snap.frame_id;
+
+        /* 物体类型不匹配 (主控想看 BOX, 视觉端却给 TARGET) → 当作无识别 */
+        if (snap.obj_kind != expect_kind)
+        {
+            s_sample_none++;
+        }
+        else if (snap.class_id == 0U)
+        {
+            s_sample_none++;
+        }
+        else if (snap.class_id <= (uint8)RECOG_CLASS_ID_MAX)
+        {
+            s_class_hist[snap.class_id]++;
+            s_sample_total++;
+        }
+        else
+        {
+            /* 越界视为无识别 */
+            s_sample_none++;
+        }
+    }
+
+    /* 视觉端持续无识别 → 失败 */
+    if (s_sample_none >= (uint16)RECOG_MAX_NONE_SAMPLES)
+    {
+        return -1;
+    }
+
+    /* 满足最少采样数后, 看最高票占比 */
+    if (s_sample_total >= (uint16)RECOG_MIN_SAMPLES)
+    {
+        uint8  best_cls = 0U;
+        uint16 best_cnt = 0U;
+        for (uint8 i = 1U; i <= (uint8)RECOG_CLASS_ID_MAX; ++i)
+        {
+            if (s_class_hist[i] > best_cnt)
+            {
+                best_cnt = s_class_hist[i];
+                best_cls = i;
+            }
+        }
+        /* 占比达标 → 立即确认 */
+        if ((uint32)best_cnt * 100U >= (uint32)s_sample_total * (uint32)RECOG_MAJORITY_THRESH_PCT)
+        {
+            return (int16)best_cls;
+        }
+    }
+
+    /* 时间窗到了 → 兜底返回最高票 (即便比例不够, 只要 >0) */
+    if (s_sample_ticks >= (uint16)RECOG_SAMPLE_MAX_TICKS)
+    {
+        uint8  best_cls = 0U;
+        uint16 best_cnt = 0U;
+        for (uint8 i = 1U; i <= (uint8)RECOG_CLASS_ID_MAX; ++i)
+        {
+            if (s_class_hist[i] > best_cnt)
+            {
+                best_cnt = s_class_hist[i];
+                best_cls = i;
+            }
+        }
+        if (best_cnt > 0U)
+        {
+            return (int16)best_cls;
+        }
+        return -2;     /* 兜底失败 */
+    }
+
+    return 0;          /* 继续采样 */
+}
+
+/*===================================================================================================================
+ * 物体提取 + 访问顺序
+ *=================================================================================================================*/
+
+/**
+ * 排除法 — 利用"箱子 class_id 集合 = 目标 class_id 集合 = {1..N}"的赛规先验,
+ * 当某一类(box 或 target)的未识别项仅剩 1 个时, 直接推断它的 class_id
+ * 而无需绕过去观察, 节省识别时间.
+ *
+ * 推断条件:
+ *   - 该类总共 N 个物体
+ *   - 已识别 N-1 个 (ok=1, class_id ∈ 1..N 各不相同)
+ *   - 缺失的 class_id 唯一 → 赋给最后那 1 个未识别项
+ *
+ * 同时考虑跨类推断:
+ *   - 假设箱子有 [1, 2, ?]
+ *   - 目标已全部识别为 [1, 2, 3]
+ *   - 那么剩余的箱子必然是 3 (因为箱-目标 1:1, 1..N 集合相同)
+ *
+ * @return  本轮新推断出的物体数量 (0 表示无可推断)
+ */
+static uint8 try_infer_remaining(void)
+{
+    uint8 inferred_now = 0U;
+
+    /* 分别统计 box / target 的已识别 class_id 集合 */
+    uint8 box_used[RECOG_CLASS_ID_MAX + 2U] = {0};
+    uint8 tgt_used[RECOG_CLASS_ID_MAX + 2U] = {0};
+    uint8 box_unknown_idx = 0xFFU;
+    uint8 box_unknown_cnt = 0U;
+    uint8 tgt_unknown_idx = 0xFFU;
+    uint8 tgt_unknown_cnt = 0U;
+
+    for (uint8 i = 0U; i < s_item_count; ++i)
+    {
+        if (s_items[i].kind == APP_LINK_OBJ_KIND_BOX)
+        {
+            if (s_items[i].ok && s_items[i].class_id <= RECOG_CLASS_ID_MAX)
+            {
+                box_used[s_items[i].class_id] = 1U;
+            }
+            else
+            {
+                box_unknown_idx = i;
+                ++box_unknown_cnt;
+            }
+        }
+        else
+        {
+            if (s_items[i].ok && s_items[i].class_id <= RECOG_CLASS_ID_MAX)
+            {
+                tgt_used[s_items[i].class_id] = 1U;
+            }
+            else
+            {
+                tgt_unknown_idx = i;
+                ++tgt_unknown_cnt;
+            }
+        }
+    }
+
+    /* ------- 同类内 (N-1 推 1) ------- */
+    if (box_unknown_cnt == 1U && s_box_count >= 1U)
+    {
+        uint8 missing = 0U;
+        for (uint8 cls = 1U; cls <= s_box_count; ++cls)
+        {
+            if (!box_used[cls]) { missing = (missing == 0U) ? cls : 0xFFU; }
+        }
+        if (missing > 0U && missing != 0xFFU && box_unknown_idx != 0xFFU)
+        {
+            s_items[box_unknown_idx].class_id = missing;
+            s_items[box_unknown_idx].ok       = 1U;
+            s_items[box_unknown_idx].visited  = 1U;
+            s_items[box_unknown_idx].inferred = 1U;
+            box_used[missing] = 1U;
+            ++inferred_now;
+            box_unknown_cnt = 0U;
+        }
+    }
+
+    if (tgt_unknown_cnt == 1U && s_target_count >= 1U)
+    {
+        uint8 missing = 0U;
+        for (uint8 cls = 1U; cls <= s_target_count; ++cls)
+        {
+            if (!tgt_used[cls]) { missing = (missing == 0U) ? cls : 0xFFU; }
+        }
+        if (missing > 0U && missing != 0xFFU && tgt_unknown_idx != 0xFFU)
+        {
+            s_items[tgt_unknown_idx].class_id = missing;
+            s_items[tgt_unknown_idx].ok       = 1U;
+            s_items[tgt_unknown_idx].visited  = 1U;
+            s_items[tgt_unknown_idx].inferred = 1U;
+            tgt_used[missing] = 1U;
+            ++inferred_now;
+            tgt_unknown_cnt = 0U;
+        }
+    }
+
+    /* ------- 跨类推断: 如果一类全部已识别, 另一类的剩余项可由 1..N 集合反推 ------- */
+    /* 例: box 已知 [1, ?]; target 已知 [1, 2] → ? 必为 2                       */
+    /* 注意: 跨类推断只能给"另一类全部已识别 (含本轮新推断)"的情况使用              */
+
+    /* (a) target 全识别 → 推 box 剩余项 */
+    if (tgt_unknown_cnt == 0U && box_unknown_cnt >= 1U
+        && s_box_count == s_target_count)
+    {
+        /* 收集还未识别的 box 索引列表 */
+        uint8 ulist[RECOG_MAX_TARGETS + 1U];
+        uint8 un = 0U;
+        for (uint8 i = 0U; i < s_item_count; ++i)
+        {
+            if (s_items[i].kind != APP_LINK_OBJ_KIND_BOX) { continue; }
+            if (s_items[i].ok)                            { continue; }
+            if (un < (uint8)RECOG_MAX_TARGETS) { ulist[un++] = i; }
+        }
+        /* 列出 box 缺失的 class_id (和 target 集合做差集) */
+        uint8 missing_list[RECOG_CLASS_ID_MAX + 1U];
+        uint8 mn = 0U;
+        for (uint8 cls = 1U; cls <= s_target_count; ++cls)
+        {
+            if (!box_used[cls] && tgt_used[cls])
+            {
+                if (mn < (uint8)RECOG_CLASS_ID_MAX) { missing_list[mn++] = cls; }
+            }
+        }
+        if (mn == 1U && un == 1U)
+        {
+            s_items[ulist[0]].class_id = missing_list[0];
+            s_items[ulist[0]].ok       = 1U;
+            s_items[ulist[0]].visited  = 1U;
+            s_items[ulist[0]].inferred = 1U;
+            ++inferred_now;
+        }
+    }
+
+    /* (b) box 全识别 → 推 target 剩余项 */
+    if (box_unknown_cnt == 0U && tgt_unknown_cnt >= 1U
+        && s_box_count == s_target_count)
+    {
+        uint8 ulist[RECOG_MAX_TARGETS + 1U];
+        uint8 un = 0U;
+        for (uint8 i = 0U; i < s_item_count; ++i)
+        {
+            if (s_items[i].kind != APP_LINK_OBJ_KIND_TARGET) { continue; }
+            if (s_items[i].ok)                                { continue; }
+            if (un < (uint8)RECOG_MAX_TARGETS) { ulist[un++] = i; }
+        }
+        uint8 missing_list[RECOG_CLASS_ID_MAX + 1U];
+        uint8 mn = 0U;
+        for (uint8 cls = 1U; cls <= s_box_count; ++cls)
+        {
+            if (!tgt_used[cls] && box_used[cls])
+            {
+                if (mn < (uint8)RECOG_CLASS_ID_MAX) { missing_list[mn++] = cls; }
+            }
+        }
+        if (mn == 1U && un == 1U)
+        {
+            s_items[ulist[0]].class_id = missing_list[0];
+            s_items[ulist[0]].ok       = 1U;
+            s_items[ulist[0]].visited  = 1U;
+            s_items[ulist[0]].inferred = 1U;
+            ++inferred_now;
+        }
+    }
+
+    return inferred_now;
+}
+
+/**
+ * 检查识别 tour 是否已经"事实完成":
+ * 所有 box / target 都 ok=1 (含推断).
+ */
+static uint8 all_resolved(void)
+{
+    if (s_item_count == 0U) { return 0U; }
+    for (uint8 i = 0U; i < s_item_count; ++i)
+    {
+        if (!s_items[i].ok) { return 0U; }
+    }
+    return 1U;
+}
+
+static void extract_items(const uint8 map[MAP_ROWS][MAP_COLS])
+{
+    s_item_count   = 0U;
+    s_box_count    = 0U;
+    s_target_count = 0U;
+
+    for (int8 r = (int8)CHASSIS_GRID_INNER_MIN_Y; r <= (int8)CHASSIS_GRID_INNER_MAX_Y; ++r)
+    {
+        for (int8 c = (int8)CHASSIS_GRID_INNER_MIN_X; c <= (int8)CHASSIS_GRID_INNER_MAX_X; ++c)
+        {
+            if ((s_item_count >= (uint8)(2U * RECOG_MAX_TARGETS))) { continue; }
+            if (map[r][c] == MAP_BOX)
+            {
+                s_items[s_item_count].pos.x = c;
+                s_items[s_item_count].pos.y = r;
+                s_items[s_item_count].kind  = APP_LINK_OBJ_KIND_BOX;
+                s_items[s_item_count].class_id = 0U;
+                s_items[s_item_count].visited  = 0U;
+                s_items[s_item_count].ok       = 0U;
+                ++s_item_count;
+                ++s_box_count;
+            }
+            else if (map[r][c] == MAP_TARGET)
+            {
+                s_items[s_item_count].pos.x = c;
+                s_items[s_item_count].pos.y = r;
+                s_items[s_item_count].kind  = APP_LINK_OBJ_KIND_TARGET;
+                s_items[s_item_count].class_id = 0U;
+                s_items[s_item_count].visited  = 0U;
+                s_items[s_item_count].ok       = 0U;
+                ++s_item_count;
+                ++s_target_count;
+            }
+        }
+    }
+}
+
+/**
+ * 选下一个未访问的物体 — 贪心: 离当前位置曼哈顿距离最近.
+ * (BFS 路径长度更准, 但开销大 (每次 O(n*MR*MC)); 内场 14×10 的曼哈顿近似已足够.)
+ *
+ * @return 选中下标, 没有未访问项时返回 0xFF
+ */
+static uint8 pick_next_item(Point_t cur)
+{
+    uint8 best = 0xFFU;
+    int16 best_d = 32767;
+
+    for (uint8 i = 0U; i < s_item_count; ++i)
+    {
+        if (s_items[i].visited) { continue; }
+        int16 d = (int16)(abs((int)s_items[i].pos.x - (int)cur.x)
+                        + abs((int)s_items[i].pos.y - (int)cur.y));
+        if (d < best_d)
+        {
+            best_d = d;
+            best   = i;
+        }
+    }
+    return best;
+}
+
+/*===================================================================================================================
+ * 配对 — 把 box.class_id 与 target.class_id 配对成 box_to_target_idx 数组
+ * 输出: box_to_target_out[i] = "第 i 个箱子 (按 extract 顺序中的相对索引)" 应推到 "第 ? 个目标"
+ *      约定与 algo_sokoban_solver 内部 extract_elements 顺序一致
+ *=================================================================================================================*/
+static uint8 build_box_to_target_mapping(uint8 box_to_target_out[SOKOBAN_MAX_BOXES])
+{
+    /* 先收集 boxes / targets 的 class_id (按 extract 顺序记录的相对索引) */
+    uint8 box_class[SOKOBAN_MAX_BOXES];
+    uint8 tgt_class[SOKOBAN_MAX_BOXES];
+    uint8 box_idx_in_extract = 0U;
+    uint8 tgt_idx_in_extract = 0U;
+
+    memset(box_class, 0, sizeof(box_class));
+    memset(tgt_class, 0, sizeof(tgt_class));
+
+    /* extract_items 已按行/列扫描顺序存入 s_items, 与 algo_sokoban_solver
+     * 的 extract_elements(MAP_BOX) / extract_elements(MAP_TARGET) 同顺序;
+     * 因此分别按 kind 累加自身相对下标. */
+    for (uint8 i = 0U; i < s_item_count; ++i)
+    {
+        if (s_items[i].kind == APP_LINK_OBJ_KIND_BOX)
+        {
+            if (box_idx_in_extract < (uint8)SOKOBAN_MAX_BOXES)
+            {
+                box_class[box_idx_in_extract] = s_items[i].class_id;
+                ++box_idx_in_extract;
+            }
+        }
+        else
+        {
+            if (tgt_idx_in_extract < (uint8)SOKOBAN_MAX_BOXES)
+            {
+                tgt_class[tgt_idx_in_extract] = s_items[i].class_id;
+                ++tgt_idx_in_extract;
+            }
+        }
+    }
+
+    if (box_idx_in_extract != tgt_idx_in_extract) { return 0U; }
+    if (box_idx_in_extract == 0U)                  { return 0U; }
+
+    /* 为每个 box 找同 class_id 的 target (要求一一匹配, 不可重复占用) */
+    uint8 t_used[SOKOBAN_MAX_BOXES] = {0};
+    for (uint8 bi = 0U; bi < box_idx_in_extract; ++bi)
+    {
+        uint8 cls = box_class[bi];
+        uint8 matched = 0U;
+        if (cls == 0U) { return 0U; }      /* 任何 box 未识别 → 配对失败 */
+
+        for (uint8 ti = 0U; ti < tgt_idx_in_extract; ++ti)
+        {
+            if (t_used[ti])           { continue; }
+            if (tgt_class[ti] != cls) { continue; }
+            box_to_target_out[bi] = ti;
+            t_used[ti] = 1U;
+            matched = 1U;
+            break;
+        }
+        if (!matched) { return 0U; }
+    }
+
+    /* 剩余位补 0, 不影响, 因为 Sokoban_Solve_Stage2 只用前 box_count 项 */
+    for (uint8 bi = box_idx_in_extract; bi < (uint8)SOKOBAN_MAX_BOXES; ++bi)
+    {
+        box_to_target_out[bi] = 0U;
+    }
+    return 1U;
+}
+
+/*===================================================================================================================
+ * 子状态 handler
+ *=================================================================================================================*/
+
+static void enter_sub_nav(void)
+{
+    s_sub_state    = RECOG_SUB_NAV;
+    s_nav_started  = 0U;
+    s_face_started = 0U;
+}
+
+static void enter_sub_face(void)
+{
+    s_sub_state    = RECOG_SUB_FACE;
+    s_face_started = 0U;
+}
+
+static void enter_sub_sample(void)
+{
+    s_sub_state = RECOG_SUB_SAMPLE;
+    sample_state_reset();
+}
+
+static void enter_sub_next(void)
+{
+    s_sub_state = RECOG_SUB_NEXT;
+}
+
+/*===================================================================================================================
+ * 对外: Reset / Tick
+ *=================================================================================================================*/
+
+void App_Recognize_Reset(void)
+{
+    s_sub_state    = RECOG_SUB_INIT;
+    s_item_count   = 0U;
+    s_box_count    = 0U;
+    s_target_count = 0U;
+    s_cur_idx      = 0U;
+    s_nav_started  = 0U;
+    s_face_started = 0U;
+    sample_state_reset();
+    memset(s_items, 0, sizeof(s_items));
+}
+
+AppRecognizeStatus_e App_Recognize_Tick(const uint8 map[MAP_ROWS][MAP_COLS],
+                                        Point_t player_pos,
+                                        uint8 has_bomb,
+                                        uint8 level,
+                                        uint8 box_to_target_out[SOKOBAN_MAX_BOXES])
+{
+    switch (s_sub_state)
+    {
+        case RECOG_SUB_INIT:
+        {
+            /* Stage1 简单贪心模式不需要识别: 关 1 且地图无炸弹直接放行 */
+            if ((level <= 1U) && (has_bomb == 0U))
+            {
+                return APP_RECOG_DONE_NO_NEED;
+            }
+
+            extract_items(map);
+            if (s_item_count == 0U)
+            {
+                /* 地图无 BOX/TARGET → 没东西可识别, 放行 */
+                return APP_RECOG_DONE_NO_NEED;
+            }
+            if (s_box_count != s_target_count)
+            {
+                /* 数量不一致 (视觉端漏识别 / 地图错乱) → 直接判失败 */
+                s_sub_state = RECOG_SUB_FAIL;
+                return APP_RECOG_FAIL;
+            }
+            s_cur_idx = pick_next_item(player_pos);
+            if (s_cur_idx == 0xFFU)
+            {
+                /* 不应发生 (s_item_count > 0) */
+                s_sub_state = RECOG_SUB_DONE;
+                return APP_RECOG_RUNNING;
+            }
+            /* 找当前物体的观察点 */
+            if (!find_observe_point(map, player_pos, s_items[s_cur_idx].pos,
+                                    &s_items[s_cur_idx].observe))
+            {
+                /* 不可达 → 跳过该物体, 标 visited+fail */
+                s_items[s_cur_idx].visited = 1U;
+                s_items[s_cur_idx].ok      = 0U;
+                /* 仍循环 NEXT 决定整体失败 */
+                enter_sub_next();
+                return APP_RECOG_RUNNING;
+            }
+            enter_sub_nav();
+            return APP_RECOG_RUNNING;
+        }
+
+        case RECOG_SUB_NAV:
+        {
+            Point_t obs = s_items[s_cur_idx].observe;
+            if (!s_nav_started)
+            {
+                HAL_CHASSIS_MOVE_TO((uint8)obs.x, (uint8)obs.y);
+                s_nav_started = 1U;
+                return APP_RECOG_RUNNING;
+            }
+            if (!chassis_ctrl_is_arrived())
+            {
+                return APP_RECOG_RUNNING;
+            }
+            enter_sub_face();
+            return APP_RECOG_RUNNING;
+        }
+
+        case RECOG_SUB_FACE:
+        {
+            if (!s_face_started)
+            {
+                float yaw_target = recog_calc_face_yaw_deg(s_items[s_cur_idx].observe,
+                                                           s_items[s_cur_idx].pos);
+                chassis_ctrl_rotate_to_deg(yaw_target);
+                s_face_started = 1U;
+                return APP_RECOG_RUNNING;
+            }
+            if (!chassis_ctrl_is_arrived())
+            {
+                return APP_RECOG_RUNNING;
+            }
+            enter_sub_sample();
+            return APP_RECOG_RUNNING;
+        }
+
+        case RECOG_SUB_SAMPLE:
+        {
+            int16 r = sample_majority_step(s_items[s_cur_idx].kind);
+            if (r > 0)
+            {
+                s_items[s_cur_idx].class_id = (uint8)r;
+                s_items[s_cur_idx].visited  = 1U;
+                s_items[s_cur_idx].ok       = 1U;
+                s_items[s_cur_idx].inferred = 0U;
+                /* 排除法: 若一类只剩 1 个未识别, 直接推断不再绕过去 */
+                (void)try_infer_remaining();
+                enter_sub_next();
+            }
+            else if (r == -1 || r == -2)
+            {
+                /* 当前物体识别失败 — 不立即整体失败, 给后续物体机会;
+                 * 最终在 NEXT/DONE 阶段统一判断映射是否完整 */
+                s_items[s_cur_idx].visited = 1U;
+                s_items[s_cur_idx].ok      = 0U;
+                enter_sub_next();
+            }
+            return APP_RECOG_RUNNING;
+        }
+
+        case RECOG_SUB_NEXT:
+        {
+            /* 排除法可能在跨类配对后才生效, 这里再补一次推断 */
+            (void)try_infer_remaining();
+
+            /* 已全部识别完 → 配对 */
+            if (all_resolved())
+            {
+                if (build_box_to_target_mapping(box_to_target_out))
+                {
+                    s_sub_state = RECOG_SUB_DONE;
+                    return APP_RECOG_DONE_OK;
+                }
+                s_sub_state = RECOG_SUB_FAIL;
+                return APP_RECOG_FAIL;
+            }
+
+            uint8 next = pick_next_item(player_pos);
+            if (next != 0xFFU)
+            {
+                s_cur_idx = next;
+                if (!find_observe_point(map, player_pos, s_items[s_cur_idx].pos,
+                                        &s_items[s_cur_idx].observe))
+                {
+                    s_items[s_cur_idx].visited = 1U;
+                    s_items[s_cur_idx].ok      = 0U;
+                    /* 留在 NEXT, 下一 tick 继续挑 */
+                    return APP_RECOG_RUNNING;
+                }
+                enter_sub_nav();
+                return APP_RECOG_RUNNING;
+            }
+            /* 所有物体都尝试过仍未全识别 → 配对失败 */
+            if (build_box_to_target_mapping(box_to_target_out))
+            {
+                s_sub_state = RECOG_SUB_DONE;
+                return APP_RECOG_DONE_OK;
+            }
+            s_sub_state = RECOG_SUB_FAIL;
+            return APP_RECOG_FAIL;
+        }
+
+        case RECOG_SUB_DONE:
+        {
+            return APP_RECOG_DONE_OK;
+        }
+
+        case RECOG_SUB_FAIL:
+        default:
+        {
+            return APP_RECOG_FAIL;
+        }
+    }
+}
+
+void App_Recognize_Get_Debug(AppRecognizeDebug_t *out)
+{
+    if (out == NULL) { return; }
+
+    out->sub_state         = s_sub_state;
+    out->total_targets     = s_item_count;
+    out->current_idx       = s_cur_idx;
+    if (s_cur_idx < s_item_count)
+    {
+        out->current_kind     = s_items[s_cur_idx].kind;
+        out->current_class_id = s_items[s_cur_idx].class_id;
+    }
+    else
+    {
+        out->current_kind     = 0U;
+        out->current_class_id = 0U;
+    }
+    out->sample_count      = s_sample_total;
+
+    /* 实测/推断/已确定 计数 */
+    uint8 visited = 0U, inferred = 0U, rb = 0U, rt = 0U;
+    for (uint8 i = 0U; i < s_item_count; ++i)
+    {
+        if (s_items[i].visited && !s_items[i].inferred) { ++visited; }
+        if (s_items[i].inferred) { ++inferred; }
+        if (s_items[i].ok)
+        {
+            if (s_items[i].kind == APP_LINK_OBJ_KIND_BOX) { ++rb; } else { ++rt; }
+        }
+    }
+    out->visited_count   = visited;
+    out->inferred_count  = inferred;
+    out->resolved_box    = rb;
+    out->resolved_target = rt;
+}

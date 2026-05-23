@@ -82,6 +82,17 @@ static volatile uint32 s_car_snap_ms      = 0U;
 static volatile uint32 s_car_frame_id     = 0U;
 static volatile uint8  s_car_snap_valid   = 0U;
 
+/* 【识别 tour】BOX_CLASS 帧权威副本 + seq-lock (ISR 写, 主循环读) */
+#define APP_LINK_BOX_CLASS_RETRY_MAX  (8U)
+
+static volatile uint32 s_box_cls_seq      = 0U;
+static volatile uint8  s_box_cls_kind     = 0U;
+static volatile uint8  s_box_cls_id       = 0U;
+static volatile uint8  s_box_cls_vseq     = 0U;
+static volatile uint32 s_box_cls_ms       = 0U;
+static volatile uint32 s_box_cls_frame_id = 0U;
+static volatile uint8  s_box_cls_valid    = 0U;
+
 /*-------------------------------------------------------------------------------------------------------------------
  * ISR 内调用: MAP 载荷已合法写入地图后，再提交车辆坐标（与地图同一帧语义一致）
  *-----------------------------------------------------------------------------------------------------------------*/
@@ -121,6 +132,50 @@ void app_link_get_car_snapshot(app_link_car_snapshot_t *out)
         out->valid    = s_car_snap_valid;
         __DMB();
         s2 = s_car_seq;
+        if (s1 == s2) { return; }
+    }
+
+    out->valid = 0U;
+}
+
+/*-------------------------------------------------------------------------------------------------------------------
+ * BOX_CLASS 帧 - ISR 写入 (载荷已经过 LEN/CRC 校验)
+ *-----------------------------------------------------------------------------------------------------------------*/
+static void commit_box_class_frame(uint8 obj_kind, uint8 class_id, uint8 vision_seq)
+{
+    s_box_cls_seq++;
+    __DMB();
+    s_box_cls_kind     = obj_kind;
+    s_box_cls_id       = class_id;
+    s_box_cls_vseq     = vision_seq;
+    s_box_cls_ms       = s_ms_now;
+    s_box_cls_frame_id++;
+    s_box_cls_valid    = 1U;
+    __DMB();
+    s_box_cls_seq++;
+}
+
+void app_link_get_box_class_snapshot(app_link_box_class_snapshot_t *out)
+{
+    uint32 retry;
+    uint32 s1;
+    uint32 s2;
+
+    if (out == NULL) { return; }
+
+    for (retry = 0U; retry <= APP_LINK_BOX_CLASS_RETRY_MAX; ++retry)
+    {
+        s1 = s_box_cls_seq;
+        if ((s1 & 1U) != 0U) { continue; }
+        __DMB();
+        out->obj_kind   = s_box_cls_kind;
+        out->class_id   = s_box_cls_id;
+        out->vision_seq = s_box_cls_vseq;
+        out->stamp_ms   = s_box_cls_ms;
+        out->frame_id   = s_box_cls_frame_id;
+        out->valid      = s_box_cls_valid;
+        __DMB();
+        s2 = s_box_cls_seq;
         if (s1 == s2) { return; }
     }
 
@@ -365,6 +420,32 @@ static void dispatch_frame(void)
             break;
         }
 
+        case APP_LINK_TYPE_BOX_CLASS:
+        {
+            uint8 obj_kind;
+            uint8 class_id;
+            uint8 vision_seq;
+
+            if (s_rx_len != (uint8)APP_LINK_BOX_CLASS_PAYLOAD_LEN)
+            {
+                ++g_link_stats.frames_len_err;
+                break;
+            }
+            obj_kind   = s_rx_payload[0];
+            class_id   = s_rx_payload[1];
+            vision_seq = s_rx_payload[2];
+            if ((obj_kind != APP_LINK_OBJ_KIND_BOX) &&
+                (obj_kind != APP_LINK_OBJ_KIND_TARGET))
+            {
+                ++g_link_stats.frames_len_err;
+                break;
+            }
+            commit_box_class_frame(obj_kind, class_id, vision_seq);
+            ++g_link_stats.frames_ok;
+            g_link_last_hb_ms = s_ms_now;     /* 任何有效帧都视为链路活跃 */
+            break;
+        }
+
         default:
         {
             ++g_link_stats.frames_unknown_type;
@@ -411,6 +492,18 @@ void app_link_init(void)
     s_car_snap_valid   = 0U;
     __DMB();
     s_car_seq++;
+
+    /* BOX_CLASS 快照清零 */
+    s_box_cls_seq++;
+    __DMB();
+    s_box_cls_kind     = 0U;
+    s_box_cls_id       = 0U;
+    s_box_cls_vseq     = 0U;
+    s_box_cls_ms       = 0U;
+    s_box_cls_frame_id = 0U;
+    s_box_cls_valid    = 0U;
+    __DMB();
+    s_box_cls_seq++;
 
     g_link_stats.frames_ok           = 0U;
     g_link_stats.frames_crc_err      = 0U;

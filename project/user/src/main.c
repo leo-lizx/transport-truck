@@ -61,6 +61,94 @@ void main_loop_on_pit_tick(void)
     s_main_tick_pending++;
 }
 
+/*==========================================================================
+ *  UART4 → UART1 字节透传 (仅 STATIC_MAP_DRIVE 模式生效, 其他模式空体)
+ *  - ISR 写: LPUART4_IRQHandler 每收到 1 字节调用 main_uart4_tap_byte()
+ *  - 主循环读: main_uart4_tap_drain_5ms() 把缓冲整块 uart_write_buffer 出去
+ *  - 缓冲 1KB 足以覆盖一帧 ~200B + 几帧 100ms 心跳的突发, 满则丢最旧
+ *  - 之所以攒够再发: 一帧 MAP 帧 200B @ 115200 ≈ 17ms 才能发完, 期间 printf
+ *    可能交错穿插, drain 一次写一整块 uart_write_buffer 内部不会被切断
+ *========================================================================*/
+#if (MAIN_RUN_MODE == MAIN_RUN_MODE_STATIC_MAP_DRIVE)
+#define MAIN_UART4_TAP_BUF_LEN   (1024U)
+static volatile uint8  s_u4tap_buf[MAIN_UART4_TAP_BUF_LEN];
+static volatile uint16 s_u4tap_head = 0U;   /* 写指针 (ISR) */
+static volatile uint16 s_u4tap_tail = 0U;   /* 读指针 (主循环) */
+static volatile uint32 s_u4tap_drop = 0U;   /* 缓冲满丢弃字节累计 */
+#endif
+
+/* ISR hook: 不能阻塞, 不能调 printf. 仅在缓冲未满时记一字节. */
+void main_uart4_tap_byte(uint8 b)
+{
+#if (MAIN_RUN_MODE == MAIN_RUN_MODE_STATIC_MAP_DRIVE)
+    uint16 next = (uint16)(s_u4tap_head + 1U);
+    if (next >= MAIN_UART4_TAP_BUF_LEN) next = 0U;
+    if (next == s_u4tap_tail)
+    {
+        s_u4tap_drop++;            /* 满了, 丢弃当前字节 */
+        return;
+    }
+    s_u4tap_buf[s_u4tap_head] = b;
+    s_u4tap_head = next;
+#else
+    (void)b;
+#endif
+}
+
+#if (MAIN_RUN_MODE == MAIN_RUN_MODE_STATIC_MAP_DRIVE)
+/*
+ * 主循环 5ms 调用: 把 UART4 字节缓冲一次性写到 UART1 (= debug 端口).
+ *   - 每次最多写一段连续区域 (head/tail 不绕回时整段, 绕回时分两段)
+ *   - 用 SMD_RAW_BEGIN/END 包住, 上位机抓帧用; 内部为二进制原始字节
+ *   - 主控收到地图后 ISR 已被关闭 (uart_rx_interrupt(UART4, 0)), 后续不再有新字节
+ */
+static void main_uart4_tap_drain_5ms(void)
+{
+    uint16 head, tail;
+    static uint32 s_last_drop = 0U;
+
+    /* 读端临界区: 用 atomic snapshot 避免 ISR 中途修改 head 造成 len 计算错位.
+     * 这里只读 head/tail 一次即可, 单字段 16-bit 在 M7 上读取原子. */
+    head = s_u4tap_head;
+    tail = s_u4tap_tail;
+
+    if (head == tail) {
+        if (s_u4tap_drop != s_last_drop) {
+            s_last_drop = s_u4tap_drop;
+            printf("SMD_RAW_DROP=%lu\n", (unsigned long)s_last_drop);
+        }
+        return;
+    }
+
+    printf("SMD_RAW_BEGIN len=%u\n",
+           (unsigned)((head >= tail) ? (head - tail) :
+                                       (MAIN_UART4_TAP_BUF_LEN - tail + head)));
+
+    if (head > tail) {
+        /* 一段连续区: tail .. head-1 */
+        uart_write_buffer(UART_1, (const uint8 *)&s_u4tap_buf[tail],
+                          (uint32)(head - tail));
+    } else {
+        /* 绕回: tail..LEN-1 + 0..head-1, 分两次写 */
+        uart_write_buffer(UART_1, (const uint8 *)&s_u4tap_buf[tail],
+                          (uint32)(MAIN_UART4_TAP_BUF_LEN - tail));
+        if (head > 0U) {
+            uart_write_buffer(UART_1, (const uint8 *)&s_u4tap_buf[0],
+                              (uint32)head);
+        }
+    }
+    s_u4tap_tail = head;
+
+    /* SMD_RAW_END 单独一行换行, 上位机用 BEGIN..END 抓块 */
+    printf("\nSMD_RAW_END\n");
+
+    if (s_u4tap_drop != s_last_drop) {
+        s_last_drop = s_u4tap_drop;
+        printf("SMD_RAW_DROP=%lu\n", (unsigned long)s_last_drop);
+    }
+}
+#endif
+
 /*
  * 阻塞直到下一个 5ms tick 到来, 返回本次消费的 tick 数 (>=1).
  * - 没有 pending tick 时 __WFI() 让 CPU 休眠, 任意中断 (PIT/UART/SysTick) 可唤醒
@@ -99,9 +187,10 @@ static uint32 wait_for_tick(void)
 #define MAIN_RUN_MODE_POINT_NAV       (3)
 #define MAIN_RUN_MODE_SOKO_SELFTEST   (4)
 #define MAIN_RUN_MODE_OPENART1_TEST   (5)
+#define MAIN_RUN_MODE_STATIC_MAP_DRIVE (6)  /* 静态地图离线解算 + 整车跑航点 */
 
 /* >>>>>>>>>>>> 改这里切换调试模式 <<<<<<<<<<<< */
-#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_POINT_NAV)  /* 电机低速验证 */
+#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_STATIC_MAP_DRIVE)  /* 静态地图整车测试 */
 /* <<<<<<<<<<<< 改这里切换调试模式 >>>>>>>>>>>> */
 
 /* OpenART1 地图链路硬件口: 若实测 UART4 走 D0/D1, 只改下面两行宏. */
@@ -114,24 +203,41 @@ static uint32 wait_for_tick(void)
 #define MAIN_TEST_LOG_UART_TX         (UART1_TX_B12)
 #define MAIN_TEST_LOG_UART_RX         (UART1_RX_B13)
 
-#if (MAIN_RUN_MODE == MAIN_RUN_MODE_SOKO_SELFTEST)
+/* ========================================================================== */
+/* 位置/起点宏（上提至所有调试模式之前, 避免 SOKO_SELFTEST/STATIC_MAP_DRIVE 内
+ * 引用时未定义）. 起点 (1, 5.5) 是发车区中心, 由顶层 chassis_ctrl_set_pose 写死. */
+/* ========================================================================== */
+#define MAIN_POS_NAV_START_X_GRID     (1.0f)
+#define MAIN_POS_NAV_START_Y_GRID     (5.5f)
+
+#define MAIN_POS_GRID_TO_M_X(g)       (((float)(g) - 0.5f) * CHASSIS_GRID_STEP_X_M)
+#define MAIN_POS_GRID_TO_M_Y(g)       (((float)(g) - 0.5f) * CHASSIS_GRID_STEP_Y_M)
+
+#if (MAIN_RUN_MODE == MAIN_RUN_MODE_SOKO_SELFTEST) || (MAIN_RUN_MODE == MAIN_RUN_MODE_STATIC_MAP_DRIVE)
+/* main_selftest_char_to_map / main_selftest_log 也被 STATIC_MAP_DRIVE 用 (打日志),
+ * 所以仍把"工具函数 + 字面量地图"放在两种模式共用的条件里. STATIC_MAP_DRIVE 不再引用
+ * s_soko_selftest_map, 但保留它供 SOKO_SELFTEST 自测使用. */
 /*
  * 固定自测图: 由用户编辑的竖版地图整理为 12x16 横版格式.
  * 目的: 保留原始关卡结构, 同时满足求解器固定 12 行 16 列的输入约束.
+ *
+ * 注: 地图本身不带发车位置标记 (无 '@'), 发车格写死为
+ *     (CHASSIS_START_GRID_X, CHASSIS_START_GRID_Y) = (1, 6),
+ *     与 chassis_config.h / 底层 init 完全一致.
  */
 static const char s_soko_selftest_map[MAP_ROWS][MAP_COLS + 1] = {
-    "################",
-    "#----------#---#",
-    "#----------##@-#",
-    "#----$------#--#",
-    "#--------------#",
-    "#---$-##-------#",
-    "#-----#-##-----#",
-    "#--$--#--------#",
-    "#-----#--------#",
-    "#-----#---#----#",
-    "#-----#---##...#",
-    "################"
+################
+#-#------------#
+#-.------#####-#
+##$###---#---#-#
+#----#---#.#-#-#
+#----#####.#-#-#
+#-------$--$-#-#
+#-----------##-#
+#--------------#
+#-----####-----#
+#--------------#
+################
 };
 
 static uint8 main_selftest_char_to_map(char ch)
@@ -201,32 +307,24 @@ static void main_selftest_print_map_and_player(Point_t player_pos)
 static void main_run_soko_selftest_once(void)
 {
     uint8 map[MAP_ROWS][MAP_COLS];
-    Point_t player_pos = {-1, -1};
+    Point_t player_pos;
     SokoFullSolution_t solution;
     uint8 r, c;
+
+    /* 起点 = (1, 5.5), 与 main 顶部 set_pose 同源宏 */
+    player_pos.x = (int8)MAIN_POS_NAV_START_X_GRID;
+    player_pos.y = (int8)MAIN_POS_NAV_START_Y_GRID;
 
     for (r = 0U; r < MAP_ROWS; r++)
     {
         for (c = 0U; c < MAP_COLS; c++)
         {
-            char ch = s_soko_selftest_map[r][c];
-            if ('@' == ch)
-            {
-                player_pos.x = (int8)c;
-                player_pos.y = (int8)r;
-            }
-            map[r][c] = main_selftest_char_to_map(ch);
+            map[r][c] = main_selftest_char_to_map(s_soko_selftest_map[r][c]);
         }
     }
 
     main_selftest_log("SOKO_MAP=T4\n");
     main_selftest_print_map_and_player(player_pos);
-    if ((player_pos.x < 0) || (player_pos.y < 0))
-    {
-        main_selftest_log("SOLVED=0\n");
-        main_selftest_log("ERR=NO_PLAYER\n");
-        return;
-    }
 
     memset(&solution, 0, sizeof(solution));
     if (!Sokoban_Solve_Stage1(map, player_pos, &solution))
@@ -268,6 +366,267 @@ static void main_run_soko_selftest_periodic_5ms(void)
 }
 #endif
 
+/* ============================================================================
+ *  STATIC_MAP_DRIVE 模式: 上电串口收一次地图 → 解算 → 主循环逐航点跑车 → 回起点
+ *  - 地图源: 串口 app_link 协议的 MAP 帧 (TYPE=0x01, LEN=192/194), UART4 收
+ *  - 接收完成判据: g_link_last_map_ms 由 0 变非 0 (= 至少落地一帧合法 MAP)
+ *  - 起点: (1, 5.5), 由顶层 chassis_ctrl_set_pose 写死, 这里只读不写
+ *  - 解算: 收到地图后调一次 Sokoban_Solve_Stage1, 失败则只打印不开车
+ *  - 全部箱子推完 → chassis_ctrl_move_to_m 回 (1, 5.5) 驻停
+ * ============================================================================ */
+#if (MAIN_RUN_MODE == MAIN_RUN_MODE_STATIC_MAP_DRIVE)
+typedef enum {
+    SMD_PHASE_WAIT_MAP = 0, /* 等待串口下来一帧静态地图 */
+    SMD_PHASE_WARMUP,       /* 解算成功后等 IMU/编码器稳定 */
+    SMD_PHASE_PUSH_BOXES,   /* 逐子箱跑航点 */
+    SMD_PHASE_RETURN_HOME,  /* 跑完后回起点 */
+    SMD_PHASE_DONE          /* 已驻停 */
+} smd_phase_e;
+
+static SokoFullSolution_t  s_smd_solution;
+static SokoWaypointPath_t  s_smd_waypoints;
+static uint8               s_smd_map[MAP_ROWS][MAP_COLS];
+static uint8               s_smd_solve_ok     = 0U;   /* 0=未解算/失败 1=可发车 */
+static uint8               s_smd_sub_idx      = 0U;   /* 当前子箱索引 */
+static uint16              s_smd_wp_idx       = 0U;   /* 当前航点索引 */
+static uint8               s_smd_navigating   = 0U;   /* 0=该派发 1=已派发等到位 */
+static smd_phase_e         s_smd_phase        = SMD_PHASE_WAIT_MAP;
+static uint16              s_smd_warmup_ticks = 0U;
+static uint32              s_smd_map_recv_ms  = 0U;   /* 用于检测 g_link_last_map_ms 变化 */
+
+static char main_smd_map_to_char(uint8 v)
+{
+    switch (v)
+    {
+    case MAP_WALL:   return '#';
+    case MAP_TARGET: return '.';
+    case MAP_BOX:    return '$';
+    case MAP_BOMB:   return '*';
+    case MAP_EMPTY:
+    default:         return '-';
+    }
+}
+
+/*
+ * 已收到地图 → 调求解器 → 装载首子箱 waypoints.
+ * 不再读编译期字面量, 直接拿 s_smd_map (由 app_link_get_map_snapshot 拷贝).
+ * 地图 / 起点 / 解算结果一律 printf 输出, 走默认 debug 端口.
+ */
+static void main_smd_solve_after_recv(void)
+{
+    Point_t start_pos;
+    uint8 r;
+
+    start_pos.x = (int8)MAIN_POS_NAV_START_X_GRID;   /* 1 */
+    start_pos.y = (int8)MAIN_POS_NAV_START_Y_GRID;   /* 5 (5.5 截位) */
+
+    printf("SMD_MAP_BEGIN\n");
+    for (r = 0U; r < MAP_ROWS; r++)
+    {
+        char line[MAP_COLS + 1];
+        uint8 c;
+        for (c = 0U; c < MAP_COLS; c++)
+        {
+            line[c] = main_smd_map_to_char(s_smd_map[r][c]);
+        }
+        line[MAP_COLS] = '\0';
+        printf("%s\n", line);
+    }
+    printf("SMD_MAP_END\n");
+    printf("SMD_PLAYER_START=%.2f,%.2f (grid=%d,%d)\n",
+           (double)MAIN_POS_NAV_START_X_GRID,
+           (double)MAIN_POS_NAV_START_Y_GRID,
+           (int)start_pos.x, (int)start_pos.y);
+
+    memset(&s_smd_solution, 0, sizeof(s_smd_solution));
+    if (!Sokoban_Solve_Stage1(s_smd_map, start_pos, &s_smd_solution))
+    {
+        printf("SMD_ERR=NO_SOLUTION\n");
+        return;
+    }
+    if (!s_smd_solution.is_solved || s_smd_solution.total_boxes == 0U)
+    {
+        printf("SMD_ERR=UNSOLVED boxes=%d solved=%d\n",
+               (int)s_smd_solution.total_boxes,
+               (int)s_smd_solution.is_solved);
+        return;
+    }
+
+    s_smd_sub_idx = 0U;
+    Sokoban_Actions_To_Waypoints(s_smd_solution.sub_solutions[0].actions,
+                                 s_smd_solution.sub_solutions[0].count,
+                                 start_pos,
+                                 &s_smd_waypoints);
+    s_smd_wp_idx = 0U;
+    s_smd_navigating = 0U;
+    s_smd_solve_ok = 1U;
+
+    printf("SMD_SOLVED=1 boxes=%d wp0=%d\n",
+           (int)s_smd_solution.total_boxes,
+           (int)s_smd_waypoints.count);
+}
+
+/*
+ * WAIT_MAP 阶段: 每 5ms 检查 g_link_last_map_ms 是否已经非 0.
+ *   = 0  : 尚未收到任何合法 MAP 帧, 继续等
+ *   != 0 : 至少已落地一帧 → 拷快照 → 解算 → 关 UART4 RX 锁定地图
+ * 解算成功后立即关掉 UART4 接收中断, 后续上位机再发地图不再被采纳.
+ */
+static void main_smd_wait_map_5ms(void)
+{
+    static uint16 s_div = 0U;
+
+    /* g_link_last_map_ms 是 volatile 32 位, M7 上读取原子 */
+    uint32 now_recv_ms = g_link_last_map_ms;
+    if (now_recv_ms != 0U)
+    {
+        if (now_recv_ms != s_smd_map_recv_ms)
+        {
+            s_smd_map_recv_ms = now_recv_ms;
+            app_link_get_map_snapshot(s_smd_map);
+            printf("SMD_MAP_RECV ms=%lu ok=%lu crc=%lu len=%lu\n",
+                   (unsigned long)now_recv_ms,
+                   (unsigned long)g_link_stats.frames_ok,
+                   (unsigned long)g_link_stats.frames_crc_err,
+                   (unsigned long)g_link_stats.frames_len_err);
+            main_smd_solve_after_recv();
+            if (s_smd_solve_ok)
+            {
+                /* 关掉 UART4 接收中断 — 锁定当前地图, 不再接受新帧 */
+                uart_rx_interrupt(MAIN_OPENART1_UART, 0);
+                printf("SMD_MAP_LOCKED rx_off\n");
+                s_smd_phase = SMD_PHASE_WARMUP;
+                s_smd_warmup_ticks = 0U;
+            }
+            /* 解算失败: 留在 WAIT_MAP, UART4 仍开, 等上位机重发新帧 */
+        }
+        return;
+    }
+
+    /* 还没收到, 1s 打一次链路统计便于排查 */
+    if (++s_div >= 200U)
+    {
+        s_div = 0U;
+        printf("SMD_WAIT_MAP hb=%lu ok=%lu crc=%lu len=%lu byte_to=%lu\n",
+               (unsigned long)g_link_stats.hb_cnt,
+               (unsigned long)g_link_stats.frames_ok,
+               (unsigned long)g_link_stats.frames_crc_err,
+               (unsigned long)g_link_stats.frames_len_err,
+               (unsigned long)g_link_stats.frames_byte_timeout);
+    }
+}
+
+/*
+ * 主循环 5ms tick 总入口: WAIT_MAP → WARMUP → PUSH_BOXES → RETURN_HOME → DONE.
+ * 只做"航点 → chassis_ctrl_move_to_grid → is_arrived → 下一点"最小闭环.
+ */
+static void main_run_static_map_drive_5ms(void)
+{
+    if (s_smd_phase == SMD_PHASE_WAIT_MAP)
+    {
+        main_smd_wait_map_5ms();
+        return;
+    }
+
+    if (!s_smd_solve_ok || (s_smd_phase == SMD_PHASE_DONE))
+    {
+        return;
+    }
+
+    if (s_smd_phase == SMD_PHASE_WARMUP)
+    {
+        if (++s_smd_warmup_ticks >= MAIN_POINT_NAV_WARMUP_TICKS)
+        {
+            s_smd_phase = SMD_PHASE_PUSH_BOXES;
+        }
+        return;
+    }
+
+    /* 还没派发当前航点 → 立即下发 */
+    if (!s_smd_navigating)
+    {
+        Point_t next;
+        if (s_smd_phase == SMD_PHASE_PUSH_BOXES)
+        {
+            if (s_smd_wp_idx >= s_smd_waypoints.count)
+            {
+                /* 当前子箱跑完, 切下一子箱 */
+                s_smd_sub_idx++;
+                if (s_smd_sub_idx >= s_smd_solution.total_boxes)
+                {
+                    /* 全部箱子完成 → 回 (1, 5.5) 起点驻停.
+                     * 用与 main 顶部 set_pose 同源的宏, 只调底层 move_to_m. */
+                    s_smd_phase = SMD_PHASE_RETURN_HOME;
+                    printf("SMD_RETURN_HOME tgt=%.2f,%.2f\n",
+                           (double)MAIN_POS_NAV_START_X_GRID,
+                           (double)MAIN_POS_NAV_START_Y_GRID);
+                    chassis_ctrl_move_to_m(MAIN_POS_GRID_TO_M_X(MAIN_POS_NAV_START_X_GRID),
+                                           MAIN_POS_GRID_TO_M_Y(MAIN_POS_NAV_START_Y_GRID),
+                                           0.0f);
+                    s_smd_navigating = 1U;
+                    return;
+                }
+                Sokoban_Actions_To_Waypoints(s_smd_solution.sub_solutions[s_smd_sub_idx].actions,
+                                             s_smd_solution.sub_solutions[s_smd_sub_idx].count,
+                                             s_smd_solution.player_end_pos[s_smd_sub_idx - 1U],
+                                             &s_smd_waypoints);
+                s_smd_wp_idx = 0U;
+                printf("SMD_NEXT_BOX sub=%d wp=%d\n",
+                       (int)s_smd_sub_idx, (int)s_smd_waypoints.count);
+            }
+            next = s_smd_waypoints.points[s_smd_wp_idx];
+            chassis_ctrl_move_to_grid((uint8)next.x, (uint8)next.y);
+            s_smd_navigating = 1U;
+        }
+        return;
+    }
+
+    /* 已派发, 等到位 */
+    if (!chassis_ctrl_is_arrived())
+    {
+        return;
+    }
+
+    s_smd_navigating = 0U;
+
+    if (s_smd_phase == SMD_PHASE_PUSH_BOXES)
+    {
+        s_smd_wp_idx++;
+    }
+    else if (s_smd_phase == SMD_PHASE_RETURN_HOME)
+    {
+        s_smd_phase = SMD_PHASE_DONE;
+        chassis_ctrl_stop();
+        printf("SMD_DONE\n");
+    }
+}
+
+/* 50ms 调试打印 (与 POINT_NAV 同列, 末三列 = phase / sub_idx / wp_idx) */
+static void main_run_static_map_drive_log_50ms(void)
+{
+    static uint8 s_div = 0U;
+    if (++s_div < 10U) return;
+    s_div = 0U;
+    {
+        chassis_pose_t pose = chassis_ctrl_get_pose();
+        float tgt_x = 0.0f, tgt_y = 0.0f, dx, dy, dist_sq;
+        chassis_ctrl_get_point_nav_target_m(&tgt_x, &tgt_y);
+        dx = tgt_x - pose.x_m;
+        dy = tgt_y - pose.y_m;
+        dist_sq = dx * dx + dy * dy;
+        printf("%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%d,%d,%d,%d\n",
+               pose.x_m, pose.y_m,
+               tgt_x, tgt_y,
+               dist_sq,
+               pose.yaw_deg,
+               (int)chassis_ctrl_is_arrived(),
+               (int)s_smd_phase,
+               (int)s_smd_sub_idx,
+               (int)s_smd_wp_idx);
+    }
+}
+#endif /* MAIN_RUN_MODE_STATIC_MAP_DRIVE */
+
 /* 航向保持目标角 (deg), 仅 YAW_HOLD 模式生效 */
 #define MAIN_HOLD_YAW_TARGET_DEG      (0.0f)
 
@@ -280,8 +639,8 @@ static void main_run_soko_selftest_periodic_5ms(void)
  *   目标坐标传整数即可, 内部按 grid * step 自动换算成米送入闭环.
  *   起点用半整数 (0.5, 5.5) 描述发车区中心位置, 与硬件实测吻合.
  * ============================================================ */
-#define MAIN_POS_NAV_START_X_GRID     (1.0f)
-#define MAIN_POS_NAV_START_Y_GRID     (5.5f)
+/* 注: MAIN_POS_NAV_START_X_GRID / MAIN_POS_NAV_START_Y_GRID 已上提到文件
+ * 顶部 SOKO_SELFTEST 宏前, 避免静态地图模式编译期前向引用. */
 
 /* >>>>>>>>>>>> 改这两行换目标格 <<<<<<<<<<<< */
 #define MAIN_POS_NAV_TARGET_X_GRID    (14)     /* 整数 0..14, 14 = 右边界 */
@@ -307,8 +666,8 @@ static void main_run_soko_selftest_periodic_5ms(void)
  *   n=14 → 13.5 × STEP_X = 3.086m (第14格中心, 距右墙 0.114m, 可到达)
  *   n=10 → 9.5  × STEP_Y = 2.28m  (第10格中心, 距下墙 0.12m,  可到达)
  * 注: 若传入半整数 5.5 则 (5.5-0.5)×STEP = 5×STEP = 第5/6格边界, 用于起点描述. */
-#define MAIN_POS_GRID_TO_M_X(g)       (((float)(g) - 0.5f) * CHASSIS_GRID_STEP_X_M)
-#define MAIN_POS_GRID_TO_M_Y(g)       (((float)(g) - 0.5f) * CHASSIS_GRID_STEP_Y_M)
+/* MAIN_POS_GRID_TO_M_X / MAIN_POS_GRID_TO_M_Y 已上提到文件顶部, 此处仅留
+ * TARGET 米坐标派生宏以便阅读. */
 #define MAIN_POS_NAV_TARGET_X_M       MAIN_POS_GRID_TO_M_X(MAIN_POS_NAV_TARGET_X_GRID)
 #define MAIN_POS_NAV_TARGET_Y_M       MAIN_POS_GRID_TO_M_Y(MAIN_POS_NAV_TARGET_Y_GRID)
 
@@ -373,7 +732,7 @@ main(void)
     // 1. 通信外设初始化
     // ------------------------------------------------------------------
     // OpenART1: 地图识别模块, 通过 UART4 上报 MAP/HEARTBEAT 帧.
-#if ((MAIN_RUN_MODE == MAIN_RUN_MODE_GAME) || (MAIN_RUN_MODE == MAIN_RUN_MODE_OPENART1_TEST))
+#if ((MAIN_RUN_MODE == MAIN_RUN_MODE_GAME) || (MAIN_RUN_MODE == MAIN_RUN_MODE_OPENART1_TEST) || (MAIN_RUN_MODE == MAIN_RUN_MODE_STATIC_MAP_DRIVE))
     uart_init(MAIN_OPENART1_UART, 115200, MAIN_OPENART1_UART_TX, MAIN_OPENART1_UART_RX);
     uart_rx_interrupt(MAIN_OPENART1_UART, 1);
     app_link_init();                /* P0-1: 协议解析层初始化, 必须在 uart_rx_interrupt 之后 */
@@ -426,6 +785,13 @@ main(void)
     /* 推箱求解自测: 不驱动车体, 仅保留底层初始化和 DAP 串口输出. */
     uart_init(UART_1, 115200, UART1_TX_B12, UART1_RX_B13);
     chassis_ctrl_stop();
+#elif (MAIN_RUN_MODE == MAIN_RUN_MODE_STATIC_MAP_DRIVE)
+    /* 静态地图离线测试:
+     *   位姿/航向/锁 0° 全由顶部 chassis_ctrl_init + set_pose 统一处理.
+     *   日志直接走 printf (默认 debug 端口, 由 debug_init() 在 main 顶部初始化).
+     *   状态机起点 = WAIT_MAP, 直到 UART4 下来一帧合法 MAP 再解算开车;
+     *   解算成功后会自动 uart_rx_interrupt(UART4, 0) 锁定地图. */
+    printf("SMD_BOOT wait MAP frame from UART4...\n");
 #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_OPENART1_TEST)
     /* OpenART1 UART4 链路测试: 只收视觉帧和打印统计, 不进入游戏状态机. */
     chassis_ctrl_stop();
@@ -568,6 +934,10 @@ main(void)
         }
     #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_SOKO_SELFTEST)
         main_run_soko_selftest_periodic_5ms();
+    #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_STATIC_MAP_DRIVE)
+        main_uart4_tap_drain_5ms();
+        main_run_static_map_drive_5ms();
+        main_run_static_map_drive_log_50ms();
     #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_OPENART1_TEST)
         {
             static uint16 s_link_print_div = 0U;

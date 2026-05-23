@@ -73,5 +73,31 @@ vr = sv.verify_run_script(m2, (5, 7), script, stage=1)
 assert vr['ok'], vr['message']
 print(vr['message'])
 
+# 测试8: 排除法 (V2 侦查) — N-1 推 1
+print("\n=== 测试8: 排除法 (V2 侦查) ===")
+m8, p8 = sv.generate_map(stage=2, box_count=3, seed=11)
+# 先跑无推断
+no_inf = sv.plan_scout_phase_v2(m8, p8, use_inference=False)
+inf    = sv.plan_scout_phase_v2(m8, p8, use_inference=True)
+total_items = 6  # 3 box + 3 target
+# 排除法: 至少最后一个 box 和最后一个 target 都能被推断 → real ≤ 4
+print(f"  无推断: real={no_inf['visited_real']} inferred={no_inf['visited_inferred']} (期望 6/0)")
+print(f"  开推断: real={inf['visited_real']}    inferred={inf['visited_inferred']}")
+assert no_inf['visited_real'] == total_items, "无推断时应实测全部"
+assert inf['visited_real'] < total_items, "推断时应少于全量"
+assert inf['all_visited'], "推断后应全部 resolved"
+assert inf['box_to_target_idx'] is not None
+print(f"  推断结果 box_classes={inf['box_classes']} target_classes={inf['target_classes']}")
+print(f"  box→target 映射: {inf['box_to_target_idx']}")
+
+# 测试9: V2 + Stage2 完整求解 (走真实路径)
+print("\n=== 测试9: V2 完整求解 ===")
+sol9 = sv.solve_level(2, m8, p8, use_inference=True)
+assert sol9 is not None and sol9['scout']['all_visited']
+print(f"  总步数(开推断): {sol9['total_steps']}  侦查实测+推断: "
+      f"{sol9['scout']['visited_real']}+{sol9['scout']['visited_inferred']}")
+sol9b = sv.solve_level(2, m8, p8, use_inference=False)
+print(f"  总步数(无推断): {sol9b['total_steps']}")
+assert sol9['total_steps'] <= sol9b['total_steps'], "推断应不慢于无推断"
 print("\n=============================")
 print("所有测试通过！")
