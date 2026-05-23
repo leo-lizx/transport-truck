@@ -120,27 +120,15 @@ static void main_uart4_tap_drain_5ms(void)
         return;
     }
 
-    printf("SMD_RAW_BEGIN len=%u\n",
-           (unsigned)((head >= tail) ? (head - tail) :
-                                       (MAIN_UART4_TAP_BUF_LEN - tail + head)));
-
-    if (head > tail) {
-        /* 一段连续区: tail .. head-1 */
-        uart_write_buffer(UART_1, (const uint8 *)&s_u4tap_buf[tail],
-                          (uint32)(head - tail));
-    } else {
-        /* 绕回: tail..LEN-1 + 0..head-1, 分两次写 */
-        uart_write_buffer(UART_1, (const uint8 *)&s_u4tap_buf[tail],
-                          (uint32)(MAIN_UART4_TAP_BUF_LEN - tail));
-        if (head > 0U) {
-            uart_write_buffer(UART_1, (const uint8 *)&s_u4tap_buf[0],
-                              (uint32)head);
-        }
-    }
-    s_u4tap_tail = head;
-
-    /* SMD_RAW_END 单独一行换行, 上位机用 BEGIN..END 抓块 */
-    printf("\nSMD_RAW_END\n");
+    /* 不能用 uart_write_buffer 直接把二进制帧字节写到 UART1:
+     * OpenART1 协议帧中大概率含有 0x0C(清屏)/0x1B(ESC序列)/0x13(XOFF)
+     * 等控制字符, PC 终端收到后会清空显示区或锁住软件流控,
+     * 造成用户看到"串口无输出"的假象.
+     * 改为只打印字节数, UART4 收发正常与否可通过计数确认. */
+    printf("SMD_RAW len=%u\n",
+           (unsigned)((head >= tail) ? (uint16)(head - tail) :
+                                       (uint16)(MAIN_UART4_TAP_BUF_LEN - tail + head)));
+    s_u4tap_tail = head;   /* 消耗掉缓冲, 防止无限增长 */
 
     if (s_u4tap_drop != s_last_drop) {
         s_last_drop = s_u4tap_drop;
@@ -213,10 +201,9 @@ static uint32 wait_for_tick(void)
 #define MAIN_POS_GRID_TO_M_X(g)       (((float)(g) - 0.5f) * CHASSIS_GRID_STEP_X_M)
 #define MAIN_POS_GRID_TO_M_Y(g)       (((float)(g) - 0.5f) * CHASSIS_GRID_STEP_Y_M)
 
-#if (MAIN_RUN_MODE == MAIN_RUN_MODE_SOKO_SELFTEST) || (MAIN_RUN_MODE == MAIN_RUN_MODE_STATIC_MAP_DRIVE)
-/* main_selftest_char_to_map / main_selftest_log 也被 STATIC_MAP_DRIVE 用 (打日志),
- * 所以仍把"工具函数 + 字面量地图"放在两种模式共用的条件里. STATIC_MAP_DRIVE 不再引用
- * s_soko_selftest_map, 但保留它供 SOKO_SELFTEST 自测使用. */
+#if (MAIN_RUN_MODE == MAIN_RUN_MODE_SOKO_SELFTEST)
+/* 推箱自测辅助函数 + 字面量地图, 仅 SOKO_SELFTEST 模式编译.
+ * STATIC_MAP_DRIVE 的日志全走 printf, 不依赖这里的任何符号. */
 /*
  * 固定自测图: 由用户编辑的竖版地图整理为 12x16 横版格式.
  * 目的: 保留原始关卡结构, 同时满足求解器固定 12 行 16 列的输入约束.
@@ -226,18 +213,18 @@ static uint32 wait_for_tick(void)
  *     与 chassis_config.h / 底层 init 完全一致.
  */
 static const char s_soko_selftest_map[MAP_ROWS][MAP_COLS + 1] = {
-################
-#-#------------#
-#-.------#####-#
-##$###---#---#-#
-#----#---#.#-#-#
-#----#####.#-#-#
-#-------$--$-#-#
-#-----------##-#
-#--------------#
-#-----####-----#
-#--------------#
-################
+    "################",
+    "#-#------------#",
+    "#-.------#####-#",
+    "##$###---#---#-#",
+    "#----#---#.#-#-#",
+    "#----#####.#-#-#",
+    "#-------$--$-#-#",
+    "#-----------##-#",
+    "#--------------#",
+    "#-----####-----#",
+    "#--------------#",
+    "################",
 };
 
 static uint8 main_selftest_char_to_map(char ch)
@@ -364,7 +351,7 @@ static void main_run_soko_selftest_periodic_5ms(void)
         main_run_soko_selftest_once();
     }
 }
-#endif
+#endif /* MAIN_RUN_MODE_SOKO_SELFTEST */
 
 /* ============================================================================
  *  STATIC_MAP_DRIVE 模式: 上电串口收一次地图 → 解算 → 主循环逐航点跑车 → 回起点
@@ -374,6 +361,11 @@ static void main_run_soko_selftest_periodic_5ms(void)
  *  - 解算: 收到地图后调一次 Sokoban_Solve_Stage1, 失败则只打印不开车
  *  - 全部箱子推完 → chassis_ctrl_move_to_m 回 (1, 5.5) 驻停
  * ============================================================================ */
+
+/* 暖机 tick 数 (5ms/tick): SMD 的 WARMUP 阶段和 POINT_NAV 的暖机阶段共用.
+ * 此宏必须在所有 #if MAIN_RUN_MODE 块之外定义, 否则切换模式时无法访问. */
+#define MAIN_POINT_NAV_WARMUP_TICKS   (200U)   /* 200 × 5ms = 1s 暖机 */
+
 #if (MAIN_RUN_MODE == MAIN_RUN_MODE_STATIC_MAP_DRIVE)
 typedef enum {
     SMD_PHASE_WAIT_MAP = 0, /* 等待串口下来一帧静态地图 */
@@ -503,16 +495,18 @@ static void main_smd_wait_map_5ms(void)
         return;
     }
 
-    /* 还没收到, 1s 打一次链路统计便于排查 */
+    /* 还没收到, 1s 打一次链路统计便于排查.
+     * drop= 到达但不符合协议格式的字节数 (非零说明 UART4 有数据但帧头不对) */
     if (++s_div >= 200U)
     {
         s_div = 0U;
-        printf("SMD_WAIT_MAP hb=%lu ok=%lu crc=%lu len=%lu byte_to=%lu\n",
+        printf("SMD_WAIT_MAP hb=%lu ok=%lu crc=%lu len=%lu byte_to=%lu drop=%lu\n",
                (unsigned long)g_link_stats.hb_cnt,
                (unsigned long)g_link_stats.frames_ok,
                (unsigned long)g_link_stats.frames_crc_err,
                (unsigned long)g_link_stats.frames_len_err,
-               (unsigned long)g_link_stats.frames_byte_timeout);
+               (unsigned long)g_link_stats.frames_byte_timeout,
+               (unsigned long)g_link_stats.sync_drops);
     }
 }
 
@@ -658,7 +652,7 @@ static void main_run_static_map_drive_log_50ms(void)
  *   3. 静止检测滑窗填满 (STILL_WINDOW_LEN × 5ms): 窗口未满时在线零偏自适应不工作.
  * 暖机期 chassis_ctrl 保持 YAW_HOLD, 位置积分 s_pos_i 不运行, 无积分超调风险.
  */
-#define MAIN_POINT_NAV_WARMUP_TICKS   (200U)   /* 200 × 5ms = 1s 暖机 */
+/* 注: MAIN_POINT_NAV_WARMUP_TICKS 已上提到 main_run_static_map_drive_5ms 前, 避免前向引用. */
 
 /* 格 → 米换算 (POINT_NAV 专用, 不影响 BFS 的内场索引体系).
  * 约定: 整数 n = 第 n 格中心 (1-based), 公式为 (n - 0.5) × STEP.
@@ -727,6 +721,23 @@ main(void)
 
     clock_init(SYSTEM_CLOCK_600M);  // 不可删除
     debug_init();                   // 调试端口初始化
+    /* IAR DLib 默认对 stdout 使用 256 字节全缓冲.
+     * 若不关闭缓冲, printf 的字节会攒满 256 字节才调用 __write.
+     * 传入 NULL + size=0 在部分 IAR 版本上会令 setvbuf 失败(返回非零),
+     * stdout 保持全缓冲 → printf 输出被永久困在 256B 缓冲中.
+     * 改为提供静态 1 字节缓冲 + _IONBF, 保证 setvbuf 成功.
+     * 同时主循环每轮 fflush(stdout) 兜底, 防止任何意外缓冲残留. */
+    {
+        static char s_stdout_buf;
+        setvbuf(stdout, &s_stdout_buf, _IONBF, sizeof(s_stdout_buf));
+    }
+    /* UART1 TX 硬件路径直接验证 (绕过 IAR stdio/__write, 直接调 uart_write_byte):
+     *   若终端出现 "HW:OK"  但后续 printf 不出现 → IAR __write 链路有问题
+     *   若 "HW:OK" 也不出现             → UART1 TX 硬件/引脚/时钟配置有问题 */
+    uart_write_string(UART_1, "HW:OK\r\n");
+    /* 最早可能的 UART1 printf 输出 — 在 IMU 标定(1s)和 PIT 启动之前.
+     * 若 "HW:OK" 出现而此行不出现, 说明 setvbuf/__write 链路仍有问题. */
+    printf("BOOT mode=%d\n", (int)MAIN_RUN_MODE);
 
     // ------------------------------------------------------------------
     // 1. 通信外设初始化
@@ -787,11 +798,14 @@ main(void)
     chassis_ctrl_stop();
 #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_STATIC_MAP_DRIVE)
     /* 静态地图离线测试:
-     *   位姿/航向/锁 0° 全由顶部 chassis_ctrl_init + set_pose 统一处理.
-     *   日志直接走 printf (默认 debug 端口, 由 debug_init() 在 main 顶部初始化).
-     *   状态机起点 = WAIT_MAP, 直到 UART4 下来一帧合法 MAP 再解算开车;
-     *   解算成功后会自动 uart_rx_interrupt(UART4, 0) 锁定地图. */
-    printf("SMD_BOOT wait MAP frame from UART4...\n");
+     *   接收口: UART4 (C16/C17) ← OpenART1 MAP/HEARTBEAT 帧 (已在上方公共块初始化)
+     *   发送口: UART1 (B12/B13) ← debug_init() 已初始化, printf 走此口
+     *
+     *   debug_init() 默认会开 UART1 RX 中断 (DEBUG_UART_USE_INTERRUPT=1),
+     *   而 LPUART1_IRQHandler 把 UART1 收到的字节喂给 app_link_isr_feed_byte.
+     *   本模式地图只来自 UART4, 关掉 UART1 RX 中断防止 PC 端打字污染解析器. */
+    uart_rx_interrupt(UART_1, 0);   /* UART1 仅做 TX 输出, 禁用 RX 中断 */
+    printf("SMD_BOOT: TX=UART1(B12) RX=UART4(C16) wait MAP frame...\n");
 #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_OPENART1_TEST)
     /* OpenART1 UART4 链路测试: 只收视觉帧和打印统计, 不进入游戏状态机. */
     chassis_ctrl_stop();
@@ -825,7 +839,36 @@ main(void)
          * 在此阻塞直到 PIT_CH0 5ms tick 到来, 期间 __WFI 休眠, 任意中断可唤醒.
          * 注意 wait 必须在每轮主循环工作之前调用, 保证节拍对齐 PIT 边沿.
          */
+        /* ── 诊断 A: 进入 while(1) 即触发, 与 PIT 完全无关 ──────────────────
+         * 若终端出现 "LOOP_OK" → while(1) 已运行, UART1 TX 硬件路径正常
+         * 若 "LOOP_OK" 不出现 → 程序未进入 while(1) (初始化崩溃?) 或
+         *                        UART1 TX 硬件/引脚/波特率/接线有问题
+         * ─────────────────────────────────────────────────────────────── */
+        {
+            static uint8 s_loop_diag = 0U;
+            if (!s_loop_diag)
+            {
+                s_loop_diag = 1U;
+                uart_write_string(UART_1, "LOOP_OK\r\n");
+            }
+        }
+
         (void)wait_for_tick();
+
+        /* ── 诊断 B: wait_for_tick() 返回才执行, 依赖 PIT_CH0 ────────────
+         * 每 200 tick (= 1s) 打一次, 避免 200行/s 刷屏.
+         * 若 "LOOP_OK" 出现而 "T:N" 始终不出现 → wait_for_tick() 永远阻塞,
+         *   PIT_CH0 未正常触发 (检查 pit_ms_init / PIT ISR)
+         * 若两者均出现 → 初始化和 PIT 全部正常, 问题在之后的业务逻辑
+         * ─────────────────────────────────────────────────────────────── */
+        {
+            static uint32 s_tick_cnt = 0U;
+            s_tick_cnt++;
+            if ((s_tick_cnt % 200U) == 0U)
+            {
+                printf("T:%lu\n", (unsigned long)(s_tick_cnt / 200U));
+            }
+        }
 
     #if (MAIN_RUN_MODE == MAIN_RUN_MODE_SINGLE_WHEEL)
         /* ⬇⬇⬇ 单轮 PID 打印, 姿态调试阶段这里被 #if 屏蔽 ⬇⬇⬇ */
@@ -993,6 +1036,9 @@ main(void)
             menu_render_div = 0U;
             chassis_menu_render_100ms();
         }
+
+        /* 兜底: 若 setvbuf 因任何原因失败, fflush 确保每轮至多 5ms 延迟 */
+        fflush(stdout);
 
         /* P0-5: 节拍由 wait_for_tick() 在循环顶部统一接管, 此处不再 system_delay_ms */
     }

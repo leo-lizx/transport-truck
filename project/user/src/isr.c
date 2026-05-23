@@ -84,11 +84,12 @@ void PIT_IRQHandler(void)
 
 void LPUART1_IRQHandler(void)
 { /* P0-1 改造说明:
-     *   LPUART1 (B12/B13) 同时承担 debug 输出与 OpenART 视觉数据接收。
-     *   debug 模块只用 TX, RX 由本协议层独占, 因此这里直接把字节交给
-     *   app_link_isr_feed_byte() 而不再喂 debug 环形缓冲 (避免 64B 缓冲溢出).
-     *   ─ 字节级零拷贝, 单次中断耗时 < 5 ?s.
-     *   ─ 状态机内部已做溢出/超时/同步保护, 不会卡死.
+     *   原设计: LPUART1 (B12/B13) 同时承担 debug TX 与 OpenART 视觉数据接收,
+     *           字节直接喂给 app_link_isr_feed_byte() (不走 debug FIFO).
+     *   现状:   STATIC_MAP_DRIVE 模式已将 OpenART 迁移到 UART4 (C16/C17),
+     *           UART1 RX 中断在该模式初始化时被 uart_rx_interrupt(UART_1,0) 关闭,
+     *           因此本 handler 在 STATIC_MAP_DRIVE 下不会触发.
+     *   其他模式 (OPENART1_TEST / GAME 等) 若 OpenART 仍接 UART1, 本 handler 继续有效.
      */
     if(kLPUART_RxDataRegFullFlag & LPUART_GetStatusFlags(LPUART1))
     {
