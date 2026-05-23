@@ -99,5 +99,18 @@ print(f"  总步数(开推断): {sol9['total_steps']}  侦查实测+推断: "
 sol9b = sv.solve_level(2, m8, p8, use_inference=False)
 print(f"  总步数(无推断): {sol9b['total_steps']}")
 assert sol9['total_steps'] <= sol9b['total_steps'], "推断应不慢于无推断"
+
+# Test 10: half-grid launch start should not be truncated to the blocked lower row.
+print("\n=== Test 10: half-grid launch start ===")
+m10 = sv._make_empty_map()
+m10[5][1] = sv.WALL
+m10[4][4] = sv.BOX
+m10[4][8] = sv.TARGET
+r10 = sv.solve_stage1_from_float_start(m10, (5.5, 1.0), preferred_start=(6, 1))
+assert r10 is not None, "half-grid start should pick a reachable integer entry cell"
+assert r10['entry_cell'] == (6, 1), f"expected entry (6,1), got {r10['entry_cell']}"
+assert abs(r10['entry_distance_m'] - (0.5 * sv.GRID_STEP_Y_M)) < 1e-6
+assert r10['first_sub_waypoints'][0] == (6, 1), "first waypoint sent to chassis must be a definite grid cell"
+
 print("\n=============================")
 print("所有测试通过！")

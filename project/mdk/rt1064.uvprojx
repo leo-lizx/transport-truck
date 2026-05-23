@@ -408,6 +408,43 @@
         </Group>
         <Group>
           <GroupName>code</GroupName>
+          <Files>
+            <File>
+              <FileName>app_main_config.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\..\code\app_main_config.h</FilePath>
+            </File>
+            <File>
+              <FileName>app_main_modes.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\..\code\app_main_modes.c</FilePath>
+            </File>
+            <File>
+              <FileName>app_main_modes.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\..\code\app_main_modes.h</FilePath>
+            </File>
+            <File>
+              <FileName>app_main_runtime.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\..\code\app_main_runtime.c</FilePath>
+            </File>
+            <File>
+              <FileName>app_main_runtime.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\..\code\app_main_runtime.h</FilePath>
+            </File>
+            <File>
+              <FileName>app_static_map_drive_helper.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\..\code\app_static_map_drive_helper.c</FilePath>
+            </File>
+            <File>
+              <FileName>app_static_map_drive_helper.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\..\code\app_static_map_drive_helper.h</FilePath>
+            </File>
+          </Files>
         </Group>
         <Group>
           <GroupName>doc</GroupName>

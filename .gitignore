@@ -67,3 +67,4 @@ project/code/plan.md
 
 .vscode
 *.icf
+*.pyc

@@ -1144,10 +1144,31 @@
             <name>$PROJ_DIR$\..\..\code\app_game_logic.h</name>
         </file>
         <file>
+            <name>$PROJ_DIR$\..\..\code\app_main_config.h</name>
+        </file>
+        <file>
+            <name>$PROJ_DIR$\..\..\code\app_main_modes.c</name>
+        </file>
+        <file>
+            <name>$PROJ_DIR$\..\..\code\app_main_modes.h</name>
+        </file>
+        <file>
+            <name>$PROJ_DIR$\..\..\code\app_main_runtime.c</name>
+        </file>
+        <file>
+            <name>$PROJ_DIR$\..\..\code\app_main_runtime.h</name>
+        </file>
+        <file>
             <name>$PROJ_DIR$\..\..\code\app_link.c</name>
         </file>
         <file>
             <name>$PROJ_DIR$\..\..\code\app_link.h</name>
+        </file>
+        <file>
+            <name>$PROJ_DIR$\..\..\code\app_static_map_drive_helper.c</name>
+        </file>
+        <file>
+            <name>$PROJ_DIR$\..\..\code\app_static_map_drive_helper.h</name>
         </file>
         <file>
             <name>$PROJ_DIR$\..\..\code\app_recognize.c</name>
