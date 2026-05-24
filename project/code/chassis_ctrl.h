@@ -66,28 +66,6 @@ typedef struct
     float wz_cmd_dps;       /**< 当前角速度指令（°/s） */
 } chassis_attitude_debug_info_t;
 
-/** 运行时可调参数（用于按键菜单在线调参） */
-#define CHASSIS_CTRL_TUNE_WHEEL_COUNT   (4U)
-
-typedef struct
-{
-    float wheel_pid_kp[CHASSIS_CTRL_TUNE_WHEEL_COUNT];
-    float wheel_pid_ki[CHASSIS_CTRL_TUNE_WHEEL_COUNT];
-    float wheel_pid_kd[CHASSIS_CTRL_TUNE_WHEEL_COUNT];
-
-    float pos_kp;
-    float yaw_kp;
-
-    float max_linear_speed_mps;
-    float max_yaw_speed_dps;
-
-    float cmd_accel_limit_mps2;
-    float cmd_accel_limit_dps2;
-} chassis_tune_params_t;
-
-/* 全局运行时调参参数（单一数据源，默认值在 chassis_ctrl.c 初始化） */
-extern volatile chassis_tune_params_t g_chassis_tune_params;
-
 /* ========================== 公共 API ========================== */
 
 /**
@@ -264,6 +242,16 @@ void chassis_ctrl_get_tune_params(chassis_tune_params_t *out_params);
  * @param  in_params  输入参数结构体指针
  */
 void chassis_ctrl_set_tune_params(const chassis_tune_params_t *in_params);
+
+/**
+ * @brief  设置单个轮子的速度 PID，并同步到底层 PID 控制器
+ * @param  wheel_index  轮子索引，取值见 chassis_wheel_index_t
+ * @param  kp           比例项，单位无量纲，范围由 chassis_config_sanitize_tune 限幅
+ * @param  ki           积分项，单位无量纲，范围由 chassis_config_sanitize_tune 限幅
+ * @param  kd           微分项，单位无量纲，范围由 chassis_config_sanitize_tune 限幅
+ * @return 1=设置成功；0=轮索引非法
+ */
+uint8 chassis_ctrl_set_wheel_pid_tune(uint8 wheel_index, float kp, float ki, float kd);
 
 /* ==================================================================
  * 【P0-8】发车区 / 越界几何判定 API（已迁至 chassis_zone.h）

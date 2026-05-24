@@ -1186,6 +1186,9 @@
             <name>$PROJ_DIR$\..\..\code\chassis_config.h</name>
         </file>
         <file>
+            <name>$PROJ_DIR$\..\..\code\chassis_config.c</name>
+        </file>
+        <file>
             <name>$PROJ_DIR$\..\..\code\chassis_ctrl.c</name>
         </file>
         <file>

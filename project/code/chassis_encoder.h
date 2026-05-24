@@ -20,6 +20,7 @@
  *     3. chassis_encoder_get_speed() — 获取最近一次速度读数
  *===========================================================================*/
 
+#include "zf_driver_encoder.h"
 #include "chassis_config.h"
 
 /** 单个编码器的配置与状态 */
@@ -54,3 +55,4 @@ void chassis_encoder_update(chassis_encoder_t *enc, float dt_s);
 float chassis_encoder_get_speed(const chassis_encoder_t *enc);
 
 #endif /* CHASSIS_ENCODER_H */
+

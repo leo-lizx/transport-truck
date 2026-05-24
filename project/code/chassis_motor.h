@@ -19,6 +19,8 @@
  *     3. chassis_motor_stop()    — 紧急停止
  *===========================================================================*/
 
+#include "zf_driver_gpio.h"
+#include "zf_driver_pwm.h"
 #include "chassis_config.h"
 
 /** 单个电机的驱动配置 */

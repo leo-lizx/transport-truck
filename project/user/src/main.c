@@ -9,13 +9,25 @@
 int main(void)
 {
     uint8 menu_render_div = 0U;
+    const app_main_options_t app_options = {
+        APP_RUN_MODE_STATIC_MAP_DRIVE,
+        APP_STATIC_MAP_SOURCE_MANUAL,
+        (uint8)CHASSIS_WHEEL_LF,
+        1U,
+        3.3f,
+        40.0f,
+        23.0f,
+        0.0f,
+        0.0f
+    };
 
     clock_init(SYSTEM_CLOCK_600M);
     debug_init();
     App_MainRuntime_SetupStdout();
 
     uart_write_string(UART_1, "HW:OK\r\n");
-    printf("BOOT mode=%d\n", (int)MAIN_RUN_MODE);
+    App_MainModes_Config(&app_options);
+    printf("BOOT mode=%d\n", (int)app_options.run_mode);
 
     App_MainModes_InitCommunication();
 
@@ -55,4 +67,3 @@ int main(void)
         fflush(stdout);
     }
 }
-

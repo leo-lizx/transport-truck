@@ -83,10 +83,23 @@ typedef enum {
     STAGE_PAUSE_ON_LINK_LOSS        // 【P0-2】视觉链路超时刹停, 链路恢复后自动续跑
 } GameStage_e;
 
-// 地图全局变量 (由副镜头串口解析后写入此数组)
+/* 全局地图快照（主循环侧稳定副本，MAP_* 枚举值，定义见 algo_sokoban_solver.h）。
+ * 写者：Game_Logic_Task_Run() 入口处调用 app_link_get_map_snapshot()，主循环单线程写入。
+ * 读者：本文件内各 stage handler，均在主循环中裸读，无需加锁。
+ * 线程安全：LPUART1 ISR 不直接写此数组；ISR 只写 app_link 内部 seq-lock 缓冲区，
+ *            主循环拷贝后才更新此变量，不存在半更新或撕裂读问题。
+ */
 extern uint8 g_game_map[MAP_ROWS][MAP_COLS];
 
-// 业务调度函数
+/**
+ * @brief  游戏主状态机单步推进（每 5ms 调用一次）。
+ *         包含：视觉链路在线检测、地图快照刷新、越界判定、
+ *         各阶段业务逻辑分发（WAIT_START / RECOGNIZE_MAP / PLAN_PATH /
+ *         EXECUTE_ACTION / LEVEL_JUDGE / DEADLOCK_RESET / DONE /
+ *         PAUSE_ON_LINK_LOSS）。
+ * @note   调用时机：main.c 中 APP_RUN_MODE_GAME 模式下每 5ms tick 调用一次。
+ *         禁止在中断中调用；所有业务逻辑均为主循环单线程执行，不可重入。
+ */
 void Game_Logic_Task_Run(void);
 
 /* ==================================================================

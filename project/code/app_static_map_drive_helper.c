@@ -2,7 +2,8 @@
  * [app_static_map_drive_helper.c] 静态地图推箱启动辅助实现
  *
  * 由于车可能从半格物理位置出发，本模块会把起点附近可进入的整数格全部
- * 作为候选入口，分别调用推箱求解器，再按总估算距离选出最适合执行的方案。
+ * 作为候选入口，分别调用推箱求解器，再按总估算距离选出最适合执行的方案，
+ * 最后复用求解器的动作压缩接口生成完整网格航点数组。
  *===========================================================================*/
 
 #include "app_static_map_drive_helper.h"
@@ -12,6 +13,7 @@
 
 /* 推箱求解结果体较大，放到静态区避免占用主循环栈空间。 */
 static SokoFullSolution_t s_candidate_solution;
+static SokoWaypointPath_t s_candidate_segment_waypoints;
 
 /*
  * 函数: App_StaticMapDrive_CharToMap
@@ -273,74 +275,77 @@ static float app_smd_solution_distance_m(const SokoFullSolution_t *solution)
     return dist;
 }
 
-/*
- * 函数: app_smd_action_delta
- * 功能: 将推箱动作枚举转换成网格坐标增量。
- * 参数:
- *   act - 动作枚举。
- *   dx  - 输出 X 增量。
- *   dy  - 输出 Y 增量。
- * 返回: 1=动作有效；0=未知动作，增量置 0。
- */
-static uint8 app_smd_action_delta(SokoAction_e act, int8 *dx, int8 *dy)
+static uint8 app_smd_append_waypoint(SokoWaypointPath_t *dst, Point_t point)
 {
-    switch (act)
+    if (dst->count > 0U)
     {
-    case SOKO_ACT_UP:    *dx =  0; *dy = -1; return 1U;
-    case SOKO_ACT_DOWN:  *dx =  0; *dy =  1; return 1U;
-    case SOKO_ACT_LEFT:  *dx = -1; *dy =  0; return 1U;
-    case SOKO_ACT_RIGHT: *dx =  1; *dy =  0; return 1U;
-    default:             *dx =  0; *dy =  0; return 0U;
+        Point_t last = dst->points[dst->count - 1U];
+        if ((last.x == point.x) && (last.y == point.y))
+        {
+            return 1U;
+        }
     }
+    if (dst->count >= SOKOBAN_MAX_WAYPOINTS)
+    {
+        return 0U;
+    }
+    dst->points[dst->count] = point;
+    dst->count++;
+    return 1U;
+}
+
+static uint8 app_smd_append_waypoint_path(SokoWaypointPath_t *dst,
+                                          const SokoWaypointPath_t *src)
+{
+    uint16 i;
+    for (i = 0U; i < src->count; i++)
+    {
+        if (app_smd_append_waypoint(dst, src->points[i]) == 0U)
+        {
+            return 0U;
+        }
+    }
+    return 1U;
 }
 
 /*
- * 函数: app_smd_actions_to_waypoints_from_entry
- * 功能: 从入口格开始，把动作序列压缩成底盘航点序列。
- * 参数:
- *   actions - 求解器动作数组。
- *   count   - 动作数量。
- *   entry   - 执行起点入口格。
- *   wp_path - 输出航点路径。
- * 返回: 输出航点数量。
- * 压缩规则: 连续同方向动作只保留该连续段末端作为航点，减少底盘频繁切点。
+ * 函数: app_smd_build_full_waypoints
+ * 功能: 把求解器的分段动作结果展开为一个完整网格航点数组。
+ * 说明: 动作压缩复用 algo_sokoban_solver.c 的 Sokoban_Actions_To_Waypoints()，
+ *       本模块只负责把半格发车入口和多个箱子段拼接起来。
  */
-static uint16 app_smd_actions_to_waypoints_from_entry(const SokoAction_e *actions,
-                                                      uint16 count,
-                                                      Point_t entry,
-                                                      SokoWaypointPath_t *wp_path)
+static uint8 app_smd_build_full_waypoints(const SokoFullSolution_t *solution,
+                                          Point_t entry,
+                                          SokoWaypointPath_t *waypoints)
 {
-    uint16 i;
-    int8 cx = entry.x;
-    int8 cy = entry.y;
+    uint8 sub;
 
-    wp_path->count = 0U;
-    if (wp_path->count < SOKOBAN_MAX_WAYPOINTS)
+    if ((solution == NULL) || (waypoints == NULL))
     {
-        /* 首航点就是选中的入口格，让车先从发车物理点收敛到可规划网格中心。 */
-        wp_path->points[wp_path->count] = entry;
-        wp_path->count++;
+        return 0U;
     }
 
-    for (i = 0U; i < count; i++)
+    waypoints->count = 0U;
+    if (app_smd_append_waypoint(waypoints, entry) == 0U)
     {
-        int8 dx, dy;
-        if (!app_smd_action_delta(actions[i], &dx, &dy)) break;
-        cx = (int8)(cx + dx);
-        cy = (int8)(cy + dy);
+        return 0U;
+    }
 
-        if ((i == (uint16)(count - 1U)) || (actions[i] != actions[i + 1U]))
+    for (sub = 0U; sub < solution->total_boxes; sub++)
+    {
+        Point_t start = (sub == 0U) ? entry : solution->player_end_pos[sub - 1U];
+        memset(&s_candidate_segment_waypoints, 0, sizeof(s_candidate_segment_waypoints));
+        (void)Sokoban_Actions_To_Waypoints(solution->sub_solutions[sub].actions,
+                                           solution->sub_solutions[sub].count,
+                                           start,
+                                           &s_candidate_segment_waypoints);
+        if (app_smd_append_waypoint_path(waypoints, &s_candidate_segment_waypoints) == 0U)
         {
-            /* 连续同方向动作合并成一个航点，减少上层导航切点次数。 */
-            if (wp_path->count < SOKOBAN_MAX_WAYPOINTS)
-            {
-                wp_path->points[wp_path->count].x = cx;
-                wp_path->points[wp_path->count].y = cy;
-                wp_path->count++;
-            }
+            return 0U;
         }
     }
-    return wp_path->count;
+
+    return (waypoints->count > 0U) ? 1U : 0U;
 }
 
 /*
@@ -357,7 +362,7 @@ static uint16 app_smd_actions_to_waypoints_from_entry(const SokoAction_e *action
  *   1. 根据浮点起点生成最多 4 个整数入口候选。
  *   2. 对每个候选入口调用 Sokoban_Solve_Stage1。
  *   3. 用“入口距离 + 推箱动作估算距离”打分，选择最短方案。
- *   4. 为首个箱子生成第一段航点，后续段由主状态机继续展开。
+ *   4. 复用 Sokoban_Actions_To_Waypoints() 生成完整航点数组。
  */
 uint8 App_StaticMapDrive_SolveFromLaunch(const uint8 map[MAP_ROWS][MAP_COLS],
                                          float start_x_grid,
@@ -411,11 +416,10 @@ uint8 App_StaticMapDrive_SolveFromLaunch(const uint8 map[MAP_ROWS][MAP_COLS],
 
     if (best_valid != 0U)
     {
-        /* 只预生成第一段航点；后续箱子的航点由主流程在每段结束后继续展开。 */
-        (void)app_smd_actions_to_waypoints_from_entry(out->solution.sub_solutions[0].actions,
-                                                      out->solution.sub_solutions[0].count,
-                                                      out->entry,
-                                                      &out->first_waypoints);
+        if (app_smd_build_full_waypoints(&out->solution, out->entry, &out->waypoints) == 0U)
+        {
+            return 0U;
+        }
     }
 
     return best_valid;

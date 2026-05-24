@@ -3,7 +3,6 @@
 #include "chassis_ctrl.h"
 #include "chassis_imu.h"
 #include "zf_common_headfile.h"
-#include "zf_driver_flash.h"
 
 /*===========================================================================
  * [chassis_menu.c] 底盘参数菜单（两级）
@@ -73,23 +72,6 @@ typedef struct
     uint8 param_count;       /* 当前页面参数数量 */
 } menu_page_meta_t;
 
-/* Flash 存储布局：
- * - 使用 127 号扇区的第 7 页存储调参参数（尽量避开程序常用区域）。
- * - 数据头包含 magic/version/checksum，保证掉电后数据可校验。
- */
-#define CHASSIS_MENU_FLASH_SECTOR      (127U)       /* 参数存储扇区编号 */
-#define CHASSIS_MENU_FLASH_PAGE        (FLASH_PAGE_7) /* 参数存储页编号 */
-#define CHASSIS_MENU_FLASH_MAGIC       (0x4D4E5455U)   /* "MNTU" */
-#define CHASSIS_MENU_FLASH_VERSION     (2U)         /* 当前参数布局版本 */
-
-typedef struct
-{
-    uint32 magic;                 /* 数据块魔数，用于识别有效配置 */
-    uint32 version;               /* 数据结构版本号 */
-    chassis_tune_params_t params; /* 参数有效载荷 */
-    uint32 checksum;              /* 数据完整性校验和 */
-} chassis_menu_flash_blob_t;
-
 static menu_level_enum s_menu_level = MENU_LEVEL_ROOT;  /* 当前菜单层级 */
 static uint8 s_root_index = 0U;                         /* 一级菜单当前页索引 */
 static uint8 s_param_index = 0U;                        /* 二级菜单当前参数索引 */
@@ -97,7 +79,6 @@ static uint8 s_need_redraw = 1U;                        /* 界面重绘请求标
 static uint8 s_render_ticks = 0U;                       /* 渲染节拍计数（10ms 基准） */
 static char s_status_text[24] = "STATUS: READY";       /* 当前状态文本 */
 static char s_status_text_prev[24] = "";               /* 上次状态文本（用于变化检测） */
-static uint8 s_flash_ready = 0U;                        /* Flash 可用标志 */
 static uint8 s_full_refresh_done = 0U;                  /* 是否至少完成过一次整屏绘制 */
 static uint8 s_param_hold_inc_ticks = 0U;               /* K3 长按连发节拍计数（10ms 基准） */
 static uint8 s_param_hold_dec_ticks = 0U;               /* K4 长按连发节拍计数（10ms 基准） */
@@ -152,74 +133,66 @@ static const menu_page_meta_t s_pages[] =
 
 static float menu_get_param_value(menu_param_id_enum id)
 {
+    chassis_tune_params_t params;
+
+    chassis_ctrl_get_tune_params(&params);
+
     /* 按参数 ID 路由到当前参数结构中的实际字段。 */
     switch (id)
     {
-        case MENU_PARAM_LF_KP:  return g_chassis_tune_params.wheel_pid_kp[CHASSIS_WHEEL_LF]; /* 左前轮 Kp */
-        case MENU_PARAM_LF_KI:  return g_chassis_tune_params.wheel_pid_ki[CHASSIS_WHEEL_LF]; /* 左前轮 Ki */
-        case MENU_PARAM_LF_KD:  return g_chassis_tune_params.wheel_pid_kd[CHASSIS_WHEEL_LF]; /* 左前轮 Kd */
-        case MENU_PARAM_RF_KP:  return g_chassis_tune_params.wheel_pid_kp[CHASSIS_WHEEL_RF]; /* 右前轮 Kp */
-        case MENU_PARAM_RF_KI:  return g_chassis_tune_params.wheel_pid_ki[CHASSIS_WHEEL_RF]; /* 右前轮 Ki */
-        case MENU_PARAM_RF_KD:  return g_chassis_tune_params.wheel_pid_kd[CHASSIS_WHEEL_RF]; /* 右前轮 Kd */
-        case MENU_PARAM_LB_KP:  return g_chassis_tune_params.wheel_pid_kp[CHASSIS_WHEEL_LB]; /* 左后轮 Kp */
-        case MENU_PARAM_LB_KI:  return g_chassis_tune_params.wheel_pid_ki[CHASSIS_WHEEL_LB]; /* 左后轮 Ki */
-        case MENU_PARAM_LB_KD:  return g_chassis_tune_params.wheel_pid_kd[CHASSIS_WHEEL_LB]; /* 左后轮 Kd */
-        case MENU_PARAM_RB_KP:  return g_chassis_tune_params.wheel_pid_kp[CHASSIS_WHEEL_RB]; /* 右后轮 Kp */
-        case MENU_PARAM_RB_KI:  return g_chassis_tune_params.wheel_pid_ki[CHASSIS_WHEEL_RB]; /* 右后轮 Ki */
-        case MENU_PARAM_RB_KD:  return g_chassis_tune_params.wheel_pid_kd[CHASSIS_WHEEL_RB]; /* 右后轮 Kd */
-        case MENU_PARAM_POS_KP: return g_chassis_tune_params.pos_kp;                             /* 位置环比例项 */
-        case MENU_PARAM_YAW_KP: return g_chassis_tune_params.yaw_kp;                             /* 航向环比例项 */
-        case MENU_PARAM_MAX_V:  return g_chassis_tune_params.max_linear_speed_mps;               /* 最大线速度上限 */
-        case MENU_PARAM_MAX_W:  return g_chassis_tune_params.max_yaw_speed_dps;                  /* 最大角速度上限 */
-        case MENU_PARAM_ACC_V:  return g_chassis_tune_params.cmd_accel_limit_mps2;               /* 线速度加速度限制 */
-        case MENU_PARAM_ACC_W:  return g_chassis_tune_params.cmd_accel_limit_dps2;               /* 角速度加速度限制 */
-        default:               return g_chassis_tune_params.wheel_pid_kp[CHASSIS_WHEEL_LF];      /* 异常 ID 回退值 */
+        case MENU_PARAM_LF_KP:  return params.wheel_pid.kp[CHASSIS_WHEEL_LF];       /* 左前轮 Kp */
+        case MENU_PARAM_LF_KI:  return params.wheel_pid.ki[CHASSIS_WHEEL_LF];       /* 左前轮 Ki */
+        case MENU_PARAM_LF_KD:  return params.wheel_pid.kd[CHASSIS_WHEEL_LF];       /* 左前轮 Kd */
+        case MENU_PARAM_RF_KP:  return params.wheel_pid.kp[CHASSIS_WHEEL_RF];       /* 右前轮 Kp */
+        case MENU_PARAM_RF_KI:  return params.wheel_pid.ki[CHASSIS_WHEEL_RF];       /* 右前轮 Ki */
+        case MENU_PARAM_RF_KD:  return params.wheel_pid.kd[CHASSIS_WHEEL_RF];       /* 右前轮 Kd */
+        case MENU_PARAM_LB_KP:  return params.wheel_pid.kp[CHASSIS_WHEEL_LB];       /* 左后轮 Kp */
+        case MENU_PARAM_LB_KI:  return params.wheel_pid.ki[CHASSIS_WHEEL_LB];       /* 左后轮 Ki */
+        case MENU_PARAM_LB_KD:  return params.wheel_pid.kd[CHASSIS_WHEEL_LB];       /* 左后轮 Kd */
+        case MENU_PARAM_RB_KP:  return params.wheel_pid.kp[CHASSIS_WHEEL_RB];       /* 右后轮 Kp */
+        case MENU_PARAM_RB_KI:  return params.wheel_pid.ki[CHASSIS_WHEEL_RB];       /* 右后轮 Ki */
+        case MENU_PARAM_RB_KD:  return params.wheel_pid.kd[CHASSIS_WHEEL_RB];       /* 右后轮 Kd */
+        case MENU_PARAM_POS_KP: return params.position.kp;                          /* 位置环比例项 */
+        case MENU_PARAM_YAW_KP: return params.yaw.kp;                               /* 航向环比例项 */
+        case MENU_PARAM_MAX_V:  return params.limit.max_linear_speed_mps;           /* 最大线速度上限 */
+        case MENU_PARAM_MAX_W:  return params.limit.max_yaw_speed_dps;              /* 最大角速度上限 */
+        case MENU_PARAM_ACC_V:  return params.limit.accel_limit_mps2;               /* 线速度加速度限制 */
+        case MENU_PARAM_ACC_W:  return params.limit.yaw_accel_limit_dps2;           /* 角速度加速度限制 */
+        default:               return params.wheel_pid.kp[CHASSIS_WHEEL_LF];        /* 异常 ID 回退值 */
     }
 }
 
 /* 根据参数ID写入当前参数值。 */
-static void menu_set_param_value(menu_param_id_enum id, float value)
+static void menu_set_param_value(chassis_tune_params_t *params, menu_param_id_enum id, float value)
 {
-    /* 按参数 ID 写回对应字段，所有修改都落在全局参数单源中。 */
+    if (params == NULL)
+    {
+        return;
+    }
+
+    /* 按参数 ID 写回局部快照，最后由 chassis_ctrl_set_tune_params() 统一下发。 */
     switch (id)
     {
-        case MENU_PARAM_LF_KP: g_chassis_tune_params.wheel_pid_kp[CHASSIS_WHEEL_LF] = value; break; /* 设置左前轮 Kp */
-        case MENU_PARAM_LF_KI: g_chassis_tune_params.wheel_pid_ki[CHASSIS_WHEEL_LF] = value; break; /* 设置左前轮 Ki */
-        case MENU_PARAM_LF_KD: g_chassis_tune_params.wheel_pid_kd[CHASSIS_WHEEL_LF] = value; break; /* 设置左前轮 Kd */
-        case MENU_PARAM_RF_KP: g_chassis_tune_params.wheel_pid_kp[CHASSIS_WHEEL_RF] = value; break; /* 设置右前轮 Kp */
-        case MENU_PARAM_RF_KI: g_chassis_tune_params.wheel_pid_ki[CHASSIS_WHEEL_RF] = value; break; /* 设置右前轮 Ki */
-        case MENU_PARAM_RF_KD: g_chassis_tune_params.wheel_pid_kd[CHASSIS_WHEEL_RF] = value; break; /* 设置右前轮 Kd */
-        case MENU_PARAM_LB_KP: g_chassis_tune_params.wheel_pid_kp[CHASSIS_WHEEL_LB] = value; break; /* 设置左后轮 Kp */
-        case MENU_PARAM_LB_KI: g_chassis_tune_params.wheel_pid_ki[CHASSIS_WHEEL_LB] = value; break; /* 设置左后轮 Ki */
-        case MENU_PARAM_LB_KD: g_chassis_tune_params.wheel_pid_kd[CHASSIS_WHEEL_LB] = value; break; /* 设置左后轮 Kd */
-        case MENU_PARAM_RB_KP: g_chassis_tune_params.wheel_pid_kp[CHASSIS_WHEEL_RB] = value; break; /* 设置右后轮 Kp */
-        case MENU_PARAM_RB_KI: g_chassis_tune_params.wheel_pid_ki[CHASSIS_WHEEL_RB] = value; break; /* 设置右后轮 Ki */
-        case MENU_PARAM_RB_KD: g_chassis_tune_params.wheel_pid_kd[CHASSIS_WHEEL_RB] = value; break; /* 设置右后轮 Kd */
-        case MENU_PARAM_POS_KP: g_chassis_tune_params.pos_kp = value; break;                           /* 设置位置环 Kp */
-        case MENU_PARAM_YAW_KP: g_chassis_tune_params.yaw_kp = value; break;                           /* 设置航向环 Kp */
-        case MENU_PARAM_MAX_V:  g_chassis_tune_params.max_linear_speed_mps = value; break;             /* 设置线速度上限 */
-        case MENU_PARAM_MAX_W:  g_chassis_tune_params.max_yaw_speed_dps = value; break;                /* 设置角速度上限 */
-        case MENU_PARAM_ACC_V:  g_chassis_tune_params.cmd_accel_limit_mps2 = value; break;             /* 设置线加速度上限 */
-        case MENU_PARAM_ACC_W:  g_chassis_tune_params.cmd_accel_limit_dps2 = value; break;             /* 设置角加速度上限 */
-        default: break;                                                                          /* 异常 ID 直接忽略 */
+        case MENU_PARAM_LF_KP: params->wheel_pid.kp[CHASSIS_WHEEL_LF] = value; break; /* 设置左前轮 Kp */
+        case MENU_PARAM_LF_KI: params->wheel_pid.ki[CHASSIS_WHEEL_LF] = value; break; /* 设置左前轮 Ki */
+        case MENU_PARAM_LF_KD: params->wheel_pid.kd[CHASSIS_WHEEL_LF] = value; break; /* 设置左前轮 Kd */
+        case MENU_PARAM_RF_KP: params->wheel_pid.kp[CHASSIS_WHEEL_RF] = value; break; /* 设置右前轮 Kp */
+        case MENU_PARAM_RF_KI: params->wheel_pid.ki[CHASSIS_WHEEL_RF] = value; break; /* 设置右前轮 Ki */
+        case MENU_PARAM_RF_KD: params->wheel_pid.kd[CHASSIS_WHEEL_RF] = value; break; /* 设置右前轮 Kd */
+        case MENU_PARAM_LB_KP: params->wheel_pid.kp[CHASSIS_WHEEL_LB] = value; break; /* 设置左后轮 Kp */
+        case MENU_PARAM_LB_KI: params->wheel_pid.ki[CHASSIS_WHEEL_LB] = value; break; /* 设置左后轮 Ki */
+        case MENU_PARAM_LB_KD: params->wheel_pid.kd[CHASSIS_WHEEL_LB] = value; break; /* 设置左后轮 Kd */
+        case MENU_PARAM_RB_KP: params->wheel_pid.kp[CHASSIS_WHEEL_RB] = value; break; /* 设置右后轮 Kp */
+        case MENU_PARAM_RB_KI: params->wheel_pid.ki[CHASSIS_WHEEL_RB] = value; break; /* 设置右后轮 Ki */
+        case MENU_PARAM_RB_KD: params->wheel_pid.kd[CHASSIS_WHEEL_RB] = value; break; /* 设置右后轮 Kd */
+        case MENU_PARAM_POS_KP: params->position.kp = value; break;                   /* 设置位置环 Kp */
+        case MENU_PARAM_YAW_KP: params->yaw.kp = value; break;                        /* 设置航向环 Kp */
+        case MENU_PARAM_MAX_V:  params->limit.max_linear_speed_mps = value; break;    /* 设置线速度上限 */
+        case MENU_PARAM_MAX_W:  params->limit.max_yaw_speed_dps = value; break;       /* 设置角速度上限 */
+        case MENU_PARAM_ACC_V:  params->limit.accel_limit_mps2 = value; break;        /* 设置线加速度上限 */
+        case MENU_PARAM_ACC_W:  params->limit.yaw_accel_limit_dps2 = value; break;    /* 设置角加速度上限 */
+        default: break;                                                               /* 异常 ID 直接忽略 */
     }
-}
-
-/* 简单加和校验：对除 checksum 之外的全部 32bit 字做累加。 */
-/* ==========================================================================
- *  § 2. Flash 持久化 (校验和 + 读/写 + 状态提示)
- * ========================================================================== */
-
-static uint32 menu_flash_checksum(const uint32 *words, uint16 word_count)
-{
-    uint16 i;        /* 循环下标：遍历每个 32bit 数据字 */
-    uint32 sum = 0U; /* 校验累加值 */
-
-    for (i = 0U; i < word_count; ++i)
-    {
-        sum += words[i];
-    }
-    return sum;
 }
 
 /* 将状态文本写入固定缓冲区，用于屏幕反馈。 */
@@ -245,75 +218,27 @@ static void menu_set_status(const char *text)
 /* 从 Flash 读取参数，校验通过后覆盖当前参数。 */
 static uint8 menu_load_params_from_flash(void)
 {
-    uint32 raw_words[(sizeof(chassis_menu_flash_blob_t) + 3U) / 4U]; /* Flash 原始字缓冲 */
-    chassis_menu_flash_blob_t blob;                                  /* 反序列化后的结构体 */
-    uint32 calc_checksum;                                            /* 重新计算得到的校验和 */
-    uint16 payload_words;                                            /* 除 checksum 之外的数据字数量 */
-
-    if (0U == s_flash_ready)
+    if (chassis_config_load_from_flash() != 0U)
     {
-        menu_set_status("STATUS: FLASH OFF"); /* 提示 Flash 功能不可用 */
-        return 0U;                             /* 返回失败 */
+        menu_set_status("STATUS: LOAD OK");
+        return 1U;
     }
 
-    /* 从指定扇区页读取参数镜像。 */
-    flash_read_page(CHASSIS_MENU_FLASH_SECTOR, CHASSIS_MENU_FLASH_PAGE,
-                    raw_words, (uint16)(sizeof(raw_words) / sizeof(raw_words[0])));
-    /* 将原始字流还原为参数结构体。 */
-    memcpy(&blob, raw_words, sizeof(blob));
-
-    /* 只对 header+params 区域做校验，不包含 checksum 字段本身。 */
-    payload_words = (uint16)((sizeof(chassis_menu_flash_blob_t) - sizeof(uint32)) / 4U);
-    calc_checksum = menu_flash_checksum((const uint32 *)&blob, payload_words);
-
-    if ((blob.magic != CHASSIS_MENU_FLASH_MAGIC) ||
-        (blob.version != CHASSIS_MENU_FLASH_VERSION) ||
-        (blob.checksum != calc_checksum))
-    {
-        menu_set_status("STATUS: LOAD DEFAULT"); /* 校验不通过：保持默认参数 */
-        return 0U;                                /* 返回失败 */
-    }
-
-    chassis_ctrl_set_tune_params(&blob.params);  /* 将 Flash 参数下发到控制层并触发限幅 */
-    menu_set_status("STATUS: LOAD OK");         /* 更新状态提示 */
-    return 1U;                                    /* 返回成功 */
+    menu_set_status("STATUS: LOAD DEFAULT");
+    return 0U;
 }
 
 /* 将当前参数写入 Flash。 */
 static uint8 menu_save_params_to_flash(void)
 {
-    chassis_menu_flash_blob_t blob; /* 待写入 Flash 的完整镜像 */
-    uint16 payload_words;           /* 参与校验的 32bit 字数量 */
-    uint8 ret;                      /* Flash 写入返回码 */
-
-    if (0U == s_flash_ready)
+    if (chassis_config_save_to_flash() != 0U)
     {
-        menu_set_status("STATUS: FLASH OFF"); /* 提示不可写 Flash */
-        return 0U;                             /* 返回失败 */
+        menu_set_status("STATUS: SAVE OK");
+        return 1U;
     }
 
-    /* 组织写入镜像，先写头和参数，再回填校验和。 */
-    blob.magic = CHASSIS_MENU_FLASH_MAGIC;     /* 写入魔数，识别有效数据块 */
-    blob.version = CHASSIS_MENU_FLASH_VERSION; /* 写入版本号，便于未来扩展 */
-    blob.params = g_chassis_tune_params;       /* 写入当前参数快照 */
-    blob.checksum = 0U;                        /* 校验前先清零 */
-
-    payload_words = (uint16)((sizeof(chassis_menu_flash_blob_t) - sizeof(uint32)) / 4U); /* 参与校验的数据字数 */
-    blob.checksum = menu_flash_checksum((const uint32 *)&blob, payload_words);            /* 计算并回填 checksum */
-
-    /* 按页写入，返回 0 表示成功。 */
-    ret = flash_write_page(CHASSIS_MENU_FLASH_SECTOR,
-                           CHASSIS_MENU_FLASH_PAGE,
-                           (const uint32 *)&blob,
-                           (uint16)((sizeof(chassis_menu_flash_blob_t) + 3U) / 4U));
-    if (0U == ret)
-    {
-        menu_set_status("STATUS: SAVE OK"); /* 写入成功提示 */
-        return 1U;                           /* 返回成功 */
-    }
-
-    menu_set_status("STATUS: SAVE FAIL"); /* 写入失败提示 */
-    return 0U;                             /* 返回失败 */
+    menu_set_status("STATUS: SAVE FAIL");
+    return 0U;
 }
 
 /* 获取当前二级菜单项对应的参数ID。 */
@@ -338,8 +263,8 @@ static void menu_apply_current_param_delta(float delta)
     /* 先叠加增量，再做上下限保护。 */
     value = chassis_clamp_f(value + delta, meta->min_val, meta->max_val); /* 参数值加减并限幅 */
     /* 回写参数并实时下发到底盘控制层。 */
-    menu_set_param_value(id, value);              /* 写回全局参数单源 */
-    params = g_chassis_tune_params;               /* 复制一份非 volatile 副本用于接口入参 */
+    chassis_ctrl_get_tune_params(&params);        /* 复制一份一致快照用于接口入参 */
+    menu_set_param_value(&params, id, value);     /* 写回局部参数副本 */
     chassis_ctrl_set_tune_params(&params);        /* 立即下发到底盘控制模块 */
     s_need_redraw = 1U;                           /* 标记界面需要重绘 */
 }
@@ -595,8 +520,6 @@ static void menu_draw_pose(uint8 force_refresh)
 
 void chassis_menu_init(void)
 {
-    /* 初始化 Flash 驱动：0 表示成功。 */
-    s_flash_ready = (0U == flash_init()) ? 1U : 0U; /* 初始化 Flash 并记录可用标志 */
     /* 读取并应用 Flash 参数（失败会保持默认参数）。 */
     menu_load_params_from_flash(); /* 尝试读取并应用掉电保存参数 */
     /* 清空状态缓存，确保首次渲染必定更新状态行。 */

@@ -2,7 +2,7 @@
  * [app_static_map_drive_helper.h] 静态地图推箱启动辅助接口
  *
  * 处理手写/视觉地图字符转换、半格发车点入口候选枚举、推箱方案择优、
- * 首段航点生成等逻辑。主流程只关心最终的 AppStaticMapDrivePlan_t。
+ * 完整航点数组生成等逻辑。主流程只关心最终的 AppStaticMapDrivePlan_t。
  *===========================================================================*/
 
 #ifndef APP_STATIC_MAP_DRIVE_HELPER_H_
@@ -15,16 +15,16 @@ extern "C" {
 #endif
 
 /* 静态地图驱动的规划结果:
- * solution        : 完整推箱求解结果
- * first_waypoints : 从发车点/入口格到第一个箱子完成推动的首段航点
- * entry           : 实际选用的整数入口格
- * entry_dist_m    : 半格发车点到入口格中心的距离
- * score_m         : 入口距离 + 推箱动作估算距离，用于候选入口择优
+ * solution     : 完整推箱求解结果，保留每个箱子的原始动作段。
+ * waypoints    : 已展开的完整网格航点数组，STATIC_MAP_DRIVE 可直接顺序下发。
+ * entry        : 实际选用的整数入口格。
+ * entry_dist_m : 半格发车点到入口格中心的距离。
+ * score_m      : 入口距离 + 推箱动作估算距离，用于候选入口择优。
  */
 typedef struct
 {
     SokoFullSolution_t solution;
-    SokoWaypointPath_t first_waypoints;
+    SokoWaypointPath_t waypoints;
     Point_t entry;
     float entry_dist_m;
     float score_m;
