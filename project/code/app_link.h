@@ -187,6 +187,7 @@ void app_link_get_map_snapshot(uint8 dst[APP_LINK_MAP_ROWS][APP_LINK_MAP_COLS]);
  *   3. 此后调用方需在主循环中定期刷新 g_link_last_map_ms = app_link_get_ms()，否则 500ms 后菜单判定过期。
  *-----------------------------------------------------------------------------------------------------------------*/
 void app_link_inject_static_map(const uint8 map[APP_LINK_MAP_ROWS][APP_LINK_MAP_COLS]);
+void app_link_inject_static_car(uint8 car_x, uint8 car_y);
 
 /*-------------------------------------------------------------------------------------------------------------------
  * 函数: app_link_get_car_snapshot

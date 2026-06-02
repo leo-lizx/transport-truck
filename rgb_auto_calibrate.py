@@ -1,39 +1,17 @@
 # ======================================================================
-# OpenART RGB/LAB 自动标定脚本 (配套地图: map_calibrate.txt)
+# OpenART RGB/LAB 自动标定脚本 (配套当前 OpenMV 预览界面)
 #
 # 用途：
 #   1. 在固定摄像头、固定屏幕亮度后，自动采样各地图元素 RGB。
-#   2. 分两阶段采样：第一阶段采静态元素+暗色车辆，第二阶段采亮色车辆。
+#   2. 按本文件写死的标定图坐标，一次性采样 14 个 RGB 模板。
 #   3. 将结果打印到串口终端，并保存到 SD 卡（文件名含当前时间戳）。
 #   4. 输出格式可直接复制粘贴到 main copy.py 中。
 #
-# 配套标定地图 (map_calibrate.txt)：
-#   ################
-#   #$.*-----------#
-#   #--------------#
-#   #-------.------#
-#   #------$-$-----#
-#   #------*-------#
-#   #--------------#
-#   #------.-*-----#
-#   #------$-------#
-#   #--------------#
-#   #-----------.$*#
-#   ################
-#
-# 配套虚拟车脚本 (fake_car_for_calibration.py)：
-#   在 PC 上运行，模拟 camera_opencv.exe 的 TCP 服务器，
-#   自动把虚拟车放到暗色位置(1.5, 6)和亮色位置(8, 6)。
-#   默认每个位置停留 15 秒，与本脚本时序匹配。
-#
 # 完整使用流程：
-#   1. PC 上运行 close_ports.bat
-#   2. PC 上运行 python fake_car_for_calibration.py
-#   3. 启动游戏，加载 map_calibrate.txt
-#   4. 用键盘方向键把车移出发车区（触发地图生成）
-#   5. 把本脚本复制到 OpenART SD 卡根目录，改名 main.py
-#   6. 启动 OpenART，等待自动完成两阶段采样
-#   7. 从终端或 SD 卡读取结果，粘贴到 main copy.py
+#   1. 在电脑上打开 map_calibrate 标定界面，并保持窗口/亮度/摄像头位置不变。
+#   2. 把本脚本复制到 OpenART SD 卡根目录，改名 main.py。
+#   3. 在 OpenMV IDE 中运行一次，先看彩色外框和预览十字，扶正后等待自动采样。
+#   4. 从串口或 /sd/rgb_paste_to_main.py 读取结果，粘贴到 main copy.py/main.py。
 # ======================================================================
 
 import sensor, image, time, math
@@ -56,70 +34,56 @@ clock = time.clock()
 ROWS, COLS = 12, 16
 
 GRID_CORNERS = {
-    "tl": (37.0, 42.0),
-    "tr": (282.0, 35.5),
-    "bl": (47.5, 223.2),
-    "br": (280.8, 221.5),
+"tl": (30.0, 37.0), #左上
+"tr": (282.0, 31.5), #右上
+"bl": (39.5, 213.2), #左下
+"br": (284.8, 210.5), #右下
 }
 
 GRID_K1 = +0.000000
 
 # ----------------------------------------------------------------------
-# 3. 采样配置 —— 分两阶段
+# 3. 采样配置 —— 按当前 OpenMV 预览界面的 map_calibrate 布局采样
 # ----------------------------------------------------------------------
-# 第一阶段：静态元素 + 暗色车辆（车在左边缘 (1,6)）
-# 第二阶段：亮色车辆（车在中心 (8,6)）
-#
 # 格式：(变量名, 格子x, 格子y, 像素偏移x, 像素偏移y)
-
-# 第一阶段采样点（车在暗色位置 + 所有静态元素）
-PHASE1_SPECS = (
-    # 暗色车辆：车在左侧 (2,6)
-    ("CAR_HEAD_DARK_RGB",    2,  6,  0,  -4),   # 车头绿色半块（上半）
-    ("CAR_TAIL_DARK_RGB",    2,  6,  0,   4),   # 车尾青色半块（下半）
+# 坐标按 16x12 地图格填写：x 从左到右 0~15，y 从上到下 0~11。
+# 车辆色块在图中是上下半块：dy=-4 采车头，dy=+4 采车尾。
+CALIBRATION_SPECS = (
+    # 车辆：左侧样本作暗模板，中间样本作亮模板
+    ("CAR_HEAD_DARK_RGB",    1,  6,  0, -4),    # 左侧车辆上半块
+    ("CAR_TAIL_DARK_RGB",    1,  6,  0,  4),    # 左侧车辆下半块
+    ("CAR_HEAD_BRIGHT_RGB",  8,  6,  0, -4),    # 中间车辆上半块
+    ("CAR_TAIL_BRIGHT_RGB",  8,  6,  0,  4),    # 中间车辆下半块
 
     # 墙体
     ("WALL_DARK_RGB",        0,  0,  0,  0),    # 左上角墙
     ("WALL_BRIGHT_RGB",      7,  0,  0,  0),    # 顶部中间墙
 
     # 空地
-    ("FLOOR_DARK_RGB",       1,  2,  0,  0),    # 左侧边缘空地
-    ("FLOOR_BRIGHT_RGB",     7,  6,  0,  0),    # 正中心空地
+    ("FLOOR_DARK_RGB",       1,  2,  0,  0),    # 左上侧蓝色空地
+    ("FLOOR_BRIGHT_RGB",     7,  6,  0,  0),    # 中部蓝色空地
 
     # 目的地
-    ("GOAL_DARK_RGB",        2,  1,  0,  0),    # 左上角附近目的地
-    ("GOAL_BRIGHT_RGB",      8,  3,  0,  0),    # 中心区域目的地
+    ("GOAL_DARK_RGB",        2,  1,  0,  0),    # 左上粉色目的地
+    ("GOAL_BRIGHT_RGB",      8,  3,  0,  0),    # 中部粉色目的地
 
     # 箱子
-    ("BOX_DARK_RGB",         1,  1,  0,  0),    # 左上角附近箱子
-    ("BOX_BRIGHT_RGB",       7,  4,  0,  0),    # 中心区域箱子
+    ("BOX_DARK_RGB",         1,  1,  0,  0),    # 左上黄色箱子
+    ("BOX_BRIGHT_RGB",       7,  4,  0,  0),    # 中部黄色箱子
 
     # 炸弹
-    ("BOMB_DARK_RGB",        3,  1,  0,  0),    # 左上角附近炸弹
-    ("BOMB_BRIGHT_RGB",      7,  5,  0,  0),    # 中心区域炸弹
-)
-
-# 第二阶段采样点（车在亮色位置）
-PHASE2_SPECS = (
-    # 亮色车辆：车在中心 (8,6)
-    ("CAR_HEAD_BRIGHT_RGB",  8,  6,  0,  -4),   # 车头绿色半块（上半）
-    ("CAR_TAIL_BRIGHT_RGB",  8,  6,  0,   4),   # 车尾青色半块（下半）
+    ("BOMB_DARK_RGB",        3,  1,  0,  0),    # 左上红色炸弹
+    ("BOMB_BRIGHT_RGB",      7,  5,  0,  0),    # 中部红色炸弹
 )
 
 # 时序参数
-# 与 fake_car_for_calibration.py 的 HOLD_SECONDS=15 配合：
-#   0s: 两个脚本同时启动，车在暗色位置
-#   ~4s: Phase1 采样完成（3s等待 + ~1s采样）
-#   15s: fake_car 自动切换到亮色位置
-#   ~16s: Phase2 开始采样（等待12s后）
-PHASE1_DELAY_MS = 3000       # 第一阶段启动前等待（让画面稳定）
-PHASE1_FRAMES = 50           # 第一阶段采样帧数
-PHASE2_WAIT_MS = 12000       # 第一阶段结束后等待车辆切换到亮色位置
-PHASE2_FRAMES = 50           # 第二阶段采样帧数
+SAMPLE_DELAY_MS = 15000      # 启动前等待：先用彩色边框矫正画面，再自动采样
+SAMPLE_FRAMES = 60           # 采样帧数
 
 SAMPLE_RADIUS = 2            # 采样半径 2 表示 5x5 像素
 TRIM_COUNT = 3               # 按亮度排序后，去掉最暗/最亮各 N 个点
 DRAW_PREVIEW = True
+FIXED_OUTPUT_FILE = "/sd/rgb_paste_to_main.py"
 
 # 输出文件名使用当前时间戳
 def make_output_filename():
@@ -198,6 +162,28 @@ def draw_sample_points(img, img_w, img_h, specs):
             img.draw_circle(sx, sy, SAMPLE_RADIUS + 2, color=(255, 220, 0), thickness=1)
             img.draw_string(sx + 4, sy - 6, name[:4], color=(255, 220, 0), mono_space=False)
 
+def draw_calibration_overlay(img, img_w, img_h):
+    tl = calc_grid_point(0, 0, img_w, img_h)
+    tr = calc_grid_point(COLS - 1, 0, img_w, img_h)
+    bl = calc_grid_point(0, ROWS - 1, img_w, img_h)
+    br = calc_grid_point(COLS - 1, ROWS - 1, img_w, img_h)
+
+    img.draw_line(tl[0], tl[1], tr[0], tr[1], color=(255, 80, 80), thickness=1)
+    img.draw_line(tr[0], tr[1], br[0], br[1], color=(80, 255, 80), thickness=1)
+    img.draw_line(br[0], br[1], bl[0], bl[1], color=(80, 160, 255), thickness=1)
+    img.draw_line(bl[0], bl[1], tl[0], tl[1], color=(255, 220, 80), thickness=1)
+
+    img.draw_cross(tl[0], tl[1], color=(255, 80, 80), size=7, thickness=2)
+    img.draw_cross(tr[0], tr[1], color=(80, 255, 80), size=7, thickness=2)
+    img.draw_cross(bl[0], bl[1], color=(255, 220, 80), size=7, thickness=2)
+    img.draw_cross(br[0], br[1], color=(80, 160, 255), size=7, thickness=2)
+
+    return tl, tr, bl, br
+
+def draw_calibration_preview(img, img_w, img_h, specs):
+    draw_calibration_overlay(img, img_w, img_h)
+    draw_sample_points(img, img_w, img_h, specs)
+
 # ----------------------------------------------------------------------
 # 5. RGB -> LAB 转换（与正式脚本一致）
 # ----------------------------------------------------------------------
@@ -262,7 +248,7 @@ def sample_phase(specs, delay_ms, num_frames, phase_name):
         img_h = img.height()
 
         if DRAW_PREVIEW:
-            draw_sample_points(img, img_w, img_h, specs)
+            draw_calibration_preview(img, img_w, img_h, specs)
 
         elapsed = time.ticks_diff(time.ticks_ms(), start_ms)
         if elapsed < delay_ms:
@@ -325,87 +311,70 @@ PASTE_ORDER = [
     "BOMB_BRIGHT_RGB",
 ]
 
+def write_result_file(output_file, results):
+    f = open(output_file, "w")
+    f.write("# ============================================\n")
+    f.write("# RGB/LAB Calibration Result\n")
+    f.write("# Generated by rgb_auto_calibrate.py\n")
+    f.write("# OpenMV map_calibrate preview\n")
+    f.write("# ============================================\n")
+    f.write("# Copy the block below directly into main copy.py/main.py\n\n")
+
+    # 详细输出（含 LAB 参考）
+    for name in PASTE_ORDER:
+        if name in results:
+            rgb = results[name]
+            lab = rgb_to_lab(rgb)
+            f.write(format_rgb_line(name, rgb) + "\n")
+            f.write(format_lab_line(name, lab) + "\n")
+
+    f.write("\n# ============================================\n")
+    f.write("# Quick paste block:\n")
+    f.write("# ============================================\n\n")
+
+    for name in PASTE_ORDER:
+        if name in results:
+            f.write(format_rgb_line(name, results[name]) + "\n")
+
+    f.close()
+
+def write_paste_file(output_file, results):
+    f = open(output_file, "w")
+    for name in PASTE_ORDER:
+        if name in results:
+            f.write(format_rgb_line(name, results[name]) + "\n")
+    f.close()
+
 def save_results(results):
-    output_file = make_output_filename()
+    timestamp_file = make_output_filename()
     try:
-        f = open(output_file, "w")
-        f.write("# ============================================\n")
-        f.write("# RGB/LAB Calibration Result\n")
-        f.write("# Generated by rgb_auto_calibrate.py\n")
-        f.write("# Map: map_calibrate.txt\n")
-        f.write("# ============================================\n")
-        f.write("# Copy the block below directly into main copy.py\n\n")
-
-        # 详细输出（含 LAB 参考）
-        for name in PASTE_ORDER:
-            if name in results:
-                rgb = results[name]
-                lab = rgb_to_lab(rgb)
-                f.write(format_rgb_line(name, rgb) + "\n")
-                f.write(format_lab_line(name, lab) + "\n")
-
-        f.write("\n# ============================================\n")
-        f.write("# Quick paste block (copy below to main copy.py):\n")
-        f.write("# ============================================\n\n")
-
-        for name in PASTE_ORDER:
-            if name in results:
-                f.write(format_rgb_line(name, results[name]) + "\n")
-
-        f.close()
-        print("\nSaved to %s" % output_file)
+        write_result_file(timestamp_file, results)
+        print("\nSaved to %s" % timestamp_file)
+        write_paste_file(FIXED_OUTPUT_FILE, results)
+        print("Saved paste block to %s" % FIXED_OUTPUT_FILE)
     except Exception as e:
         print("Save failed:", e)
 
 # ----------------------------------------------------------------------
-# 8. 主流程：两阶段自动采样
+# 8. 主流程：静态标定图一次采样
 # ----------------------------------------------------------------------
 def run_calibration():
     print("=" * 40)
-    print(" RGB/LAB 两阶段自动标定")
-    print(" 配套: map_calibrate.txt")
-    print("       fake_car_for_calibration.py")
+    print(" RGB/LAB static calibration")
+    print(" Use the fixed sample points in CALIBRATION_SPECS")
     print("=" * 40)
 
-    # 第一阶段：采静态元素 + 暗色车辆
-    phase1_results = sample_phase(
-        PHASE1_SPECS,
-        PHASE1_DELAY_MS,
-        PHASE1_FRAMES,
-        "Phase1: 静态+暗色车"
+    all_results = sample_phase(
+        CALIBRATION_SPECS,
+        SAMPLE_DELAY_MS,
+        SAMPLE_FRAMES,
+        "Static image"
     )
-
-    # 等待车辆移动到亮色位置
-    print("\n[等待] 车辆正在移动到亮色位置...")
-    print("[等待] 请确保 fake_car_for_calibration.py 已自动切换")
-    wait_start = time.ticks_ms()
-    while time.ticks_diff(time.ticks_ms(), wait_start) < PHASE2_WAIT_MS:
-        clock.tick()
-        img = sensor.snapshot()
-        if DRAW_PREVIEW:
-            draw_sample_points(img, img.width(), img.height(), PHASE2_SPECS)
-        elapsed = time.ticks_diff(time.ticks_ms(), wait_start)
-        if elapsed % 2000 < 50:
-            remain = (PHASE2_WAIT_MS - elapsed + 999) // 1000
-            print("[等待] 剩余 %d s" % remain)
-
-    # 第二阶段：采亮色车辆
-    phase2_results = sample_phase(
-        PHASE2_SPECS,
-        1000,            # 短暂等待 1s 让画面稳定
-        PHASE2_FRAMES,
-        "Phase2: 亮色车"
-    )
-
-    # 合并结果
-    all_results = {}
-    all_results.update(phase1_results)
-    all_results.update(phase2_results)
 
     # 打印结果
     print("\n" + "=" * 40)
     print(" RGB/LAB Calibration Result")
-    print(" Map: map_calibrate.txt")
+    print(" OpenMV map_calibrate preview")
     print("=" * 40 + "\n")
 
     for name in PASTE_ORDER:
@@ -428,11 +397,10 @@ run_calibration()
 
 # 保持画面预览，避免脚本结束后立即黑屏
 print("\n[完成] 标定结束，保持预览中...")
-all_specs = PHASE1_SPECS + PHASE2_SPECS
 while True:
     clock.tick()
     img = sensor.snapshot()
     if DRAW_PREVIEW:
-        draw_sample_points(img, img.width(), img.height(), all_specs)
+        draw_calibration_preview(img, img.width(), img.height(), CALIBRATION_SPECS)
     if int(clock.fps()) > 0:
         pass

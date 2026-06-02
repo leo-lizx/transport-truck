@@ -42,6 +42,7 @@
 #include "algo_sokoban_solver.h"
 #include <math.h>       /* sqrtf — POINT_NAV 调试打印用 */
 #include <stdio.h>
+#include <string.h>
 
 /*==========================================================================
  *  P0-5: 主循环 5ms tick 节拍 (替代 system_delay_ms 阻塞)
@@ -99,6 +100,7 @@ static uint32 wait_for_tick(void)
  *   3   MAIN_RUN_MODE_POINT_NAV             ✅    无               定点导航: 按预设 9 个航点依次跑四角→回起点
  *   4   MAIN_RUN_MODE_SOKO_SELFTEST         ❌    摄像头 UART4     推箱求解自测: 接收摄像头地图帧→屏幕彩色方块显示
  *   5   MAIN_RUN_MODE_SOLVE_VERIFY          ❌    摄像头 UART4     解算验证: 收图→解算→虚拟走比赛流程, 车不动仅验算法
+ *   6   MAIN_RUN_MODE_STATIC_VERIFY         ❌    代码内置          静态验证: 内置地图→解算→屏幕慢速播放, 车不动
  *   7   MAIN_RUN_MODE_LEVEL1_TEST           ✅    OpenART 串口     第一关完整流程: 收图→等人发车→推箱→回发车区
  *   8   MAIN_RUN_MODE_HARDCODED_MAP         ✅    代码内置          硬编码地图: 上电即解算→暖机→自动推箱→回库
  *=========================================================================*/
@@ -108,11 +110,12 @@ static uint32 wait_for_tick(void)
 #define MAIN_RUN_MODE_POINT_NAV       (3)   /* 定点导航: 预设航点四角遍历, 测里程计精度 */
 #define MAIN_RUN_MODE_SOKO_SELFTEST   (4)   /* 推箱自测: 收摄像头地图→屏幕色块, 车不动 */
 #define MAIN_RUN_MODE_SOLVE_VERIFY    (5)   /* 解算验证: 收图→解算→虚拟跑流程显示, 车不动 */
+#define MAIN_RUN_MODE_STATIC_VERIFY   (6)   /* 静态验证: 内置地图→解算→屏幕慢速播放, 车不动 */
 #define MAIN_RUN_MODE_LEVEL1_TEST     (7)   /* 第一关测试: 收图→等发车→推箱→回库 (最接近比赛) */
 #define MAIN_RUN_MODE_HARDCODED_MAP   (8)   /* 硬编码地图: 代码内置地图, 上电解算→暖机→跑→回 */
 
 /* ═══════════ 改下面这行切换运行模式 (0~8) ═══════════ */
-#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_SOKO_SELFTEST)  /* 当前: 硬编码地图自动推箱 */
+#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_STATIC_VERIFY)  /* 当前: 状态6静态地图屏幕验证 */
 /* ═══════════ 改上面这行切换运行模式 (0~8) ═══════════ */
 
 /* OpenART1 地图链路硬件口: 若实测 UART4 走 D0/D1, 只改下面两行宏. */
@@ -670,6 +673,358 @@ static void main_run_hardcoded_map_log_50ms(void)
 #endif /* MAIN_RUN_MODE_HARDCODED_MAP */
 
 /* ============================================================================
+ *  STATIC_VERIFY mode (6): use one local 12x16 map, solve it once, then replay
+ *  every Sokoban action on the IPS map monitor. The chassis never moves.
+ * ============================================================================ */
+#if (MAIN_RUN_MODE == MAIN_RUN_MODE_STATIC_VERIFY)
+
+typedef enum {
+    M6_PHASE_SOLVE = 0,
+    M6_PHASE_PLAY,
+    M6_PHASE_RETURN,
+    M6_PHASE_DONE,
+    M6_PHASE_FAIL
+} m6_phase_e;
+
+#define M6_ACTION_STEP_TICKS     (60U)    /* 60 * 5ms = 300ms per action */
+#define M6_VIS_ROWS              (MAP_ROWS)
+#define M6_VIS_COLS              (MAP_COLS)
+
+#if (M6_VIS_ROWS != MAP_ROWS) || (M6_VIS_COLS != MAP_COLS)
+#error "M6 screenshot map must be 12x16."
+#endif
+
+/* Screenshot map: 12 rows x 16 cols. */
+static const char s_m6_static_map[M6_VIS_ROWS][M6_VIS_COLS + 1] = {
+    "################",
+    "#-#---#--#----.#",
+    "#---#--#-####--#",
+    "#---#--#-------#",
+    "#-.#-#-#--#----#",
+    "#@-#-#--------##",
+    "#--#----------##",
+    "#-*----------*-#",
+    "#--$-#----##$*-#",
+    "#-$--#----####-#",
+    "#----#.--------#",
+    "################"
+};
+
+static SokoFullSolution_t s_m6_solution;
+static uint8             s_m6_base_map[MAP_ROWS][MAP_COLS];
+static uint8             s_m6_anim_map[MAP_ROWS][MAP_COLS];
+static Point_t           s_m6_player;
+static Point_t           s_m6_start;
+static m6_phase_e        s_m6_phase = M6_PHASE_SOLVE;
+static uint8             s_m6_solve_ok = 0U;
+static uint8             s_m6_sub_idx = 0U;
+static uint16            s_m6_act_idx = 0U;
+static uint16            s_m6_step_ticks = 0U;
+static uint16            s_m6_done_actions = 0U;
+static uint16            s_m6_total_actions = 0U;
+static NavPath_t         s_m6_return_path;
+static uint16            s_m6_return_idx = 0U;
+
+static uint8 main_m6_char_to_map(char ch)
+{
+    switch (ch)
+    {
+    case '#': return MAP_WALL;
+    case '.': return MAP_TARGET;
+    case '$': return MAP_BOX;
+    case '*': return MAP_BOMB;
+    case '@': return MAP_EMPTY;
+    case '-':
+    default:  return MAP_EMPTY;
+    }
+}
+
+static void main_m6_load_static_map(void)
+{
+    uint8 r, c;
+    uint8 vr, vc;
+
+    s_m6_start.x = 1;
+    s_m6_start.y = 1;
+
+    for (r = 0U; r < MAP_ROWS; ++r)
+    {
+        for (c = 0U; c < MAP_COLS; ++c)
+        {
+            s_m6_anim_map[r][c] = MAP_EMPTY;
+            s_m6_base_map[r][c] = MAP_EMPTY;
+        }
+    }
+
+    for (vr = 0U; vr < M6_VIS_ROWS; ++vr)
+    {
+        for (vc = 0U; vc < M6_VIS_COLS; ++vc)
+        {
+            char ch = s_m6_static_map[vr][vc];
+            uint8 cell = main_m6_char_to_map(ch);
+            r = vr;
+            c = vc;
+
+            if (ch == '@')
+            {
+                s_m6_start.x = (int8)c;
+                s_m6_start.y = (int8)r;
+            }
+
+            s_m6_anim_map[r][c] = cell;
+            s_m6_base_map[r][c] = (cell == MAP_BOX) ? MAP_EMPTY : cell;
+        }
+    }
+
+    s_m6_player = s_m6_start;
+}
+
+static void main_m6_publish_screen_state(void)
+{
+    app_link_inject_static_map(s_m6_anim_map);
+    app_link_inject_static_car((uint8)s_m6_player.x, (uint8)s_m6_player.y);
+}
+
+static void main_m6_solve(void)
+{
+    uint8 i;
+
+    main_m6_load_static_map();
+    memset(&s_m6_solution, 0, sizeof(s_m6_solution));
+
+    if (!Sokoban_Solve_Stage1(s_m6_anim_map, s_m6_start, &s_m6_solution) ||
+        (s_m6_solution.is_solved == 0U) ||
+        (s_m6_solution.total_boxes == 0U))
+    {
+        s_m6_solve_ok = 0U;
+        s_m6_phase = M6_PHASE_FAIL;
+        main_m6_publish_screen_state();
+        return;
+    }
+
+    s_m6_total_actions = 0U;
+    for (i = 0U; i < s_m6_solution.total_boxes; ++i)
+    {
+        s_m6_total_actions = (uint16)(s_m6_total_actions +
+                                      s_m6_solution.sub_solutions[i].count);
+    }
+
+    s_m6_sub_idx = 0U;
+    s_m6_act_idx = 0U;
+    s_m6_step_ticks = 0U;
+    s_m6_done_actions = 0U;
+    s_m6_solve_ok = 1U;
+    s_m6_phase = M6_PHASE_PLAY;
+    main_m6_publish_screen_state();
+}
+
+static uint8 main_m6_action_delta(SokoAction_e act, int8 *dx, int8 *dy)
+{
+    *dx = 0;
+    *dy = 0;
+
+    switch (act)
+    {
+    case SOKO_ACT_UP:    *dy = -1; return 1U;
+    case SOKO_ACT_DOWN:  *dy =  1; return 1U;
+    case SOKO_ACT_LEFT:  *dx = -1; return 1U;
+    case SOKO_ACT_RIGHT: *dx =  1; return 1U;
+    default: return 0U;
+    }
+}
+
+static uint8 main_m6_point_in_map(Point_t p)
+{
+    return (uint8)((p.x >= 0) && (p.x < (int8)MAP_COLS) &&
+                   (p.y >= 0) && (p.y < (int8)MAP_ROWS));
+}
+
+static void main_m6_plan_return_home(void)
+{
+    memset(&s_m6_return_path, 0, sizeof(s_m6_return_path));
+    s_m6_return_idx = 0U;
+
+    if (!Algo_Nav_BFS(s_m6_anim_map, s_m6_player, s_m6_start, &s_m6_return_path))
+    {
+        s_m6_phase = M6_PHASE_FAIL;
+        return;
+    }
+
+    s_m6_phase = (s_m6_return_path.step_count == 0U) ? M6_PHASE_DONE : M6_PHASE_RETURN;
+}
+
+static void main_m6_apply_next_action(void)
+{
+    SokoActionSeq_t *seq;
+    SokoAction_e act;
+    int8 dx, dy;
+    Point_t next;
+
+    if ((s_m6_phase != M6_PHASE_PLAY) ||
+        (s_m6_sub_idx >= s_m6_solution.total_boxes))
+    {
+        return;
+    }
+
+    seq = &s_m6_solution.sub_solutions[s_m6_sub_idx];
+    if (s_m6_act_idx >= seq->count)
+    {
+        s_m6_sub_idx++;
+        s_m6_act_idx = 0U;
+        if (s_m6_sub_idx >= s_m6_solution.total_boxes)
+        {
+            main_m6_plan_return_home();
+        }
+        return;
+    }
+
+    act = seq->actions[s_m6_act_idx];
+    if (main_m6_action_delta(act, &dx, &dy) == 0U)
+    {
+        s_m6_phase = M6_PHASE_FAIL;
+        return;
+    }
+
+    next.x = (int8)(s_m6_player.x + dx);
+    next.y = (int8)(s_m6_player.y + dy);
+    if (main_m6_point_in_map(next) == 0U)
+    {
+        s_m6_phase = M6_PHASE_FAIL;
+        return;
+    }
+
+    if (s_m6_anim_map[next.y][next.x] == MAP_BOX)
+    {
+        Point_t box_next;
+        box_next.x = (int8)(next.x + dx);
+        box_next.y = (int8)(next.y + dy);
+        if ((main_m6_point_in_map(box_next) == 0U) ||
+            (s_m6_anim_map[box_next.y][box_next.x] == MAP_WALL) ||
+            (s_m6_anim_map[box_next.y][box_next.x] == MAP_BOX))
+        {
+            s_m6_phase = M6_PHASE_FAIL;
+            return;
+        }
+
+        s_m6_anim_map[next.y][next.x] = s_m6_base_map[next.y][next.x];
+        if (s_m6_base_map[box_next.y][box_next.x] == MAP_TARGET)
+        {
+            s_m6_anim_map[box_next.y][box_next.x] = MAP_TARGET;
+        }
+        else
+        {
+            s_m6_anim_map[box_next.y][box_next.x] = MAP_BOX;
+        }
+    }
+    else if (s_m6_anim_map[next.y][next.x] == MAP_WALL)
+    {
+        s_m6_phase = M6_PHASE_FAIL;
+        return;
+    }
+
+    s_m6_player = next;
+    s_m6_act_idx++;
+    s_m6_done_actions++;
+}
+
+static void main_run_static_verify_5ms(void)
+{
+    chassis_ctrl_stop();
+
+    if (s_m6_phase == M6_PHASE_SOLVE)
+    {
+        main_m6_solve();
+        return;
+    }
+
+    if (s_m6_phase == M6_PHASE_PLAY)
+    {
+        if (++s_m6_step_ticks >= M6_ACTION_STEP_TICKS)
+        {
+            s_m6_step_ticks = 0U;
+            main_m6_apply_next_action();
+        }
+    }
+    else if (s_m6_phase == M6_PHASE_RETURN)
+    {
+        if (++s_m6_step_ticks >= M6_ACTION_STEP_TICKS)
+        {
+            s_m6_step_ticks = 0U;
+            if (s_m6_return_idx < s_m6_return_path.step_count)
+            {
+                s_m6_player = s_m6_return_path.path[s_m6_return_idx];
+                s_m6_return_idx++;
+            }
+            if (s_m6_return_idx >= s_m6_return_path.step_count)
+            {
+                s_m6_phase = M6_PHASE_DONE;
+            }
+        }
+    }
+
+    main_m6_publish_screen_state();
+}
+
+static void main_mode6_render_100ms(void)
+{
+    const char *phase_str;
+    uint16 y;
+    uint8 seg_show;
+
+    ips200_set_color(RGB565_WHITE, RGB565_BLACK);
+    ips200_show_string(0U, 188U, "                                        ");
+    ips200_show_string(0U, 206U, "                                        ");
+
+    switch (s_m6_phase)
+    {
+    case M6_PHASE_SOLVE: phase_str = "M6 STATIC: SOLVING"; break;
+    case M6_PHASE_PLAY:  phase_str = "M6 STATIC: PLAYING"; break;
+    case M6_PHASE_DONE:  phase_str = "M6 STATIC: DONE";    break;
+    case M6_PHASE_FAIL:
+    default:             phase_str = "M6 STATIC: FAIL";    break;
+    }
+
+    y = 188U;
+    ips200_set_color((s_m6_phase == M6_PHASE_FAIL) ? RGB565_RED : RGB565_CYAN, RGB565_BLACK);
+    ips200_show_string(0U, y, (char *)phase_str);
+
+    if (s_m6_solve_ok != 0U)
+    {
+        ips200_set_color(RGB565_GREEN, RGB565_BLACK);
+        ips200_show_string(196U, y, "BOX:");
+        ips200_show_uint(236U, y, s_m6_solution.total_boxes, 1U);
+    }
+
+    y = 206U;
+    ips200_set_color(RGB565_WHITE, RGB565_BLACK);
+    if (s_m6_solve_ok != 0U)
+    {
+        seg_show = s_m6_sub_idx;
+        if (seg_show >= s_m6_solution.total_boxes)
+        {
+            seg_show = (uint8)(s_m6_solution.total_boxes - 1U);
+        }
+
+        ips200_show_string(0U, y, "ACT");
+        ips200_show_uint(32U, y, s_m6_done_actions, 3U);
+        ips200_show_string(62U, y, "/");
+        ips200_show_uint(72U, y, s_m6_total_actions, 3U);
+        ips200_show_string(112U, y, "SEG");
+        ips200_show_uint(144U, y, (uint32)(seg_show + 1U), 1U);
+        ips200_show_string(158U, y, "/");
+        ips200_show_uint(168U, y, s_m6_solution.total_boxes, 1U);
+        ips200_show_string(198U, y, "300ms/act");
+    }
+    else
+    {
+        ips200_set_color(RGB565_RED, RGB565_BLACK);
+        ips200_show_string(0U, y, "No solution for static map");
+    }
+}
+
+#endif /* MAIN_RUN_MODE_STATIC_VERIFY */
+
+/* ============================================================================
  *  SOLVE_VERIFY 模式 (5): 算法解算验证
  *  流程:
  *    1. WAIT_MAP     — 等待 OpenART 通过 UART4 发来地图帧
@@ -1027,6 +1382,10 @@ int main(void)
     // ------------------------------------------------------------------
     // 2. IPS200 屏幕 + 按键初始化 (调参菜单)
     // ------------------------------------------------------------------
+#if (MAIN_RUN_MODE == MAIN_RUN_MODE_STATIC_VERIFY)
+    app_link_init();
+#endif
+
     ips200_set_dir(IPS200_CROSSWISE);
     ips200_init(IPS200_TYPE_SPI);
     ips200_set_font(IPS200_8X16_FONT);
@@ -1073,6 +1432,9 @@ int main(void)
      * WAIT_LEAVE→WARMUP→PUSH_BOXES→RETURN_HOME→DONE), 全程车不动.
      * 地图色块由菜单渲染, 解算进度由 main_mode5_render_100ms() 叠加. */
     printf("SV_BOOT wait MAP from OpenART (UART4)...\n");
+    chassis_ctrl_stop();
+#elif (MAIN_RUN_MODE == MAIN_RUN_MODE_STATIC_VERIFY)
+    printf("M6_BOOT static map solver screen verify...\n");
     chassis_ctrl_stop();
 #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_LEVEL1_TEST)
     /* 第一关测试模式:
@@ -1225,6 +1587,8 @@ int main(void)
         /* 摄像头帧 → app_link ISR → 菜单自动渲染彩色方块, 主循环无需额外工作 */
     #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_SOLVE_VERIFY)
         main_run_solve_verify_5ms();
+    #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_STATIC_VERIFY)
+        main_run_static_verify_5ms();
     #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_LEVEL1_TEST)
         main_run_level1_test_5ms();
         main_run_level1_test_log_50ms();
@@ -1241,6 +1605,9 @@ int main(void)
         {
             menu_render_div = 0U;
             chassis_menu_render_100ms();
+#if (MAIN_RUN_MODE == MAIN_RUN_MODE_STATIC_VERIFY)
+            main_mode6_render_100ms();
+#endif
 #if (MAIN_RUN_MODE == MAIN_RUN_MODE_SOLVE_VERIFY)
             main_mode5_render_100ms();   /* 叠加解算进度文字到菜单下方 */
 #endif

@@ -182,6 +182,16 @@ void app_link_get_box_class_snapshot(app_link_box_class_snapshot_t *out)
     out->valid = 0U;
 }
 
+void app_link_inject_static_car(uint8 car_x, uint8 car_y)
+{
+    if ((car_x >= (uint8)APP_LINK_MAP_COLS) || (car_y >= (uint8)APP_LINK_MAP_ROWS))
+    {
+        return;
+    }
+
+    commit_car_snapshot(car_x, car_y);
+}
+
 /*===================================================================================================================
  * CRC8 查表 (多项式 0x07, 初值 0x00, 不反射, 不异或输出 — 即标准 CRC-8/SMBUS 变种)
  *=================================================================================================================*/

@@ -29,6 +29,28 @@
 #include "zf_common_headfile.h"
 
 /* ======================================================================
+ *  用户常调参数区
+ *
+ *  优先只调下面 5 个角度环参数。其它 yaw 内部参数已固定或自动推导,
+ *  不需要日常修改。
+ * ====================================================================== */
+
+/** 航向响应快慢: 越大越快, 过大可能轻微摆动 */
+#define CHASSIS_YAW_KP                  (3.50f)
+
+/** 角速度 P-only 阻尼: 越大越稳, 过大可能发闷 */
+#define CHASSIS_YAW_RATE_KP             (0.150f)
+
+/** 最大旋转速度 (°/s): 限制原地转向和导航修正的最高角速度 */
+#define CHASSIS_MAX_YAW_SPEED_DPS       (150.0f)
+
+/** 角速度加减速限制 (°/s²): 同时用于 yaw sqrt 曲线和下游 ramp */
+#define CHASSIS_CMD_ACCEL_LIMIT_DPS2    (720.0f)
+
+/** 进入在位锁的角度阈值 (°): 越小锁得越准, 越大越不抖 */
+#define CHASSIS_YAW_INPOS_ENTER_DEG     (1.50f)
+
+/* ======================================================================
  *  数学常量
  * ====================================================================== */
 
@@ -124,60 +146,14 @@
  */
 #define CHASSIS_POS_HOLD_EXIT_M           (0.10f)
 
-/**
- * 扰动恢复模式触发距离 (米).
- * 当车被外力推出保持区且 dist < 该值时, 用「弱 KP + 强 KD」缓慢归位,
- * 不再以最大速度冲回 -> 避免回程过冲再震荡.
- * 业内 gain scheduling 标准做法 (Tesla Autopilot lateral controller).
+/* 注:
+ *   原扰动恢复 (RECOVERY_*)、轴保持速度上限 (AXIS_HOLD_MAX_SPEED)、
+ *   轴切换/回切门限 (AXIS_SWITCH_TOL / AXIS_RELOCK_TOL)、
+ *   以及曼哈顿开关 (AXIS_BY_AXIS_ENABLE) 已于「位置环参数精简」中删除:
+ *     - 曼哈顿轴模式成为唯一实现, 不再有 CTE 直线分支;
+ *     - 减速统一由 brake cap (sqrt 限速) 负责, 不再单独做 gain scheduling / recovery;
+ *     - 轴保持速度、切轴门限改为按 max_speed / EPSILON 的比例自动推导 (见下方比例常量).
  */
-/**
- * 必须 > CHASSIS_POS_HOLD_EXIT_M, 否则增益调度永不触发.
- * 逻辑: 被推出保持区时 dist > HOLD_EXIT → 增益调度只在 dist < RECOVERY_DIST 时生效,
- * 若 RECOVERY_DIST < HOLD_EXIT, 恢复全程在 RECOVERY_DIST 外 → 全量 KP → 必震荡.
- */
-/* P0-修复 2026-05-08 (快到目标停下然后慢爬抖动):
- * RECOVERY_DIST 需覆盖 BRAKE_DIST 与 HOLD_EXIT, 让末段全程进入温和增益区.
- * 2026-05-19: 随 BRAKE_DIST 同步扩大至 0.30f (≥ BRAKE_DIST=0.25). */
-#define CHASSIS_POS_RECOVERY_DIST_M       (0.30f)
-
-/* 扰动恢复最小增益比例.
- * 过大时被推开后会高速冲回目标, 麦轮惯性/打滑导致剧烈震荡. */
-#define CHASSIS_POS_RECOVERY_KP_SCALE     (0.85f)
-
-/* 扰动恢复区最大合成速度 (m/s).
- * 只限制 dist < RECOVERY_DIST 的回位动作, 不影响远距离正常赶路. */
-#define CHASSIS_POS_RECOVERY_MAX_SPEED_MPS (0.30f)
-
-/* axis-by-axis 非驱动轴保持速度上限 (m/s).
- * 该值是 CTE_KP 实际是否「有效」的关键:
- *   保持轴输出 = clamp(sqrt_ctrl(err, CTE_KP, accel), ±THIS_LIMIT)
- *   如果 THIS_LIMIT 太大 (如 0.22), CTE_KP 调 10 还是调 100 输出都被夹死,
- *   完全看不出调参效果. 横向保持是「微修正」, 0.16 m/s 已够用,
- *   同时仍远低于主轴速度避免走斜线.
- * P0-修复 2026-05-11: 0.22 → 0.16. */
-#define CHASSIS_POS_AXIS_HOLD_MAX_SPEED_MPS (0.16f)
-
-/**
- * 轴向独立移动模式 (Manhattan / axis-by-axis).
- * 1 = 先走 X 走完再走 Y, 不走斜线
- * 0 = 走 CTE 直线 (旧默认)
- * 优点: 麦轮 X/Y 解耦控制更稳, 扰动恢复时只动一个轴, 不会对角震荡.
- */
-#define CHASSIS_POS_AXIS_BY_AXIS_ENABLE   (1)
-
-/**
- * axis-by-axis 模式: 当前轴误差 < 该值时切换到下一个轴 (米).
- * 这个值决定最终定位精度, 因此保持与 EPSILON 同量级.
- * 切轴后的重新锁回门限不要复用它, 否则 Y 行驶时 X 里程计/打滑漂移
- * 只要超过几厘米就会回切 X, 并把 Y ramp 清零, 表现为抖动前进.
- */
-#define CHASSIS_POS_AXIS_SWITCH_TOL_M     (0.03f)
-
-/**
- * axis-by-axis 模式: 已切入 Y 轴后, X 偏差超过该值才允许重新回切 X.
- * 需要大于 SWITCH_TOL 以免频繁抢轴, 但不能太大; 否则 Y 行驶时 X 偏差会越积越多.
- */
-#define CHASSIS_POS_AXIS_RELOCK_TOL_M     (0.10f)
 
 /**
  * 到位后 yaw 容忍带 (°). |yaw_err| < 该值即认为"航向也已到位",
@@ -192,7 +168,7 @@
  *   1.5° 太宽: vxg=1.2 m/s 投影出 vyg = 1.2*sin(1.5°) = 31 mm/s,
  *   1m 走行累积 26mm 偏移, CTE 保持环上限 0.06 m/s 追不上 -> 走斜线.
  *   收到 0.5°: vyg 言上限 10 mm/s, 1m 仅 8mm 偏, CTE 可轻松修复.
- *   同时配合 yaw_pi rate PI (在 chassis_ctrl.c 已启用) 使 IMU 实时拉回. */
+ *   超出容忍带后由 yaw sqrt_ctrl + P-only 阻尼实时拉回. */
 #define CHASSIS_YAW_GOAL_TOLERANCE_DEG    (0.50f)
 
 /* ======================================================================
@@ -395,13 +371,7 @@
  *   0.70 m/s: d_stop=0.70²/(2×2.10)=0.117m, BRAKE_DIST=0.25m ✓ 有裕量. */
 #define CHASSIS_MAX_LINEAR_SPEED_MPS    (0.70f)
 
-/** 车体最大旋转角速度（°/s）
- *  P0-修复 2026-04-29 姿态闭环转速慢: 原 90°/s 对应单轮仅 ≈0.4 m/s,
- *  远低于 MAX_LINEAR=1.35, 大量裕度被浪费 -> 提到 180°/s。
- *  P0-调参 2026-05-02 (姿态环中段忽快忽慢):
- *      180°/s 与 KP*err_max(≈90°/s @ KP=1.2) + ramp 不匹配。
- *      回到 150°/s, 单轮 ≈0.5 m/s, 与 PID 实际输出、轮端能力都匹配。 */
-#define CHASSIS_MAX_YAW_SPEED_DPS       (150.0f)
+/* CHASSIS_MAX_YAW_SPEED_DPS 已移到文件顶部“用户常调参数区”。 */
 
 /**
  * 单轮 PID 调试模式下调试轮目标速度上限（m/s）。
@@ -446,187 +416,76 @@
  * 近场仍保持 P 线性响应, 配合 BRAKE_DIST=0.25 可以平滑停车. */
 #define CHASSIS_POS_KP                  (4.6f)
 
-/**
- * 位置环横向增益 Kp_cross（Cross-Track Error 修正增益）
- *   物理意义: 横向偏差→横向修正速度. 设得比 CHASSIS_POS_KP 大
- *   可以更快地把车「推回直线」而不影响前进速度.
- *   P0-修复 2026-05-11: 10.0 → 5.0.
- *   CTE_KP 最终被 AXIS_HOLD_MAX_SPEED_MPS(0.06) 限幅, 调到 100 也没用.
- *   实际生效的是: 横向偏差多少时输出达到上限. KP=5, err=12mm 时输出
- *   sqrt_ctrl(0.012, 5, 3)≈0.06 m/s, 恰好触及限幅, 12mm 内线性精细修正. */
-#define CHASSIS_POS_CTE_KP              (4.0f)
-
-/**
- * 位置环 D 项增益 (沿程方向) - 速度阻尼.
- * 业内标准 derivative-on-measurement: D 反馈用 odom 直接给的速度
- * (s_fb_vx/vy), 不做差分以避免噪声放大. 等价于 PD 控制器, 抑制
- * 由电机/麦轮惯性引起的 "冲过头 -> 倒回 -> 再冲" 前后震荡.
- *
- * 物理含义: v_cmd = KP * err - KD * v_meas
- *   KD=0   : 纯 P, 欠阻尼必震荡
- *   KD=KP  : 临界阻尼附近, 最快无超调
- *   KD>KP  : 过阻尼, 收敛变慢但绝不超调
- * 麦轮一般取 KD ≈ KP/3 ~ KP, 起点用 0.3~0.5 倍.
- * P0-修复 2026-05-11 (末段抖动): 0.01 → 1.00.
- *   KD=0.01 等同于无阻尼纯 P, position_axis_velocity_cmd 里
- *   D 项 = 0.01 × v_lpf ≈ 0, 车以全速冲入 EPSILON 后只靠 ramp/brake_cap
- *   制动, 穿越目标反弹, 来回振荡. 恢复 KD=1.00 (≈KP/3) 提供实质阻尼.
- * 起调建议: KD ≈ 0.3~0.5 × KP; KD=0 等于无阻尼, 必超调. */
-#define CHASSIS_POS_KD                  (1.50f)
-
 /** 位置环沿程方向积分增益 (m/s per m·s).
  * 消除静摩擦/坡面等引起的稳态位置残差.
- * 建议从 0 开始调, 每次 +0.05; 过大时车到位后缓慢漂移/越界. */
+ * 建议从 0 开始调, 每次 +0.05; 过大时车到位后缓慢漂移/越界. 设 0 即关闭. */
 #define CHASSIS_POS_KI                  (0.05f)
 
-/** 位置环积分输出上限 (m/s).
- * 限制积分最大能贡献的速度, 防止卷绕后冲. */
-#define CHASSIS_POS_I_LIMIT             (0.35f)
+/* ----------------------------------------------------------------------
+ *  位置环自动推导 / 内部固定常量 (用户一般无需修改)
+ *  --------------------------------------------------------------------
+ *  「位置环参数精简」后, 以下量不再各自暴露成独立可调 #define, 而是由
+ *  pos_kp / max_linear_speed_mps / cmd_accel_limit_mps2 (均为运行时可调) 与
+ *  EPSILON / HOLD_EXIT 按固定比例在 chassis_ctrl.c 中自动推导:
+ *
+ *    kd_eff          = pos_kp * KD_RATIO            (主轴速度阻尼, 麦轮 ≈ KP/3)
+ *    kd_hold         = pos_kp * HOLD_KD_RATIO       (保持轴轻阻尼)
+ *    brake_dist      = v_max²/(2·accel) + EPSILON + BRAKE_MARGIN
+ *    i_limit         = v_max * I_LIMIT_RATIO        (积分最多贡献一半速度)
+ *    i_band          = brake_dist * I_BAND_RATIO    (只在减速区内积分)
+ *    switch_tol      = EPSILON * AXIS_SWITCH_RATIO  (切轴精度略严于到位精度)
+ *    hold_max_speed  = v_max * HOLD_SPEED_RATIO     (非驱动轴保持速度上限)
+ *  另有两个与轮端特性绑定、对所有麦轮底盘通用的固定值:
+ *    d_lpf_alpha     = D_LPF_ALPHA  (D 项一阶 IIR 系数)
+ *    brake_floor     = BRAKE_FLOOR  (克服静摩擦的末段最小速度)
+ * ---------------------------------------------------------------------- */
 
-/** 条件积分带宽 (m): |dist| < 该值时才累积 I 项.
- * 防止远场全程积分饱和, 通常取 2~5 倍 EPSILON. */
-#define CHASSIS_POS_I_BAND_M            (0.22f)
+/** 主轴速度阻尼比例: kd_eff = pos_kp × 该值. 麦轮临界阻尼经验值 ≈ KP/3. */
+#define CHASSIS_POS_KD_RATIO            (0.333f)
 
-/**
- * 位置环横向/非驱动轴 D 项增益 - 与 CTE_KP 配套.
- * 设得太低时保持轴像弹簧, Y 行驶时 X 轴会前后来回晃.
- * P0-修复 2026-05-11: 1.00 → 3.00.
- *   取 CTE_KD ≈ CTE_KP/2.5 = 7.75/2.5 ≈ 3.1, 阻尼比约 0.7,
- *   与 CTE_KP=7.75 配合消除保持轴弹簧振荡. */
-#define CHASSIS_POS_CTE_KD              (0.200f)
+/** 保持轴 (非驱动轴) 阻尼比例: kd_hold = pos_kp × 该值. 保持轴限速很低, 取轻阻尼. */
+#define CHASSIS_POS_HOLD_KD_RATIO       (0.15f)
+
+/** brake_dist 安全裕量 (m): brake_dist = d_stop + EPSILON + 该值. */
+#define CHASSIS_POS_BRAKE_MARGIN_M      (0.03f)
+
+/** 积分输出上限比例: i_limit = max_linear_speed × 该值 (积分最多贡献一半速度). */
+#define CHASSIS_POS_I_LIMIT_RATIO       (0.5f)
+
+/** 条件积分带宽比例: i_band = brake_dist × 该值 (只在减速区内累积积分). */
+#define CHASSIS_POS_I_BAND_RATIO        (0.7f)
+
+/** 切轴门限比例: switch_tol = EPSILON × 该值 (切轴精度略严于到位精度). */
+#define CHASSIS_POS_AXIS_SWITCH_RATIO   (0.6f)
+
+/** 非驱动轴保持速度上限比例: hold_max_speed = max_linear_speed × 该值. */
+#define CHASSIS_POS_HOLD_SPEED_RATIO    (0.23f)
 
 /**
  * D 项低通滤波系数 α (一阶 IIR, Tesla/Waymo 标准做法).
- * y = (1-α)*y_prev + α*x,  截止频率 ≈ α/(2π·dt).
- * α=0.30 @ dt=20ms -> 截止 ≈ 2.4Hz, 衰减 odom 高频噪声 (~20Hz) 约 -18dB.
- * 增大 α -> 响应更快但噪声更多; 减小 -> 更平滑但阻尼延迟增大.
- * P0-调参 2026-05-08 (抖动): 0.30 → 0.15, 截止降到 ~1.2Hz, D 信号更平滑. */
+ * y = (1-α)*y_prev + α*x, 截止频率 ≈ α/(2π·dt).
+ * 0.15 @ dt=20ms -> 截止 ≈ 1.2Hz, 衰减 odom 高频噪声, 对所有麦轮底盘通用. */
 #define CHASSIS_POS_D_LPF_ALPHA         (0.15f)
 
 /**
- * 位置环 yaw 跟踪门距 (m) - P0-修复 2026-05-02 (atan2 噪声风暴):
- *   接近目标时 dx/dy 都很小, atan2(dy, dx) 对 odom 噪声极其敏感:
- *     dist=5cm, odom 噪声 1cm -> tgt_yaw 跳 ±10°
- *     dist=1cm, odom 噪声 1cm -> tgt_yaw 跳 ±90° -> wz 直接饱和摆头
- *   工程做法 (ROS Navigation / ArduPilot WP nav 同款): 距离门控
- *     dist > 该值 -> 跟踪 atan2(dy,dx)  (远段对准方位角)
- *     dist < 该值 -> 冻结目标 yaw       (近段只关心位置, 朝向无所谓)
- *   建议 = 5 ~ 10 倍 EPSILON, 保证近场区也比 odom 噪声 (~1cm) 大一个量级. */
-#define CHASSIS_POS_YAW_TRACK_DIST_M     (0.20f)
-
-/**
- * 位置环减速区半径 (m): dist < 该值时 brake_cap 开始按 sqrt 曲线限速.
- *
- * 物理约束 (ramp 决定最小制动距离):
- *   ramp 每帧最多减速 accel_limit × 0.02s.
- *   从 max_linear_speed 减到 0 需要的滑行距离:
- *     d_stop = v_max² / (2 × accel_limit)
- *   必须 BRAKE_DIST - EPSILON ≥ d_stop, 否则 brake_cap 的目标速度
- *   来不及被 ramp 追上, 车仍高速穿越 EPSILON 并反弹振荡.
- *
- * 当前参数 (max_speed=1.0 m/s, accel=3.0 m/s²):
- *   d_stop = 1.0² / (2×3.0) = 0.167m
- *   BRAKE_DIST ≥ 0.167 + EPSILON(0.06) = 0.227m → 取 0.25m 留裕量
- *
- * P0-修复 2026-05-11 (末段抖动): 0.11 → 0.25.
- *   0.14m 时制动区仅 9cm, v_max=0.9 m/s 停车需 13.5cm, 仍然穿越 EPSILON 振荡.
- *   v_max=0.90 m/s, accel=3.0 m/s²: d_stop=0.135m → BRAKE_DIST≥0.185m → 取 0.25m.
- *   若调低 max_speed 可相应缩小: 0.5 m/s 时 d_stop≈4cm, 取 0.15m 即可. */
-#define CHASSIS_POS_BRAKE_DIST_M         (0.25f)
-
-/**
- * brake_cap 末段最小有效速度 (m/s) - P0-修复 2026-05-12 (拐点 5s 停留根因).
- *
- * 问题: brake_cap 用 sqrt_ctrl(brake_err=dist-EPSILON, KP=4.5, accel=3) 限速.
- *   dist=0.06m -> brake_err=0.01m -> v_max_brake = 4.5*0.01 = 0.045 m/s.
- *   0.045 m/s 分到 4 麦轮 ≈ 0.011 m/s/轮, BREAKAWAY_TARGET_EPS=0.01 临界,
- *   前馈 ramp 系数仅 0.1, ff = 0.1*1200 = 120 PWM step, 远不够克服静摩擦.
- *   车在 dist∈[EPSILON, EPSILON+几mm] 区域 "爬不动", 表现为拐点 5s 停留.
- *
- * 修法 (ROS Nav2 / ArduPilot AC_PosControl 同款):
- *   v_max_brake = max(sqrt_ctrl(...), V_FLOOR)
- * V_FLOOR 保证末段输出足以克服静摩擦, 车始终能推进到 EPSILON 内触发 layer1.
- *
- * 取值 0.12 m/s: 分到 4 麦轮 = 0.03 m/s/轮 远 > BREAKAWAY_TARGET_EPS(0.01),
- * 前馈 ramp 系数 = 1.0 饱和, ff = 1200 PWM 足以启动;
- * 同时 0.12 m/s × 0.02s = 2.4mm/拍, 穿越 EPSILON(50mm) 后只多走 5mm 安全. */
-/* 0.15 → 0.05: 旧值制造 0.15→0 的速度阶跃, 让 brake_cap 在 EPSILON 边界突变;
- * 0.05 与轮端静摩擦 ff 起步阈值同量级, 让 sqrt 减速曲线一路连续衰减. */
+ * brake_cap 末段最小有效速度 (m/s).
+ * 保证 sqrt 减速曲线末段输出仍足以克服静摩擦, 车始终能推进到 EPSILON 内.
+ * 只与轮端静摩擦特性相关, 与 0.05 的轮端 ff 起步阈值同量级. */
 #define CHASSIS_POS_BRAKE_FLOOR_MPS      (0.05f)
 
-/** 航向环 Kp：值越大，朝向对准越快；过大易振荡
- *  P0-调参 2026-04-29: 取消 YAW_MIN_WZ 阶跃后 wz 连续, 可适度提 KP 加快响应。
- *  P0-调参 2026-05-02 (大角度阶跃响应慢 + 中段"假停"):
- *      原 0.8: err=90° 时 wz=72°/s, 不到 MAX_YAW=150 一半, 中段被 D 项抵后几乎不转。
- *      调到 1.2: err=125° 即到 max, 完整利用 ramp/MAX 限幅, 180°阶跃 ≈1.5s 动作.
- *  P0-改进 2026-05-02 (sqrt_controller 移植):
- *      yaw_pi 改用 ArduPilot 的 sqrt_controller 后, KP 只控"零附近"的小角度增益,
- *      大角度由 sqrt(2·a·err) 自动饱和到 max_yaw_speed, 与 KP 无关.
- *      故 KP 可大胆放到 4~6, 让 0~20° 段也能跑得快, 而不会引入大角度过冲.
- *  P0-回调 2026-05-02 (持续抖动):
- *      KP=4 + KD=0.01 + 死区 1° -> 在 ±1° 内激出高频小振荡. 回到 2.0,
- *      与 KD=0.08 / 死区 2° 配套, 小角度仍比老 0.65 快 3 倍, 不抖. */
-#define CHASSIS_YAW_KP                  (3.50f)
-
-/** sqrt_controller 用的最大角加速度 (°/s²) - P0-改进 2026-05-02
- *  物理意义: 终末减速段每秒能掉多少 °/s 的角速度.
- *  设大 -> 减速距离短, 跟踪更紧, 但要求底盘能真正减得下来 (受轮抓地力 / 轮速环带宽限制),
- *          否则会"刹不住"出现超调.
- *  设小 -> 减速段长, 平滑无超调但收敛慢.
- *  与 CHASSIS_CMD_ACCEL_LIMIT_DPS2 (上游 ramp 限幅) 保持同量级, 这里取 1200 留 1.2x 裕量. */
-#define CHASSIS_YAW_ACCEL_MAX_DPS2      (1200.0f)
-
 /* ----------------------------------------------------------------------
- *  级联 P-PI + 速度前馈 (P0-改进 2026-05-02 大角度慢/稳态偏差):
- *  ------------------------------------------------------------------
- *  原结构: 单环位置 PID, err -> wz, KP 控全程 -> 大慢小抖两难.
- *  新结构 (ArduPilot AC_AttitudeControl 同款):
+ *  航向环实现: sqrt_ctrl + P-only 速率阻尼
  *
- *      err_ang ─[sqrt_ctrl]─> wz_target ─┬───── (前馈) ─────┐
- *                                         │                  ▼
- *                                         └─→ + ─[ PI ]─> + ── wz_cmd
- *                                       wz_meas
+ *  常调参数已集中到文件顶部:
+ *    CHASSIS_YAW_KP / CHASSIS_YAW_RATE_KP / CHASSIS_MAX_YAW_SPEED_DPS
+ *    CHASSIS_CMD_ACCEL_LIMIT_DPS2 / CHASSIS_YAW_INPOS_ENTER_DEG
  *
- *  外环 (sqrt_ctrl): 算"应该多快转", 与 KP_v 无关, 大角度自动饱和到 max_yaw
- *  内环 (rate PI):    跟踪 wz_target - wz_meas, I 全程累积 -> 自动学到摩擦补偿
- *  前馈 (wz_target):  让大角度时输出直接饱和, 不依赖 KP 增益
- *
- *  好处:
- *    - 大角度: 前馈直接饱和到 max_yaw, 与 KP_pos 无关 -> 110° 不再慢
- *    - 稳态:   I 在整个运动过程中持续学习, 收尾时已有足够能量克服静摩擦 -> 无 10° 偏差
- *    - 整定:   KP_pos 只决定收敛形状, KP_v / KI_v 决定跟踪精度, 解耦清晰
+ *  内部固定规则:
+ *    - sqrt_ctrl 的角加速度与下游 ramp 共用 CHASSIS_CMD_ACCEL_LIMIT_DPS2
+ *    - In-position 释放阈值 = ENTER_DEG * 2.0
+ *    - In-position 角速度稳定判据 = 25.0°/s
+ *    - rate 内环无 I 项, 只做 P-only 阻尼
  * ---------------------------------------------------------------------- */
-
-/* ----------------------------------------------------------------------
- *  级联 P-PI 路径已成为唯一实现 (旧单环 PID #else 分支已删).
- *  调参旋钮:
- *    CHASSIS_YAW_RATE_KP / KI / I_LIMIT / I_LEAK
- * ---------------------------------------------------------------------- */
-
-/** 内环 (rate loop) 比例增益: wz_err -> wz_correction
- *  小 (0.3~0.5): 弱跟踪, 主要靠前馈, 稳; 大 (1~2): 紧跟踪, 但易激出抖动. */
-#define CHASSIS_YAW_RATE_KP             (0.150f)
-
-/** 内环积分增益: 全程累积, 自动学到摩擦/不平衡转矩. */
-#define CHASSIS_YAW_RATE_KI             (0.70f)
-
-/** 内环积分上限 (°/s 量纲): 设为 max_yaw 的 30~50% 合适, 太大易反向卷绕过冲 */
-#define CHASSIS_YAW_RATE_I_LIMIT        (120.0f)
-
-/** 内环积分泄漏率 (per 20ms): 0 = 不泄漏 (纯积分), 0.001~0.01 = 慢泄漏.
- *  作用: 长期堵转时防止 I 永久挂账, 避免负载消失瞬间冲过头. */
-#define CHASSIS_YAW_RATE_I_LEAK         (0.003f)
-
-/* ----- In-Position 滞回锁 (双阈, 收尾抖动抑制) ---------------------------- */
-
-/** 进入"在位"阈值 (°): 误差必须小于此值才考虑锁死 */
-#define CHASSIS_YAW_INPOS_ENTER_DEG     (1.50f)
-
-/** 释放"在位"阈值 (°): 误差超过此值才解锁, 必须 > ENTER 才有滞回 */
-#define CHASSIS_YAW_INPOS_EXIT_DEG      (3.00f)
-
-/** "稳定"判据: 车体角速度低于此值才认为真停下来了 (°/s) */
-#define CHASSIS_YAW_INPOS_SETTLE_DPS    (25.00f)
 
 /* ======================================================================
  *  轮速 PID 静摩擦前馈 (Stiction feed-forward)
@@ -848,7 +707,7 @@
  *      提到 720, 0→150°/s 仅 ≈210ms, 与 PID 响应节奏匹配。
  *      不担心轮胎打滑: yaw 加速是转动, 单轮线加速在 ramp 下还是受
  *      cmd_accel_limit_mps2 限制。 */
-#define CHASSIS_CMD_ACCEL_LIMIT_DPS2    (720.0f)
+/* CHASSIS_CMD_ACCEL_LIMIT_DPS2 已移到文件顶部“用户常调参数区”。 */
 
 /* ======================================================================
  *  里程计标定系数 — 补偿轮径/打滑等误差
