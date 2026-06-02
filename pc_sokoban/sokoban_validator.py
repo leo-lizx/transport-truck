@@ -35,6 +35,9 @@ INNER_R_MAX = 10   # CHASSIS_GRID_MAX_Y - 1
 INNER_C_MIN = 1
 INNER_C_MAX = 14   # CHASSIS_GRID_MAX_X - 1
 
+GRID_STEP_X_M = 3.20 / 14.0
+GRID_STEP_Y_M = 2.40 / 10.0
+
 EMPTY  = 0
 WALL   = 1
 TARGET = 2
@@ -822,6 +825,83 @@ def solve_stage1(the_map: list, player_pos: tuple) -> Optional[dict]:
         'targets':       targets,
         'total_steps':   sum(len(s['actions']) for s in sub_solutions),
     }
+
+
+def _axis_integer_candidates(v: float) -> list:
+    lo = int(v)
+    if abs(v - lo) < 1e-6:
+        return [lo]
+    return [lo, lo + 1]
+
+
+def _action_distance_m(actions: list) -> float:
+    total = 0.0
+    for d in actions:
+        if d in (2, 3):  # LEFT / RIGHT
+            total += GRID_STEP_X_M
+        else:
+            total += GRID_STEP_Y_M
+    return total
+
+
+def _entry_distance_m(start_grid_rc: tuple, entry_cell: tuple) -> float:
+    dr = (entry_cell[0] - start_grid_rc[0]) * GRID_STEP_Y_M
+    dc = (entry_cell[1] - start_grid_rc[1]) * GRID_STEP_X_M
+    return (dr * dr + dc * dc) ** 0.5
+
+
+def solve_stage1_from_float_start(the_map: list,
+                                  start_grid_rc: tuple,
+                                  preferred_start: Optional[tuple] = None) -> Optional[dict]:
+    """
+    Adapt a physical half-grid launch center to deterministic integer grid execution.
+
+    The solver itself remains integer-grid based.  We try all integer cells adjacent
+    to the physical start, solve from each reachable candidate, then choose the
+    shortest physical route.  The selected entry cell is prepended to the first
+    waypoint list so the chassis first receives a definite grid target.
+    """
+    rows = _axis_integer_candidates(float(start_grid_rc[0]))
+    cols = _axis_integer_candidates(float(start_grid_rc[1]))
+    candidates = []
+    for r in rows:
+        for c in cols:
+            cell = (r, c)
+            if cell not in candidates:
+                candidates.append(cell)
+
+    if preferred_start in candidates:
+        candidates.remove(preferred_start)
+        candidates.insert(0, preferred_start)
+
+    best = None
+    best_score = 0.0
+    for entry in candidates:
+        if not is_free(the_map, *entry):
+            continue
+
+        result = solve_stage1(the_map, entry)
+        if result is None:
+            continue
+
+        entry_dist = _entry_distance_m(start_grid_rc, entry)
+        action_dist = sum(_action_distance_m(sub['actions'])
+                          for sub in result['sub_solutions'])
+        score = entry_dist + action_dist
+        first_actions = result['sub_solutions'][0]['actions'] if result['sub_solutions'] else []
+        candidate = dict(result)
+        candidate.update({
+            'entry_cell': entry,
+            'entry_distance_m': entry_dist,
+            'score_m': score,
+            'first_sub_waypoints': [entry] + actions_to_waypoints(first_actions, entry),
+        })
+
+        if best is None or score < best_score - 1e-9:
+            best = candidate
+            best_score = score
+
+    return best
 
 
 # ============================================================

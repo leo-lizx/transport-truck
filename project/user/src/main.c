@@ -1,42 +1,7 @@
-/*********************************************************************************************************************
-* RT1064DVL6A Opensourec Library 即（RT1064DVL6A 开源库）是一个基于官方 SDK 接口的第三方开源库
-* Copyright (c) 2022 SEEKFREE 逐飞科技
-*
-* 本文件是 RT1064DVL6A 开源库的一部分
-*
-* RT1064DVL6A 开源库 是免费软件
-* 您可以根据自由软件基金会发布的 GPL（GNU General Public License，即 GNU通用公共许可证）的条款
-* 即 GPL 的第3版（即 GPL3.0）或（您选择的）任何后来的版本，重新发布和/或修改它
-*
-* 本开源库的发布是希望它能发挥作用，但并未对其作任何的保证
-* 甚至没有隐含的适销性或适合特定用途的保证
-* 更多细节请参见 GPL
-*
-* 您应该在收到本开源库的同时收到一份 GPL 的副本
-* 如果没有，请参阅<https://www.gnu.org/licenses/>
-*
-* 额外注明：
-* 本开源库使用 GPL3.0 开源许可证协议 以上许可申明为译文版本
-* 许可申明英文版在 libraries/doc 文件夹下的 GPL3_permission_statement.txt 文件中
-* 许可证副本在 libraries 文件夹下 即该文件夹下的 LICENSE 文件
-* 欢迎各位使用并传播本程序 但修改内容时必须保留逐飞科技的版权声明（即本声明）
-*
-* 文件名称          main
-* 公司名称          成都逐飞科技有限公司
-* 版本信息          查看 libraries/doc 文件夹内 version 文件 版本说明
-* 开发环境          IAR 8.32.4 or MDK 5.33
-* 适用平台          RT1064DVL6A
-* 店铺链接          https://seekfree.taobao.com/
-*
-* 修改记录
-* 日期              作者                备注
-* 2022-09-21        SeekFree            first version
-********************************************************************************************************************/
-
 #include "zf_common_headfile.h"
 #include "chassis_ctrl.h"
-#include "chassis_pid.h"
 #include "chassis_menu.h"
+<<<<<<< HEAD
 #include "app_game_logic.h"
 #include "app_link.h"   /* P0-1: 视觉-主控帧协议 */
 #include "algo_sokoban_solver.h"
@@ -1007,13 +972,33 @@ static void main_apply_debug_wheel_pid(void)
 /* ========================================================================== */
 /*  ⬆⬆⬆ 单轮 PID 调试辅助函数结束 ⬆⬆⬆                                          */
 /* ========================================================================== */
+=======
+#include "app_main_config.h"
+#include "app_main_modes.h"
+#include "app_main_runtime.h"
+#include <stdio.h>
+
+>>>>>>> fb10f7195934aa24ca52652ff9c18c4a13a84a03
 int main(void)
 {
     uint8 menu_render_div = 0U;
+    const app_main_options_t app_options = {
+        APP_RUN_MODE_STATIC_MAP_DRIVE,
+        APP_STATIC_MAP_SOURCE_MANUAL,
+        (uint8)CHASSIS_WHEEL_LF,
+        1U,
+        3.3f,
+        40.0f,
+        23.0f,
+        0.0f,
+        0.0f
+    };
 
-    clock_init(SYSTEM_CLOCK_600M);  // 不可删除
-    debug_init();                   // 调试端口初始化
+    clock_init(SYSTEM_CLOCK_600M);
+    debug_init();
+    App_MainRuntime_SetupStdout();
 
+<<<<<<< HEAD
     // ------------------------------------------------------------------
     // 1. 通信外设初始化
     // ------------------------------------------------------------------
@@ -1027,25 +1012,28 @@ int main(void)
     // ------------------------------------------------------------------
     // 2. IPS200 屏幕 + 按键初始化 (调参菜单)
     // ------------------------------------------------------------------
+=======
+    uart_write_string(UART_1, "HW:OK\r\n");
+    App_MainModes_Config(&app_options);
+    printf("BOOT mode=%d\n", (int)app_options.run_mode);
+
+    App_MainModes_InitCommunication();
+
+>>>>>>> fb10f7195934aa24ca52652ff9c18c4a13a84a03
     ips200_set_dir(IPS200_CROSSWISE);
     ips200_init(IPS200_TYPE_SPI);
     ips200_set_font(IPS200_8X16_FONT);
     ips200_set_color(RGB565_WHITE, RGB565_BLACK);
     key_init(10);
 
-    // ------------------------------------------------------------------
-    // 3. 底盘控制子系统初始化 + 调参菜单
-    //    包括: IMU 零偏标定、电机 PWM、编码器、PID 参数
-    //    注意: 调用此函数前请确保车模静止放置在平面上
-    // ------------------------------------------------------------------
     chassis_ctrl_init();
     chassis_menu_init();
-    /* 发车位: 整数格约定 (0.5, 5.5) → 自动换算成米送入里程计原点.
-     * 半整数表示发车区中心 (距左墙半格, 距上墙 5.5 格), 与实车摆放吻合. */
     chassis_ctrl_set_pose(MAIN_POS_GRID_TO_M_X(MAIN_POS_NAV_START_X_GRID),
                           MAIN_POS_GRID_TO_M_Y(MAIN_POS_NAV_START_Y_GRID),
                           0.0f);
+    App_MainModes_AfterChassisInit();
 
+<<<<<<< HEAD
 #if (MAIN_RUN_MODE == MAIN_RUN_MODE_SINGLE_WHEEL)
     /* ⬇⬇⬇ 单轮 PID 调试启动逻辑, 姿态调试阶段这里被 #if 屏蔽 ⬇⬇⬇ */
     /* 单轮 PID 调试模式: 仅一个轮子参与闭环, 其余轮子目标恒 0;
@@ -1096,46 +1084,21 @@ int main(void)
     // 4. PIT 定时中断初始化
     //    CH0: 5ms 姿态采样  CH1: 20ms 底盘闭环  CH2: 10ms 菜单扫描（渲染在主循环）
     // ------------------------------------------------------------------
+=======
+>>>>>>> fb10f7195934aa24ca52652ff9c18c4a13a84a03
     pit_ms_init(PIT_CH0, 5);
     pit_ms_init(PIT_CH1, 20);
     pit_ms_init(PIT_CH2, 10);
 
-    // ------------------------------------------------------------------
-    // 5. 主循环: 游戏状态机
-    //    Game_Logic_Task_Run 为非阻塞函数，内部维护推箱子状态机。
-    // ------------------------------------------------------------------
-    // 静态调试阶段可先不运行状态机，改为手动下发网格目标点。
-    // app_chassis_ctrl_move_to_grid(3, 5);
-
     while (1)
     {
-        /*
-         * P0-5: 替代 system_delay_ms(5).
-         * 在此阻塞直到 PIT_CH0 5ms tick 到来, 期间 __WFI 休眠, 任意中断可唤醒.
-         * 注意 wait 必须在每轮主循环工作之前调用, 保证节拍对齐 PIT 边沿.
-         */
-        (void)wait_for_tick();
+        App_MainRuntime_PrintLoopEnteredOnce();
+        (void)App_MainRuntime_WaitForTick();
+        App_MainRuntime_PrintTickHeartbeat();
 
-    #if (MAIN_RUN_MODE == MAIN_RUN_MODE_SINGLE_WHEEL)
-        /* ⬇⬇⬇ 单轮 PID 打印, 姿态调试阶段这里被 #if 屏蔽 ⬇⬇⬇ */
-        /* 单轮 PID 调试: 100ms 打印目标速度/实际速度两列, 上位机绘曲线 */
-        chassis_pid_debug_task_5ms();
-    #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_YAW_HOLD)
-        /* ✅ 姿态闭环调试打印走这里: 50ms 打印 12 通道, 用于画角度曲线 */
-        chassis_ctrl_attitude_debug_task_5ms();
-    #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_POINT_NAV)
-        /* 路径航点遍历状态机:
-         *   暖机 1s → 依次下发航点 → 全程结束后驻停于终点.
-         *
-         *   标志位: chassis_ctrl_is_arrived() (chassis 内部 s_arrived)
-         *     == 0: 行驶中 / 旋转中 (发车时由 move_to_grid / rotate_to_deg 内部清零)
-         *     == 1: 已到达当前目标
-         *   到达后立即更新索引并派发下一个航点, 自动将标志位清零; 全程结束驻停. */
-        {
-            /* 航点动作类型 */
-            #define S_NAV_MOVE_GRID  (0U)   /* chassis_ctrl_move_to_grid(x格, y格) */
-            #define S_NAV_MOVE_M     (2U)   /* chassis_ctrl_move_to_m (用于半格精度) */
+        App_MainModes_Task5ms();
 
+<<<<<<< HEAD
             /* 航点描述: { 动作, a, b }
              *   S_NAV_MOVE_GRID: a=x(格), b=y(格)
              *   S_NAV_MOVE_M:    a=x(格,运行时换算为米), b=y(格,运行时换算为米)
@@ -1238,6 +1201,11 @@ int main(void)
         /* 菜单渲染放到主循环，避免在 PIT 中断内刷屏造成控制节拍抖动。 */
         menu_render_div++;
         if (menu_render_div >= MAIN_MENU_RENDER_DIV)
+=======
+        menu_render_div++;
+        if ((App_MainModes_ShouldRenderMenu() != 0U) &&
+            (menu_render_div >= MAIN_MENU_RENDER_DIV))
+>>>>>>> fb10f7195934aa24ca52652ff9c18c4a13a84a03
         {
             menu_render_div = 0U;
             chassis_menu_render_100ms();
@@ -1246,6 +1214,6 @@ int main(void)
 #endif
         }
 
-        /* P0-5: 节拍由 wait_for_tick() 在循环顶部统一接管, 此处不再 system_delay_ms */
+        fflush(stdout);
     }
 }

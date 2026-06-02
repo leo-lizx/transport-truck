@@ -332,7 +332,17 @@ GETCHAR_PROTOTYPE
 #else
 PUTCHAR_PROTOTYPE
 {
-    uart_write_buffer(DEBUG_UART_INDEX, buf, (char)size);
+    /* 修复1: 原 (char)size 在 --char_is_signed 下会将 size>=128 截断为负数,
+     * 进而被隐式转换为超大 uint32 (如 256→0, 128→0xFFFFFF80), 导致
+     * LPUART_WriteBlocking 发送 0 字节或死循环. 改为 (uint32)size.
+     * 修复2: IAR DLib 在 setvbuf/_IONBF 初始化或 fflush 时会以 buf=NULL,
+     * size=0 调用 __write 做 flush. 若不拦截则 NULL 传入
+     * LPUART_WriteBlocking → assert(NULL!=data) 触发 fsl_assert.c 断点. */
+    if (NULL == buf || size <= 0)
+    {
+        return 0;
+    }
+    uart_write_buffer(DEBUG_UART_INDEX, buf, (uint32)size);
     return size;
 }
 

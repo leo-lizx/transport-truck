@@ -430,8 +430,10 @@ static void dispatch_frame(void)
                 commit_car_snapshot(cx, cy);
             }
             ++g_link_stats.frames_ok;
-            g_link_last_map_ms = s_ms_now;
-            g_link_last_hb_ms  = s_ms_now;
+            /* 哨兵修正: PIT 启动前 s_ms_now==0, 若直接赋 0 则接收方
+             * 判断 g_link_last_map_ms!=0 失败, 误认为未收到地图. */
+            g_link_last_map_ms = (s_ms_now != 0U) ? s_ms_now : 1U;
+            g_link_last_hb_ms  = (s_ms_now != 0U) ? s_ms_now : 1U;
             break;
         }
 
@@ -445,7 +447,7 @@ static void dispatch_frame(void)
             ++g_link_stats.frames_ok;
             ++g_link_stats.hb_cnt;
             g_link_stats.last_hb_seq = s_rx_payload[0];
-            g_link_last_hb_ms = s_ms_now;
+            g_link_last_hb_ms = (s_ms_now != 0U) ? s_ms_now : 1U;
             break;
         }
 

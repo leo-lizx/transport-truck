@@ -5,8 +5,11 @@
 #include "chassis_ctrl.h"
 #include "chassis_imu.h"
 #include "zf_common_headfile.h"
+<<<<<<< HEAD
 #include "zf_driver_flash.h"
 #include <string.h>
+=======
+>>>>>>> fb10f7195934aa24ca52652ff9c18c4a13a84a03
 
 /*===========================================================================
  * [chassis_menu.c] IPS map monitor
@@ -26,6 +29,7 @@
 
 typedef struct
 {
+<<<<<<< HEAD
     uint32 magic;
     uint32 version;
     chassis_tune_params_t params;
@@ -39,6 +43,32 @@ typedef struct
 #define MENU_CELL_GAP                  (1U)
 #define MENU_MAP_W                     (APP_LINK_MAP_COLS * MENU_CELL_SIZE)
 #define MENU_MAP_H                     (APP_LINK_MAP_ROWS * MENU_CELL_SIZE)
+=======
+    const char *name;  /* 参数显示名 */
+    uint8 decimal;     /* 小数位数 */
+    float step;        /* 每次调节步进 */
+    float min_val;     /* 参数最小允许值 */
+    float max_val;     /* 参数最大允许值 */
+} menu_param_meta_t;
+
+typedef struct
+{
+    const char *name;        /* 页面名称（LIMIT/NAV/PID） */
+    const uint8 *param_ids;  /* 当前页面包含的参数 ID 列表 */
+    uint8 param_count;       /* 当前页面参数数量 */
+} menu_page_meta_t;
+
+static menu_level_enum s_menu_level = MENU_LEVEL_ROOT;  /* 当前菜单层级 */
+static uint8 s_root_index = 0U;                         /* 一级菜单当前页索引 */
+static uint8 s_param_index = 0U;                        /* 二级菜单当前参数索引 */
+static uint8 s_need_redraw = 1U;                        /* 界面重绘请求标志 */
+static uint8 s_render_ticks = 0U;                       /* 渲染节拍计数（10ms 基准） */
+static char s_status_text[24] = "STATUS: READY";       /* 当前状态文本 */
+static char s_status_text_prev[24] = "";               /* 上次状态文本（用于变化检测） */
+static uint8 s_full_refresh_done = 0U;                  /* 是否至少完成过一次整屏绘制 */
+static uint8 s_param_hold_inc_ticks = 0U;               /* K3 长按连发节拍计数（10ms 基准） */
+static uint8 s_param_hold_dec_ticks = 0U;               /* K4 长按连发节拍计数（10ms 基准） */
+>>>>>>> fb10f7195934aa24ca52652ff9c18c4a13a84a03
 
 #define MENU_RGB565(r, g, b)           (uint16)((((uint16)(r) & 0xF8U) << 8) | \
                                                 (((uint16)(g) & 0xF8U) << 3) | \
@@ -57,6 +87,7 @@ typedef struct
 #define MENU_COLOR_BOMB                MENU_RGB565(255U, 24U, 74U)
 #define MENU_COLOR_CAR                 RGB565_CYAN
 
+<<<<<<< HEAD
 static uint8 s_flash_ready = 0U;
 static uint8 s_need_full_refresh = 1U;
 static uint8 s_last_map_ready = 0xFFU;
@@ -106,11 +137,143 @@ static uint8 menu_load_params_from_flash(void)
 
     chassis_ctrl_set_tune_params(&blob.params);
     return 1U;
+=======
+static const uint8 s_page_pid_lf_params[] = { MENU_PARAM_LF_KP, MENU_PARAM_LF_KI, MENU_PARAM_LF_KD }; /* PID-LF 页参数映射 */
+static const uint8 s_page_pid_rf_params[] = { MENU_PARAM_RF_KP, MENU_PARAM_RF_KI, MENU_PARAM_RF_KD }; /* PID-RF 页参数映射 */
+static const uint8 s_page_pid_lb_params[] = { MENU_PARAM_LB_KP, MENU_PARAM_LB_KI, MENU_PARAM_LB_KD }; /* PID-LB 页参数映射 */
+static const uint8 s_page_pid_rb_params[] = { MENU_PARAM_RB_KP, MENU_PARAM_RB_KI, MENU_PARAM_RB_KD }; /* PID-RB 页参数映射 */
+static const uint8 s_page_nav_params[]   = { MENU_PARAM_POS_KP, MENU_PARAM_YAW_KP };                           /* NAV 页参数映射 */
+static const uint8 s_page_limit_params[] = { MENU_PARAM_MAX_V, MENU_PARAM_MAX_W, MENU_PARAM_ACC_V, MENU_PARAM_ACC_W }; /* LIMIT 页参数映射 */
+
+static const menu_page_meta_t s_pages[] =
+{
+    { "LIMIT", s_page_limit_params, (uint8)(sizeof(s_page_limit_params) / sizeof(s_page_limit_params[0])) },
+    { "NAV",   s_page_nav_params,   (uint8)(sizeof(s_page_nav_params)   / sizeof(s_page_nav_params[0])) },
+    { "PID-LF", s_page_pid_lf_params, (uint8)(sizeof(s_page_pid_lf_params) / sizeof(s_page_pid_lf_params[0])) },
+    { "PID-RF", s_page_pid_rf_params, (uint8)(sizeof(s_page_pid_rf_params) / sizeof(s_page_pid_rf_params[0])) },
+    { "PID-LB", s_page_pid_lb_params, (uint8)(sizeof(s_page_pid_lb_params) / sizeof(s_page_pid_lb_params[0])) },
+    { "PID-RB", s_page_pid_rb_params, (uint8)(sizeof(s_page_pid_rb_params) / sizeof(s_page_pid_rb_params[0])) },
+};
+
+#define MENU_PAGE_COUNT ((uint8)(sizeof(s_pages) / sizeof(s_pages[0]))) /* 一级菜单页数 */
+
+/* 根据参数ID读取当前参数值。 */
+/* ==========================================================================
+ *  § 1. 参数读写 (param_id ↔ g_chassis_tune_params 字段映射)
+ * ========================================================================== */
+
+static float menu_get_param_value(menu_param_id_enum id)
+{
+    chassis_tune_params_t params;
+
+    chassis_ctrl_get_tune_params(&params);
+
+    /* 按参数 ID 路由到当前参数结构中的实际字段。 */
+    switch (id)
+    {
+        case MENU_PARAM_LF_KP:  return params.wheel_pid.kp[CHASSIS_WHEEL_LF];       /* 左前轮 Kp */
+        case MENU_PARAM_LF_KI:  return params.wheel_pid.ki[CHASSIS_WHEEL_LF];       /* 左前轮 Ki */
+        case MENU_PARAM_LF_KD:  return params.wheel_pid.kd[CHASSIS_WHEEL_LF];       /* 左前轮 Kd */
+        case MENU_PARAM_RF_KP:  return params.wheel_pid.kp[CHASSIS_WHEEL_RF];       /* 右前轮 Kp */
+        case MENU_PARAM_RF_KI:  return params.wheel_pid.ki[CHASSIS_WHEEL_RF];       /* 右前轮 Ki */
+        case MENU_PARAM_RF_KD:  return params.wheel_pid.kd[CHASSIS_WHEEL_RF];       /* 右前轮 Kd */
+        case MENU_PARAM_LB_KP:  return params.wheel_pid.kp[CHASSIS_WHEEL_LB];       /* 左后轮 Kp */
+        case MENU_PARAM_LB_KI:  return params.wheel_pid.ki[CHASSIS_WHEEL_LB];       /* 左后轮 Ki */
+        case MENU_PARAM_LB_KD:  return params.wheel_pid.kd[CHASSIS_WHEEL_LB];       /* 左后轮 Kd */
+        case MENU_PARAM_RB_KP:  return params.wheel_pid.kp[CHASSIS_WHEEL_RB];       /* 右后轮 Kp */
+        case MENU_PARAM_RB_KI:  return params.wheel_pid.ki[CHASSIS_WHEEL_RB];       /* 右后轮 Ki */
+        case MENU_PARAM_RB_KD:  return params.wheel_pid.kd[CHASSIS_WHEEL_RB];       /* 右后轮 Kd */
+        case MENU_PARAM_POS_KP: return params.position.kp;                          /* 位置环比例项 */
+        case MENU_PARAM_YAW_KP: return params.yaw.kp;                               /* 航向环比例项 */
+        case MENU_PARAM_MAX_V:  return params.limit.max_linear_speed_mps;           /* 最大线速度上限 */
+        case MENU_PARAM_MAX_W:  return params.limit.max_yaw_speed_dps;              /* 最大角速度上限 */
+        case MENU_PARAM_ACC_V:  return params.limit.accel_limit_mps2;               /* 线速度加速度限制 */
+        case MENU_PARAM_ACC_W:  return params.limit.yaw_accel_limit_dps2;           /* 角速度加速度限制 */
+        default:               return params.wheel_pid.kp[CHASSIS_WHEEL_LF];        /* 异常 ID 回退值 */
+    }
+}
+
+/* 根据参数ID写入当前参数值。 */
+static void menu_set_param_value(chassis_tune_params_t *params, menu_param_id_enum id, float value)
+{
+    if (params == NULL)
+    {
+        return;
+    }
+
+    /* 按参数 ID 写回局部快照，最后由 chassis_ctrl_set_tune_params() 统一下发。 */
+    switch (id)
+    {
+        case MENU_PARAM_LF_KP: params->wheel_pid.kp[CHASSIS_WHEEL_LF] = value; break; /* 设置左前轮 Kp */
+        case MENU_PARAM_LF_KI: params->wheel_pid.ki[CHASSIS_WHEEL_LF] = value; break; /* 设置左前轮 Ki */
+        case MENU_PARAM_LF_KD: params->wheel_pid.kd[CHASSIS_WHEEL_LF] = value; break; /* 设置左前轮 Kd */
+        case MENU_PARAM_RF_KP: params->wheel_pid.kp[CHASSIS_WHEEL_RF] = value; break; /* 设置右前轮 Kp */
+        case MENU_PARAM_RF_KI: params->wheel_pid.ki[CHASSIS_WHEEL_RF] = value; break; /* 设置右前轮 Ki */
+        case MENU_PARAM_RF_KD: params->wheel_pid.kd[CHASSIS_WHEEL_RF] = value; break; /* 设置右前轮 Kd */
+        case MENU_PARAM_LB_KP: params->wheel_pid.kp[CHASSIS_WHEEL_LB] = value; break; /* 设置左后轮 Kp */
+        case MENU_PARAM_LB_KI: params->wheel_pid.ki[CHASSIS_WHEEL_LB] = value; break; /* 设置左后轮 Ki */
+        case MENU_PARAM_LB_KD: params->wheel_pid.kd[CHASSIS_WHEEL_LB] = value; break; /* 设置左后轮 Kd */
+        case MENU_PARAM_RB_KP: params->wheel_pid.kp[CHASSIS_WHEEL_RB] = value; break; /* 设置右后轮 Kp */
+        case MENU_PARAM_RB_KI: params->wheel_pid.ki[CHASSIS_WHEEL_RB] = value; break; /* 设置右后轮 Ki */
+        case MENU_PARAM_RB_KD: params->wheel_pid.kd[CHASSIS_WHEEL_RB] = value; break; /* 设置右后轮 Kd */
+        case MENU_PARAM_POS_KP: params->position.kp = value; break;                   /* 设置位置环 Kp */
+        case MENU_PARAM_YAW_KP: params->yaw.kp = value; break;                        /* 设置航向环 Kp */
+        case MENU_PARAM_MAX_V:  params->limit.max_linear_speed_mps = value; break;    /* 设置线速度上限 */
+        case MENU_PARAM_MAX_W:  params->limit.max_yaw_speed_dps = value; break;       /* 设置角速度上限 */
+        case MENU_PARAM_ACC_V:  params->limit.accel_limit_mps2 = value; break;        /* 设置线加速度上限 */
+        case MENU_PARAM_ACC_W:  params->limit.yaw_accel_limit_dps2 = value; break;    /* 设置角加速度上限 */
+        default: break;                                                               /* 异常 ID 直接忽略 */
+    }
+}
+
+/* 将状态文本写入固定缓冲区，用于屏幕反馈。 */
+static void menu_set_status(const char *text)
+{
+    uint8 i = 0U; /* 状态字符串拷贝下标 */
+    if (0 == text)
+    {
+        return; /* 空指针保护：无有效输入则不更新状态文本 */
+    }
+
+    for (i = 0U; i < (uint8)(sizeof(s_status_text) - 1U); ++i)
+    {
+        if ('\0' == text[i])
+        {
+            break; /* 遇到源字符串结尾，提前停止拷贝 */
+        }
+        s_status_text[i] = text[i]; /* 逐字符复制到固定缓冲区 */
+    }
+    s_status_text[i] = '\0'; /* 确保目标缓冲区以 \0 终止 */
+}
+
+/* 从 Flash 读取参数，校验通过后覆盖当前参数。 */
+static uint8 menu_load_params_from_flash(void)
+{
+    if (chassis_config_load_from_flash() != 0U)
+    {
+        menu_set_status("STATUS: LOAD OK");
+        return 1U;
+    }
+
+    menu_set_status("STATUS: LOAD DEFAULT");
+    return 0U;
+>>>>>>> fb10f7195934aa24ca52652ff9c18c4a13a84a03
 }
 
 static void menu_fill_rect(uint16 x, uint16 y, uint16 w, uint16 h, uint16 color)
 {
+<<<<<<< HEAD
     ips200_show_rgb565_image(x, y, &color, 1U, 1U, w, h, 0U);
+=======
+    if (chassis_config_save_to_flash() != 0U)
+    {
+        menu_set_status("STATUS: SAVE OK");
+        return 1U;
+    }
+
+    menu_set_status("STATUS: SAVE FAIL");
+    return 0U;
+>>>>>>> fb10f7195934aa24ca52652ff9c18c4a13a84a03
 }
 
 static void menu_clear_text_line(uint16 y)
@@ -125,6 +288,7 @@ static uint8 menu_map_frame_is_fresh(uint32 *age_ms_out)
     uint32 map_ms = g_link_last_map_ms;
     uint32 age_ms;
 
+<<<<<<< HEAD
     if (0U == map_ms)
     {
         if (age_ms_out != NULL) { *age_ms_out = 0U; }
@@ -134,6 +298,15 @@ static uint8 menu_map_frame_is_fresh(uint32 *age_ms_out)
     age_ms = now_ms - map_ms;
     if (age_ms_out != NULL) { *age_ms_out = age_ms; }
     return (age_ms <= MENU_MAP_STALE_MS) ? 1U : 0U;
+=======
+    /* 先叠加增量，再做上下限保护。 */
+    value = chassis_clamp_f(value + delta, meta->min_val, meta->max_val); /* 参数值加减并限幅 */
+    /* 回写参数并实时下发到底盘控制层。 */
+    chassis_ctrl_get_tune_params(&params);        /* 复制一份一致快照用于接口入参 */
+    menu_set_param_value(&params, id, value);     /* 写回局部参数副本 */
+    chassis_ctrl_set_tune_params(&params);        /* 立即下发到底盘控制模块 */
+    s_need_redraw = 1U;                           /* 标记界面需要重绘 */
+>>>>>>> fb10f7195934aa24ca52652ff9c18c4a13a84a03
 }
 
 static void menu_invalidate_stale_car(uint8 map_ready, app_link_car_snapshot_t *car)
@@ -330,8 +503,25 @@ static void menu_draw_dynamic_text(uint8 map_ready, uint32 map_age_ms, const app
 
 void chassis_menu_init(void)
 {
+<<<<<<< HEAD
     s_flash_ready = (0U == flash_init()) ? 1U : 0U;
     (void)menu_load_params_from_flash();
+=======
+    /* 读取并应用 Flash 参数（失败会保持默认参数）。 */
+    menu_load_params_from_flash(); /* 尝试读取并应用掉电保存参数 */
+    /* 清空状态缓存，确保首次渲染必定更新状态行。 */
+    strcpy(s_status_text_prev, ""); /* 清空旧状态文本缓存 */
+    /* 重置菜单状态机到一级页面。 */
+    s_menu_level = MENU_LEVEL_ROOT; /* 进入一级菜单层 */
+    s_root_index = 0U;              /* 一级菜单默认选中第 0 页 */
+    s_param_index = 0U;             /* 二级菜单默认选中第 0 项 */
+    s_need_redraw = 1U;             /* 标记需要首次刷新 */
+    s_render_ticks = 0U;            /* 渲染节拍计数清零 */
+    s_full_refresh_done = 0U;       /* 清除“已全刷”标志 */
+    s_param_hold_inc_ticks = 0U;    /* K3 连发计数清零 */
+    s_param_hold_dec_ticks = 0U;    /* K4 连发计数清零 */
+}
+>>>>>>> fb10f7195934aa24ca52652ff9c18c4a13a84a03
 
     s_need_full_refresh = 1U;
     s_last_map_ready = 0xFFU;

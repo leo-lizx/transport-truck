@@ -2,10 +2,10 @@
 #define CHASSIS_CONFIG_H
 
 /*===========================================================================
- * [chassis_config.h] 底盘硬件配置总表（仅头文件，无对应 .c）
+ * [chassis_config.h] 底盘结构性常量与运行时调参接口
  *
- *   集中定义底盘相关的 **所有** 硬件引脚、物理参数、控制参数。
- *   修改引脚或调参时只需编辑本文件，其他模块自动生效。
+ *   集中定义底盘硬件引脚、物理参数、控制默认值和调参结构体。
+ *   运行时活动参数、限幅和 Flash 持久化实现位于 chassis_config.c。
  *
  * [车轮编号约定]（俯视图，车头朝上）:
  *
@@ -26,7 +26,7 @@
  *     chassis_imu.h / chassis_mecanum.h / chassis_ctrl.h
  *===========================================================================*/
 
-#include "zf_common_headfile.h"
+#include "zf_common_typedef.h"
 
 /* ======================================================================
  *  数学常量
@@ -803,7 +803,7 @@
  * ---------------------------------------------------------------------- */
 
 /** 1 = 启用编码器 yaw 弱观测; 0 = 关闭 (调试时纯靠 IMU) */
-#define CHASSIS_ODOM_YAW_FUSION_ENABLE   (1)
+#define CHASSIS_ODOM_YAW_FUSION_ENABLE   (0)
 
 /** 编码器 yaw 观测噪声方差 (°²).
  *  大 -> KF 几乎不信, 仅做长期纠偏 (推荐); 小 -> KF 信任高, 打滑会污染.
@@ -1086,6 +1086,235 @@ typedef enum
     CHASSIS_WHEEL_RB,       /**< 右后轮 */
     CHASSIS_WHEEL_COUNT     /**< 轮子总数 = 4，用于数组大小 */
 } chassis_wheel_index_t;
+
+/* ======================================================================
+ *  运行时调参配置
+ *
+ *  调参类型按控制职责拆分，避免单个结构体过长。连续控制量统一使用 float；
+ *  开关和索引用 uint8。g_chassis_tune_params 使用 volatile，因为主循环菜单写入，
+ *  20ms 控制中断读取。写入活动配置时由 chassis_config_apply() 关中断复制。
+ * ====================================================================== */
+
+#define CHASSIS_CTRL_TUNE_WHEEL_COUNT   (4U)
+
+typedef struct
+{
+    /* 单位: 无量纲；默认: CHASSIS_WHEEL_PID_*；建议范围 Kp[0,400] Ki[0,80] Kd[0,40]。
+     * 增大 Kp/Ki 会提升轮速跟随和稳态补偿，过大会抖；增大 Kd 会增加阻尼。 */
+    float kp[CHASSIS_CTRL_TUNE_WHEEL_COUNT];
+    float ki[CHASSIS_CTRL_TUNE_WHEEL_COUNT];
+    float kd[CHASSIS_CTRL_TUNE_WHEEL_COUNT];
+} chassis_wheel_pid_tune_t;
+
+typedef struct
+{
+    /* 单位: (m/s)/m；默认: CHASSIS_POS_KP；建议范围 [0,5]。
+     * 增大会更快拉向目标点，过大会接近目标时过冲。 */
+    float kp;
+
+    /* 单位: (m/s)/(m/s)；默认: CHASSIS_POS_KD；建议范围 [0,5]。
+     * 增大会抑制末段冲击，过大会动作迟钝。 */
+    float kd;
+
+    /* 单位: (m/s)/(m*s)；默认: CHASSIS_POS_KI；建议范围 [0,1]。
+     * 增大会补偿低速静差，过大会产生慢性振荡。 */
+    float ki;
+
+    /* 单位: m/s；默认: CHASSIS_POS_I_LIMIT；建议范围 [0,0.5]。
+     * 增大会放宽积分输出上限，过大会让残留积分推动车体。 */
+    float i_limit_mps;
+
+    /* 单位: m；默认: CHASSIS_POS_I_BAND_M；建议范围 [0,1]。
+     * 增大会让积分更早介入，过大会污染远距离加速段。 */
+    float i_band_m;
+
+    /* 单位: (m/s)/m；默认: CHASSIS_POS_CTE_KP；建议范围 [0,20]。
+     * 增大会加强横向保持，过大会使麦轮侧向修正抖动。 */
+    float cte_kp;
+
+    /* 单位: (m/s)/(m/s)；默认: CHASSIS_POS_CTE_KD；建议范围 [0,5]。
+     * 增大会抑制横向保持振荡，过大会横向响应变慢。 */
+    float cte_kd;
+
+    /* 单位: m/s；默认: CHASSIS_POS_AXIS_HOLD_MAX_SPEED_MPS；建议范围 [0.02,0.5]。
+     * 增大会更快修正非驱动轴误差，过大会把直线走成斜线。 */
+    float axis_hold_max_speed_mps;
+
+    /* 单位: m；默认: CHASSIS_POS_BRAKE_DIST_M；建议范围 [0.05,1]。
+     * 增大会更早减速，减小会缩短制动距离但更容易冲过目标。 */
+    float brake_dist_m;
+
+    /* 单位: m/s；默认: CHASSIS_POS_BRAKE_FLOOR_MPS；建议范围 [0,0.5]。
+     * 增大会避免末段走不动，过大会到点前还在冲。 */
+    float brake_floor_mps;
+
+    /* 单位: m；默认: CHASSIS_TARGET_REACHED_EPSILON_M；建议范围 [0.01,0.2]。
+     * 增大会更容易判定到达，减小会提高定位要求但可能久等。 */
+    float target_reached_epsilon_m;
+} chassis_position_tune_t;
+
+typedef struct
+{
+    /* 单位: (deg/s)/deg；默认: CHASSIS_YAW_KP；建议范围 [0,10]。
+     * 增大会更快回正航向，过大会原地扭动。 */
+    float kp;
+
+    /* 单位: deg；默认: CHASSIS_YAW_DEADZONE_DEG；建议范围 [0,5]。
+     * 增大会减少小角度抖动，过大会允许车头偏斜。 */
+    float deadzone_deg;
+
+    /* 单位: (deg/s)/(deg*s)；默认: CHASSIS_YAW_KI；建议范围 [0,5]。
+     * 增大会消除航向稳态误差，过大会低频摆动。 */
+    float ki;
+
+    /* 单位: deg*s；默认: CHASSIS_YAW_I_LIMIT；建议范围 [0,200]。
+     * 增大会放宽航向积分，过大会产生积分拖尾。 */
+    float i_limit;
+
+    /* 单位: 无量纲；默认: CHASSIS_YAW_RATE_KP；建议范围 [0,2]。
+     * 增大会加强角速度阻尼，过大会转向迟钝。 */
+    float rate_kp;
+
+    /* 单位: 无量纲；默认: CHASSIS_YAW_RATE_KI；建议范围 [0,5]。
+     * 增大会补偿角速度静差，过大会扭动。 */
+    float rate_ki;
+
+    /* 单位: deg/s；默认: CHASSIS_YAW_RATE_I_LIMIT；建议范围 [0,500]。
+     * 增大会放宽角速度积分输出，过大会拖尾。 */
+    float rate_i_limit;
+
+    /* 单位: 比例/20ms；默认: CHASSIS_YAW_RATE_I_LEAK；建议范围 [0,0.05]。
+     * 增大会更快泄放积分，过大会削弱稳态补偿。 */
+    float rate_i_leak;
+} chassis_yaw_tune_t;
+
+typedef struct
+{
+    /* 单位: m/s；默认: CHASSIS_MAX_LINEAR_SPEED_MPS；建议范围 [0.05,3.5]。
+     * 增大会提高平移上限，过大会导致打滑和定位误差变大。 */
+    float max_linear_speed_mps;
+
+    /* 单位: deg/s；默认: CHASSIS_MAX_YAW_SPEED_DPS；建议范围 [10,360]。
+     * 增大会提高转向上限，过大会让航向环更难稳定。 */
+    float max_yaw_speed_dps;
+
+    /* 单位: m/s^2；默认: CHASSIS_CMD_ACCEL_LIMIT_MPS2；建议范围 [0.1,5]。
+     * 增大会加速更快，过大会轮胎打滑；减小会更稳但响应慢。 */
+    float accel_limit_mps2;
+
+    /* 单位: deg/s^2；默认: CHASSIS_CMD_ACCEL_LIMIT_DPS2；建议范围 [20,1000]。
+     * 增大会转向响应更快，过大会产生角速度冲击。 */
+    float yaw_accel_limit_dps2;
+} chassis_motion_limit_tune_t;
+
+typedef struct
+{
+    /* 单位: m/s；默认: CHASSIS_WHEEL_BREAKAWAY_TARGET_EPS_MPS；建议范围 [0,0.1]。
+     * 增大会更早启用静摩擦补偿，过大会低速抖动。 */
+    float breakaway_target_eps_mps;
+
+    /* 单位: PWM 计数；默认: CHASSIS_WHEEL_BREAKAWAY_PWM_FLOOR；建议范围 [0,3000]。
+     * 增大会更容易克服静摩擦，过大会起步突跳。 */
+    float breakaway_pwm_floor;
+
+    /* 单位: PWM 计数；默认: 单轮调试当前工程值 800；建议范围 [0,3000]。
+     * 增大会让单轮调试更容易起转，过大会低速测试不细腻。 */
+    float debug_start_pwm_min;
+} chassis_wheel_feedforward_tune_t;
+
+typedef struct
+{
+    /* 单位: 比例；默认: CHASSIS_ODOM_SCALE_X/Y；建议范围 [0.1,2]。
+     * 增大会放大对应方向里程计位移，减小会缩小位移估计。 */
+    float scale_x;
+    float scale_y;
+} chassis_odom_tune_t;
+
+typedef struct
+{
+    /* 四个麦轮速度 PID，数组顺序使用 chassis_wheel_index_e。 */
+    chassis_wheel_pid_tune_t wheel_pid;
+
+    /* 点到点位置闭环与直线横向保持参数。 */
+    chassis_position_tune_t position;
+
+    /* 航向角外环、角速度内环与积分泄放参数。 */
+    chassis_yaw_tune_t yaw;
+
+    /* 主循环命令限速与加速度斜坡参数。 */
+    chassis_motion_limit_tune_t limit;
+
+    /* 低速静摩擦补偿与单轮调试启动 PWM。 */
+    chassis_wheel_feedforward_tune_t wheel_ff;
+
+    /* 编码器里程计 X/Y 方向比例修正。 */
+    chassis_odom_tune_t odom;
+} chassis_tune_params_t;
+
+extern volatile chassis_tune_params_t g_chassis_tune_params;
+
+/*
+ * 返回默认调参配置地址。默认值来源于本文件的 CHASSIS_* 默认宏。
+ * 调用时机: 初始化、恢复默认值、构造 Flash 回退配置。
+ */
+const chassis_tune_params_t *chassis_config_defaults(void);
+
+/*
+ * 将参数限制到允许范围。单位和范围见 chassis_tune_params_t 字段注释。
+ * 调用时机: 写入活动配置或保存 Flash 前。
+ */
+void chassis_config_sanitize_tune(chassis_tune_params_t *params);
+
+/*
+ * 读取当前活动调参配置快照。
+ * 并发: 关中断复制，调用方拿到的是同一时刻的完整结构体。
+ */
+void chassis_config_get_snapshot(chassis_tune_params_t *out_params);
+
+/*
+ * 设置单个轮子的速度 PID。单位、范围和影响见 chassis_wheel_pid_tune_t。
+ * 返回: 1=参数有效并已写入活动配置；0=轮索引非法。
+ * 注意: 该接口只更新活动配置；需要同步控制器内部 PID 时调用 chassis_ctrl_set_tune_params()。
+ */
+uint8 chassis_config_set_wheel_pid(uint8 wheel_index, float kp, float ki, float kd);
+
+/* 设置位置环参数组。返回 1=成功；0=入参为空。 */
+uint8 chassis_config_set_position_tune(const chassis_position_tune_t *position);
+
+/* 设置航向环参数组。返回 1=成功；0=入参为空。 */
+uint8 chassis_config_set_yaw_tune(const chassis_yaw_tune_t *yaw);
+
+/* 设置速度/加速度限幅参数组。返回 1=成功；0=入参为空。 */
+uint8 chassis_config_set_motion_limit_tune(const chassis_motion_limit_tune_t *limit);
+
+/* 设置轮端前馈参数组。返回 1=成功；0=入参为空。 */
+uint8 chassis_config_set_wheel_feedforward_tune(const chassis_wheel_feedforward_tune_t *wheel_ff);
+
+/* 设置里程计比例参数组。返回 1=成功；0=入参为空。 */
+uint8 chassis_config_set_odom_tune(const chassis_odom_tune_t *odom);
+
+/*
+ * 写入活动调参配置并立即生效于全局变量。
+ * 并发: 关中断复制，避免 20ms 控制中断读到半更新结构体。
+ */
+void chassis_config_apply(const chassis_tune_params_t *params);
+
+/*
+ * 从 Flash 加载调参配置。存储位置: sector 127，FLASH_PAGE_6/7 双槽。
+ * 返回: 1=CRC 正确且已应用；0=无有效配置，调用方应使用默认值。
+ */
+uint8 chassis_config_load_from_flash(void);
+
+/*
+ * 保存当前活动调参配置到 Flash 双槽。禁止在中断中调用。
+ * 返回: 1=写入成功；0=写入失败。
+ */
+uint8 chassis_config_save_to_flash(void);
+
+/*
+ * 恢复默认调参配置并立即应用，不主动写 Flash。
+ */
+void chassis_config_reset_to_defaults(void);
 
 /* ======================================================================
  *  通用工具函数（static inline，头文件内联，各模块可直接调用）
