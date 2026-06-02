@@ -237,6 +237,7 @@ typedef enum {
  */
 static SokoFullSolution_t  s_smd_solution;
 static SokoWaypointPath_t  s_smd_waypoints;
+static AppStaticMapDrivePlan_t s_smd_plan;
 static uint8               s_smd_map[MAP_ROWS][MAP_COLS];
 static uint8               s_smd_solve_ok     = 0U;
 static uint8               s_smd_sub_idx      = 0U;
@@ -340,15 +341,15 @@ static const char s_smd_manual_map[MAP_ROWS][MAP_COLS + 1] = {
 
 /*
  * 函数: app_main_smd_solve_after_recv
- * 功能: 地图准备好后直接调用 Stage1 求解器和航点转换接口。
+ * 功能: 地图准备好后调用静态地图 helper 求解，并生成完整航点数组。
  * 参数: 无，输入来自模块静态变量 s_smd_map。
  * 返回: 无，求解成功与否写入 s_smd_solve_ok。
+ * 关键点: helper 会按实际发车点 (1,5.5) 枚举入口格，避免首段多走或少走半格。
  * 嵌入式注意: 求解只在地图锁定时执行一次，不放在每个 5ms tick 内重复执行。
  */
 static void app_main_smd_solve_after_recv(void)
 {
-    Point_t player;
-    uint8   r, b;
+    uint8 r;
 
     /* 打印最终参与求解的地图，便于确认地图内容是否正确。 */
     printf("SMD_MAP_BEGIN\n");
@@ -365,60 +366,56 @@ static void app_main_smd_solve_after_recv(void)
     }
     printf("SMD_MAP_END\n");
 
-    /* 发车格取整数坐标，与底盘里程计零点对齐。 */
-    player.x = (int8)CHASSIS_START_GRID_X;
-    player.y = (int8)CHASSIS_START_GRID_Y;
-    printf("SMD_PLAYER_START=%d,%d\n", (int)player.x, (int)player.y);
-
+    printf("SMD_PLAYER_START=%.2f,%.2f (launch grid coordinate)\n",
+           (double)MAIN_POS_NAV_START_X_GRID,
+           (double)MAIN_POS_NAV_START_Y_GRID);
     s_smd_solve_ok = 0U;
-    memset(&s_smd_solution, 0, sizeof(s_smd_solution));
+    memset(&s_smd_plan, 0, sizeof(s_smd_plan));
 
-    /* Stage1：贪心分配 + 单箱 BFS，一次求出所有箱子的动作序列。 */
-    if (!Sokoban_Solve_Stage1(s_smd_map, player, &s_smd_solution))
     {
-        printf("SMD_ERR=NO_SOLUTION\n");
-        return;
-    }
-    if (!s_smd_solution.is_solved || s_smd_solution.total_boxes == 0U)
-    {
-        printf("SMD_ERR=UNSOLVED boxes=%d\n", (int)s_smd_solution.total_boxes);
-        return;
-    }
+        Point_t preferred_start;
+        preferred_start.x = (int8)CHASSIS_START_GRID_X;
+        preferred_start.y = (int8)CHASSIS_START_GRID_Y;
 
-    /* 每段动作序列转换为转弯航点，鼓续追加到统一航点数组。 */
-    memset(&s_smd_waypoints, 0, sizeof(s_smd_waypoints));
-    {
-        Point_t cur_pos = player;
-        for (b = 0U; b < s_smd_solution.total_boxes; b++)
+        if (!App_StaticMapDrive_SolveFromLaunch(s_smd_map,
+                                                MAIN_POS_NAV_START_X_GRID,
+                                                MAIN_POS_NAV_START_Y_GRID,
+                                                preferred_start,
+                                                &s_smd_plan))
         {
-            SokoWaypointPath_t seg;
-            uint16 i;
-            /* 同向连续动作压缩为一个转弯点，减少底盘下发频次。 */
-            Sokoban_Actions_To_Waypoints(
-                s_smd_solution.sub_solutions[b].actions,
-                s_smd_solution.sub_solutions[b].count,
-                cur_pos, &seg);
-            for (i = 0U; i < seg.count; i++)
-            {
-                if (s_smd_waypoints.count < SOKOBAN_MAX_WAYPOINTS)
-                {
-                    s_smd_waypoints.points[s_smd_waypoints.count] = seg.points[i];
-                    s_smd_waypoints.count++;
-                }
-            }
-            /* 本段结束后玩家坐标由求解器给出，作为下一段起点。 */
-            cur_pos = s_smd_solution.player_end_pos[b];
+            printf("SMD_ERR=NO_SOLUTION\n");
+            return;
         }
     }
 
+    s_smd_solution = s_smd_plan.solution;
+    if (!s_smd_solution.is_solved || s_smd_solution.total_boxes == 0U)
+    {
+        printf("SMD_ERR=UNSOLVED boxes=%d solved=%d\n",
+               (int)s_smd_solution.total_boxes,
+               (int)s_smd_solution.is_solved);
+        return;
+    }
+
+    s_smd_waypoints = s_smd_plan.waypoints;
     s_smd_sub_idx    = 0U;
     s_smd_wp_idx     = 0U;
     s_smd_navigating = 0U;
     s_smd_solve_ok   = 1U;
 
-    printf("SMD_SOLVED=1 boxes=%d path_wp=%d\n",
+    printf("SMD_SOLVED=1 boxes=%d entry=%d,%d entry_m=%.4f score=%.4f path_wp=%d\n",
            (int)s_smd_solution.total_boxes,
+           (int)s_smd_plan.entry.x,
+           (int)s_smd_plan.entry.y,
+           (double)s_smd_plan.entry_dist_m,
+           (double)s_smd_plan.score_m,
            (int)s_smd_waypoints.count);
+    {
+        float entry_x_m;
+        float entry_y_m;
+        app_main_smd_grid_to_abs_m(s_smd_plan.entry, &entry_x_m, &entry_y_m);
+        app_main_smd_log_grid_target("ENTRY", 0U, 0U, s_smd_plan.entry, entry_x_m, entry_y_m);
+    }
     app_main_smd_print_waypoint_path(&s_smd_waypoints);
 }
 
