@@ -11,18 +11,6 @@ static volatile uint8 s_pid_debug_wheel_index = (uint8)CHASSIS_WHEEL_RF; /* 当�
 static volatile float s_pid_debug_target_value = 0.0f;                    /* 最近一次目标值 */
 static volatile float s_pid_debug_actual_value = 0.0f;                    /* 最近一次实际值 */
 
-static const char *pid_debug_wheel_name(uint8 wheel_index)
-{
-    switch (wheel_index)
-    {
-        case (uint8)CHASSIS_WHEEL_LF: return "LF";
-        case (uint8)CHASSIS_WHEEL_RF: return "RF";
-        case (uint8)CHASSIS_WHEEL_LB: return "LB";
-        case (uint8)CHASSIS_WHEEL_RB: return "RB";
-        default: return "UK";
-    }
-}
-
 /**
  * @brief  初始化增量式 PID 控制器
  */
@@ -134,8 +122,6 @@ void chassis_pid_debug_task_5ms(void)
     div = 0U;
 
     chassis_pid_debug_get_snapshot(&snapshot);
-    // wheel_name = pid_debug_wheel_name(snapshot.wheel_index);
-    (void)pid_debug_wheel_name; /* 抑制 unused 警告: 当前打印没带轮名标签, 函数留着以备重启 */
 
     /* 同步取 4 路 LPF 速度快照, 用于"接线诊断": 手转任一物理轮观察哪个 index 在动 */
     chassis_ctrl_get_wheel_feedback_snapshot(wheel_fb);

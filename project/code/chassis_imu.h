@@ -50,12 +50,6 @@ float chassis_imu_get_yaw_deg(void);
 void chassis_imu_set_yaw_deg(float yaw_deg);
 
 /**
- * @brief  查询滑窗静止检测最近一次结果
- * @return 1 = 当前判定为静止 (零偏在线辨识活跃); 0 = 运动中
- */
-uint8 chassis_imu_is_still(void);
-
-/**
  * @brief  读取滑窗 LPF 后的偏航角速度 (供姿态环 D 项使用)
  * @return 偏航角速度 (°/s, 已完成零偏补偿 / 符号修正 / LPF)
  */

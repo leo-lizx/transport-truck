@@ -23,35 +23,14 @@
 /* 软限位依赖：P0-3 解耦 g_game_map 直访, 改为运行时 seq-lock 快照 (apply_soft_limit_guard 内部拷贝) */
 
 /* ---------------------- 航向闭环常量 ----------------------
- * 这 4 个参数已迁移到 chassis_config.h, 这里仅做本地短别名转发,
- * 方便阅读 yaw_pi() 时不用记前缀。如要调参请改 chassis_config.h。
+ * 级联 P-PI 路径使用 CHASSIS_YAW_RATE_* 系列, 调参直接改 chassis_config.h.
  */
-#define YAW_DEADZONE_DEG   CHASSIS_YAW_DEADZONE_DEG
-#define YAW_KI             CHASSIS_YAW_KI
-#define YAW_I_LIMIT        CHASSIS_YAW_I_LIMIT
-#define YAW_MIN_WZ_DPS     CHASSIS_YAW_MIN_WZ_DPS
 
 /* 单轮 PID 调试起步补偿参数（用于克服静摩擦） */
 #define WHEEL_DEBUG_START_SPEED_EPS_MPS   (0.03f)   /* 低于此反馈速度视为静止 */
 #define WHEEL_DEBUG_START_TARGET_EPS_MPS  (0.05f)   /* 低于此目标速度不启用补偿 */
 #define WHEEL_DEBUG_START_PWM_MIN         (800.0f)  /* 起步最小 PWM 幅值 */
 #define WHEEL_DEBUG_TARGET_RAMP_MPS_PER_TICK (0.8f) /* 20ms 每拍目标最多变化量 */
-#define WHEEL_DEBUG_SIGN_FIX_GUARD_TICKS  (40U)     /* 起步保护期: 800ms 内只允许一次自动反号 */
-#define WHEEL_DEBUG_SIGN_FIX_CONFIRM_CNT  (12U)     /* 反号连续计数(@20ms)达到该值才翻转反馈符号 */
-/*
- * P0-修复(抖动): 自动反号本意是开机查接线用, 运行中触发会清零 PID, 引发周期性
- * "一抖一抖"现象. 改为: 仅在启动保护期(s_debug_startup_guard_ticks > 0)期间
- * 允许检测/翻转, 且每次启动只允许翻转一次. 之后无论反馈相位如何都不再动符号.
- *
- * P0-修复(2026-04-25 顿挫): 即使加了启动保护期, 启动初几拍编码器/电机瞬态
- * 仍可能让"目标·反馈反号"连续 12 拍触发翻转, 翻转动作里 chassis_pid_reset()
- * 会把 pid->output 清零 -> 实际 PWM 跌到 0 -> "顿一下后再起来". 在
- * chassis_config.h 里 ENC_SIGN/DIR_SIGN 已用 wfb 自检 + 单轮验证标定到位的
- * 工程下, 这个自动机制只会破坏闭环, 默认关闭. 真要重新标轮时再打开.
- */
-#ifndef WHEEL_DEBUG_AUTO_FLIP_FB_SIGN
-#define WHEEL_DEBUG_AUTO_FLIP_FB_SIGN     (0)
-#endif
 
 /* 轮速闭环抗抖参数（抑制低速量化噪声和来回翻向） */
 #define WHEEL_FB_LPF_ALPHA                (0.35f)   /* 轮速反馈一阶低通系数，越小越平滑 */
@@ -69,21 +48,11 @@
  * 主任务调用见下方 task_20ms 末尾. */
 
 /* ---------------------- 控制模式 ---------------------- */
-/*
- * 单轮 PID 调试专用开关：
- * 1 = 仅保留 MODE_SINGLE_WHEEL_PID_DEBUG 主链路，其余模式逻辑临时屏蔽（保留在 #else 以便恢复）
- * 0 = 启用全部控制模式
- *
- * 2026-04-27 调姿态闭环, 必须放开全部模式 (否则 MODE_YAW_HOLD 在 task_20ms 里会被 force_stop 短路).
- */
-#define CHASSIS_CTRL_SINGLE_WHEEL_PID_DEBUG_ONLY   (0)
 
 typedef enum {
-    MODE_YAW_HOLD = 0,      /* 原地航向保持（默认）            */
-    MODE_POINT_NAV,         /* 网格点位导航                    */
-    MODE_MOVE_YAW,          /* 外部平移 + 航向指令             */
-    MODE_ATT_DEBUG,         /* 航向闭环调试（行为同 YAW_HOLD） */
-    MODE_SINGLE_WHEEL_PID_DEBUG /* 单轮 PID 调试（仅一个轮子给目标） */
+    MODE_YAW_HOLD = 0,      /* 原地航向保持（默认） / rotate_to_deg 复用 */
+    MODE_POINT_NAV,         /* 网格点位导航                              */
+    MODE_SINGLE_WHEEL_PID_DEBUG /* 单轮 PID 调试（仅一个轮子给目标）        */
 } ctrl_mode_t;
 
 /* ====================== 硬件实例 ====================== */
@@ -220,18 +189,11 @@ static uint8_t s_axis_y_locked = 0U;
 static float s_axis_hold_x_m = 0.0f;
 static float s_axis_hold_y_m = 0.0f;
 
-/* 外部移动+航向模式的平移指令 */
-static volatile float s_cmd_vx = 0.0f;
-static volatile float s_cmd_vy = 0.0f;
-
 /* 单轮 PID 调试参数 */
 static volatile uint8 s_debug_wheel_index = (uint8)CHASSIS_WHEEL_LF;
 static volatile float s_debug_wheel_target_mps = 0.0f;
 static volatile float s_debug_fb_sign_mul[CHASSIS_WHEEL_COUNT] = {1.0f, 1.0f, 1.0f, 1.0f};
-static volatile uint8 s_debug_fb_sign_mismatch_cnt[CHASSIS_WHEEL_COUNT] = {0U, 0U, 0U, 0U};
-static volatile uint8 s_debug_fb_sign_flipped[CHASSIS_WHEEL_COUNT] = {0U, 0U, 0U, 0U}; /* 本次启动周期内是否已自动翻转过, 防止反复跳 */
 static volatile float  s_debug_target_ramp_mps      = 0.0f;
-static volatile uint16 s_debug_startup_guard_ticks  = 0U;
 
 /* 航向积分项 */
 static volatile float s_yaw_i  = 0.0f;
@@ -311,7 +273,6 @@ static chassis_tune_params_t sanitize(chassis_tune_params_t p)
     return p;
 }
 
-#if (0 == CHASSIS_CTRL_SINGLE_WHEEL_PID_DEBUG_ONLY)
 /** 车体速度矢量限幅: (vx,vy)模长 ≤ max_linear, |wz| ≤ max_yaw */
 static void limit_speed(chassis_body_speed_cmd_t *c)
 {
@@ -380,7 +341,6 @@ static float axis_hold_velocity_cmd(float hold_error,
 }
 
 /** 紧急停机: 清零滤波器、PID、PWM */
-#endif /* (0 == CHASSIS_CTRL_SINGLE_WHEEL_PID_DEBUG_ONLY) */
 
 static void force_stop(void)
 {
@@ -401,7 +361,6 @@ static void force_stop(void)
     s_wheel_fb_lpf_inited = 0U;
 }
 
-#if (0 == CHASSIS_CTRL_SINGLE_WHEEL_PID_DEBUG_ONLY)
 /* 软限位 helpers + apply_soft_limit_guard() 已迁至 chassis_zone.c
  * (chassis_zone_apply_soft_limit_guard). 调用点见 task_20ms 末尾. */
 
@@ -431,36 +390,19 @@ static void apply_speed(chassis_body_speed_cmd_t cmd,
         float pwm_forward_domain;
         float pwm_motor_domain;
         const float abs_target = fabsf(targets[i]);
+        const float abs_fb     = fabsf(wheel_fb_mps[i]);
 
-        /* P0-重构 2026-04-29 PWM 连续化: PID 永远连续计算, 不再做 WHEEL_STOP
-         * 硬清零 (旧版 stop_wheel_with_pid_reset 会把 pid->output 拍 0 ->
-         * 下一拍从 0 重新累加 -> PWM 跌崖式跳变, 表现为"一段一段").
-         * target=0 且 fb≈0 时增量 PID 自然衰减到 0, 不需要手动中断. */
         pwm_forward_domain = chassis_pid_step(&s_pid[i], targets[i], wheel_fb_mps[i]);
 
-        /*
-         * 静摩擦前馈 (P0-重构 2026-04-29):
-         *
-         * 旧版状态机问题: 进入 breakaway 时直接 s_pid[i].output = kick (覆盖!),
-         * PID 输出从 <FLOOR 阶跃到 ≥FLOOR; 退出时又恢复 PID 自累加.
-         * 状态机 on/off 翻转 = PWM 阶跃 = "一段一段"输出.
-         *
-         * 新方案: 去状态机, 改纯加性平滑前馈
-         *   ff = sign(target) * FLOOR * smooth_ramp(|target|)
-         * 性质:
-         *   · target=0      → ff=0,                输出 = PID
-         *   · |target|=EPS  → ff=0   (边界连续过零)
-         *   · |target|≥2EPS → ff=±FLOOR (静摩擦补偿到位)
-         *   · 不覆盖 PID 内部状态, 闭环不会被打断
-         *   · PID 看到反馈起来后会主动减小输出, 与 ff 自然平衡
-         */
-        if (abs_target > CHASSIS_WHEEL_BREAKAWAY_TARGET_EPS_MPS) {
-            float ramp = (abs_target - CHASSIS_WHEEL_BREAKAWAY_TARGET_EPS_MPS)
-                       /  CHASSIS_WHEEL_BREAKAWAY_TARGET_EPS_MPS;
-            float ff_pwm;
-            if (ramp > 1.0f) ramp = 1.0f;
-            ff_pwm = CHASSIS_WHEEL_BREAKAWAY_PWM_FLOOR * ramp;
-            if (targets[i] < 0.0f) ff_pwm = -ff_pwm;
+        /* 静摩擦前馈 (仅起步注入, 运动中关闭):
+         *   起步: |target|>EPS 且 |fb|<FB_STATIC_EPS -> 加性 ff = sign(t)*FLOOR
+         *   一旦轮真正起转 (|fb|>=FB_STATIC_EPS), ff=0, 完全交给 PID
+         * 这样消除 "PID + ff 双重补偿" 在运动中导致的 PWM 抖动. */
+        if ((abs_target > CHASSIS_WHEEL_BREAKAWAY_TARGET_EPS_MPS) &&
+            (abs_fb     < CHASSIS_WHEEL_BREAKAWAY_FB_STATIC_EPS_MPS)) {
+            float ff_pwm = (targets[i] >= 0.0f)
+                         ?  CHASSIS_WHEEL_BREAKAWAY_PWM_FLOOR
+                         : -CHASSIS_WHEEL_BREAKAWAY_PWM_FLOOR;
             pwm_forward_domain += ff_pwm;
         }
 
@@ -475,7 +417,6 @@ static void apply_speed(chassis_body_speed_cmd_t cmd,
         chassis_motor_set_pwm(&s_mot[i], pwm_motor_domain);
     }
 }
-#endif /* (0 == CHASSIS_CTRL_SINGLE_WHEEL_PID_DEBUG_ONLY) */
 
 /** 单轮 PID 调试链路：仅一个轮子给目标速度，其余轮子目标为 0 */
 static void apply_single_wheel_pid_debug(const float wheel_fb_mps[CHASSIS_WHEEL_COUNT])
@@ -506,10 +447,6 @@ static void apply_single_wheel_pid_debug(const float wheel_fb_mps[CHASSIS_WHEEL_
         }
     }
     targets[debug_idx] = s_debug_target_ramp_mps;
-    if (s_debug_startup_guard_ticks > 0U)
-    {
-        s_debug_startup_guard_ticks--;
-    }
 
     /* 调试模式不输出车体运动指令。 */
     s_last_cmd = (chassis_body_speed_cmd_t){0};
@@ -535,68 +472,18 @@ static void apply_single_wheel_pid_debug(const float wheel_fb_mps[CHASSIS_WHEEL_
                 continue;
             }
 
-            /*
-             * 若目标与反馈长期反号, 自动翻转该轮反馈符号, 打断正反馈发散.
-             * P0-修复(抖动): 仅在启动保护期内、且本次启动还没翻过的前提下才允许触发,
-             * 防止运行中 PID 振荡产生短时反号导致周期性翻转 + 重置 PID, 形成
-             * "一抖一抖"的周期性抽搐.
-             * P0-修复(2026-04-25 顿挫): 默认编译关闭. 见顶部
-             *   WHEEL_DEBUG_AUTO_FLIP_FB_SIGN 注释.
-             */
-#if (WHEEL_DEBUG_AUTO_FLIP_FB_SIGN != 0)
-            if ((s_debug_startup_guard_ticks > 0U) &&
-                (s_debug_fb_sign_flipped[i] == 0U) &&
-                (fabsf(targets[i]) > WHEEL_DEBUG_START_TARGET_EPS_MPS) &&
-                (fabsf(wheel_fb_mps[i]) > WHEEL_DEBUG_START_SPEED_EPS_MPS))
-            {
-                if ((targets[i] * feedback_for_pid) < 0.0f)
-                {
-                    if (s_debug_fb_sign_mismatch_cnt[i] < 255U)
-                    {
-                        s_debug_fb_sign_mismatch_cnt[i]++;
-                    }
-                }
-                else
-                {
-                    s_debug_fb_sign_mismatch_cnt[i] = 0U;
-                }
-
-                if (s_debug_fb_sign_mismatch_cnt[i] >= WHEEL_DEBUG_SIGN_FIX_CONFIRM_CNT)
-                {
-                    s_debug_fb_sign_mul[i] = -s_debug_fb_sign_mul[i];
-                    s_debug_fb_sign_mismatch_cnt[i] = 0U;
-                    s_debug_fb_sign_flipped[i] = 1U; /* 本次启动只允许翻一次 */
-                    chassis_pid_reset(&s_pid[i]);
-                    feedback_for_pid = wheel_fb_mps[i] * s_debug_fb_sign_mul[i];
-                }
-            }
-            else
-            {
-                s_debug_fb_sign_mismatch_cnt[i] = 0U;
-            }
-#else
-            /* 自动反号默认关闭, 维持中性状态以备宏开启时不会误触发 */
-            s_debug_fb_sign_mismatch_cnt[i] = 0U;
-#endif
-
             /* 单轮调试同样在“前进符号域”做闭环，打印值和控制值保持一致。 */
             pwm_forward_domain = chassis_pid_step(&s_pid[i], targets[i], feedback_for_pid);
             pwm_motor_domain = pwm_forward_domain * s_mot[i].dir_sign;
 
-            /*
-             * 起步抗静摩擦: 目标非零但轮速接近零时, 给最小启动 PWM.
-             * P0-修复(抖动): 软启动覆盖电机 PWM 时, 同步把 PID 内部累加器 pid->output
-             * 钳到与之等价的"前进域"PWM 上, 实现无扰切换 (bumpless transfer).
-             * 否则等反馈一过 0.03 m/s 软启动释放, PID 累加器还停在低值或继续增量,
-             * 会让最终 PWM 在 800 与 PID 自由值之间产生明显阶跃, 形成第二种抖动源.
-             */
+            /* 起步抗静摩擦: 目标非零但轮速接近零时, 给最小启动 PWM,
+             * 同时把 PID 累加器钳到等价值实现无扰切换 (bumpless transfer). */
             if ((fabsf(targets[i]) > WHEEL_DEBUG_START_TARGET_EPS_MPS) &&
                 (fabsf(feedback_for_pid) < WHEEL_DEBUG_START_SPEED_EPS_MPS) &&
                 (fabsf(pwm_motor_domain) < WHEEL_DEBUG_START_PWM_MIN))
             {
                 float target_sign = (targets[i] >= 0.0f) ? 1.0f : -1.0f;
                 pwm_motor_domain = WHEEL_DEBUG_START_PWM_MIN * target_sign * s_mot[i].dir_sign;
-                /* PID 累加器钳到前进域等价值, 让下次 chassis_pid_step 在此基础上做增量 */
                 s_pid[i].output = WHEEL_DEBUG_START_PWM_MIN * target_sign;
             }
 
@@ -614,7 +501,6 @@ static void apply_single_wheel_pid_debug(const float wheel_fb_mps[CHASSIS_WHEEL_
                                   debug_feedback_value);
 }
 
-#if (0 == CHASSIS_CTRL_SINGLE_WHEEL_PID_DEBUG_ONLY)
 /**
  * sqrt_controller —— 时间最优"位置 → 速度"控制器
  * 来源: ArduPilot AC_AttitudeControl::sqrt_controller (GPLv3, 已工业验证多年).
@@ -695,11 +581,11 @@ static float position_axis_velocity_cmd(float axis_error,
 /**
  * 航向 PI 闭环
  * @param err              航向误差(°)，已归一化
- * @param enable_rate_loop 是否启用内环 rATE PI 反馈:
- *                          1 = MODE_YAW_HOLD / POINT_NAV (静止或低振动) -> 完整级联, 享KI学摩擦
- *                          0 = MODE_MOVE_YAW (平动中) -> 开环 rate, 避免 IMU 振动噪声被KI放大成限环
+ * @param enable_rate_loop 是否启用内环 rate PI 反馈:
+ *                          1 = MODE_YAW_HOLD (静止) -> 完整级联, 享 KI 学摩擦
+ *                          0 = POINT_NAV 平动期间 -> 纯前馈, 避免 IMU 振动噪声被 KI 放大成限环
  *                          原因: 平动时底盘振动使 IMU yaw_rate 噪声 ±10°/s, 进 rate_err
- *                          进 I -> wz 护 -> 麦轮护 -> 车体更护. 平动期间只靠
+ *                          进 I -> wz 抖 -> 麦轮抖 -> 车体更抖. 平动期间只靠
  *                          前馈+外环P 足以完成轨迹跟踪, 稳态偏差由后续 YAW_HOLD 兜底.
  * @return                 角速度指令(°/s)
  */
@@ -713,7 +599,6 @@ static float yaw_pi(float err, uint8 enable_rate_loop, uint8 allow_inpos_lock)
     const float yaw_rate_dps = chassis_imu_get_yaw_rate_dps();   /* 实测车体角速度 */
     float wz;
 
-#if (CHASSIS_YAW_USE_CASCADED_CTRL != 0)
     /* ==================================================================
      * 0) In-Position Schmitt-trigger 锁 (P0-改进 2026-05-02 收尾抖动)
      *    工业伺服通用结构, 解决 "wz_target 残值 + 轮端 breakaway 阶跃"
@@ -800,38 +685,8 @@ static float yaw_pi(float err, uint8 enable_rate_loop, uint8 allow_inpos_lock)
                          -g_chassis_tune_params.max_yaw_speed_dps,
                           g_chassis_tune_params.max_yaw_speed_dps);
 
-#else /* ============== 旧的单环 PID 路径 (回退) ============== */
-    {
-        float p_term = sqrt_controller(err, g_chassis_tune_params.yaw_kp, CHASSIS_YAW_ACCEL_MAX_DPS2);
-        float d_term = -CHASSIS_YAW_KD * yaw_rate_dps;
-        float i_term;
-
-        if ((err * s_yaw_i) < 0.0f) { s_yaw_i = 0.0f; }
-        if (fabsf(err) <= YAW_DEADZONE_DEG) {
-            float err_ratio = fabsf(err) / YAW_DEADZONE_DEG;
-            float wz_ratio  = fabsf(yaw_rate_dps) / 5.0f;
-            float scale = (err_ratio > wz_ratio) ? err_ratio : wz_ratio;
-            if (scale > 1.0f) { scale = 1.0f; }
-            scale = scale * scale;
-            s_yaw_i *= 0.20f;
-            p_term  *= scale;
-            d_term  *= scale;
-        } else if (fabsf(err) <= CHASSIS_YAW_I_BAND_DEG) {
-            s_yaw_i += err * CHASSIS_TASK_DT_20MS_S;
-            s_yaw_i  = chassis_clamp_f(s_yaw_i, -YAW_I_LIMIT, YAW_I_LIMIT);
-        }
-        i_term = YAW_KI * s_yaw_i;
-        wz = p_term + i_term + d_term;
-        if ((fabsf(err) <= YAW_DEADZONE_DEG) && (fabsf(wz) < 1.0f)) { wz = 0.0f; }
-        wz = chassis_clamp_f(wz, -g_chassis_tune_params.max_yaw_speed_dps,
-                                  g_chassis_tune_params.max_yaw_speed_dps);
-    }
-#endif
-
     return wz;
 }
-
-#endif /* (0 == CHASSIS_CTRL_SINGLE_WHEEL_PID_DEBUG_ONLY) */
 
 /** 模式切换辅助: 清积分 + 设模式 */
 static void enter_mode(ctrl_mode_t m)
@@ -877,8 +732,6 @@ void chassis_ctrl_init(void)
     s_tgt_x_m      = 0.0f;
     s_tgt_y_m      = 0.0f;
     s_tgt_yaw_deg  = 0.0f;
-    s_cmd_vx       = 0.0f;
-    s_cmd_vy       = 0.0f;
     /*
      * 不在这里写死调试轮索引. 真正的"选轮"由 chassis_ctrl_start_single_wheel_pid_debug()
      * 统一负责 (它会同时设置 s_debug_wheel_index 和 chassis_pid.c 里的
@@ -923,11 +776,9 @@ void chassis_ctrl_task_20ms(void)
 {
     float ws_raw[CHASSIS_WHEEL_COUNT]; /* 四轮原始速度反馈 */
     float ws_pid[CHASSIS_WHEEL_COUNT]; /* 供闭环使用的滤波速度反馈 */
-#if (0 == CHASSIS_CTRL_SINGLE_WHEEL_PID_DEBUG_ONLY)
     float vx_raw, vy_raw;
     float yaw_rad, cy, sy;
     chassis_body_speed_cmd_t cmd = {0};
-#endif
     uint8 i;
 
     /* 1) 编码器采样 */
@@ -948,22 +799,6 @@ void chassis_ctrl_task_20ms(void)
     }
     s_wheel_fb_lpf_inited = 1U;
 
-#if (1 == CHASSIS_CTRL_SINGLE_WHEEL_PID_DEBUG_ONLY)
-    /*
-     * 当前仅调试单轮 PID：
-     * - MODE_SINGLE_WHEEL_PID_DEBUG: 执行单轮闭环
-     * - 其他模式: 强制停机（相当于暂时注释掉其他模式主控制逻辑）
-     */
-    if (MODE_SINGLE_WHEEL_PID_DEBUG == s_mode)
-    {
-        apply_single_wheel_pid_debug(ws_pid);
-    }
-    else
-    {
-        force_stop();
-    }
-    return;
-#else
     /* 2) 逆运动学 → 车体速度反馈 */
     chassis_mecanum_inverse(ws_pid, &vx_raw, &vy_raw);
     s_fb_vx = vx_raw * CHASSIS_ODOM_SCALE_X;
@@ -1042,7 +877,6 @@ void chassis_ctrl_task_20ms(void)
         float dy   = s_tgt_y_m - s_pose.y_m;
         float dist = sqrtf(dx * dx + dy * dy);
         float vxg, vyg, norm;
-        float v_drive_min = CHASSIS_POS_MIN_DRIVE_SPEED_MPS;
         float yerr;
 
         /* ================================================================
@@ -1070,25 +904,22 @@ void chassis_ctrl_task_20ms(void)
          * yaw 精校/速度稳定都不参与到达判断, 避免车已经到点却长时间不切下一个目标.
          * ----------------------------------------------------------------*/
         if ((0U == s_arrived) && (dist <= CHASSIS_TARGET_REACHED_EPSILON_M)) {
-            /* P0-修复 2026-05-12 (大位移潜在 bug):
-             * 旧版到位帧调 yaw_pi(yerr_arrive, 1, 1) 输出 wz, 经 ramp 限制后
-             * 送 apply_speed -> 麦轮接到 wz≠0 命令转一点点, 下一拍 layer2 force_stop
-             * 又抹掉 -> 纯抖动无意义. 且 force_stop 不清 s_yaw_in_position 残留锁.
-             *
-             * 新版直接 force_stop + s_arrived=1, 等价 layer2 提前一拍执行,
-             * 干净利落, 上层主循环下一拍即可切下个目标. */
-            (void)dx; (void)dy;  /* avoid unused if compiler complains */
+            /* 到位: 输出 cmd=0 让 ramp_filter 平滑衰减惯性, PID 自然跟随
+             * 反馈减速. 不再 force_stop 硬清 ramp/PID, 避免末段急刹一脚. */
             s_arrived = 1U;
             s_recovery_active = 0U;
             s_yaw_in_position = 0;
-            force_stop();
-            return;
+            cmd.vx_body_mps = 0.0f;
+            cmd.vy_body_mps = 0.0f;
+            cmd.wz_dps      = 0.0f;
+            break;
         }
         if (s_arrived && (dist <= CHASSIS_POS_HOLD_EXIT_M)) {
-            /* 到位驻车: 目标点已完成一拍姿态闭环保持, 之后只停车不再单独调角. */
-            s_arrived = 1U;
-            force_stop();
-            return;
+            /* 到位驻车: 同样让 ramp 自然收敛, 避免周期性 force_stop 抽搐. */
+            cmd.vx_body_mps = 0.0f;
+            cmd.vy_body_mps = 0.0f;
+            cmd.wz_dps      = 0.0f;
+            break;
         }
         /* ================================================================
          * 【层3】大扰动 (Schmitt-trigger 下边界): 超出保持圈, 重启驱动
@@ -1113,23 +944,6 @@ void chassis_ctrl_task_20ms(void)
          * 【层4】正常位置驱动: brake_cap + gain_schedule + axis-by-axis PD
          * dist > EPSILON (6cm), 车还在赶路或减速进场中.
          * ================================================================*/
-        if ((CHASSIS_POS_BRAKE_DIST_M > 1e-6f) && (dist < CHASSIS_POS_BRAKE_DIST_M)) {
-            /* 线性 ramp: dist=BRAKE -> v=V_MIN; dist=EPSILON -> v=0
-             * 注意: 此处只影响 v_drive_min (最小推进速度下限),
-             * 实际速度上限由下方 sqrt_controller brake_cap 控制. */
-            float ratio = (dist - CHASSIS_TARGET_REACHED_EPSILON_M)
-                        / (CHASSIS_POS_BRAKE_DIST_M - CHASSIS_TARGET_REACHED_EPSILON_M);
-            if (ratio < 0.0f) ratio = 0.0f;
-            if (ratio > 1.0f) ratio = 1.0f;
-            v_drive_min = CHASSIS_POS_MIN_DRIVE_SPEED_MPS * ratio;
-            if ((ratio > 0.0f) &&
-                (v_drive_min < (2.0f * CHASSIS_WHEEL_BREAKAWAY_TARGET_EPS_MPS)))
-            {
-                /* 只要还没进 EPSILON, 最小推进不能被衰减到静摩擦阈值以下.
-                 * 否则车会停在 5cm 到位圈外, s_arrived 永远不置 1, 上层航点也不会切换. */
-                v_drive_min = 2.0f * CHASSIS_WHEEL_BREAKAWAY_TARGET_EPS_MPS;
-            }
-        }
 
         /* ----------------------------------------------------------------
          * 位置 P 控制 (axis-by-axis 曼哈顿模式 + gain scheduling):
@@ -1241,18 +1055,12 @@ void chassis_ctrl_task_20ms(void)
                            (fabsf(dy) > CHASSIS_POS_AXIS_SWITCH_TOL_M)) {
                     float x_hold_err;
                     if (!s_axis_y_locked) {
-                        /* P0-修复 2026-05-12 (拐点抖动 + 大位移根因):
-                         * 旧版 clear_ramp_global_axis(1,0,...) 把 ramp.vxg 硬清 0,
-                         * 但车 X 方向仍有惯性速度 (编码器反馈非 0), 下一帧 PID
-                         * 反向制动 X + Y 主轴速度叠加 -> 麦轮跳变 -> 拐点抖动.
-                         * 同时 s_v_along_lpf=0 让 D 项突变 -> 二次冲击.
-                         *
-                         * 业内做法 (ArduPilot AC_PosControl trajectory transition):
-                         *   切轴时只锚定保持轴目标 (X 锁在切换点),
-                         *   ramp/LPF 让其自然衰减, 由 X 保持环 (CTE_KP) 平滑接管.
-                         *   X 速度从惯性值 → 0 由 ramp accel_limit 平滑过渡 (3m/s² × 0.02s
-                         *   = 60 mm/s/拍, 0.5 m/s 残速 8 拍即 160ms 内自然衰减完). */
+                        /* 切轴瞬间: 锚定 X 保持轴 + 清 D LPF/积分,
+                         * 让 Y 主轴从干净基线起步, 避免 D 突变带来"切轴顿挫". */
                         s_axis_hold_x_m = s_pose.x_m;
+                        s_v_along_lpf   = 0.0f;
+                        s_v_cross_lpf   = 0.0f;
+                        s_pos_i         = 0.0f;
                     }
                     x_hold_err         = s_axis_hold_x_m - s_pose.x_m;
                     s_axis_y_locked    = 1U;
@@ -1323,32 +1131,16 @@ void chassis_ctrl_task_20ms(void)
         }
         norm = sqrtf(vxg * vxg + vyg * vyg);
 
-        /* P0-改进 2026-05-05 (PD 兼容的 MIN_DRIVE):
-         * 旧: norm < V_MIN 直接按比例放大 -> PD 反向刹车时被反向放大成
-         *     ±V_MIN 冲击, 引发 0.12 m/s 来回震荡.
-         * 新: 只在 PD 输出方向"指向目标"时才补足最小推进, 否则让 PD
-         *     自由刹车. 用沿程方向投影 v_along_cmd 判断:
-         *       v_along_cmd > 0 (向目标) 且 norm < V_MIN -> 补到 V_MIN
-         *       v_along_cmd <= 0 (PD 想刹车/倒车)        -> 不动
-         * 这样末段 PD 自然平滑收敛, 不再被 MIN_DRIVE 反向冲击. */
+        /* 接近目标时按位置误差限速, 避免冲过 EPSILON 反弹.
+         * sqrt_ctrl 末段会算出 ~0 速度, FLOOR 保证仍能推进 EPSILON 内. */
         {
-            /* 不重算: 用径向投影 (vxg*dx+vyg*dy) 等价判方向, 与 d_along 同号 -> 指向目标 */
-            float v_align = (vxg * dx + vyg * dy);
-
-            /* BRAKE_DIST 内限速: 用位置误差生成可停住的速度上限, 避免接近目标时先急停再续走. */
             if ((CHASSIS_POS_BRAKE_DIST_M > 1e-6f) && (dist < CHASSIS_POS_BRAKE_DIST_M) && (norm > 1e-6f)) {
                 float brake_err = dist - CHASSIS_TARGET_REACHED_EPSILON_M;
                 float v_max_brake;
                 if (brake_err < 0.0f) brake_err = 0.0f;
-                /* NOTE: 这里用 pos_kp (全量) 而非内层块的 kp_eff (gain-scheduled),
-                 * 因为 kp_eff 在内层块作用域内不可见. 实际无影响: RECOVERY 区内 PD
-                 * 输出已被 gain scheduling 缩小, brake_cap 上限更宽松但不会更快. */
                 v_max_brake = sqrt_controller(brake_err,
                                               g_chassis_tune_params.pos_kp,
                                               g_chassis_tune_params.cmd_accel_limit_mps2);
-                /* P0-修复 2026-05-12 (拐点 5s 停留根因):
-                 * 末段最小速度地板. brake_err→0 时 v_max_brake→0 把车锁死在 EPSILON 边缘,
-                 * 4 麦轮 ≈0.011 m/s/轮 远低于静摩擦突破阈值. V_FLOOR 保证末段始终能推进. */
                 if (v_max_brake < CHASSIS_POS_BRAKE_FLOOR_MPS) {
                     v_max_brake = CHASSIS_POS_BRAKE_FLOOR_MPS;
                 }
@@ -1369,14 +1161,6 @@ void chassis_ctrl_task_20ms(void)
                 vxg *= recovery_scale;
                 vyg *= recovery_scale;
                 norm = CHASSIS_POS_RECOVERY_MAX_SPEED_MPS;
-            }
-
-            /* MIN_DRIVE: 防止低速卡死 (当前 v_drive_min=0 则跳过) */
-            if ((v_drive_min > 0.0f) && (norm < v_drive_min) && (v_align > 0.0f) && (dist > 1e-6f)) {
-                float sc = v_drive_min / (norm > 1e-6f ? norm : 1.0f);
-                vxg *= sc;
-                vyg *= sc;
-                norm = v_drive_min;
             }
         }
         if (norm > g_chassis_tune_params.max_linear_speed_mps && norm > 1e-6f) {
@@ -1423,26 +1207,13 @@ void chassis_ctrl_task_20ms(void)
         else
 #endif
         {
-            /* P0-修复 2026-05-12 (走斜线根因):
-             * 旧 yaw_pi(yerr, 0, 0) 关闭 rate PI -> 只用前馈 wz_target = sqrt_ctrl(yerr,KP),
-             * IMU 角速度反馈完全不闭环. yaw 漂 1°(死区内) 不纠, 漂 2° 时 wz=7°/s 推力
-             * 不足以拉回, 车持续偏 1~2° 走 -> vxg=1.2 m/s 投影出 vyg=21~42 mm/s 漂移
-             * -> 1m 路径累积 17~35mm Y 偏, CTE 上限 0.06 m/s 追不上 -> 走斜线.
-             *
-             * 修法 (ArduPilot AC_AttitudeControl + ROS Nav2 标准):
-             *   enable_rate_loop=1: 内环 PI 实时跟踪 wz_target - wz_imu, 快速拉回 yaw
-             *   in_pos_lock=0:      平动中不锁位, 避免 yerr≈0 时输出被锁死为 0
-             * I 项防振: leak=0.003 + I_LIMIT=120, 平动振动噪声会被 leak 平均. */
-            cmd.wz_dps = yaw_pi(yerr, 1U, 0U);
+            /* 平动期间用纯前馈 + 外环 sqrt_ctrl, 不开 rate-loop:
+             * IMU 振动噪声进 PI 会被 KP_v=0.15 放大成 ±1.5°/s wz 抖,
+             * 投影到麦轮 ≈4.6 mm/s 高频脉动, 表现为车身轻微颤抖.
+             * yaw 长期偏差由 axis_by_axis 的 yaw_snap + 起步对齐 + 保持轴 CTE 兜底.
+             * 静态保持时另一处仍用 rate PI + in-pos lock, 高精度. */
+            cmd.wz_dps = yaw_pi(yerr, 0U, 0U);
         }
-        break;
-    }
-
-    case MODE_MOVE_YAW: {
-        float yerr = chassis_normalize_angle_deg(s_tgt_yaw_deg - s_pose.yaw_deg);
-        cmd.vx_body_mps = s_cmd_vx;
-        cmd.vy_body_mps = s_cmd_vy;
-        cmd.wz_dps      = yaw_pi(yerr, 0U, 0U);  /* 完整级联PI + 禁in-pos锁(平动中不锁) */
         break;
     }
 
@@ -1451,26 +1222,17 @@ void chassis_ctrl_task_20ms(void)
         return;
     }
 
-    default: {  /* MODE_YAW_HOLD / MODE_ATT_DEBUG / rotate_to_deg */
+    default: {  /* MODE_YAW_HOLD / rotate_to_deg */
         float yerr = chassis_normalize_angle_deg(s_tgt_yaw_deg - s_pose.yaw_deg);
         cmd.vx_body_mps = 0.0f;
         cmd.vy_body_mps = 0.0f;
-        /*
-         * P0-修复 2026-05-02 (姿态环"一段一段"潜伏 bug):
-         * 旧代码这里传 compensate=1U, 启用 yaw_pi() 内的 YAW_MIN_WZ 阶跃补偿.
-         * 当前 CHASSIS_YAW_MIN_WZ_DPS=0 使其暂时无效, 但只要有人把它调大,
-         * wz 就会在零附近被一把抬到 ±YAW_MIN_WZ -> 麦轮目标阶跃 -> PWM 阶跃
-         * -> 车体段段抽搐. 新方案约定: 静摩擦统一由轮端 breakaway 前馈处理,
-         * yaw 输出全程保持连续, 不再做阶跃补偿. 与 MODE_MOVE_YAW 一致传 0U.
-         */
-        cmd.wz_dps = yaw_pi(yerr, 1U, 1U);  /* 静止保持: 允许 in-pos 锁消除极限环 */
+        /* 静止保持: 完整级联 PI + 允许 in-pos 锁消除极限环 */
+        cmd.wz_dps = yaw_pi(yerr, 1U, 1U);
 
         /* rotate_to_deg 到达判定: 误差进入容忍带且 in-pos 锁已触发 (车体稳定) */
-        if (s_rotate_active) {
-            if (s_yaw_in_position) {
-                s_arrived       = 1U;
-                s_rotate_active = 0U;
-            }
+        if (s_rotate_active && s_yaw_in_position) {
+            s_arrived       = 1U;
+            s_rotate_active = 0U;
         }
         break;
     }
@@ -1485,7 +1247,6 @@ void chassis_ctrl_task_20ms(void)
     }
 
     apply_speed(cmd, ws_pid);
-#endif
 }
 
 /* ==========================================================================
@@ -1591,17 +1352,6 @@ void chassis_ctrl_move_to_m(float x_m, float y_m, float hold_yaw_deg)
     __enable_irq();
 }
 
-void chassis_ctrl_set_move_yaw_cmd(float vx_body_mps, float vy_body_mps,
-                                   float target_yaw_deg)
-{
-    s_cmd_vx       = vx_body_mps;
-    s_cmd_vy       = vy_body_mps;
-    s_tgt_yaw_deg  = chassis_normalize_angle_deg(target_yaw_deg);
-
-    enter_mode(MODE_MOVE_YAW);
-    s_arrived = 1U;
-}
-
 void chassis_ctrl_hold_yaw(float target_yaw_deg)
 {
     s_tgt_yaw_deg = chassis_normalize_angle_deg(target_yaw_deg);
@@ -1615,14 +1365,6 @@ void chassis_ctrl_rotate_to_deg(float target_yaw_deg)
     enter_mode(MODE_YAW_HOLD);  /* 复用 YAW_HOLD: vx=vy=0, 只输出 wz */
     s_rotate_active = 1U;
     s_arrived       = 0U;
-}
-
-void chassis_ctrl_rotate_by_deg(float delta_yaw_deg)
-{
-    chassis_pose_t pose;
-
-    pose_read_snapshot(&pose);
-    chassis_ctrl_rotate_to_deg(pose.yaw_deg + delta_yaw_deg);
 }
 
 /* ==========================================================================
@@ -1639,10 +1381,7 @@ void chassis_ctrl_start_single_wheel_pid_debug(uint8 wheel_index,
     s_debug_wheel_index = safe_wheel;
     s_debug_wheel_target_mps = debug_target_speed_clamp(target_speed_mps);
     s_debug_fb_sign_mul[safe_wheel] = 1.0f;
-    s_debug_fb_sign_mismatch_cnt[safe_wheel] = 0U;
-    s_debug_fb_sign_flipped[safe_wheel] = 0U; /* 新一轮启动, 重置"已翻过"标记 */
     s_debug_target_ramp_mps = 0.0f;
-    s_debug_startup_guard_ticks = WHEEL_DEBUG_SIGN_FIX_GUARD_TICKS;
 
     force_stop();
     chassis_pid_debug_select_wheel((chassis_wheel_index_t)safe_wheel);
@@ -1692,13 +1431,6 @@ void chassis_ctrl_get_wheel_feedback_snapshot(float out_wheel_fb_mps[4])
 
 /*--- 航向调试 ---*/
 
-void chassis_ctrl_attitude_debug_start_zero(void)
-{
-    force_stop();
-    chassis_ctrl_hold_yaw(0.0f);
-    s_mode = MODE_ATT_DEBUG;  /* 覆盖 hold_yaw 设置的模式 */
-}
-
 void chassis_ctrl_attitude_debug_get_state(chassis_attitude_debug_info_t *out)
 {
     chassis_pose_t pose_snap;
@@ -1711,55 +1443,35 @@ void chassis_ctrl_attitude_debug_get_state(chassis_attitude_debug_info_t *out)
     out->wz_cmd_dps      = s_last_cmd.wz_dps;
 }
 
-/** 调试用: 拷贝四轮反馈 + PID 输出快照, 方便诊断方向/PWM */
-void chassis_ctrl_attitude_debug_get_wheel_pwm(float out_pwm[CHASSIS_WHEEL_COUNT])
-{
-    uint8 i;
-    if (!out_pwm) return;
-    for (i = 0U; i < (uint8)CHASSIS_WHEEL_COUNT; ++i)
-    {
-        out_pwm[i] = s_pid[i].output;   /* 前进符号域 PWM, 未乘 dir_sign */
-    }
-}
-
 void chassis_ctrl_attitude_debug_task_5ms(void)
 {
     static uint8 div = 0U;
-    chassis_attitude_debug_info_t info;
-    float pwm_snap[CHASSIS_WHEEL_COUNT];
+    chassis_pose_t pose_snap;
     float fb_snap[CHASSIS_WHEEL_COUNT];
+    uint8 i;
 
     /* 50ms 分频 (10 * 5ms tick): 比 100ms 更密, 上位机绘曲线更平滑 */
     if (++div < 10U) return;
     div = 0U;
 
-    chassis_ctrl_attitude_debug_get_state(&info);
-    chassis_ctrl_attitude_debug_get_wheel_pwm(pwm_snap);
-    chassis_ctrl_get_wheel_feedback_snapshot(fb_snap);
+    pose_read_snapshot(&pose_snap);
+    for (i = 0U; i < (uint8)CHASSIS_WHEEL_COUNT; ++i) {
+        fb_snap[i] = s_wheel_fb_lpf[i];
+    }
 
     /*
-     * VOFA+ FireWater 协议格式: 纯 ASCII, 通道用 ',' 分隔, 行尾 '\n', 无前缀。
-     * 通道顺序 (共 12 路, 在 VOFA+ 里按这个顺序绑变量名即可):
-     *   ch01 = target_yaw_deg          目标航向 (deg)
-     *   ch02 = current_yaw_deg         当前航向 (deg)
-     *   ch03 = yaw_err_deg             航向误差 (deg)
-     *   ch04 = wz_cmd_dps              角速度指令 (dps)
-     *   ch05 = pwm_LF (前进符号域, 未乘 dir_sign)
-     *   ch06 = pwm_RF
-     *   ch07 = pwm_LB
-     *   ch08 = pwm_RB
-     *   ch09 = fb_LF (m/s)
-     *   ch10 = fb_RF
-     *   ch11 = fb_LB
-     *   ch12 = fb_RB
+     * VOFA+ FireWater 协议格式 (12 通道):
+     *   ch01-04 = target/current/err/wz_cmd   (deg, deg, deg, dps)
+     *   ch05-08 = pwm LF/RF/LB/RB             (前进符号域, 未乘 dir_sign)
+     *   ch09-12 = fb  LF/RF/LB/RB             (m/s, LPF 后)
      */
     printf("%.4f,%.4f,%.4f,%.4f,%.2f,%.2f,%.2f,%.2f,%.4f,%.4f,%.4f,%.4f\n",
-           info.target_yaw_deg,
-           info.current_yaw_deg,
-           info.yaw_err_deg,
-           info.wz_cmd_dps,
-           pwm_snap[CHASSIS_WHEEL_LF], pwm_snap[CHASSIS_WHEEL_RF],
-           pwm_snap[CHASSIS_WHEEL_LB], pwm_snap[CHASSIS_WHEEL_RB],
+           s_tgt_yaw_deg,
+           pose_snap.yaw_deg,
+           chassis_normalize_angle_deg(s_tgt_yaw_deg - pose_snap.yaw_deg),
+           s_last_cmd.wz_dps,
+           s_pid[CHASSIS_WHEEL_LF].output, s_pid[CHASSIS_WHEEL_RF].output,
+           s_pid[CHASSIS_WHEEL_LB].output, s_pid[CHASSIS_WHEEL_RB].output,
            fb_snap[CHASSIS_WHEEL_LF], fb_snap[CHASSIS_WHEEL_RF],
            fb_snap[CHASSIS_WHEEL_LB], fb_snap[CHASSIS_WHEEL_RB]);
 }
@@ -1780,14 +1492,6 @@ chassis_pose_t chassis_ctrl_get_pose(void)
     /* P0-3: seq-lock 读, 防止主循环看到 (新yaw, 旧x, 旧y) 的撕裂 */
     chassis_pose_t c;
     pose_read_snapshot(&c);
-    return c;
-}
-
-chassis_body_speed_cmd_t chassis_ctrl_get_last_cmd(void)
-{
-    chassis_body_speed_cmd_t c = { s_last_cmd.vx_body_mps,
-                                   s_last_cmd.vy_body_mps,
-                                   s_last_cmd.wz_dps };
     return c;
 }
 

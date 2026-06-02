@@ -504,16 +504,6 @@
 #define CHASSIS_POS_D_LPF_ALPHA         (0.15f)
 
 /**
- * 位置环最小推进速度 (m/s) - P0-改进 2026-05-02 (终末段龟速爬):
- *   纯 P 在 dist 接近 epsilon 时输出极小 (dist=5cm, KP=0.9 -> v=0.045 m/s),
- *   分到四个麦轮后单轮速度逼近静摩擦门槛, 表现为"间歇前进、慢慢爬完最后几 cm".
- *   做法: 当 dist > epsilon 但 P 输出模长 < V_MIN 时, 把模长抬到 V_MIN,
- *   方向仍由 dx/dy 决定. 工程上取略高于轮端 BREAKAWAY 启动速度.
- *   设为 0 -> 关闭最小推进, 退化为纯 P.
- *   P0-调参 2026-05-08: 0.02 → 0.05, 确保末段能克服静摩擦. */
-#define CHASSIS_POS_MIN_DRIVE_SPEED_MPS  (0.0f)
-
-/**
  * 位置环 yaw 跟踪门距 (m) - P0-修复 2026-05-02 (atan2 噪声风暴):
  *   接近目标时 dx/dy 都很小, atan2(dy, dx) 对 odom 噪声极其敏感:
  *     dist=5cm, odom 噪声 1cm -> tgt_yaw 跳 ±10°
@@ -560,7 +550,9 @@
  * 取值 0.12 m/s: 分到 4 麦轮 = 0.03 m/s/轮 远 > BREAKAWAY_TARGET_EPS(0.01),
  * 前馈 ramp 系数 = 1.0 饱和, ff = 1200 PWM 足以启动;
  * 同时 0.12 m/s × 0.02s = 2.4mm/拍, 穿越 EPSILON(50mm) 后只多走 5mm 安全. */
-#define CHASSIS_POS_BRAKE_FLOOR_MPS      (0.15f)
+/* 0.15 → 0.05: 旧值制造 0.15→0 的速度阶跃, 让 brake_cap 在 EPSILON 边界突变;
+ * 0.05 与轮端静摩擦 ff 起步阈值同量级, 让 sqrt 减速曲线一路连续衰减. */
+#define CHASSIS_POS_BRAKE_FLOOR_MPS      (0.05f)
 
 /** 航向环 Kp：值越大，朝向对准越快；过大易振荡
  *  P0-调参 2026-04-29: 取消 YAW_MIN_WZ 阶跃后 wz 连续, 可适度提 KP 加快响应。
@@ -605,152 +597,36 @@
  *    - 整定:   KP_pos 只决定收敛形状, KP_v / KI_v 决定跟踪精度, 解耦清晰
  * ---------------------------------------------------------------------- */
 
-/** 1 = 启用级联 P-PI; 0 = 旧的单环 PID (回退用) */
-#define CHASSIS_YAW_USE_CASCADED_CTRL    (1)
+/* ----------------------------------------------------------------------
+ *  级联 P-PI 路径已成为唯一实现 (旧单环 PID #else 分支已删).
+ *  调参旋钮:
+ *    CHASSIS_YAW_RATE_KP / KI / I_LIMIT / I_LEAK
+ * ---------------------------------------------------------------------- */
 
 /** 内环 (rate loop) 比例增益: wz_err -> wz_correction
- *  小 (0.3~0.5): 弱跟踪, 主要靠前馈, 稳; 大 (1~2): 紧跟踪, 但易激出抖动.
- *  与外环解耦, 只决定"跟随快慢", 不影响轨迹形状. */
+ *  小 (0.3~0.5): 弱跟踪, 主要靠前馈, 稳; 大 (1~2): 紧跟踪, 但易激出抖动. */
 #define CHASSIS_YAW_RATE_KP             (0.150f)
 
-/** 内环积分增益: 全程累积, 自动学到摩擦/不平衡转矩
- *  这是治本"稳态偏差"的关键. 小 (0.5): I 学得慢, 残差残留时间长;
- *  大 (5+): 学得快但容易过冲. 1~3 工业典型. */
+/** 内环积分增益: 全程累积, 自动学到摩擦/不平衡转矩. */
 #define CHASSIS_YAW_RATE_KI             (0.70f)
 
-/** 内环积分上限 (°/s 量纲, 等价于"I 项最多能贡献多少 wz")
- *  设为 max_yaw 的 30~50% 合适, 太大易反向卷绕过冲 */
+/** 内环积分上限 (°/s 量纲): 设为 max_yaw 的 30~50% 合适, 太大易反向卷绕过冲 */
 #define CHASSIS_YAW_RATE_I_LIMIT        (120.0f)
 
-/** 内环积分泄漏率 (per 20ms): 0 = 不泄漏 (纯积分), 0.001~0.01 = 慢泄漏
- *  作用: 长期堵转时防止 I 永久挂账, 避免负载消失瞬间冲过头.
- *  0.005 等效时间常数 ~4s, 工程经验值. */
+/** 内环积分泄漏率 (per 20ms): 0 = 不泄漏 (纯积分), 0.001~0.01 = 慢泄漏.
+ *  作用: 长期堵转时防止 I 永久挂账, 避免负载消失瞬间冲过头. */
 #define CHASSIS_YAW_RATE_I_LEAK         (0.003f)
 
-/* ----------------------------------------------------------------------
- *  In-Position 滞回锁 (P0-改进 2026-05-02 收尾抖动):
- *  ----------------------------------------------------------------------
- *  问题: err 在死区内 (1.5°) 时, wz_target = KP·err = 3°/s 仍非零, 经轮端
- *        breakaway (PWM=1200 阶跃) 把车体一抖 -> IMU 看到反向 yaw_rate ->
- *        err 翻号 -> wz 翻号 -> 反向阶跃 -> 20Hz 极限环.
- *
- *  解法: 工业伺服 (Yaskawa PSEL / Mitsubishi INP / ArduPilot pos_hold) 通用做法:
- *        Schmitt-trigger 双阈值锁
- *          进入: |err| < IN_POS  AND  |wz_meas| < SETTLE_RATE  -> 锁死, wz=0, I 冻结
- *          释放: |err| > OUT_POS                               -> 解锁, 恢复 PI
- *        OUT_POS > IN_POS 提供滞回, 防 IMU 噪声 / 微动反复触发.
- *
- *  一旦"在位", 整条 sqrt->前馈->PI 全部硬归零, 断开 wz_target -> 轮端 breakaway
- *  的传染路径, 极限环消失.
- * ---------------------------------------------------------------------- */
+/* ----- In-Position 滞回锁 (双阈, 收尾抖动抑制) ---------------------------- */
 
 /** 进入"在位"阈值 (°): 误差必须小于此值才考虑锁死 */
 #define CHASSIS_YAW_INPOS_ENTER_DEG     (1.50f)
 
-/** 释放"在位"阈值 (°): 误差超过此值才解锁, 必须 > ENTER 才有滞回
- *  典型 1.5x ~ 2x ENTER, 太小没滞回意义, 太大跟踪精度变差 */
+/** 释放"在位"阈值 (°): 误差超过此值才解锁, 必须 > ENTER 才有滞回 */
 #define CHASSIS_YAW_INPOS_EXIT_DEG      (3.00f)
 
-/** "稳定"判据: 车体角速度低于此值才认为真停下来了 (°/s)
- *  设小: 难锁住; 设大: 正在转就被锁了, 影响动态精度 */
+/** "稳定"判据: 车体角速度低于此值才认为真停下来了 (°/s) */
 #define CHASSIS_YAW_INPOS_SETTLE_DPS    (25.00f)
-
-/* ----- 航向闭环 (yaw_pi) 其余参数：原本散落在 chassis_ctrl.c, 集中到此 ----- */
-
-/**
- * 航向误差死区（度）。
- * |err| <= 该值时 P/D 项依然计算 (输出连续), 仅接近 0 时 I 项衰减,
- * 用“软死区”避免 wz 阶跃 -> 保证姿态环输出连续。
- * 调大: 允许更大残差但更稳; 调小: 跟踪更紧但易抽搽。
- * (P0-修复 2026-04-29: 原者在死区内直接 return 0 造成 wz 阶跃,
- *  现仅用于控制 I 项衰减, 不再阶跃输出)
- *
- *  P0-回调 2026-05-02 (持续抖动): 1.0° 太紧, IMU 噪声 + 轮端微动直接把车推出
- *  死区, 反复触发 P/D, 表现为持续抖. 回到 2.0°. */
-#define CHASSIS_YAW_DEADZONE_DEG        (1.60f)
-
-/**
- * 航向 I 增益。
- * 用于消除稳态误差（如轮子对地摩擦不一致导致的偏角）。
- * 先把 KP 调到不振荡, 再缓慢加 KI；过大会反复过冲。
- */
-#define CHASSIS_YAW_KI                  (0.45f)
-/**
- * 航向 D 增益 (P0-新增 2026-04-29 抗超调).
- * D = -KD * yaw_rate_dps (derivative-on-measurement, 无 setpoint kick).
- * 物理意义: 阻尼项, 车体转得越快越要"踩刹车", 抑制冲过头.
- *
- * 调参顺序:
- *   1. 先把 KD=0, 调 KP 到刚好不振荡;
- *   2. 加 KD: 0.05 起步, 每次 +0.05;
- *   3. 太大: 高频抖动 / 听到电机嗡嗡响 -> 回退;
- *   4. 太小: 仍有 5%+ 超调 -> 继续加.
- * 经验范围: 0.05 ~ 0.50, 当前 0.10 适合中等惯量 (4 麦轮 + 摄像头云台).
- *
- * P0-修复 2026-05-02 (姿态环超调反弹/大角度振荡):
- *   原 KD=0 完全没有阻尼 -> 车体冲过零点无刹车 -> 反向超调 5~10°.
- *   开到 0.10 提供基础阻尼, 配合下面 I_BAND/I_LIMIT 收窄, 三件套一起改.
- *
- * P0-调参 2026-05-02 (中段"假停"现象):
- *   KD=0.10 在车体 yaw_rate=80°/s 时 d_term = -8°/s, 把 P=72°/s 抵一半,
- *   中段看起来“转不动". 降到 0.05 仍留 ≥1/4 阻尼, 超调 ≤3° 完全可接受.
- *
- * P0-回调 2026-05-02 (持续抖动):
- *   KD=0.01 等于没阻尼, sqrt_controller 高 KP 下小角度发散. 提到 0.08:
- *   yaw_rate=80°/s 时 d_term=-6.4°/s, 比 KP·err (2·5°=10°/s) 小, 中段不"假停";
- *   yaw_rate=10°/s 时 d_term=-0.8°/s, 终末段刚好压住小幅振荡. */
-#define CHASSIS_YAW_KD                  (0.10f)
-
-/**
- * 航向条件积分带宽 (°, P0-新增 2026-04-29 防积分饱和).
- * 仅当 |err| < 此值时才累积 I 项, 大误差阶段 I 上锁.
- * 这样大角度阶跃响应不会"先冲过头再回拉", 显著缩短调节时间.
- *
- * 取值: 通常 = 死区*2 ~ 期望稳态精度*5, 当前 5° 对应车体已转到接近目标
- * 才开始消除残差.
- *   - 调小: 稳态更准但中等误差残留时间变长;
- *   - 调大: 收敛更快但可能恢复轻度超调.
- *
- * P0-修复 2026-05-02 (姿态环大角度振荡):
- *   原 20° 太宽, 大误差阶段也在累 I -> 到达目标时 I 已严重饱和 -> 过冲反弹.
- *   收紧到 5°, 让 I 项只在收尾阶段消静差.
- */
-#define CHASSIS_YAW_I_BAND_DEG          (5.0f)
-/**
- * 航向积分项幅值上限（°·s）。
- * 防止长期堵转或大误差时积分饱和, 松开后冲过头。
- * 经验值: 30~120, 越保守越小。
- *
- * P0-修复 2026-05-02 (姿态卡角不动):
- *   原 120 + KI=0.05 -> i_term 可达 ±6°/s, 足以与 P 项对抗导致车卡角
- *   (P 项 0.8*err 在 err=20° 时也才 16°/s, 反向 I 抵掉后实际驱动很弱).
- *   收到 30°·s 即 i_term 上限 ±1.5°/s, 仅能消静差不再压住 P.
- *
- * P0-回调 2026-05-02 (持续抖动):
- *   200·KI=200·0.45=90°/s, 上一次回调被忘了同步, 这里也是抖动重要源.
- *   恢复 30, i_term 上限 ±13.5°/s, 足够消摩擦差异不会反过来推车抖.
- */
-#define CHASSIS_YAW_I_LIMIT             (30.0f)
-
-/**
- * 原地航向保持时的最小角速度补偿（°/s）。
- *
- * P0-重要修复 2026-04-29 (姿态闭环 jump-rotate):
- *   原设计用途: 补偿车轮静摩擦 -> err 出死区但 PI 输出还很小时
- *   强制拍个最小 wz, 让车子能动起来。
- *   问题: 该补偿是个阶跃函数 (wz 从真实 PI 值 一下跳到 ±10),
- *   导致轮端目标速度也阶跃, 与轮端 breakaway 状态机双重阶跃叠加
- *   -> PWM “一段一段”地给 -> 车体一跳一跳地转。
- *
- *   现改为 0 禁用: 静摩擦补偿交给轮端 breakaway 机制处理
- *   (见 chassis_config.h 同名节), 它按目标缩放 PWM + 迟滞防抖,
- *   不会造成 wz 阶跃。
- *
- * 什么时候考虑重启 (调回 ≥5):
- *   - 如果未来改拿位置环, 发现在某些场合 breakaway 不足, 车身微转
- *     仍起不来, 可适度调到 3~5°/s 作为堆叠保险。但一般不需要。
- */
-#define CHASSIS_YAW_MIN_WZ_DPS          (0.0f)
 
 /* ======================================================================
  *  轮速 PID 静摩擦前馈 (Stiction feed-forward)
@@ -780,11 +656,16 @@
  *      调到 0.020: wz ≥6°/s 即可让 ff 介入, 四轮齐步起步;
  *                  静止 target=0 仍然 ff=0; 死区刚出时 (target≈0.008) ff 仍为 0
  *                  不会引入微抖. */
-#define CHASSIS_WHEEL_BREAKAWAY_TARGET_EPS_MPS  (0.010f)
+#define CHASSIS_WHEEL_BREAKAWAY_TARGET_EPS_MPS  (0.030f)
 
 /** 静摩擦前馈: 饱和幅值 (PWM 原始单位, PWM_DUTY_MAX=10000)
  *  10% duty 是 4 麦轮整车的经验起转点; 别超 4000 (40%) 否则小目标过冲 */
-#define CHASSIS_WHEEL_BREAKAWAY_PWM_FLOOR       (1200.0f)
+#define CHASSIS_WHEEL_BREAKAWAY_PWM_FLOOR       (900.0f)
+
+/** 静摩擦前馈"反馈视为静止"门槛 (m/s):
+ *  仅当 target>EPS 且 |fb|<该值时才注入 ff, 一旦轮真正起转 ff=0 -> PID 自洽,
+ *  避免运动中 PID + ff 双重补偿带来的高频抖动. */
+#define CHASSIS_WHEEL_BREAKAWAY_FB_STATIC_EPS_MPS (0.05f)
 
 /* ======================================================================
  *  IMU 航向角积分参数
@@ -1058,33 +939,25 @@
 /** 轮速 PID 默认微分增益 Kd（作为各轮初值模板） */
 #define CHASSIS_WHEEL_PID_DEFAULT_KD    (1.0f)
 
-/** 左前轮初始 PID：Kp */
+/* 4 轮 PID 统一: 旧版 Ki 在 20~35 之间各异 + Kd=0,
+ * 4 轮阶跃响应不同步 -> 行进中持续轻微抖, 转弯时车体扭.
+ * 改成 Kp=40 / Ki=10 / Kd=1.5 (Kd≈Kp/27, 增量 PID 适度阻尼).
+ * 4 轮硬件差异应通过 ENC_SIGN/DIR_SIGN 标定, 不该让 PID 背锅. */
 #define CHASSIS_WHEEL_PID_LF_KP         (40.0f)
-/** 左前轮初始 PID：Ki */
-#define CHASSIS_WHEEL_PID_LF_KI         (35.0f)
-/** 左前轮初始 PID：Kd */
-#define CHASSIS_WHEEL_PID_LF_KD         (0.0f)
+#define CHASSIS_WHEEL_PID_LF_KI         (10.0f)
+#define CHASSIS_WHEEL_PID_LF_KD         (1.5f)
 
-/** 右前轮初始 PID：Kp */
 #define CHASSIS_WHEEL_PID_RF_KP         (40.0f)
-/** 右前轮初始 PID：Ki */
-#define CHASSIS_WHEEL_PID_RF_KI         (20.0f)
-/** 右前轮初始 PID：Kd */
-#define CHASSIS_WHEEL_PID_RF_KD         (0.0f)
+#define CHASSIS_WHEEL_PID_RF_KI         (10.0f)
+#define CHASSIS_WHEEL_PID_RF_KD         (1.5f)
 
-/** 左后轮初始 PID：Kp */
 #define CHASSIS_WHEEL_PID_LB_KP         (40.0f)
-/** 左后轮初始 PID：Ki */
-#define CHASSIS_WHEEL_PID_LB_KI         (25.0f)
-/** 左后轮初始 PID：Kd */
-#define CHASSIS_WHEEL_PID_LB_KD         (0.0f)
+#define CHASSIS_WHEEL_PID_LB_KI         (10.0f)
+#define CHASSIS_WHEEL_PID_LB_KD         (1.5f)
 
-/** 右后轮初始 PID：Kp */
 #define CHASSIS_WHEEL_PID_RB_KP         (40.0f)
-/** 右后轮初始 PID：Ki */
-#define CHASSIS_WHEEL_PID_RB_KI         (23.0f)
-/** 右后轮初始 PID：Kd */
-#define CHASSIS_WHEEL_PID_RB_KD         (0.0f)
+#define CHASSIS_WHEEL_PID_RB_KI         (10.0f)
+#define CHASSIS_WHEEL_PID_RB_KD         (1.5f)
 
 /** 兼容宏：保持旧名称可用 */
 #define CHASSIS_WHEEL_PID_KP            (CHASSIS_WHEEL_PID_DEFAULT_KP)

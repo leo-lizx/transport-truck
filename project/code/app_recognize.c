@@ -42,11 +42,19 @@
 /** 最少采样次数 — 不到这个数即使比例够也再等等 */
 #define RECOG_MIN_SAMPLES              (8U)
 
-/** 视觉端无识别 (class_id=0) 容忍上限: 累计达到则判此物体识别失败 */
-#define RECOG_MAX_NONE_SAMPLES         (40U)
+/** 视觉端无识别 (class_id=0) 容忍上限: B16 — 改为"连续 N 帧 None"判据.
+ *  视觉端 BOX_CLASS 帧约 50~100ms/帧, 连续 30 帧 ≈ 1.5~3s 持续无识别才失败.
+ *  允许偶发掉帧不影响整体识别. */
+#define RECOG_MAX_CONSEC_NONE          (30U)
 
 /** 5ms 周期 */
 #define RECOG_TICK_MS                  (5U)
+
+/** B3a: 单点 NAV (跑到观察点) 最长时长 — 5s @ 5ms tick */
+#define RECOG_NAV_TIMEOUT_TICKS        (1000U)
+
+/** B3a: 单点 FACE (旋转到位) 最长时长 — 3s */
+#define RECOG_FACE_TIMEOUT_TICKS       (600U)
 
 /** 单次 SAMPLE 阶段最大 tick 数 */
 #define RECOG_SAMPLE_MAX_TICKS         (RECOG_SAMPLE_WINDOW_MS / RECOG_TICK_MS)
@@ -82,11 +90,12 @@ static uint8             s_cur_idx      = 0U;     /* s_items 中当前处理项 
 /* 子阶段状态 */
 static uint8  s_nav_started     = 0U;
 static uint8  s_face_started    = 0U;
+static uint16 s_subphase_ticks  = 0U;     /* B3a: NAV/FACE 子阶段计时, enter_sub_* 时清零 */
 
 /* 多数票统计 */
 static uint16 s_sample_ticks    = 0U;
 static uint16 s_sample_total    = 0U;
-static uint16 s_sample_none     = 0U;
+static uint16 s_sample_consec_none = 0U;     /* B16: 连续 None 计数, 任一有效帧清零 */
 static uint16 s_class_hist[RECOG_CLASS_ID_MAX + 1U] = {0};
 static uint32 s_last_seen_frame_id = 0U;     /* 已采样过的最大 frame_id, 防重复计票 */
 
@@ -162,13 +171,18 @@ static uint8 find_observe_point(const uint8 map[MAP_ROWS][MAP_COLS],
  */
 static float recog_calc_face_yaw_deg(Point_t observe, Point_t target)
 {
-    float ox_m = chassis_grid_x_to_m((uint8)observe.x);
-    float oy_m = chassis_grid_y_to_m((uint8)observe.y);
+    /* B7: observe 不用格中心, 用底盘 odom 真实位姿 (车不一定停在格正中心,
+     * 5cm 偏差 + 14cm 邻接距离 → 格中心算的 yaw 最多偏 20°, 够把物体甩出视场). */
+    chassis_pose_t pose = chassis_ctrl_get_pose();
+    float ox_m = pose.x_m;
+    float oy_m = pose.y_m;
     float tx_m = chassis_grid_x_to_m((uint8)target.x);
     float ty_m = chassis_grid_y_to_m((uint8)target.y);
     float dx   = tx_m - ox_m;
     float dy   = ty_m - oy_m;
     float yaw_rad;
+
+    (void)observe;     /* 仅供调试观测保留, 不再参与计算 */
 
     /* 退化情形: 重合 (理论上不会发生, 观察点必与物体相邻); 留前向 0° 兜底 */
     if ((dx == 0.0f) && (dy == 0.0f))
@@ -187,7 +201,7 @@ static void sample_state_reset(void)
 {
     s_sample_ticks       = 0U;
     s_sample_total       = 0U;
-    s_sample_none        = 0U;
+    s_sample_consec_none = 0U;
     s_last_seen_frame_id = 0U;
     memset(s_class_hist, 0, sizeof(s_class_hist));
 }
@@ -210,29 +224,31 @@ static int16 sample_majority_step(uint8 expect_kind)
     {
         s_last_seen_frame_id = snap.frame_id;
 
-        /* 物体类型不匹配 (主控想看 BOX, 视觉端却给 TARGET) → 当作无识别 */
+        /* B11: 物体类型不匹配 (主控想看 BOX, 视觉端却给 TARGET): 静默忽略,
+         * 不计入 None 也不计入 total. 否则相邻 box/target 会把 None 拉满判失败. */
         if (snap.obj_kind != expect_kind)
         {
-            s_sample_none++;
+            /* skip — 既不计 None 也不计 total */
         }
         else if (snap.class_id == 0U)
         {
-            s_sample_none++;
+            s_sample_consec_none++;            /* B16: 连续 None */
         }
         else if (snap.class_id <= (uint8)RECOG_CLASS_ID_MAX)
         {
             s_class_hist[snap.class_id]++;
             s_sample_total++;
+            s_sample_consec_none = 0U;          /* B16: 收到有效帧 → 清零 */
         }
         else
         {
-            /* 越界视为无识别 */
-            s_sample_none++;
+            /* 越界视为 None */
+            s_sample_consec_none++;
         }
     }
 
-    /* 视觉端持续无识别 → 失败 */
-    if (s_sample_none >= (uint16)RECOG_MAX_NONE_SAMPLES)
+    /* B16: 视觉端连续无识别 → 失败 (允许偶发掉帧) */
+    if (s_sample_consec_none >= (uint16)RECOG_MAX_CONSEC_NONE)
     {
         return -1;
     }
@@ -606,12 +622,14 @@ static void enter_sub_nav(void)
     s_sub_state    = RECOG_SUB_NAV;
     s_nav_started  = 0U;
     s_face_started = 0U;
+    s_subphase_ticks = 0U;        /* B3a: 进入新子阶段, watchdog 清零 */
 }
 
 static void enter_sub_face(void)
 {
     s_sub_state    = RECOG_SUB_FACE;
     s_face_started = 0U;
+    s_subphase_ticks = 0U;        /* B3a */
 }
 
 static void enter_sub_sample(void)
@@ -638,6 +656,7 @@ void App_Recognize_Reset(void)
     s_cur_idx      = 0U;
     s_nav_started  = 0U;
     s_face_started = 0U;
+    s_subphase_ticks = 0U;        /* B3a */
     sample_state_reset();
     memset(s_items, 0, sizeof(s_items));
 }
@@ -695,10 +714,19 @@ AppRecognizeStatus_e App_Recognize_Tick(const uint8 map[MAP_ROWS][MAP_COLS],
         case RECOG_SUB_NAV:
         {
             Point_t obs = s_items[s_cur_idx].observe;
+            s_subphase_ticks++;            /* B3a: NAV 超时计时 */
             if (!s_nav_started)
             {
                 HAL_CHASSIS_MOVE_TO((uint8)obs.x, (uint8)obs.y);
                 s_nav_started = 1U;
+                return APP_RECOG_RUNNING;
+            }
+            /* B3a: 5s 仍跑不到 → 跳过此物体, 留给排除法 (地图保证可解) */
+            if (s_subphase_ticks > RECOG_NAV_TIMEOUT_TICKS)
+            {
+                s_items[s_cur_idx].visited = 1U;
+                s_items[s_cur_idx].ok      = 0U;
+                enter_sub_next();
                 return APP_RECOG_RUNNING;
             }
             if (!chassis_ctrl_is_arrived())
@@ -711,12 +739,19 @@ AppRecognizeStatus_e App_Recognize_Tick(const uint8 map[MAP_ROWS][MAP_COLS],
 
         case RECOG_SUB_FACE:
         {
+            s_subphase_ticks++;            /* B3a: FACE 超时计时 */
             if (!s_face_started)
             {
                 float yaw_target = recog_calc_face_yaw_deg(s_items[s_cur_idx].observe,
                                                            s_items[s_cur_idx].pos);
                 chassis_ctrl_rotate_to_deg(yaw_target);
                 s_face_started = 1U;
+                return APP_RECOG_RUNNING;
+            }
+            /* B3a: 3s 仍转不到位 → 直接进 SAMPLE 试试 (车头偏一点视觉也可能识别) */
+            if (s_subphase_ticks > RECOG_FACE_TIMEOUT_TICKS)
+            {
+                enter_sub_sample();
                 return APP_RECOG_RUNNING;
             }
             if (!chassis_ctrl_is_arrived())

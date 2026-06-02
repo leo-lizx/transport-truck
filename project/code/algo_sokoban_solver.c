@@ -1,4 +1,5 @@
 #include "algo_sokoban_solver.h"
+#include "chassis_config.h"
 #include <string.h>
 #include <stdlib.h>     /* abs() */
 
@@ -774,10 +775,11 @@ uint8 Sokoban_Find_Bomb_Wall(const uint8 map[MAP_ROWS][MAP_COLS],
                 blocked_len = tmp_path.step_count;
             }
 
-            /* 收益评分：可达目标数主导，兼顾清墙数量与路径代价 */
-            score = (int32)reachable_targets * 1000
+            /* B13: 评分 — 优先解锁不可达目标 (×200), 其次清墙数 (×20),
+             *       同时强惩罚长路径 (二次项防止权重 1000 压制路径项) */
+            score = (int32)reachable_targets * 200
                   + (int32)cleared_walls * 20
-                  - (int32)blocked_len;
+                  - ((int32)blocked_len * (int32)blocked_len) / 50;
 
             if (!found || score > best_score) {
                 best_score = score;

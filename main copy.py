@@ -760,6 +760,13 @@ def classify_cell(img, x, y, img_w, img_h, grid_x, grid_y):
 # ----------------------------------------------------------------------
 # 3. 核心逻辑主循环 (图像识别 -> 位置锁定 -> 打包发送)
 # ----------------------------------------------------------------------
+# 【画面稳定控制】只有当画面真正变化（车移动/地图改变）时才刷新显示，
+# 避免屏幕持续闪烁。稳定帧中只做轻量采样，不绘制调试覆盖层。
+prev_map_str = ""                       # 上一帧的地图字符串，用于变化检测
+stable_frame_count = 0                  # 连续稳定帧计数
+needs_redraw = True                     # 当前帧是否需要绘制调试覆盖层
+REFRESH_EVERY_N_STABLE = 30             # 即使稳定，每 N 帧强制刷新一次（约 0.5 秒）
+
 while(True):
     clock.tick()                       # 开始计算帧处理时间
     img = sensor.snapshot()            # 捕获当前摄像头图像
@@ -783,8 +790,9 @@ while(True):
                 char = classify_cell(img, tx, ty, img_w, img_h, x_idx, y_idx)
                 map_list.append(char)
 
-                # 在可视化缓冲区画出实心白点，用于调试对位情况
-                img.draw_circle(tx, ty, 2, color=(255, 255, 255), fill=True)
+                # 仅在画面有变化时才绘制采样白点，避免屏幕持续刷新闪烁
+                if needs_redraw:
+                    img.draw_circle(tx, ty, 2, color=(255, 255, 255), fill=True)
             else:
                 map_list.append("?")   # 若采样出界，记为问号补位
 
@@ -848,7 +856,7 @@ while(True):
             car_y = ROWS - 1
         car_found = True
 
-    if CALIB_SHOW_CORNERS:
+    if CALIB_SHOW_CORNERS and needs_redraw:
         tl_pt, tr_pt, bl_pt, br_pt = draw_calibration_overlay(img, img_w, img_h)
 
     # 记录 last_pos，供下一帧 ROI 锁定搜索使用。
@@ -857,6 +865,27 @@ while(True):
 
     # 输出阶段统一为单一@，并与投票后的发送坐标严格一致。
     map_list_out = build_map_with_single_car(map_list, car_found, car_x, car_y)
+
+    # --- 画面变化检测：比对当前地图与上一帧，仅变化时才刷新显示 ---
+    current_map_str = "".join(map_list_out)
+    map_changed = (current_map_str != prev_map_str)
+
+    if map_changed:
+        # 仅当不是首次捕获（prev 非空）时，才安排下一帧重绘；
+        # 首次已在 needs_redraw=True 时绘制过，无需重复。
+        if prev_map_str != "":
+            needs_redraw = True      # 真实变化 → 下一帧重绘覆盖层
+        else:
+            needs_redraw = False     # 首次地图已绘制，后续等真实变化再刷新
+        prev_map_str = current_map_str
+        stable_frame_count = 0
+    else:
+        stable_frame_count += 1
+        if stable_frame_count >= REFRESH_EVERY_N_STABLE:
+            needs_redraw = True      # 长时间稳定后强制刷新一次
+            stable_frame_count = 0
+        else:
+            needs_redraw = False     # 跳过下一帧的覆盖层绘制
 
     # --- 阶段 B：数据打包与发送 (194 字节完整协议帧) ---
     # 包内容：192个字节的赛道字符 + 1个字节的车辆坐标X + 1个字节的车辆坐标Y
@@ -875,10 +904,10 @@ while(True):
     # 定时维护通讯心跳包
     send_heartbeat_if_due()
 
-    # --- 阶段 C：调试信息交互 (每 2 帧稳定更新一次打印) ---
-    if frame_cnt % 2 == 0:
+    # --- 阶段 C：调试信息交互 (仅在地图变化时刷新，避免终端闪烁) ---
+    if map_changed or (stable_frame_count == 0 and needs_redraw):
         print("\033[H", end="")        # 终端光标归零（清屏效果）
-        print("系统帧率: %0.1f | 小车实时坐标: (%d, %d)" % (clock.fps(), car_x, car_y))
+        print("系统帧率: %0.1f | 小车实时坐标: (%d, %d) | 帧号: %d" % (clock.fps(), car_x, car_y, frame_cnt))
         if CALIB_SHOW_CORNERS and tl_pt is not None:
             print("TL=%s TR=%s BL=%s BR=%s" % (tl_pt, tr_pt, bl_pt, br_pt))
         # 打印 ASCII 预览图，检查视觉逻辑是否与实际场地一致

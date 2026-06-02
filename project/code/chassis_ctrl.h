@@ -15,7 +15,7 @@
  *     5ms PIT 中断:  chassis_ctrl_task_5ms()
  *     20ms PIT 中断: chassis_ctrl_task_20ms()
  *     业务层:        chassis_ctrl_move_to_grid(x, y)
- *                    chassis_ctrl_set_move_yaw_cmd(vx, vy, yaw)
+ *                    chassis_ctrl_hold_yaw(yaw)
  *                    while (!chassis_ctrl_is_arrived()) { ... }
  *
  *   内部控制流程（20ms 周期内依次执行）：
@@ -129,15 +129,6 @@ void chassis_ctrl_move_to_grid(uint8 target_x_grid, uint8 target_y_grid);
 void chassis_ctrl_move_to_m(float x_m, float y_m, float hold_yaw_deg);
 
 /**
- * @brief  下发“移动 + 航向”指令（车体系速度 + 航向闭环目标角）
- *         该模式下不走点位导航，直接按速度指令运动，同时执行航向闭环。
- * @param  vx_body_mps     车体系 X 方向速度（m/s，向右为正）
- * @param  vy_body_mps     车体系 Y 方向速度（m/s，向前为正）
- * @param  target_yaw_deg  目标航向角（度）
- */
-void chassis_ctrl_set_move_yaw_cmd(float vx_body_mps, float vy_body_mps, float target_yaw_deg);
-
-/**
  * @brief  切换到航向保持模式：停止位置移动，仅保持指定航向角
  * @param  target_yaw_deg  目标航向角（度）
  */
@@ -150,13 +141,6 @@ void chassis_ctrl_hold_yaw(float target_yaw_deg);
  * @param  target_yaw_deg  目标航向角（度，[-180, +180]）
  */
 void chassis_ctrl_rotate_to_deg(float target_yaw_deg);
-
-/**
- * @brief  以当前航向为基准原地相对旋转指定角度（不改变 x/y 坐标）
- *         旋转完成后 chassis_ctrl_is_arrived() 返回 1.
- * @param  delta_yaw_deg  相对旋转角度（度，正值逆时针/按当前 yaw 正方向）
- */
-void chassis_ctrl_rotate_by_deg(float delta_yaw_deg);
 
 /**
  * @brief  启动单轮 PID 调试模式
@@ -187,26 +171,14 @@ void chassis_ctrl_stop_single_wheel_pid_debug(void);
 void chassis_ctrl_get_wheel_feedback_snapshot(float out_wheel_fb_mps[4]);
 
 /**
- * @brief  进入航向调试模式：固定 0 度航向保持，停止平移
- *         推荐在 main 初始化完成后调用一次。
- */
-void chassis_ctrl_attitude_debug_start_zero(void);
-
-/**
  * @brief  读取航向闭环调试信息（线程安全的结构体拷贝）
  * @param  out_info  输出信息结构体指针，传空则忽略
  */
 void chassis_ctrl_attitude_debug_get_state(chassis_attitude_debug_info_t *out_info);
 
 /**
- * @brief  读取四轮 PID 输出快照 (前进符号域, 未乘 dir_sign)
- * @param  out_pwm  长度 4 的输出数组, 顺序: LF / RF / LB / RB
- */
-void chassis_ctrl_attitude_debug_get_wheel_pwm(float out_pwm[4]);
-
-/**
  * @brief  航向闭环调试任务（建议主循环每 5ms 调用一次）
- *         内部 100ms 打印一次目标角/当前角/误差/角速度指令。
+ *         内部 50ms 打印 12 通道 (yaw 跟踪 + 4 轮 PWM + 4 轮反馈).
  */
 void chassis_ctrl_attitude_debug_task_5ms(void);
 
@@ -221,12 +193,6 @@ uint8 chassis_ctrl_is_arrived(void);
  * @return 当前位姿 {x_m, y_m, yaw_deg}
  */
 chassis_pose_t chassis_ctrl_get_pose(void);
-
-/**
- * @brief  获取最近一次输出的车体速度指令（调试用）
- * @return 车体速度指令
- */
-chassis_body_speed_cmd_t chassis_ctrl_get_last_cmd(void);
 
 /**
  * @brief  里程计车体速度投影到全局坐标系（m/s），用于视觉延迟补偿。

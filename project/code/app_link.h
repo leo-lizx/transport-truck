@@ -176,6 +176,19 @@ uint32 app_link_get_ms(void);
 void app_link_get_map_snapshot(uint8 dst[APP_LINK_MAP_ROWS][APP_LINK_MAP_COLS]);
 
 /*-------------------------------------------------------------------------------------------------------------------
+ * 函数: app_link_inject_static_map
+ * 功能: 将静态地图（编译期或本地构造）注入协议层的权威地图副本，使菜单在无串口链路时也能渲染地图色块。
+ *       典型场景: SOKO_SELFTEST / HARDCODED_MAP 等模式需要在屏幕上观察地图但不需要 OpenART 发帧。
+ * 参数: map —— 12×16 单元格枚举值数组 (MAP_EMPTY/WALL/TARGET/BOX/BOMB)
+ * 返回: 无
+ * 备注:
+ *   1. 内部使用与 commit_map_frame 相同的 seq-lock 写入路径，读者（菜单/业务层）无需额外同步。
+ *   2. 写入后自动置 g_link_last_map_ms 为当前时基，使菜单判定地图"新鲜"并触发色块渲染。
+ *   3. 此后调用方需在主循环中定期刷新 g_link_last_map_ms = app_link_get_ms()，否则 500ms 后菜单判定过期。
+ *-----------------------------------------------------------------------------------------------------------------*/
+void app_link_inject_static_map(const uint8 map[APP_LINK_MAP_ROWS][APP_LINK_MAP_COLS]);
+
+/*-------------------------------------------------------------------------------------------------------------------
  * 函数: app_link_get_car_snapshot
  * 功能: seq-lock 读出最近一次有效的 MAP 车辆格坐标 + 时间戳 + 帧号，避免与 ISR 写入撕裂
  * 参数: out —— 输出；可为 NULL（直接忽略）

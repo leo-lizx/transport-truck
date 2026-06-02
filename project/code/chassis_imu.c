@@ -211,11 +211,8 @@ static uint8 still_detect_step(float raw_dps, float *out_mean, float *out_var)
     return (var < CHASSIS_IMU_STILL_VAR_TH_DPS2) ? 1U : 0U;
 }
 
-/** 调试用: 读取最近一次静止判别结果 (1=静止) */
-uint8 chassis_imu_is_still(void)
-{
-    return s_imu_is_still;
-}
+/* chassis_imu_is_still() 已删除: 无外部调用者. s_imu_is_still 仍由 update_5ms
+ * 内部更新, 保留以便 GDB / Live Watch 观察. */
 
 /* ==========================================================================
  *  § 4. 初始化与静态零偏标定 (启动期唯一调用一次)

@@ -51,6 +51,49 @@ static GameFailureReason_e s_failure_reason     = GAME_FAIL_NONE;
 static uint8               s_wait_start_phase   = 0U;
 static LaunchZone_e        s_default_launch_zone = LAUNCH_ZONE_LEFT;
 
+/* ----- 【B1+B12】地图快照冻结标志 ----------------------------------
+ * s_map_freeze: 1 = 主循环入口不再 app_link_get_map_snapshot 覆盖 g_game_map
+ * 触发场景:
+ *   1) 炸弹爆炸后 (主控直接 Sokoban_Apply_Bomb_Explosion 修改地图,
+ *      视觉端不一定能在 1 帧内同步, 防止陈旧帧覆盖)
+ *   2) RECOGNIZE_MAP 识别 tour 期间 (s_items[] 已按当时地图缓存,
+ *      期间地图变更会导致访问错误格)
+ * 清除场景:
+ *   1) STAGE_WAIT_START 入口 (新一关或复位, 兜底)
+ *   2) STAGE_DONE 入口 (比赛结束)
+ *   3) RECOGNIZE_MAP 结束 (DONE_OK / DONE_NO_NEED / FAIL 都清除)
+ *   4) DEADLOCK_RESET 完成 (重新开始, 视觉权威)
+ * 注意: 设置后视觉端发的所有更新会被忽略, 直到清除.
+ * --------------------------------------------------------------- */
+static uint8               s_map_freeze         = 0U;
+
+/* ----- 【B3b】航点执行 watchdog ------------------------------------
+ * 单航点最长允许执行时长 = 5s @ 5ms/tick = 1000 tick.
+ * 超时后先重发一次 MOVE_TO; 第二次仍超时切 STAGE_DEADLOCK_RESET.
+ * --------------------------------------------------------------- */
+#define WAYPOINT_TIMEOUT_TICKS         (1000U)
+static uint16              s_wp_timeout_ticks   = 0U;
+static uint8               s_wp_retry_count     = 0U;
+
+/* ----- 【B8】WAIT_START phase 0 自动复位超时 -----------------------
+ * 10s 仍到不了发车区 → 跳过自动复位进 phase 1, 让操作员手动放车.
+ * --------------------------------------------------------------- */
+#define WAIT_START_PHASE0_TIMEOUT_TICKS  (2000U)
+static uint16              s_wait_phase0_ticks  = 0U;
+
+/* ----- 自动发车横移 (贴墙摆位 → 单轴驶出发车区) --------------------
+ * 摆位约定: 左发车区车左侧贴左墙黄线 / 右发车区车右侧贴右墙黄线.
+ * phase 1 由被动"等人推车"改为主动朝场内横移, 横移到位/几何判定
+ * "完全离开发车区"即停, 进入识别. 全程锁 yaw, 仅单轴 X 平移.
+ *   LAUNCH_EXIT_MARGIN_M       : 目标点超出"完全离开"阈值的余量
+ *   LAUNCH_DRIVE_TIMEOUT_TICKS : 4s @5ms 横移超时兜底 → 转 DEADLOCK_RESET
+ * --------------------------------------------------------------- */
+#define LAUNCH_EXIT_MARGIN_M         (0.02f)
+#define LAUNCH_DRIVE_TIMEOUT_TICKS   (800U)
+static uint8               s_launch_drive_issued = 0U;
+static uint16              s_launch_drive_ticks  = 0U;
+static uint8               s_launch_retry_count  = 0U;
+
 static SokoFullSolution_t    g_soko_solution;
 static SokoWaypointPath_t    g_soko_waypoints;
 static uint8                 g_soko_sub_idx = 0;
@@ -84,6 +127,12 @@ static void reset_exec_context(void)
     g_bomb_wp_idx = 0;
     g_exec_mode = EXEC_NONE;
     is_navigating = 0;
+    s_wp_timeout_ticks = 0U;        /* B3b: 航点 watchdog 计数清零 */
+    s_wp_retry_count   = 0U;
+    s_wait_phase0_ticks = 0U;       /* Issue A: WAIT_START phase 0 计时跨入口清零 */
+    s_launch_drive_issued = 0U;     /* 自动发车横移: 跨入口清零 */
+    s_launch_drive_ticks  = 0U;
+    s_launch_retry_count  = 0U;
 }
 
 static void goto_stage(GameStage_e next)
@@ -158,8 +207,26 @@ static Point_t choose_nearest_target(Point_t ref)
 static void sync_player_pos(void)
 {
     chassis_pose_t pose = chassis_ctrl_get_pose();
-    g_player_pos.x = (int8)chassis_m_to_grid_x(pose.x_m);
-    g_player_pos.y = (int8)chassis_m_to_grid_y(pose.y_m);
+    /* B10: 跨格滞回 — 防 odom 噪声让 g_player_pos 在两格间反复跳动.
+     * 仅当米坐标距当前格中心 > 70% 步长时才允许跨格. */
+    int8 nx = (int8)chassis_m_to_grid_x(pose.x_m);
+    int8 ny = (int8)chassis_m_to_grid_y(pose.y_m);
+    if (nx != g_player_pos.x) {
+        float center_x = chassis_grid_x_to_m((uint8)g_player_pos.x);
+        float dx_abs = pose.x_m - center_x;
+        if (dx_abs < 0.0f) dx_abs = -dx_abs;
+        if (dx_abs > 0.70f * CHASSIS_GRID_STEP_X_M) {
+            g_player_pos.x = nx;
+        }
+    }
+    if (ny != g_player_pos.y) {
+        float center_y = chassis_grid_y_to_m((uint8)g_player_pos.y);
+        float dy_abs = pose.y_m - center_y;
+        if (dy_abs < 0.0f) dy_abs = -dy_abs;
+        if (dy_abs > 0.70f * CHASSIS_GRID_STEP_Y_M) {
+            g_player_pos.y = ny;
+        }
+    }
 }
 
 /*
@@ -218,13 +285,37 @@ static uint8 exec_waypoints_common(const SokoWaypointPath_t *wp, uint16 *wp_idx)
         if (*wp_idx < wp->count) {
             HAL_CHASSIS_MOVE_TO(wp->points[*wp_idx].x, wp->points[*wp_idx].y);
             is_navigating = 1;
+            s_wp_timeout_ticks = 0U;        /* B3b: 派发新航点, watchdog 重置 */
         }
         return 0;
     }
 
-    if (!chassis_nav_arrived_for_waypoint()) return 0;
+    /* B3b: 航点 watchdog — 超时 5s 先重发, 再超时切 DEADLOCK_RESET */
+    s_wp_timeout_ticks++;
+    if (!chassis_nav_arrived_for_waypoint()) {
+        if (s_wp_timeout_ticks > WAYPOINT_TIMEOUT_TICKS) {
+            if (s_wp_retry_count == 0U) {
+                /* 第 1 次超时: 刹停后重发同一航点 (可能是 Snap 表决卡住) */
+                ++s_wp_retry_count;
+                chassis_ctrl_stop();
+                is_navigating = 0U;
+                s_wp_timeout_ticks = 0U;
+                return 0;
+            }
+            /* 第 2 次仍超时 → 进入死局复位流程 */
+            s_wp_retry_count   = 0U;
+            s_wp_timeout_ticks = 0U;
+            chassis_ctrl_stop();
+            is_navigating = 0U;
+            goto_stage(STAGE_DEADLOCK_RESET);
+            return 0;
+        }
+        return 0;
+    }
 
     is_navigating = 0;
+    s_wp_retry_count   = 0U;       /* 到位 → watchdog 全部清零 */
+    s_wp_timeout_ticks = 0U;
     (*wp_idx)++;
 
     if (*wp_idx < wp->count) {
@@ -247,7 +338,7 @@ static uint8 exec_push_box_solution(void)
         Sokoban_Actions_To_Waypoints(
             g_soko_solution.sub_solutions[g_soko_sub_idx].actions,
             g_soko_solution.sub_solutions[g_soko_sub_idx].count,
-            g_soko_solution.player_end_pos[g_soko_sub_idx - 1],
+            g_player_pos,                              /* B5: 用实时格而非 BFS 预测格 */
             &g_soko_waypoints);
         g_soko_wp_idx = 0;
         is_navigating = 0;
@@ -320,7 +411,12 @@ static uint8 build_push_box_plan(void)
         return 1;
     }
 
-    if (map_has_bomb()) {
+    /* B2: 第 1 关 = 任意箱→任意目标 (Stage1 贪心)
+     * 第 2 关 = 必须按数字配对 (Stage2, 用 g_box_to_target[])
+     * 第 3 关 = 含炸弹 (Stage2 + 炸弹辅助)
+     * 判据用 g_current_level 而非 map_has_bomb(): 第 2 关无炸弹也必须按映射配对.
+     */
+    if (g_current_level >= 2U) {
         if (!Sokoban_Solve_Stage2(g_game_map, g_player_pos,
                                   g_box_to_target,
                                   box_count,
@@ -361,32 +457,110 @@ static uint8 should_enter_next_level(void)
  *                       / DEADLOCK_RESET / DONE / PAUSE_ON_LINK_LOSS
  * ========================================================================== */
 
+/**
+ * 计算自动发车横移的目标车体中心 X (米).
+ *   左发车区: 朝右(+X)移到 "发车区右沿 + R + 余量", 刚好让外接圆脱离矩形.
+ *   右发车区: 朝左(-X)移到 "发车区左沿 - R - 余量", 镜像对称.
+ * 实际停车以 chassis_zone_is_fully_outside_launch() 几何判定为准 (与车宽无关),
+ * 此目标点只是给位置环一个"够远"的单轴终点.
+ */
+static float launch_drive_target_x_m(LaunchZone_e zone)
+{
+    float margin = CHASSIS_BODY_RADIUS_M + LAUNCH_EXIT_MARGIN_M;
+    if (zone == LAUNCH_ZONE_RIGHT) {
+        /* 右发车区左沿 = W - 发车区宽; 目标在其左侧 margin 处 ≈ 2.705m */
+        return (CHASSIS_MAP_WIDTH_M - CHASSIS_LAUNCH_ZONE_W_M) - margin;
+    }
+    /* 左发车区右沿 = 发车区宽; 目标在其右侧 margin 处 ≈ 0.495m */
+    return CHASSIS_LAUNCH_ZONE_W_M + margin;
+}
+
 static void stage_wait_start_handler(void)
 {
-    /* 【P0-8】WAIT_START 两段式:
+    /* 【P0-8 + 自动发车】WAIT_START 两段式:
      *   phase 0: 主控主动 MOVE_TO 起点 (车被人放偏时复位到发车区中心)
-     *   phase 1: 等待车被 "完全离开发车区" → 视为发车成功 → 进入 RECOGNIZE_MAP
-     * 与赛规一致: "完全离开发车区" 即视为发车成功 (规则提炼.md §3 要点 1)
+     *   phase 1: 朝场内单轴横移, 自动驶出发车区 → 进入 RECOGNIZE_MAP
+     *
+     * 摆位约定 (规则提炼 + 用户确认):
+     *   左发车区: 车左侧贴发车区左侧黄线 (x=0 墙线), 发车向右 (+X)
+     *   右发车区: 车右侧贴发车区右侧黄线 (x=W 墙线), 发车向左 (-X)
+     * 由 s_default_launch_zone 决定方向, 逻辑左右对称.
+     *
+     * B1+B12: 进入 WAIT_START 总是解冻地图 (兜底), 防上一关地图冻结状态残留.
      */
+    s_map_freeze = 0U;
+
     if (s_wait_start_phase == 0U) {
+        s_wait_phase0_ticks++;          /* B8: phase 0 超时计时 */
         if (!is_navigating) {
-            HAL_CHASSIS_MOVE_TO(CHASSIS_START_GRID_X, CHASSIS_START_GRID_Y);
+            /* 起点按发车区对称: 左区→首列(贴左墙), 右区→末列(贴右墙) */
+            uint8 start_gx = (s_default_launch_zone == LAUNCH_ZONE_RIGHT)
+                           ? (uint8)CHASSIS_GRID_INNER_MAX_X
+                           : (uint8)CHASSIS_START_GRID_X;
+            HAL_CHASSIS_MOVE_TO(start_gx, CHASSIS_START_GRID_Y);
             is_navigating = 1;
+            return;
+        }
+        /* B8: 10s 仍到不了 → 跳过自动复位, 让操作员手动放车 */
+        if (s_wait_phase0_ticks > WAIT_START_PHASE0_TIMEOUT_TICKS) {
+            chassis_ctrl_stop();
+            is_navigating = 0;
+            s_wait_phase0_ticks = 0U;
+            s_launch_drive_issued = 0U;
+            s_launch_drive_ticks  = 0U;
+            s_wait_start_phase  = 1U;
             return;
         }
         if (!chassis_nav_arrived_for_waypoint()) return;
 
         is_navigating = 0;
-        s_wait_start_phase = 1U;
+        s_wait_phase0_ticks = 0U;
+        s_launch_drive_issued = 0U;
+        s_launch_drive_ticks  = 0U;
+        s_wait_start_phase  = 1U;
         return;
     }
 
-    /* phase 1: 持续判定是否已 "完全离开发车区" */
+    /* phase 1: 自动横移驶出发车区 (主动发车) */
+
+    /* 已完全离开发车区 → 发车成功, 进入识别 */
     if (chassis_zone_is_fully_outside_launch(s_default_launch_zone)) {
+        chassis_ctrl_stop();
+        s_launch_drive_issued = 0U;
+        s_launch_drive_ticks  = 0U;
         s_wait_start_phase = 0U;     /* 重置子相位, 供后续 LEVEL_JUDGE 复用 */
+        s_map_freeze = 1U;           /* B12: 进 RECOGNIZE 前锁定地图, 防 s_items[] 错位 */
+        memset(g_box_to_target, 0, sizeof(g_box_to_target));   /* Issue C: 清陈旧映射 */
         reset_exec_context();
         App_Recognize_Reset();       /* 进入 RECOGNIZE 前清识别 tour 状态 */
         goto_stage(STAGE_RECOGNIZE_MAP);
+        return;
+    }
+
+    /* 首次进入: 朝场内下发一次单轴横移目标 (锁当前 yaw, Y 不动) */
+    if (!s_launch_drive_issued) {
+        chassis_pose_t pose = chassis_ctrl_get_pose();
+        chassis_ctrl_move_to_m(launch_drive_target_x_m(s_default_launch_zone),
+                               pose.y_m, pose.yaw_deg);
+        s_launch_drive_issued = 1U;
+        s_launch_drive_ticks  = 0U;
+        return;
+    }
+
+    /* 横移超时兜底: 重发一次; 仍超时则转死局复位 (避免卡死) */
+    s_launch_drive_ticks++;
+    if (s_launch_drive_ticks >= LAUNCH_DRIVE_TIMEOUT_TICKS) {
+        chassis_ctrl_stop();
+        s_launch_drive_issued = 0U;
+        s_launch_drive_ticks  = 0U;
+        if (s_launch_retry_count == 0U) {
+            s_launch_retry_count = 1U;   /* 允许重发一次 */
+        } else {
+            s_launch_retry_count = 0U;
+            s_wait_start_phase = 0U;
+            reset_exec_context();
+            goto_stage(STAGE_DEADLOCK_RESET);
+        }
     }
 }
 
@@ -409,11 +583,13 @@ static void stage_recognize_handler(void)
             return;
         case APP_RECOG_DONE_OK:
         case APP_RECOG_DONE_NO_NEED:
+            s_map_freeze = 0U;             /* B12: 识别结束, 解冻地图 */
             reset_exec_context();
             goto_stage(STAGE_PLAN_PATH);
             return;
         case APP_RECOG_FAIL:
         default:
+            s_map_freeze = 0U;             /* B12: 识别失败也解冻 */
             reset_exec_context();
             goto_stage(STAGE_DEADLOCK_RESET);
             return;
@@ -475,7 +651,14 @@ static void stage_execute_handler(void)
         done = exec_waypoints_common(&g_bomb_waypoints, &g_bomb_wp_idx);
         if (done) {
             Sokoban_Apply_Bomb_Explosion(g_game_map, g_bomb_wall_pos);
-            g_game_map[g_bomb_pos.y][g_bomb_pos.x] = MAP_EMPTY;
+            g_game_map[g_bomb_pos.y][g_bomb_pos.x]           = MAP_EMPTY;   /* 炸弹本体消失 */
+            /* Issue D: 显式清 wall_pos —— Apply_Bomb_Explosion 仅处理 WALL,
+             * 若视觉端在推炸弹过程中把 wall_pos 改写成 BOMB(被推到位时), 上面只清 WALL→EMPTY,
+             * BOMB 残留, 必须再补一次. 幂等. */
+            g_game_map[g_bomb_wall_pos.y][g_bomb_wall_pos.x] = MAP_EMPTY;
+            /* B1: 主控本地权威, 锁定地图; 直到本关结束(WAIT_START / DONE / DEADLOCK_RESET) 才解冻.
+             * 视觉端不一定在 1 帧内同步爆炸结果, 防 g_game_map 被陈旧帧覆盖. */
+            s_map_freeze = 1U;
             reset_exec_context();
             goto_stage(STAGE_PLAN_PATH);
             return;
@@ -535,6 +718,7 @@ static void stage_deadlock_reset_handler(void)
 
     reset_exec_context();
     s_wait_start_phase = 0U;     /* 重置 WAIT_START 子相位, 下一关重新走 "复位→等离开" */
+    s_map_freeze = 0U;           /* B12: DEADLOCK 复位 → 解冻地图, 视觉端权威 */
     App_Recognize_Reset();       /* 死局重置后重新跑识别 tour */
     goto_stage(STAGE_WAIT_START);
 }
@@ -542,6 +726,7 @@ static void stage_deadlock_reset_handler(void)
 static void stage_done_handler(void)
 {
     /* 比赛流程完成，维持静止即可。 */
+    s_map_freeze = 0U;           /* B12: 比赛结束 → 解冻地图 */
 }
 
 /* ==================================================================
@@ -575,6 +760,15 @@ uint8 Game_Link_Is_Alive(void)
 GameFailureReason_e Game_Get_Failure_Reason(void)
 {
     return s_failure_reason;
+}
+
+/* ==================================================================
+ * 【B17】对外查询: 识别 tour 进度 (转发自 App_Recognize_Get_Debug)
+ * 用途: 菜单 / IPS / 上位机显示当前识别到第几个物体, 多数票占比等.
+ * ================================================================== */
+void Game_Get_Recognize_Debug(AppRecognizeDebug_t *out)
+{
+    App_Recognize_Get_Debug(out);
 }
 
 /*
@@ -639,7 +833,15 @@ static void update_link_state(void)
             s_link_alive = 1U;
             if (current_stage == STAGE_PAUSE_ON_LINK_LOSS) {
                 /* 安全策略: 链路恢复后强制重新识别地图, 避免基于陈旧地图直接执行  */
-                current_stage = STAGE_RECOGNIZE_MAP;
+                /* B4: 恢复瞬间显式刹停 + 清 is_navigating, 防 5ms 窗口车按旧目标继续滑行 */
+                chassis_ctrl_stop();
+                is_navigating  = 0U;
+                /* Issue B: 与 stage_wait_start_handler→RECOGNIZE 路径保持一致,
+                 * 进 RECOGNIZE 期间冻结地图, 防 s_items[] 与新快照错位 */
+                s_map_freeze   = 1U;
+                /* Issue C: 清陈旧映射, 准备让 RECOGNIZE 重新写入 */
+                memset(g_box_to_target, 0, sizeof(g_box_to_target));
+                current_stage  = STAGE_RECOGNIZE_MAP;
                 App_Recognize_Reset();          /* 链路恢复后重新跑一遍识别 tour */
                 /* s_stage_resume 已不再使用, 但保留供调试观察 */
                 (void)s_stage_resume;
@@ -669,8 +871,11 @@ void Game_Logic_Task_Run(void)
 
     /* P0-3: 链路在线时刷新 g_game_map 私有快照 (seq-lock 拷贝).
      *       链路 LOSS 期间冻结上次快照, 配合 P0-2 恢复策略 (强制 RECOGNIZE_MAP) 自洽.
-     *       上电首帧到达前 s_link_alive=0, g_game_map 维持 BSS 0 = MAP_EMPTY, 业务侧无副作用. */
-    if (s_link_alive)
+     *       上电首帧到达前 s_link_alive=0, g_game_map 维持 BSS 0 = MAP_EMPTY, 业务侧无副作用.
+     *
+     * B1+B12: s_map_freeze=1 时 (识别 tour / 炸弹爆炸后) 跳过拷贝, 由主控本地权威.
+     */
+    if (s_link_alive && !s_map_freeze)
     {
         app_link_get_map_snapshot(g_game_map);
     }

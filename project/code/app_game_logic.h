@@ -113,4 +113,12 @@ typedef enum {
 
 GameFailureReason_e Game_Get_Failure_Reason(void);
 
+/* ==================================================================
+ * 【B17】识别 tour 进度查询接口 (转发自 App_Recognize_Get_Debug)
+ *   用途: 菜单 / IPS / 上位机显示当前识别到第几个物体、多数票占比等.
+ *   线程安全: 与 App_Recognize_Tick 同线程(主循环), 直接读 BSS 即可.
+ * ================================================================== */
+#include "app_recognize.h"
+void Game_Get_Recognize_Debug(AppRecognizeDebug_t *out);
+
 #endif

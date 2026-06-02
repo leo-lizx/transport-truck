@@ -360,6 +360,35 @@ void app_link_get_map_snapshot(uint8 dst[APP_LINK_MAP_ROWS][APP_LINK_MAP_COLS])
     ++g_link_map_snapshot_retry_giveup;     /* 8 次仍未成功, 计数报警   */
 }
 
+/*-------------------------------------------------------------------------------------------------------------------
+ * 函数: app_link_inject_static_map
+ * 功能: 将本地构造的地图（如自测硬编码地图）以 seq-lock 路径写入权威副本，
+ *       并置 g_link_last_map_ms 使菜单判定地图"新鲜"。
+ * 备注:
+ *   1. 时序上必须在 app_link_init() 之后调用，否则 ms 时基未就绪。
+ *   2. 主循环须周期性调用 `g_link_last_map_ms = app_link_get_ms()` 续命，
+ *      因为菜单 render_100ms 内检查 (now - g_link_last_map_ms) <= 500ms。
+ *-----------------------------------------------------------------------------------------------------------------*/
+void app_link_inject_static_map(const uint8 map[APP_LINK_MAP_ROWS][APP_LINK_MAP_COLS])
+{
+    uint32 r, c;
+
+    /* 用当前 ms 时基标记地图落点时刻，让菜单 freshness 检查通过 */
+    g_link_last_map_ms = s_ms_now;
+
+    s_map_seq++;
+    __DMB();
+    for (r = 0U; r < (uint32)APP_LINK_MAP_ROWS; ++r)
+    {
+        for (c = 0U; c < (uint32)APP_LINK_MAP_COLS; ++c)
+        {
+            s_map_authoritative[r][c] = map[r][c];
+        }
+    }
+    __DMB();
+    s_map_seq++;
+}
+
 /*===================================================================================================================
  * 帧分发
  *=================================================================================================================*/
