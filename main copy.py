@@ -24,7 +24,7 @@ sensor.skip_frames(time = 2000)        # 让感光元件稳定
 # 【关键物理防御】：锁定感光参数，拒绝环境光干扰
 sensor.set_auto_gain(False)            # 关闭自动增益，防止暗处噪点放大
 sensor.set_auto_whitebal(False)        # 关闭白平衡，防止色温漂移导致“认错颜色”
-sensor.set_auto_exposure(False, exposure_us=8000) # 手动锁定曝光时间(8ms)
+sensor.set_auto_exposure(False, exposure_us=900) # 手动锁定曝光时间(8ms)
                                        # 注意：如果场地极亮可调小至6000，极暗调大至12000
                                        # 这能大幅抑制 PVC 场地的反光亮斑
 
@@ -94,9 +94,9 @@ ROWS, COLS = 12, 16
 
 # 场地四角外侧格子的中心点坐标（需根据实际场地微调）
 GRID_CORNERS = {
-    "tl": (36.5, 35.0),  # 左上
-    "tr": (283.0, 28.5), # 右上
-    "bl": (47.0, 221.8), # 左下
+    "tl": (36.5, 35.5),  # 左上
+    "tr": (282.6, 28.5), # 右上
+    "bl": (45.0, 223.0), # 左下
     "br": (280.8, 220.5),# 右下
 }
 
@@ -166,19 +166,19 @@ def vote_car_position(found, x, y):
 # ----------------------------------------------------------------------
 # ！！这部分 RGB 值依然需要你在比赛现场根据实际光照进行重新采样修改！！
 CAR_HEAD_DARK_RGB = (25, 152, 0)      # 车头（H）
-CAR_HEAD_BRIGHT_RGB = (74, 225, 239)  
+CAR_HEAD_BRIGHT_RGB = (74, 225, 239)
 CAR_TAIL_DARK_RGB = (0, 152, 195)     # 车尾（T）
-CAR_TAIL_BRIGHT_RGB = (107, 255, 33)   
+CAR_TAIL_BRIGHT_RGB = (107, 255, 33)
 WALL_DARK_RGB = (50, 85, 125)         # 墙壁（#）
-WALL_BRIGHT_RGB = (107, 170, 255)     
+WALL_BRIGHT_RGB = (107, 170, 255)
 FLOOR_DARK_RGB = (33, 12, 255)        # 空地（-）
-FLOOR_BRIGHT_RGB = (49, 97, 255)      
+FLOOR_BRIGHT_RGB = (49, 97, 255)
 GOAL_DARK_RGB = (173, 0, 255)         # 终点（.）
-GOAL_BRIGHT_RGB = (255, 32, 255)      
+GOAL_BRIGHT_RGB = (255, 32, 255)
 BOX_DARK_RGB = (99, 138, 0)           # 箱子（$）
-BOX_BRIGHT_RGB = (247, 255, 66)       
+BOX_BRIGHT_RGB = (247, 255, 66)
 BOMB_DARK_RGB = (181, 28, 58)         # 炸弹（*）
-BOMB_BRIGHT_RGB = (255, 40, 82)       
+BOMB_BRIGHT_RGB = (255, 40, 82)
 
 SYMBOL_MAP_RGB = {
     "#": (WALL_DARK_RGB, WALL_BRIGHT_RGB),
@@ -231,26 +231,26 @@ def find_best_symbol_by_mode(l_mode, a_mode, b_mode):
             tl, ta, tb = target
             # 计算加权欧氏距离（L降权处理）
             dist = math.sqrt(0.2 * (l_mode - tl)**2 + (a_mode - ta)**2 + (b_mode - tb)**2)
-            
+
             if dist < min_dist:
                 min_dist = dist
                 best_sym = sym
-                
+
     # 距离阈值保护：如果算出来的色彩偏差极大，说明可能采样到赛道外部的桌子或背景了，算作空地
-    if min_dist > 60: 
+    if min_dist > 60:
         return "-"
-        
+
     return best_sym
 
 def classify_cell(img, x, y, img_w, img_h):
     """
     【算力解放入口】：
-    摒弃极度消耗 CPU 的 Python 双层遍历循环。直接使用 C 底层的 img.get_statistics() 
+    摒弃极度消耗 CPU 的 Python 双层遍历循环。直接使用 C 底层的 img.get_statistics()
     瞬间提取 11x11 像素框内的所有色彩数据，并直接取出现频率最高的“众数 (mode)”。
     天然无视高光亮点和噪点！
     """
     radius = 5  # 采样半径 5 = 11x11 范围 (共 121 个像素点一起统计)
-    
+
     # 严格的边界防护，防止图像框画到屏幕外面导致死机报错
     x_min = max(0, int(x - radius))
     y_min = max(0, int(y - radius))
@@ -264,7 +264,7 @@ def classify_cell(img, x, y, img_w, img_h):
 
     # 极速底层 API 调用
     stats = img.get_statistics(roi=(x_min, y_min, w, h))
-    
+
     # 获取众数（该区域最主流的色彩），有效过滤掉个别反光白点
     l_mode = stats.l_mode()
     a_mode = stats.a_mode()
@@ -319,7 +319,7 @@ while(True):
     clock.tick()
     img = sensor.snapshot()
     frame_cnt += 1
-    
+
     img_w, img_h = img.width(), img.height()
     map_list = []
     car_x, car_y = 0, 0
@@ -382,7 +382,7 @@ while(True):
         print("FPS: %0.1f | 小车坐标: (%d, %d)" % (clock.fps(), car_x, car_y))
         if CALIB_SHOW_CORNERS and tl_pt is not None:
             print("基准: TL=%s TR=%s BL=%s BR=%s" % (tl_pt, tr_pt, bl_pt, br_pt))
-        
+
         # 打印字符地图阵列
         for r in range(ROWS):
             print("".join(map_list_out[r*COLS : (r+1)*COLS]))
