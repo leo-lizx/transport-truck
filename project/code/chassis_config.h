@@ -456,7 +456,7 @@
 
 /** 积分输出上限比例: i_limit = max_linear_speed × 该值.
  *  原 0.5 (贡献一半速度), 降低以抑制积分过冲 → 震荡. */
-#define CHASSIS_POS_I_LIMIT_RATIO       (0.07f)
+#define CHASSIS_POS_I_LIMIT_RATIO       (0.12f)
 
 /** 条件积分带宽比例: i_band = brake_dist × 该值 (只在减速区内累积积分).
  *  原 0.8, 缩小以推迟积分介入, 近端才发力, 避免远距离积分卷绕 → 震荡. */
