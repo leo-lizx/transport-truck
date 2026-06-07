@@ -36,19 +36,21 @@
  * ====================================================================== */
 
 /** 航向响应快慢: 越大越快, 过大可能轻微摆动 */
-#define CHASSIS_YAW_KP                  (3.50f)
+#define CHASSIS_YAW_KP                  (4.20f)
 
-/** 角速度 P-only 阻尼: 越大越稳, 过大可能发闷 */
-#define CHASSIS_YAW_RATE_KP             (0.150f)
+/** 角速度 P-only 阻尼: 越大越稳, 过大可能发闷.
+ * P0-调 2026-06-07: 0.05 几乎没阻尼, yaw 来回摆 → 车一直抖.
+ * 提到 0.25 加 5 倍阻尼, 抑制 yaw 震荡. */
+#define CHASSIS_YAW_RATE_KP             (0.25f)
 
 /** 最大旋转速度 (°/s): 限制原地转向和导航修正的最高角速度 */
-#define CHASSIS_MAX_YAW_SPEED_DPS       (150.0f)
+#define CHASSIS_MAX_YAW_SPEED_DPS       (170.0f)
 
 /** 角速度加减速限制 (°/s²): 同时用于 yaw sqrt 曲线和下游 ramp */
 #define CHASSIS_CMD_ACCEL_LIMIT_DPS2    (720.0f)
 
 /** 进入在位锁的角度阈值 (°): 越小锁得越准, 越大越不抖 */
-#define CHASSIS_YAW_INPOS_ENTER_DEG     (1.50f)
+#define CHASSIS_YAW_INPOS_ENTER_DEG     (0.50f)
 
 /* ======================================================================
  *  数学常量
@@ -137,7 +139,7 @@
  *   dist = sqrt(dx² + dy²) <= EPSILON 立即置 s_arrived=1.
  * 不再叠加速度稳定帧 / dwell 等待 / yaw 条件, 避免车已在误差范围内但上层迟迟不切点.
  */
-#define CHASSIS_TARGET_REACHED_EPSILON_M  (0.05f)
+#define CHASSIS_TARGET_REACHED_EPSILON_M  (0.015f)
 
 /**
  * 到位后的 Schmitt 滞后释放阈值（米）.
@@ -168,8 +170,10 @@
  *   1.5° 太宽: vxg=1.2 m/s 投影出 vyg = 1.2*sin(1.5°) = 31 mm/s,
  *   1m 走行累积 26mm 偏移, CTE 保持环上限 0.06 m/s 追不上 -> 走斜线.
  *   收到 0.5°: vyg 言上限 10 mm/s, 1m 仅 8mm 偏, CTE 可轻松修复.
- *   超出容忍带后由 yaw sqrt_ctrl + P-only 阻尼实时拉回. */
-#define CHASSIS_YAW_GOAL_TOLERANCE_DEG    (0.50f)
+ *   超出容忍带后由 yaw sqrt_ctrl + P-only 阻尼实时拉回.
+ * P0-修复 2026-06-07: 0.5°→0.2°. 0.5°下每米漂 8.7mm, 与保持轴 1cm 死区
+ *   叠加形成盲区 → 小 yaw 偏差无人管 → 车走不直. 0.2°每米仅漂 3.5mm. */
+#define CHASSIS_YAW_GOAL_TOLERANCE_DEG    (0.3f)
 
 /* ======================================================================
  *  OpenART 视觉位姿融合（事件驱动 Snap 为主，连续融合为辅）
@@ -347,7 +351,7 @@
  * 静止判据: 车体平移速度模长门槛 (m/s).
  * 取 0.03 m/s: 小于 BFS 起步速度, 大于 5ms 差分量化噪声 (~0.005 m/s).
  */
-#define CHASSIS_STATIC_SPEED_EPS_MPS    (0.03f)
+#define CHASSIS_STATIC_SPEED_EPS_MPS    (0.07f)
 
 /**
  * 静止持续时长门槛 (毫秒). 规则: 发车区静止 3s = 重置.
@@ -369,7 +373,7 @@
  *   1.20 m/s 时单轮峰值电流超 TB6612 过流阈值 → 驱动器关断 → 轮停.
  *   麦轮斜走单轮最坏 = 1.20×√2≈1.70 m/s, 冲击更大.
  *   0.70 m/s: d_stop=0.70²/(2×2.10)=0.117m, BRAKE_DIST=0.25m ✓ 有裕量. */
-#define CHASSIS_MAX_LINEAR_SPEED_MPS    (0.70f)
+#define CHASSIS_MAX_LINEAR_SPEED_MPS    (0.50f)
 
 /* CHASSIS_MAX_YAW_SPEED_DPS 已移到文件顶部“用户常调参数区”。 */
 
@@ -393,7 +397,7 @@
  * 取值: 当前 MAX_LINEAR=1.35 + MAX_YAW=90dps 上游限住单轮最坏 ≈1.65 m/s,
  * 兑底设 16 m/s 留 ~10 倍裕量, 平时不触发, 仅在多指令叠加暴冲时生效。
  */
-#define CHASSIS_WHEEL_SPEED_CAP_MPS     (16.0f)
+#define CHASSIS_WHEEL_SPEED_CAP_MPS     (1.0f)
 
 /** 在线调参时允许的线速度上限硬限制（m/s） */
 #define CHASSIS_TUNE_MAX_LINEAR_SPEED_LIMIT_MPS  (3.50f)
@@ -414,12 +418,12 @@
  * 只有 2.7cm 内是线性段, 稍远就切 sqrt 段大速度, 车高速冲入 EPSILON
  * 后 brake_cap 来不及刹停, 穿越后反弹. 恢复 4.5 使 linear_dist≈0.15m,
  * 近场仍保持 P 线性响应, 配合 BRAKE_DIST=0.25 可以平滑停车. */
-#define CHASSIS_POS_KP                  (4.6f)
+#define CHASSIS_POS_KP                  (8.0f)
 
 /** 位置环沿程方向积分增益 (m/s per m·s).
  * 消除静摩擦/坡面等引起的稳态位置残差.
  * 建议从 0 开始调, 每次 +0.05; 过大时车到位后缓慢漂移/越界. 设 0 即关闭. */
-#define CHASSIS_POS_KI                  (0.05f)
+#define CHASSIS_POS_KI                  (0.1f)
 
 /* ----------------------------------------------------------------------
  *  位置环自动推导 / 内部固定常量 (用户一般无需修改)
@@ -440,32 +444,44 @@
  *    brake_floor     = BRAKE_FLOOR  (克服静摩擦的末段最小速度)
  * ---------------------------------------------------------------------- */
 
-/** 主轴速度阻尼比例: kd_eff = pos_kp × 该值. 麦轮临界阻尼经验值 ≈ KP/3. */
-#define CHASSIS_POS_KD_RATIO            (0.333f)
+/** 主轴速度阻尼比例: kd_eff = pos_kp × 该值. 原 0.30, 提高以增强刹车阻尼,
+ *  配合更高的 KI 使用, 防止积分推力导致过冲震荡. 0.50 约 2/3 临界阻尼. */
+#define CHASSIS_POS_KD_RATIO            (0.30f)
 
 /** 保持轴 (非驱动轴) 阻尼比例: kd_hold = pos_kp × 该值. 保持轴限速很低, 取轻阻尼. */
-#define CHASSIS_POS_HOLD_KD_RATIO       (0.15f)
+#define CHASSIS_POS_HOLD_KD_RATIO       (2.0f)
 
 /** brake_dist 安全裕量 (m): brake_dist = d_stop + EPSILON + 该值. */
 #define CHASSIS_POS_BRAKE_MARGIN_M      (0.03f)
 
-/** 积分输出上限比例: i_limit = max_linear_speed × 该值 (积分最多贡献一半速度). */
-#define CHASSIS_POS_I_LIMIT_RATIO       (0.5f)
+/** 积分输出上限比例: i_limit = max_linear_speed × 该值.
+ *  原 0.5 (贡献一半速度), 降低以抑制积分过冲 → 震荡. */
+#define CHASSIS_POS_I_LIMIT_RATIO       (0.07f)
 
-/** 条件积分带宽比例: i_band = brake_dist × 该值 (只在减速区内累积积分). */
-#define CHASSIS_POS_I_BAND_RATIO        (0.7f)
+/** 条件积分带宽比例: i_band = brake_dist × 该值 (只在减速区内累积积分).
+ *  原 0.8, 缩小以推迟积分介入, 近端才发力, 避免远距离积分卷绕 → 震荡. */
+#define CHASSIS_POS_I_BAND_RATIO        (0.5f)
 
 /** 切轴门限比例: switch_tol = EPSILON × 该值 (切轴精度略严于到位精度). */
 #define CHASSIS_POS_AXIS_SWITCH_RATIO   (0.6f)
 
 /** 非驱动轴保持速度上限比例: hold_max_speed = max_linear_speed × 该值. */
-#define CHASSIS_POS_HOLD_SPEED_RATIO    (0.23f)
+#define CHASSIS_POS_HOLD_SPEED_RATIO    (0.25f)
+
+/**
+ * 保持轴死区 (m): |hold_error| ≤ 该值时保持轴不输出修正力.
+ * 1cm 足以滤除编码器量化噪声 (~2~5mm) 和 odom 积分短时抖动,
+ * 同时远小于 EPSILON=8cm, 不会让保持轴长期漂移累积.
+ * P0-修复 2026-06-07: 原保持轴无死区, 编码器噪声被 sqrt_controller
+ * 放大成 0.06~0.12 m/s 的修正脉冲 → Y 方向持续微幅震荡.
+ */
+#define CHASSIS_POS_HOLD_DEAD_ZONE_M     (0.005f)
 
 /**
  * D 项低通滤波系数 α (一阶 IIR, Tesla/Waymo 标准做法).
  * y = (1-α)*y_prev + α*x, 截止频率 ≈ α/(2π·dt).
  * 0.15 @ dt=20ms -> 截止 ≈ 1.2Hz, 衰减 odom 高频噪声, 对所有麦轮底盘通用. */
-#define CHASSIS_POS_D_LPF_ALPHA         (0.15f)
+#define CHASSIS_POS_D_LPF_ALPHA         (0.10f)
 
 /**
  * brake_cap 末段最小有效速度 (m/s).
@@ -507,24 +523,90 @@
  *  调参: 落地起步迟 -> FLOOR +200; 起步过冲 -> FLOOR -200。
  * ====================================================================== */
 
-/** 静摩擦前馈: 触发阈值 (m/s), 同时用作 smooth_ramp 分母
- *  P0-修复 2026-05-02 (小角度旋转四轮"一个一个动"):
- *      原 0.050: 轮端 target<0.05 时 ff=0, 而 wz 需 ≥15°/s 才能让轮 target 出阈,
- *      也就是 yaw 误差 <12.5° 时四轮没有静摩擦补偿, 各轮各靠 PID 慢慢爬,
- *      谁先克服自己的静摩擦谁先动 -> "一个一个动".
- *      调到 0.020: wz ≥6°/s 即可让 ff 介入, 四轮齐步起步;
- *                  静止 target=0 仍然 ff=0; 死区刚出时 (target≈0.008) ff 仍为 0
- *                  不会引入微抖. */
-#define CHASSIS_WHEEL_BREAKAWAY_TARGET_EPS_MPS  (0.030f)
+/* ======================================================================
+ *  静摩擦前馈 (Breakaway feed-forward) — 每轮独立可配
+ *
+ *  原问题: 增量式 PID 启动瞬间 output=0, 落地后 4 麦轮整车静摩擦动辄
+ *  1500+ PWM, PID 要爬好几秒才能动起来. 且四轮电机/减速箱/轮胎磨损不同,
+ *  静摩擦差异可达 ±30%, 全局统一 FLOOR 无法兼顾"弱轮起不来"和"强轮过冲".
+ *
+ *  实现 (apply_speed): 每轮独立查 g_chassis_tune_params 中的值
+ *      if |target| > target_eps[i] && |fb| < fb_static_eps[i]:
+ *          pwm += sign(target) * pwm_floor[i]
+ *
+ *  每轮 3 个调参旋钮:
+ *      TARGET_EPS_MPS   — 触发阈值 (m/s), 同时用作 smooth_ramp 分母
+ *      PWM_FLOOR        — 饱和幅值 (PWM_DUTY_MAX=10000)
+ *      FB_STATIC_EPS_MPS — "反馈视为静止"门槛 (m/s), 超过此值撤 ff
+ *
+ *  调参口诀:
+ *      该轮起步迟 / 不动  -> 加大该轮 FLOOR
+ *      该轮起步猛冲 / 过冲 -> 减小该轮 FLOOR
+ *      该轮起步一抖一抖    -> 加大该轮 FB_STATIC_EPS (让 ff 保持更久)
+ *      该轮小目标也冲      -> 降低该轮 TARGET_EPS (更晚触发 ff)
+ * ====================================================================== */
+
+/* ---- 默认值 (作为各轮初值模板, 也供旧代码兼容引用) ---- */
+
+/** 静摩擦前馈: 触发阈值 (m/s)
+ *  P0-修复 2026-05-02: 原 0.050 太高 -> 小角度旋转四轮"一个一个动".
+ *  0.008 -> wz>=2.5dps 即可触发 ff, 四轮齐步起步. */
+#define CHASSIS_WHEEL_BREAKAWAY_DEFAULT_TARGET_EPS_MPS     (0.08f)
 
 /** 静摩擦前馈: 饱和幅值 (PWM 原始单位, PWM_DUTY_MAX=10000)
  *  10% duty 是 4 麦轮整车的经验起转点; 别超 4000 (40%) 否则小目标过冲 */
-#define CHASSIS_WHEEL_BREAKAWAY_PWM_FLOOR       (900.0f)
+#define CHASSIS_WHEEL_BREAKAWAY_DEFAULT_PWM_FLOOR          (1000.0f)
 
 /** 静摩擦前馈"反馈视为静止"门槛 (m/s):
- *  仅当 target>EPS 且 |fb|<该值时才注入 ff, 一旦轮真正起转 ff=0 -> PID 自洽,
- *  避免运动中 PID + ff 双重补偿带来的高频抖动. */
-#define CHASSIS_WHEEL_BREAKAWAY_FB_STATIC_EPS_MPS (0.05f)
+ *  仅当 target>EPS 且 |fb|<该值时才注入 ff, 一旦轮真正起转 ff=0 交给 PID.
+ *  设大 -> ff 保持更久 -> 起步更果断但可能过冲;
+ *  设小 -> ff 撤得快 -> 可能一抖一抖 (ff 反复开关). */
+#define CHASSIS_WHEEL_BREAKAWAY_DEFAULT_FB_STATIC_EPS_MPS  (2.80f)
+
+/* ---- 左前轮 LF (Wheel 0) ---- */
+/* P0-修复 2026-06-07: TARGET_EPS=0+FB_STATIC=2.10 → breakaway 永远激活.
+ * 位置环收拢时指令小幅正负交替 → breakaway 跟跳 2000PWM → 把车甩出极限环.
+ * TARGET_EPS→0.03: 极小目标不触发; FB_STATIC→0.10: 轮一转就撤, PID 接管. */
+#define CHASSIS_WHEEL_BREAKAWAY_LF_TARGET_EPS_MPS     (0.03f)
+#define CHASSIS_WHEEL_BREAKAWAY_LF_PWM_FLOOR          (800.0f)
+#define CHASSIS_WHEEL_BREAKAWAY_LF_FB_STATIC_EPS_MPS  (0.90f)
+
+/* ---- 右前轮 RF (Wheel 1) ---- */
+#define CHASSIS_WHEEL_BREAKAWAY_RF_TARGET_EPS_MPS     (0.03f)
+#define CHASSIS_WHEEL_BREAKAWAY_RF_PWM_FLOOR          (800.0f)
+#define CHASSIS_WHEEL_BREAKAWAY_RF_FB_STATIC_EPS_MPS  (0.90f )
+
+/* ---- 左后轮 LB (Wheel 2) ---- */
+#define CHASSIS_WHEEL_BREAKAWAY_LB_TARGET_EPS_MPS     (0.03f)
+#define CHASSIS_WHEEL_BREAKAWAY_LB_PWM_FLOOR          (800.0f)
+#define CHASSIS_WHEEL_BREAKAWAY_LB_FB_STATIC_EPS_MPS  (0.90f)
+
+/* ---- 右后轮 RB (Wheel 3) ---- */
+#define CHASSIS_WHEEL_BREAKAWAY_RB_TARGET_EPS_MPS     (0.03f)
+#define CHASSIS_WHEEL_BREAKAWAY_RB_PWM_FLOOR          (800.0f)
+#define CHASSIS_WHEEL_BREAKAWAY_RB_FB_STATIC_EPS_MPS  (0.90f)
+
+/* ---- X 正向 (vx>0) 静摩擦前馈 PWM 幅值, 每轮独立 ---- */
+#define CHASSIS_WHEEL_BREAKAWAY_LF_PWM_FLOOR_XP          (800.0f)
+#define CHASSIS_WHEEL_BREAKAWAY_RF_PWM_FLOOR_XP          (800.0f)
+#define CHASSIS_WHEEL_BREAKAWAY_LB_PWM_FLOOR_XP          (800.0f)
+#define CHASSIS_WHEEL_BREAKAWAY_RB_PWM_FLOOR_XP          (800.0f)
+
+/* ---- X 负向 (vx<0) 静摩擦前馈 PWM 幅值, 每轮独立 ---- */
+/* P0-修复 2026-06-07: 原 XN 不对称 (LB=1200 独大) → -X 起步时左侧推力 > 右侧
+ * → 偏航力矩 → yaw 环介入 → Y 轴耦合震荡. 改为与 XP 对称互换 (方向反了所以左右对调):
+ *   XP: LF=1000 RF=1200 LB=1000 RB=1400  (右侧强)
+ *   XN: LF=1200 RF=1000 LB=1400 RB=1000  (左侧强, 与 XP 对称)
+ * 两侧推力均衡后 yaw 力矩抵消, 不再干扰 Y 保持轴. */
+#define CHASSIS_WHEEL_BREAKAWAY_LF_PWM_FLOOR_XN          (800.0f)
+#define CHASSIS_WHEEL_BREAKAWAY_RF_PWM_FLOOR_XN          (800.0f)
+#define CHASSIS_WHEEL_BREAKAWAY_LB_PWM_FLOOR_XN          (800.0f)
+#define CHASSIS_WHEEL_BREAKAWAY_RB_PWM_FLOOR_XN          (800.0f)
+
+/* 兼容宏: 保持旧名称可用 (指向默认值, 新代码请用 g_chassis_tune_params 中的值) */
+#define CHASSIS_WHEEL_BREAKAWAY_TARGET_EPS_MPS    CHASSIS_WHEEL_BREAKAWAY_DEFAULT_TARGET_EPS_MPS
+#define CHASSIS_WHEEL_BREAKAWAY_PWM_FLOOR         CHASSIS_WHEEL_BREAKAWAY_DEFAULT_PWM_FLOOR
+#define CHASSIS_WHEEL_BREAKAWAY_FB_STATIC_EPS_MPS CHASSIS_WHEEL_BREAKAWAY_DEFAULT_FB_STATIC_EPS_MPS
 
 /* ======================================================================
  *  IMU 航向角积分参数
@@ -668,11 +750,11 @@
  *  大 -> KF 几乎不信, 仅做长期纠偏 (推荐); 小 -> KF 信任高, 打滑会污染.
  *  100 (= 10° std) 大约 1 分钟才把 1° 真实漂移拉一半, 既能压住 IMU 长期累积,
  *  又不会被瞬间打滑(常 < 5°)拉走. */
-#define CHASSIS_ODOM_YAW_R_DEG2          (100.0f)
+#define CHASSIS_ODOM_YAW_R_DEG2          (90.0f)
 
 /** odom yaw 与 IMU yaw 偏差超过此值视为打滑 / 重定位事件,
  *  本拍跳过这次观测 (避免单次大跳跃污染 KF) */
-#define CHASSIS_ODOM_YAW_OUTLIER_DEG     (9.0f)
+#define CHASSIS_ODOM_YAW_OUTLIER_DEG     (3.0f)
 
 /** Innovation Gating: |wz_odom - wz_imu| 超过此值视为编码器异常 (°/s),
  *  本拍跳过 KF 注入. (P0-修复 2026-05-02 抬车空转污染 KF):
@@ -686,7 +768,7 @@
  *  设小 (10): 严苛, 高速转向时也可能误拒 (轮胎打滑常见 wz_odom 偏 5~10°/s)
  *  设大 (50): 宽松, 但抬车空转判别迟钝
  *  20°/s 是工程平衡点, 正常打滑差 < 10, 抬车差 > 50, 留 2x 余量. */
-#define CHASSIS_ODOM_YAW_INNOV_GATE_DPS  (10.0f)
+#define CHASSIS_ODOM_YAW_INNOV_GATE_DPS  (20.0f)
 
 /* ======================================================================
  *  缓加速参数 — 防止目标速度突变导致轮胎打滑
@@ -698,8 +780,11 @@
  *   1.2 m/s²: 0→2.35 m/s 需 ~2s, 2m 行程全程在爬坡, 最高仅 1.55 m/s
  *   3.0 m/s²: 0→2.35 m/s 仅 0.78s, 2m 行程可短暂跑满速
  * 麦轮横向移动靠滚轮分力, 不依赖轮端抓地, 比纵向更耐高加速.
- * P0-调参 2026-05-08 (收敛太慢): 3.00 → 5.00, 加快速度命令爬坡/刹车响应. */
-#define CHASSIS_CMD_ACCEL_LIMIT_MPS2    (1.10f)
+ * P0-调参 2026-05-08 (收敛太慢): 3.00 → 5.00, 加快速度命令爬坡/刹车响应.
+ * P0-修复 2026-06-07: 0.60 太低, ramp 每拍只能变 0.012 m/s,
+ * brake cap 要求减速但 ramp 跟不上 → 近目标冲过头 → 回程方向反转时尤其严重.
+ * 提到 3.00: dv=0.06/拍, 从 0.5→0.1 仅需 7 拍=140ms, brake cap 能生效. */
+#define CHASSIS_CMD_ACCEL_LIMIT_MPS2    (3.00f)
 
 /** 角速度最大加速度（°/s²）
  *  P0-调参 2026-05-02 (大角度阶跃响应慢):
@@ -719,10 +804,10 @@
 
 /** X 方向里程计缩放系数 */
 //#define CHASSIS_ODOM_SCALE_X            (0.468539f)
-#define CHASSIS_ODOM_SCALE_X            (0.397f)
+#define CHASSIS_ODOM_SCALE_X            (0.405f)
 
 /** Y 方向里程计缩放系数 */
-#define CHASSIS_ODOM_SCALE_Y            (0.426f)
+#define CHASSIS_ODOM_SCALE_Y            (0.420f)
 
 //#define CHASSIS_ODOM_SCALE_Y            (0.43617f)
 
@@ -802,21 +887,21 @@
  * 4 轮阶跃响应不同步 -> 行进中持续轻微抖, 转弯时车体扭.
  * 改成 Kp=40 / Ki=10 / Kd=1.5 (Kd≈Kp/27, 增量 PID 适度阻尼).
  * 4 轮硬件差异应通过 ENC_SIGN/DIR_SIGN 标定, 不该让 PID 背锅. */
-#define CHASSIS_WHEEL_PID_LF_KP         (40.0f)
-#define CHASSIS_WHEEL_PID_LF_KI         (10.0f)
-#define CHASSIS_WHEEL_PID_LF_KD         (1.5f)
+#define CHASSIS_WHEEL_PID_LF_KP         (70.0f)
+#define CHASSIS_WHEEL_PID_LF_KI         (20.0f)
+#define CHASSIS_WHEEL_PID_LF_KD         (0.0f)
 
-#define CHASSIS_WHEEL_PID_RF_KP         (40.0f)
-#define CHASSIS_WHEEL_PID_RF_KI         (10.0f)
-#define CHASSIS_WHEEL_PID_RF_KD         (1.5f)
+#define CHASSIS_WHEEL_PID_RF_KP         (70.0f)
+#define CHASSIS_WHEEL_PID_RF_KI         (20.0f)
+#define CHASSIS_WHEEL_PID_RF_KD         (0.0f)
 
-#define CHASSIS_WHEEL_PID_LB_KP         (40.0f)
-#define CHASSIS_WHEEL_PID_LB_KI         (10.0f)
-#define CHASSIS_WHEEL_PID_LB_KD         (1.5f)
+#define CHASSIS_WHEEL_PID_LB_KP         (70.0f)
+#define CHASSIS_WHEEL_PID_LB_KI         (20.0f)
+#define CHASSIS_WHEEL_PID_LB_KD         (0.0f)
 
-#define CHASSIS_WHEEL_PID_RB_KP         (40.0f)
-#define CHASSIS_WHEEL_PID_RB_KI         (10.0f)
-#define CHASSIS_WHEEL_PID_RB_KD         (1.5f)
+#define CHASSIS_WHEEL_PID_RB_KP         (70.0f)
+#define CHASSIS_WHEEL_PID_RB_KI         (20.0f)
+#define CHASSIS_WHEEL_PID_RB_KD         (0.0f)
 
 /** 兼容宏：保持旧名称可用 */
 #define CHASSIS_WHEEL_PID_KP            (CHASSIS_WHEEL_PID_DEFAULT_KP)
@@ -1040,3 +1125,4 @@ static inline float chassis_normalize_angle_deg(float angle_deg)
 }
 
 #endif /* CHASSIS_CONFIG_H */
+

@@ -51,10 +51,10 @@
 //                    若再换串口, 需同步迁移中断服务函数
 //     回退方法  : 把 INDEX/TX/RX 三宏改回 UART_1 / UART1_TX_B12 / UART1_RX_B13 即可
 // =====================================================================
-#define DEBUG_UART_INDEX            (UART_1)                                    // 指定 debug uart 所使用的的串口 (无线模块)
+#define DEBUG_UART_INDEX            (UART_8)                                    // 指定 debug uart 所使用的的串口 (无线模块)
 #define DEBUG_UART_BAUDRATE         (115200)                                    // 指定 debug uart 波特率 (须与无线模块一致)
-#define DEBUG_UART_TX_PIN           (UART1_TX_B12)                              // 指定 debug uart TX 引脚 -> 无线模块 RX
-#define DEBUG_UART_RX_PIN           (UART1_RX_B13)                              // 指定 debug uart RX 引脚 -> 无线模块 TX
+#define DEBUG_UART_TX_PIN           (UART8_TX_D16)                              // 指定 debug uart TX 引脚 -> 无线模块 RX
+#define DEBUG_UART_RX_PIN           (UART8_RX_D17)                              // 指定 debug uart RX 引脚 -> 无线模块 TX
 
 #define DEBUG_UART_USE_INTERRUPT    (1)                                         // 是否启用 debug uart 接收中断
 

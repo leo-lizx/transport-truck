@@ -115,7 +115,7 @@ static uint32 wait_for_tick(void)
 #define MAIN_RUN_MODE_HARDCODED_MAP   (8)   /* 硬编码地图: 代码内置地图, 上电解算→暖机→跑→回 */
 
 /* ═══════════ 改下面这行切换运行模式 (0~8) ═══════════ */
-#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_STATIC_VERIFY)  /* 当前: 状态6静态地图屏幕验证 */
+#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_POINT_NAV)  /* 当前: 状态6静态地图屏幕验证 */
 /* ═══════════ 改上面这行切换运行模式 (0~8) ═══════════ */
 
 /* OpenART1 地图链路硬件口: 若实测 UART4 走 D0/D1, 只改下面两行宏. */
@@ -1288,7 +1288,7 @@ static void main_mode5_render_100ms(void)
 #define MAIN_POS_NAV_TARGET_Y_GRID    (10)     /* 整数 0..10, 10 = 下边界 */
 /* <<<<<<<<<<<< 改这两行换目标格 >>>>>>>>>>>> */
 
-#define MAIN_POS_NAV_HOLD_YAW_DEG     (0.0f)   /* 全程锁住 0° 航向 */
+#define MAIN_POS_NAV_HOLD_YAW_DEG     (90.0f)   /* 全程锁住 0° 航向 */
 
 /*
  * 上电暖机等待时长 (5ms tick 数). 200 × 5ms = 1s.
@@ -1328,8 +1328,8 @@ static void main_mode5_render_100ms(void)
 #define MAIN_PID_DEBUG_TARGET_MPS     (3.3f)   /* 极小速度验证: 约 18 rpm, 肉眼可见缓转 */
 
 #define MAIN_PID_DEBUG_FORCE_PID      (1)
-#define MAIN_PID_DEBUG_KP             (40.0f)
-#define MAIN_PID_DEBUG_KI             (23.0f)
+#define MAIN_PID_DEBUG_KP             (70.0f)
+#define MAIN_PID_DEBUG_KI             (20.0f)
 #define MAIN_PID_DEBUG_KD             (0.0f)
 #endif /* MAIN_RUN_MODE_SINGLE_WHEEL */
 /* ========================================================================== */
@@ -1514,16 +1514,97 @@ int main(void)
              * 可将行程缩短到 ~15m，漂移减半。若赛规要求重复访问则保留。
              * ──────────────────────────────────────────────────────────── */
             static const s_nav_wp_t s_wps[] = {
-                { S_NAV_MOVE_GRID,  8.0f,  6.0f  },  /* ① 左上角 (1,1)   */
-                { S_NAV_MOVE_GRID,  8.0f, 7.0f  },  /* ② 右上角 (14,1)  */
-                { S_NAV_MOVE_GRID,  9.0f, 7.0f },  /* ③ 右下角 (14,10) */
-                { S_NAV_MOVE_GRID,  9.0f, 5.0f },  /* ④ 左下角 (1,10)  */
-                { S_NAV_MOVE_GRID,  6.0f,  4.0f  },  /* ⑤ 中心  (7,5)    */
-                { S_NAV_MOVE_GRID,  9.0f,  4.0f  },  /* ⑥ 左上角 (1,1) 再次经过 */
-                { S_NAV_MOVE_GRID,  14.0f, 10.0f },  /* ⑦ 右下角 (14,10) 再次经过 */
-                { S_NAV_MOVE_GRID,  1.0f,  1.0f  },  /* ⑧ 左上角 (1,1)  作为回程中转 */
-                { S_NAV_MOVE_M,     1.0f,  5.5f  },  /* ⑨ 回起点 (1,5.5) */
-            };
+                { S_NAV_MOVE_M,  1.0f,  5.50f  },  /* ⑥ 左上角 (1,1) 再次经过 */
+                { S_NAV_MOVE_M,  2.0f, 5.50f },  /* ⑦ 右下角 (14,10) 再次经过 */
+                { S_NAV_MOVE_M,  3.0f,  5.50f  },  /* ⑧ 左上角 (1,1)  作为回程中转 */
+                { S_NAV_MOVE_M,   4.0f,  5.50f  },  /* ⑨ 回起点 (1,5.5) */
+                { S_NAV_MOVE_M,  5.0f,  5.50f  },  /* ① 左上角 (1,1)   */
+                { S_NAV_MOVE_M,  6.0f, 5.50f  },  /* ② 右上角 (14,1)  */
+                { S_NAV_MOVE_M,  7.0f, 5.50f },  /* ③ 右下角 (14,10) */
+                { S_NAV_MOVE_M,  8.0f, 5.50f }, 
+                 { S_NAV_MOVE_M,  7.0f,  5.50f  },  /* ⑥ 左上角 (1,1) 再次经过 */
+                { S_NAV_MOVE_M,  6.0f, 5.50f },  /* ⑦ 右下角 (14,10) 再次经过 */
+                { S_NAV_MOVE_M,  5.0f,  5.50f  },  /* ⑧ 左上角 (1,1)  作为回程中转 */
+                { S_NAV_MOVE_M,  4.0f,  5.50f  },  /* ⑨ 回起点 (1,5.5) */
+                { S_NAV_MOVE_M,  3.0f,  5.50f  },  /* ① 左上角 (1,1)   */
+                { S_NAV_MOVE_M,  2.0f, 5.50f  },  /* ② 右上角 (14,1)  */
+                { S_NAV_MOVE_M,  1.0f, 5.50f }, 
+                 { S_NAV_MOVE_M,  7.0f, 5.50f },
+                 { S_NAV_MOVE_M,  14.0f,  5.50f  },  /* ① 左上角 (1,1)   */
+                { S_NAV_MOVE_M,  14.0f, 10.0f  },
+                 { S_NAV_MOVE_M,  7.0f, 10.0f  },
+                { S_NAV_MOVE_M,  1.0f, 10.0f },  /* ③ 右下角 (14,10) */
+                { S_NAV_MOVE_M,  9.0f, 10.0f },  /* ④ 左下角 (1,10)  */
+                { S_NAV_MOVE_M,  9.0f,  4.0f  },  /* ⑤ 中心  (7,5)    */
+                { S_NAV_MOVE_M,  9.0f,  10.0f  },  /* ⑥ 左上角 (1,1) 再次经过 */
+                { S_NAV_MOVE_M,  14.0f, 10.0f },  /* ⑦ 右下角 (14,10) 再次经过 */
+                { S_NAV_MOVE_M,  14.0f,  5.50f  },  /* ⑧ 左上角 (1,1)  作为回程中转 */
+                { S_NAV_MOVE_M,   14.0f,  1.0f  },  /* ⑨ 回起点 (1,5.5) */
+                { S_NAV_MOVE_M,  14.0f,  5.50f  },  /* ① 左上角 (1,1)   */
+                { S_NAV_MOVE_M,  8.0f, 5.50f  },  /* ② 右上角 (14,1)  */
+                { S_NAV_MOVE_M,  8.0f, 10.0f }, 
+                { S_NAV_MOVE_M,  1.0f, 10.0f }, 
+                { S_NAV_MOVE_M,  1.0f,  5.50f  },
+                { S_NAV_MOVE_M,  1.0f, 1.0f },
+                { S_NAV_MOVE_M,  1.0f,  5.50f  }, 
+                
+
+            }; 
+                // { S_NAV_MOVE_M,  14.0f,  5.50f  },  /* ① 左上角 (1,1)   */
+                // { S_NAV_MOVE_M,  14.0f, 10.0f  },  /* ② 右上角 (14,1)  */
+                // { S_NAV_MOVE_M,  1.0f, 10.0f },  /* ③ 右下角 (14,10) */
+                // { S_NAV_MOVE_M,  9.0f, 5.0f },  /* ④ 左下角 (1,10)  */
+                // { S_NAV_MOVE_M,  6.0f,  4.0f  },  /* ⑤ 中心  (7,5)    */
+                // { S_NAV_MOVE_M,  9.0f,  4.0f  },  /* ⑥ 左上角 (1,1) 再次经过 */
+                // { S_NAV_MOVE_M,  14.0f, 10.0f },  /* ⑦ 右下角 (14,10) 再次经过 */
+                // { S_NAV_MOVE_M,  1.0f,  1.0f  },  /* ⑧ 左上角 (1,1)  作为回程中转 */
+                // { S_NAV_MOVE_M,   14.0f,  10.0f  },  /* ⑨ 回起点 (1,5.5) */
+                // { S_NAV_MOVE_M,  14.0f,  5.50f  },  /* ① 左上角 (1,1)   */
+                // { S_NAV_MOVE_M,  8.0f, 7.0f  },  /* ② 右上角 (14,1)  */
+                // { S_NAV_MOVE_M,  9.0f, 7.0f },  /* ③ 右下角 (14,10) */
+                // { S_NAV_MOVE_M,  9.0f, 5.0f },  /* ④ 左下角 (1,10)  */
+                // { S_NAV_MOVE_M,  6.0f,  4.0f  },  /* ⑤ 中心  (7,5)    */
+                // { S_NAV_MOVE_M,  9.0f,  4.0f  },  /* ⑥ 左上角 (1,1) 再次经过 */
+                // { S_NAV_MOVE_M,  14.0f, 10.0f },  /* ⑦ 右下角 (14,10) 再次经过 */
+                // { S_NAV_MOVE_M,  1.0f,  1.0f  },  /* ⑧ 左上角 (1,1)  作为回程中转 */
+                // { S_NAV_MOVE_M,   14.0f,  10.0f  },  /* ⑨ 回起点 (1,5.5) */
+                // { S_NAV_MOVE_M,  14.0f,  5.50f  },  /* ① 左上角 (1,1)   */
+                // { S_NAV_MOVE_M,  8.0f, 7.0f  },  /* ② 右上角 (14,1)  */
+                // { S_NAV_MOVE_M,  9.0f, 7.0f },  /* ③ 右下角 (14,10) */
+                // { S_NAV_MOVE_M,  1.0f, 5.50f },  /* ④ 左下角 (1,10)  */
+                // { S_NAV_MOVE_M,  6.0f,  4.0f  },  /* ⑤ 中心  (7,5)    */
+                // { S_NAV_MOVE_M,  9.0f,  4.0f  },  /* ⑥ 左上角 (1,1) 再次经过 */
+                // { S_NAV_MOVE_M,  14.0f, 10.0f },  /* ⑦ 右下角 (14,10) 再次经过 */
+                // { S_NAV_MOVE_M,  1.0f,  1.0f  },  /* ⑧ 左上角 (1,1)  作为回程中转 */
+                // { S_NAV_MOVE_M,   14.0f,  10.0f  },  /* ⑨ 回起点 (1,5.5) */
+                // { S_NAV_MOVE_M,  14.0f,  5.50f  },  /* ① 左上角 (1,1)   */
+                // { S_NAV_MOVE_M,  8.0f, 7.0f  },  /* ② 右上角 (14,1)  */
+                // { S_NAV_MOVE_M,  9.0f, 7.0f },  /* ③ 右下角 (14,10) */
+                // { S_NAV_MOVE_M,  9.0f, 5.0f },  /* ④ 左下角 (1,10)  */
+                // { S_NAV_MOVE_M,  6.0f,  4.0f  },  /* ⑤ 中心  (7,5)    */
+                // { S_NAV_MOVE_M,  9.0f,  4.0f  },  /* ⑥ 左上角 (1,1) 再次经过 */
+                // { S_NAV_MOVE_M,  14.0f, 10.0f },  /* ⑦ 右下角 (14,10) 再次经过 */
+                // { S_NAV_MOVE_M,  1.0f,  1.0f  },  /* ⑧ 左上角 (1,1)  作为回程中转 */
+                // { S_NAV_MOVE_M,   14.0f,  10.0f  },  /* ⑨ 回起点 (1,5.5) */
+                // { S_NAV_MOVE_M,  8.0f, 7.0f  },  /* ② 右上角 (14,1)  */
+                // { S_NAV_MOVE_M,  9.0f, 7.0f },  /* ③ 右下角 (14,10) */
+                // { S_NAV_MOVE_M,  9.0f, 5.0f },  /* ④ 左下角 (1,10)  */
+                // { S_NAV_MOVE_M,  6.0f,  4.0f  },  /* ⑤ 中心  (7,5)    */
+                // { S_NAV_MOVE_M,  9.0f,  4.0f  },  /* ⑥ 左上角 (1,1) 再次经过 */
+                // { S_NAV_MOVE_M,  14.0f, 10.0f },  /* ⑦ 右下角 (14,10) 再次经过 */
+                // { S_NAV_MOVE_M,  1.0f,  1.0f  },  /* ⑧ 左上角 (1,1)  作为回程中转 */
+                // { S_NAV_MOVE_M,   14.0f,  10.0f  },  /* ⑨ 回起点 (1,5.5) */
+                // { S_NAV_MOVE_M,  14.0f,  5.50f  },  /* ① 左上角 (1,1)   */
+                // { S_NAV_MOVE_M,  8.0f, 7.0f  },  /* ② 右上角 (14,1)  */
+                // { S_NAV_MOVE_M,  9.0f, 7.0f },  /* ③ 右下角 (14,10) */
+                // { S_NAV_MOVE_M,  9.0f, 5.0f },  /* ④ 左下角 (1,10)  */
+                // { S_NAV_MOVE_M,  6.0f,  4.0f  },  /* ⑤ 中心  (7,5)    */
+                // { S_NAV_MOVE_M,  9.0f,  4.0f  },  /* ⑥ 左上角 (1,1) 再次经过 */
+                // { S_NAV_MOVE_M,  14.0f, 10.0f },  /* ⑦ 右下角 (14,10) 再次经过 */
+                // { S_NAV_MOVE_M,  1.0f,  1.0f  },  /* ⑧ 左上角 (1,1)  作为回程中转 */
+                // { S_NAV_MOVE_M,   1.0f,  5.5f  },  /* ⑨ 回起点 (1,5.5) */
+                
+          //  };
 
             static uint8  s_wp_idx       = 0U;   /* 当前航点索引 (0 起, 到 count 停止) */
             static uint16 s_warmup_ticks = 0U;   /* 暖机计数 (5ms tick) */
@@ -1573,13 +1654,31 @@ int main(void)
                     dx      = tgt_x - pose.x_m;
                     dy      = tgt_y - pose.y_m;
                     dist_sq = dx * dx + dy * dy;
-                    printf("%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%d,%d\n",
+                    printf("%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%d,%d,%lu\n",
                            pose.x_m, pose.y_m,
                            tgt_x, tgt_y,
                            dist_sq,
                            pose.yaw_deg,
                            (int)chassis_ctrl_is_arrived(),
-                           (int)s_wp_idx);
+                           (int)s_wp_idx,
+                           (unsigned long)g_chassis_arrival_count);
+                    /* 诊断: 车体期望/实际速度 + 四轮期望/实际速度
+                     * VOFA 模式下注释掉, 否则带前缀的 printf 会污染纯数据流 */
+                    // {
+                    //     float wfb[4];
+                    //     chassis_ctrl_get_wheel_feedback_snapshot(wfb);
+                    //     printf("D:vt=%.3f,%.3f vf=%.3f,%.3f | ",
+                    //            g_chassis_diag_body_spd_tgt_vx,
+                    //            g_chassis_diag_body_spd_tgt_vy,
+                    //            g_chassis_diag_body_spd_fb_vx,
+                    //            g_chassis_diag_body_spd_fb_vy);
+                    //     printf("wt=%.3f,%.3f,%.3f,%.3f wf=%.3f,%.3f,%.3f,%.3f\n",
+                    //            g_chassis_diag_wheel_tgt[0],
+                    //            g_chassis_diag_wheel_tgt[1],
+                    //            g_chassis_diag_wheel_tgt[2],
+                    //            g_chassis_diag_wheel_tgt[3],
+                    //            wfb[0], wfb[1], wfb[2], wfb[3]);
+                    // }
                 }
             }
         }

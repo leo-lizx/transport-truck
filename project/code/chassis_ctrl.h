@@ -83,10 +83,25 @@ typedef struct
 
     float cmd_accel_limit_mps2;
     float cmd_accel_limit_dps2;
+
+    /* 静摩擦前馈 — 每轮独立 (LF/RF/LB/RB) */
+    float wheel_breakaway_target_eps_mps[CHASSIS_CTRL_TUNE_WHEEL_COUNT];
+    float wheel_breakaway_pwm_floor[CHASSIS_CTRL_TUNE_WHEEL_COUNT];    /* Y 方向 (vy 主导, 不区分正负) */
+    float wheel_breakaway_pwm_floor_xp[CHASSIS_CTRL_TUNE_WHEEL_COUNT]; /* X 正向 (vx>0) */
+    float wheel_breakaway_pwm_floor_xn[CHASSIS_CTRL_TUNE_WHEEL_COUNT]; /* X 负向 (vx<0) */
+    float wheel_breakaway_fb_static_eps_mps[CHASSIS_CTRL_TUNE_WHEEL_COUNT];
 } chassis_tune_params_t;
 
 /* 全局运行时调参参数（单一数据源，默认值在 chassis_ctrl.c 初始化） */
 extern volatile chassis_tune_params_t g_chassis_tune_params;
+
+/* 诊断数据: 轮速和车体速度快照, 供串口打印对比期望 vs 实际 */
+extern volatile uint32 g_chassis_arrival_count;
+extern volatile float g_chassis_diag_wheel_tgt[4];
+extern volatile float g_chassis_diag_body_spd_tgt_vx;
+extern volatile float g_chassis_diag_body_spd_tgt_vy;
+extern volatile float g_chassis_diag_body_spd_fb_vx;
+extern volatile float g_chassis_diag_body_spd_fb_vy;
 
 /* ========================== 公共 API ========================== */
 
