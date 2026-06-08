@@ -23,6 +23,7 @@
 #include "chassis_config.h"
 #include <math.h>
 #include <string.h>
+
 #include <stdlib.h>     /* abs() */
 
 #ifndef PI_F
@@ -75,9 +76,8 @@ typedef struct
     Point_t observe;        /* 观察点 (与 pos 4-邻接的可立足格)      */
     uint8   kind;           /* APP_LINK_OBJ_KIND_BOX / TARGET        */
     uint8   class_id;       /* 多数票输出的类别; 0 = 未识别          */
-    uint8   visited;        /* 1 = 本轮已尝试访问 (实测 OR 推断, 不再选)*/
+    uint8   visited;        /* 1 = 本轮已尝试访问, 不再选              */
     uint8   ok;             /* 1 = class_id 已确定 (≠0)              */
-    uint8   inferred;       /* 1 = 由排除法推断得到 (未实地访问)     */
 } RecogItem_t;
 
 static AppRecognizeSub_e s_sub_state    = RECOG_SUB_INIT;
@@ -301,175 +301,8 @@ static int16 sample_majority_step(uint8 expect_kind)
  *=================================================================================================================*/
 
 /**
- * 排除法 — 利用"箱子 class_id 集合 = 目标 class_id 集合 = {1..N}"的赛规先验,
- * 当某一类(box 或 target)的未识别项仅剩 1 个时, 直接推断它的 class_id
- * 而无需绕过去观察, 节省识别时间.
- *
- * 推断条件:
- *   - 该类总共 N 个物体
- *   - 已识别 N-1 个 (ok=1, class_id ∈ 1..N 各不相同)
- *   - 缺失的 class_id 唯一 → 赋给最后那 1 个未识别项
- *
- * 同时考虑跨类推断:
- *   - 假设箱子有 [1, 2, ?]
- *   - 目标已全部识别为 [1, 2, 3]
- *   - 那么剩余的箱子必然是 3 (因为箱-目标 1:1, 1..N 集合相同)
- *
- * @return  本轮新推断出的物体数量 (0 表示无可推断)
- */
-static uint8 try_infer_remaining(void)
-{
-    uint8 inferred_now = 0U;
-
-    /* 分别统计 box / target 的已识别 class_id 集合 */
-    uint8 box_used[RECOG_CLASS_ID_MAX + 2U] = {0};
-    uint8 tgt_used[RECOG_CLASS_ID_MAX + 2U] = {0};
-    uint8 box_unknown_idx = 0xFFU;
-    uint8 box_unknown_cnt = 0U;
-    uint8 tgt_unknown_idx = 0xFFU;
-    uint8 tgt_unknown_cnt = 0U;
-
-    for (uint8 i = 0U; i < s_item_count; ++i)
-    {
-        if (s_items[i].kind == APP_LINK_OBJ_KIND_BOX)
-        {
-            if (s_items[i].ok && s_items[i].class_id <= RECOG_CLASS_ID_MAX)
-            {
-                box_used[s_items[i].class_id] = 1U;
-            }
-            else
-            {
-                box_unknown_idx = i;
-                ++box_unknown_cnt;
-            }
-        }
-        else
-        {
-            if (s_items[i].ok && s_items[i].class_id <= RECOG_CLASS_ID_MAX)
-            {
-                tgt_used[s_items[i].class_id] = 1U;
-            }
-            else
-            {
-                tgt_unknown_idx = i;
-                ++tgt_unknown_cnt;
-            }
-        }
-    }
-
-    /* ------- 同类内 (N-1 推 1) ------- */
-    if (box_unknown_cnt == 1U && s_box_count >= 1U)
-    {
-        uint8 missing = 0U;
-        for (uint8 cls = 1U; cls <= s_box_count; ++cls)
-        {
-            if (!box_used[cls]) { missing = (missing == 0U) ? cls : 0xFFU; }
-        }
-        if (missing > 0U && missing != 0xFFU && box_unknown_idx != 0xFFU)
-        {
-            s_items[box_unknown_idx].class_id = missing;
-            s_items[box_unknown_idx].ok       = 1U;
-            s_items[box_unknown_idx].visited  = 1U;
-            s_items[box_unknown_idx].inferred = 1U;
-            box_used[missing] = 1U;
-            ++inferred_now;
-            box_unknown_cnt = 0U;
-        }
-    }
-
-    if (tgt_unknown_cnt == 1U && s_target_count >= 1U)
-    {
-        uint8 missing = 0U;
-        for (uint8 cls = 1U; cls <= s_target_count; ++cls)
-        {
-            if (!tgt_used[cls]) { missing = (missing == 0U) ? cls : 0xFFU; }
-        }
-        if (missing > 0U && missing != 0xFFU && tgt_unknown_idx != 0xFFU)
-        {
-            s_items[tgt_unknown_idx].class_id = missing;
-            s_items[tgt_unknown_idx].ok       = 1U;
-            s_items[tgt_unknown_idx].visited  = 1U;
-            s_items[tgt_unknown_idx].inferred = 1U;
-            tgt_used[missing] = 1U;
-            ++inferred_now;
-            tgt_unknown_cnt = 0U;
-        }
-    }
-
-    /* ------- 跨类推断: 如果一类全部已识别, 另一类的剩余项可由 1..N 集合反推 ------- */
-    /* 例: box 已知 [1, ?]; target 已知 [1, 2] → ? 必为 2                       */
-    /* 注意: 跨类推断只能给"另一类全部已识别 (含本轮新推断)"的情况使用              */
-
-    /* (a) target 全识别 → 推 box 剩余项 */
-    if (tgt_unknown_cnt == 0U && box_unknown_cnt >= 1U
-        && s_box_count == s_target_count)
-    {
-        /* 收集还未识别的 box 索引列表 */
-        uint8 ulist[RECOG_MAX_TARGETS + 1U];
-        uint8 un = 0U;
-        for (uint8 i = 0U; i < s_item_count; ++i)
-        {
-            if (s_items[i].kind != APP_LINK_OBJ_KIND_BOX) { continue; }
-            if (s_items[i].ok)                            { continue; }
-            if (un < (uint8)RECOG_MAX_TARGETS) { ulist[un++] = i; }
-        }
-        /* 列出 box 缺失的 class_id (和 target 集合做差集) */
-        uint8 missing_list[RECOG_CLASS_ID_MAX + 1U];
-        uint8 mn = 0U;
-        for (uint8 cls = 1U; cls <= s_target_count; ++cls)
-        {
-            if (!box_used[cls] && tgt_used[cls])
-            {
-                if (mn < (uint8)RECOG_CLASS_ID_MAX) { missing_list[mn++] = cls; }
-            }
-        }
-        if (mn == 1U && un == 1U)
-        {
-            s_items[ulist[0]].class_id = missing_list[0];
-            s_items[ulist[0]].ok       = 1U;
-            s_items[ulist[0]].visited  = 1U;
-            s_items[ulist[0]].inferred = 1U;
-            ++inferred_now;
-        }
-    }
-
-    /* (b) box 全识别 → 推 target 剩余项 */
-    if (box_unknown_cnt == 0U && tgt_unknown_cnt >= 1U
-        && s_box_count == s_target_count)
-    {
-        uint8 ulist[RECOG_MAX_TARGETS + 1U];
-        uint8 un = 0U;
-        for (uint8 i = 0U; i < s_item_count; ++i)
-        {
-            if (s_items[i].kind != APP_LINK_OBJ_KIND_TARGET) { continue; }
-            if (s_items[i].ok)                                { continue; }
-            if (un < (uint8)RECOG_MAX_TARGETS) { ulist[un++] = i; }
-        }
-        uint8 missing_list[RECOG_CLASS_ID_MAX + 1U];
-        uint8 mn = 0U;
-        for (uint8 cls = 1U; cls <= s_box_count; ++cls)
-        {
-            if (!tgt_used[cls] && box_used[cls])
-            {
-                if (mn < (uint8)RECOG_CLASS_ID_MAX) { missing_list[mn++] = cls; }
-            }
-        }
-        if (mn == 1U && un == 1U)
-        {
-            s_items[ulist[0]].class_id = missing_list[0];
-            s_items[ulist[0]].ok       = 1U;
-            s_items[ulist[0]].visited  = 1U;
-            s_items[ulist[0]].inferred = 1U;
-            ++inferred_now;
-        }
-    }
-
-    return inferred_now;
-}
-
-/**
  * 检查识别 tour 是否已经"事实完成":
- * 所有 box / target 都 ok=1 (含推断).
+ * 所有 box / target 都 ok=1.
  */
 static uint8 all_resolved(void)
 {
@@ -721,7 +554,7 @@ AppRecognizeStatus_e App_Recognize_Tick(const uint8 map[MAP_ROWS][MAP_COLS],
                 s_nav_started = 1U;
                 return APP_RECOG_RUNNING;
             }
-            /* B3a: 5s 仍跑不到 → 跳过此物体, 留给排除法 (地图保证可解) */
+            /* B3a: 5s 仍跑不到 → 跳过此物体 (地图保证可解) */
             if (s_subphase_ticks > RECOG_NAV_TIMEOUT_TICKS)
             {
                 s_items[s_cur_idx].visited = 1U;
@@ -770,9 +603,6 @@ AppRecognizeStatus_e App_Recognize_Tick(const uint8 map[MAP_ROWS][MAP_COLS],
                 s_items[s_cur_idx].class_id = (uint8)r;
                 s_items[s_cur_idx].visited  = 1U;
                 s_items[s_cur_idx].ok       = 1U;
-                s_items[s_cur_idx].inferred = 0U;
-                /* 排除法: 若一类只剩 1 个未识别, 直接推断不再绕过去 */
-                (void)try_infer_remaining();
                 enter_sub_next();
             }
             else if (r == -1 || r == -2)
@@ -788,9 +618,6 @@ AppRecognizeStatus_e App_Recognize_Tick(const uint8 map[MAP_ROWS][MAP_COLS],
 
         case RECOG_SUB_NEXT:
         {
-            /* 排除法可能在跨类配对后才生效, 这里再补一次推断 */
-            (void)try_infer_remaining();
-
             /* 已全部识别完 → 配对 */
             if (all_resolved())
             {
@@ -860,19 +687,18 @@ void App_Recognize_Get_Debug(AppRecognizeDebug_t *out)
     }
     out->sample_count      = s_sample_total;
 
-    /* 实测/推断/已确定 计数 */
-    uint8 visited = 0U, inferred = 0U, rb = 0U, rt = 0U;
+    /* 实测/已确定 计数 */
+    uint8 visited = 0U, rb = 0U, rt = 0U;
     for (uint8 i = 0U; i < s_item_count; ++i)
     {
-        if (s_items[i].visited && !s_items[i].inferred) { ++visited; }
-        if (s_items[i].inferred) { ++inferred; }
+        if (s_items[i].visited) { ++visited; }
         if (s_items[i].ok)
         {
             if (s_items[i].kind == APP_LINK_OBJ_KIND_BOX) { ++rb; } else { ++rt; }
         }
     }
     out->visited_count   = visited;
-    out->inferred_count  = inferred;
+    out->inferred_count  = 0U;
     out->resolved_box    = rb;
     out->resolved_target = rt;
 }

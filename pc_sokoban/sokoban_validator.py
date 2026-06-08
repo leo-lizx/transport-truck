@@ -311,7 +311,7 @@ def plan_scout_phase(the_map: list, player_start: tuple,
     返回 scout_actions, visits, player_after_scout, scout_waypoints。
 
     注意: 这是旧版"全量遍历"实现, 仅访问 BOX 不访问 TARGET; 主要用作历史比对.
-    新版逻辑请使用 plan_scout_phase_v2 (访问 box+target, 含排除法).
+    新版逻辑请使用 plan_scout_phase_v2 (访问 box+target).
     """
     if boxes is None:
         boxes = extract_elements(the_map, BOX)
@@ -373,81 +373,49 @@ def plan_scout_phase(the_map: list, player_start: tuple,
 
 
 # ============================================================
-# 侦查 V2 — 同时访问 BOX 和 TARGET, 支持排除法 (与 C 端 app_recognize 对齐)
+# 侦查 V2 — 同时访问 BOX 和 TARGET (与 C 端 app_recognize 对齐)
 # 赛题约定: 箱子 class_id ∈ {1..N}, 目标 class_id ∈ {1..N}, 集合相同;
 #           箱-目一一对应 (相同 class_id 互推).
-# 推断条件:
-#   1) 同类内 (N-1 推 1):
-#        某一类(box 或 target)只剩 1 个未识别, 缺失的 class_id 唯一 → 推断
-#   2) 跨类反推:
-#        一类全部已识别, 另一类剩余项可由 1..N 集合做差集反推 (剩 1 时唯一)
 # ============================================================
 
 def plan_scout_phase_v2(the_map: list, player_start: tuple,
                          box_classes: Optional[list] = None,
-                         target_classes: Optional[list] = None,
-                         use_inference: bool = True) -> dict:
+                         target_classes: Optional[list] = None) -> dict:
     """
-    新版侦查规划 — 同时访问箱子和目标点.
+    侦查规划 — 逐个实地访问每个箱子和目标点.
 
     参数:
         box_classes / target_classes:
             视觉端"真值": 第 i 个箱子/目标的 class_id (1..N).
-            模拟时由地图生成器或外部分配. 若为 None, 默认按 extract 顺序赋 1..N
-            (用于纯算法验证).
-        use_inference: 是否启用排除法 (N-1 推 1 + 跨类反推).
+            模拟时由地图生成器或外部分配. 若为 None, 默认按 extract 顺序赋 1..N.
 
     返回:
-        scout_actions     : 整段移动动作 (0..3 方向流, 仅行走). 仅作历史兼容,
-                            实际执行/动画请使用 visits 中每段的 path_actions
-        scout_waypoints   : 经过的网格坐标列表 (跳过起点)
-        visits            : 每段访问/推断记录, 按时序排列
-                            {
-                              'kind'         : 'box' / 'target',
-                              'item_idx'     : 该 kind 内部的索引 (与 extract 顺序对应),
-                              'pos'          : 物体网格坐标 (row, col),
-                              'observe'      : 观察点网格坐标 (推断项为 None),
-                              'class_id'     : 1..N,
-                              'inferred'     : True=排除法推断, False=实地观察,
-                              'path_actions' : 走到观察点的方向动作 (推断项为 []),
-                              'infer_chain'  : 本次实测后由排除法连锁推断出的 visit 引用列表
-                                               (按顺序; visit dict 已加入 visits 列表)
-                            }
-        player_after_scout: 侦查结束的玩家位置
-        all_visited       : 全部物体是否都已确定 class_id
-        box_classes       : 推断后的箱子 class_id 列表 (与 extract 顺序对应)
-        target_classes    : 推断后的目标 class_id 列表
-        box_to_target_idx : (用作 Sokoban_Solve_Stage2) box_to_target_idx[i]=j
-                            表示第 i 个箱子推到第 j 个目标
-        visited_real      : 实测访问数 (绕过去的)
-        visited_inferred  : 排除法推断数
+        scout_actions, scout_waypoints, visits, player_after_scout,
+        all_visited, box_classes, target_classes, box_to_target_idx,
+        visited_count
     """
     boxes   = extract_elements(the_map, BOX)
     targets = extract_elements(the_map, TARGET)
     n_box = len(boxes)
     n_tgt = len(targets)
 
-    # 默认真值: 按 extract 顺序赋 1..N (对应箱-目)
     if box_classes is None:
         box_classes = [(i + 1) for i in range(n_box)]
     if target_classes is None:
         target_classes = [(i + 1) for i in range(n_tgt)]
 
-    # 同时维护两个池子: BOX / TARGET
     items: list = []
     for i, p in enumerate(boxes):
         items.append({
             'kind': 'box', 'item_idx': i, 'pos': p,
             'truth_class': box_classes[i] if i < len(box_classes) else 0,
-            'class_id': 0, 'visited': False, 'ok': False, 'inferred': False,
-            '_visit_dict': None,
+            'class_id': 0, 'visited': False, 'ok': False,
         })
     for i, p in enumerate(targets):
         items.append({
             'kind': 'target', 'item_idx': i, 'pos': p,
             'truth_class': target_classes[i] if i < len(target_classes) else 0,
-            'class_id': 0, 'visited': False, 'ok': False, 'inferred': False,
-            '_visit_dict': None,
+            'class_id': 0, 'visited': False, 'ok': False,
         })
 
     cur = player_start
@@ -455,88 +423,17 @@ def plan_scout_phase_v2(the_map: list, player_start: tuple,
     waypoints_flat: list = []
     visits: list = []
 
+    def face_dir_from_observe(observe: tuple, target: tuple) -> Optional[int]:
+        dr = target[0] - observe[0]
+        dc = target[1] - observe[1]
+        for d in range(4):
+            if DR[d] == dr and DC[d] == dc:
+                return d
+        return None
+
     def all_resolved() -> bool:
         return all(it['ok'] for it in items)
 
-    def make_infer_visit(it) -> dict:
-        v = {
-            'kind':         it['kind'],
-            'item_idx':     it['item_idx'],
-            'pos':          it['pos'],
-            'observe':      None,
-            'class_id':     it['class_id'],
-            'inferred':     True,
-            'path_actions': [],
-            'infer_chain':  [],
-        }
-        it['_visit_dict'] = v
-        return v
-
-    def try_infer(carrier_visit: Optional[dict]) -> int:
-        """同类 N-1 推 1 + 跨类反推. 返回新推断数量.
-        新推断的 visit 被附加到 visits 列表; 同时记录到 carrier_visit['infer_chain']."""
-        if not use_inference:
-            return 0
-        new_n = 0
-        # 收集双方已识别集合
-        box_used = {it['class_id'] for it in items
-                    if it['kind'] == 'box' and it['ok']}
-        tgt_used = {it['class_id'] for it in items
-                    if it['kind'] == 'target' and it['ok']}
-        box_unknown = [it for it in items
-                        if it['kind'] == 'box' and not it['ok']]
-        tgt_unknown = [it for it in items
-                        if it['kind'] == 'target' and not it['ok']]
-
-        def commit_infer(it, cls):
-            it['class_id'] = cls
-            it['ok'] = True
-            it['inferred'] = True
-            it['visited'] = True
-            v = make_infer_visit(it)
-            visits.append(v)
-            if carrier_visit is not None:
-                carrier_visit['infer_chain'].append(v)
-
-        # 同类内: N-1 推 1
-        if len(box_unknown) == 1 and n_box >= 1:
-            missing = [c for c in range(1, n_box + 1) if c not in box_used]
-            if len(missing) == 1:
-                commit_infer(box_unknown[0], missing[0])
-                box_used.add(missing[0])
-                box_unknown = []
-                new_n += 1
-
-        if len(tgt_unknown) == 1 and n_tgt >= 1:
-            missing = [c for c in range(1, n_tgt + 1) if c not in tgt_used]
-            if len(missing) == 1:
-                commit_infer(tgt_unknown[0], missing[0])
-                tgt_used.add(missing[0])
-                tgt_unknown = []
-                new_n += 1
-
-        # 跨类反推: target 全识别 → 推 box 剩余项 (剩 1 时)
-        if len(tgt_unknown) == 0 and len(box_unknown) == 1 and n_box == n_tgt:
-            missing = [c for c in tgt_used if c not in box_used]
-            if len(missing) == 1:
-                commit_infer(box_unknown[0], missing[0])
-                box_unknown = []
-                new_n += 1
-
-        # 跨类反推: box 全识别 → 推 target 剩余项 (剩 1 时)
-        if len(box_unknown) == 0 and len(tgt_unknown) == 1 and n_box == n_tgt:
-            missing = [c for c in box_used if c not in tgt_used]
-            if len(missing) == 1:
-                commit_infer(tgt_unknown[0], missing[0])
-                tgt_unknown = []
-                new_n += 1
-
-        return new_n
-
-    # 初始尝试推断 (玩家未动时, 一般推不出来)
-    try_infer(None)
-
-    # 主循环: 选离 cur 最近的未访问物体, 走过去观察
     while not all_resolved():
         cand = [it for it in items if not it['visited'] and not it['ok']]
         if not cand:
@@ -574,26 +471,18 @@ def plan_scout_phase_v2(the_map: list, player_start: tuple,
         best_it['class_id'] = cls
         best_it['ok'] = (cls > 0)
         best_it['visited'] = True
-        best_it['inferred'] = False
 
-        v = {
+        visits.append({
             'kind':         best_it['kind'],
             'item_idx':     best_it['item_idx'],
             'pos':          best_it['pos'],
             'observe':      best_obs,
+            'face_dir':     face_dir_from_observe(best_obs, best_it['pos']),
             'class_id':     cls,
-            'inferred':     False,
             'path_actions': list(acts),
-            'infer_chain':  [],
-        }
-        best_it['_visit_dict'] = v
-        visits.append(v)
+        })
         cur = best_obs
 
-        # 识别完该物体后立刻尝试连锁推断
-        try_infer(v)
-
-    # 提取最终 class_id 列表
     out_box_classes    = [0] * n_box
     out_target_classes = [0] * n_tgt
     for it in items:
@@ -602,7 +491,6 @@ def plan_scout_phase_v2(the_map: list, player_start: tuple,
         else:
             out_target_classes[it['item_idx']] = it['class_id']
 
-    # 配对生成 box_to_target_idx
     box_to_target_idx: list = [0] * n_box
     if all_resolved() and n_box == n_tgt:
         used = [False] * n_tgt
@@ -633,9 +521,7 @@ def plan_scout_phase_v2(the_map: list, player_start: tuple,
         'box_classes':         out_box_classes,
         'target_classes':      out_target_classes,
         'box_to_target_idx':   box_to_target_idx,
-        'visited_real':        sum(1 for it in items
-                                    if it['visited'] and not it['inferred']),
-        'visited_inferred':    sum(1 for it in items if it['inferred']),
+        'visited_count':       len(visits),
     }
 
 
@@ -969,6 +855,88 @@ def find_bomb_wall(the_map: list, player_pos: tuple,
     return best_wall
 
 
+def plan_bomb(the_map: list, player_pos: tuple,
+              blocked_target: Optional[tuple] = None
+              ) -> Optional[Tuple[tuple, tuple, list]]:
+    """
+    多炸弹联合 (炸弹, 墙体) 规划。对应 C 代码 Sokoban_Plan_Bomb()。
+
+    与 find_bomb_wall 的区别: 墙体打分阶段即把"该墙能否被某颗炸弹推到"作为硬约束,
+    并在多颗炸弹中按到墙曼哈顿距离由近到远挑选第一颗可推的。
+
+    blocked_target:
+        给定时作为破局门控 (该墙必须恢复其可达性);
+        None 时退化为"最大化可达目标 + 清墙数"的通用破局。
+
+    返回 (bomb_pos, wall_pos, bomb_actions); 无可行解返回 None。
+    """
+    bombs = extract_elements(the_map, BOMB)
+    if not bombs:
+        return None
+
+    best_score = float('-inf')
+    best_plan: Optional[Tuple[tuple, tuple, list]] = None
+
+    for r in range(1, MAP_ROWS - 1):
+        for c in range(1, MAP_COLS - 1):
+            if the_map[r][c] != WALL:
+                continue
+            wall = (r, c)
+
+            tmp = [row[:] for row in the_map]
+            cleared = 0
+            for dr in range(-1, 2):
+                for dc in range(-1, 2):
+                    rr, cc = r + dr, c + dc
+                    if 1 <= rr < MAP_ROWS - 1 and 1 <= cc < MAP_COLS - 1:
+                        if tmp[rr][cc] == WALL:
+                            tmp[rr][cc] = EMPTY
+                            cleared += 1
+
+            if blocked_target is not None:
+                path = nav_bfs(tmp, player_pos, blocked_target)
+                if path is None:
+                    continue
+                blocked_len = len(path)
+            else:
+                blocked_len = 0
+
+            reachable = sum(
+                1 for tr in range(INNER_R_MIN, INNER_R_MAX + 1)
+                for tc in range(INNER_C_MIN, INNER_C_MAX + 1)
+                if tmp[tr][tc] == TARGET and nav_bfs(tmp, player_pos, (tr, tc)) is not None
+            )
+
+            score = reachable * 200 + cleared * 20 - (blocked_len * blocked_len) // 50
+
+            # 仅当有望刷新最优时, 才付出可行性 BFS 代价
+            if best_plan is not None and score <= best_score:
+                continue
+
+            # 在多颗炸弹中按到墙曼哈顿距离由近到远, 取第一颗可推到 wall 的
+            order = sorted(range(len(bombs)),
+                           key=lambda i: abs(bombs[i][0] - r) + abs(bombs[i][1] - c))
+            chosen = None
+            chosen_actions = None
+            for bi in order:
+                sub = [row[:] for row in the_map]
+                sub[bombs[bi][0]][bombs[bi][1]] = EMPTY
+                sub[wall[0]][wall[1]] = TARGET
+                acts = sokoban_bfs_single(sub, player_pos, bombs[bi], wall)
+                if acts is not None:
+                    chosen = bombs[bi]
+                    chosen_actions = acts
+                    break
+
+            if chosen is None:
+                continue
+
+            best_score = score
+            best_plan = (chosen, wall, chosen_actions)
+
+    return best_plan
+
+
 # ============================================================
 # Stage 3 完整求解
 # ============================================================
@@ -991,8 +959,6 @@ def solve_stage3(the_map: list, player_pos: tuple,
     if not bombs:
         return None
 
-    bomb_pos = bombs[0]
-
     # 找不可达目标
     blocked_target = None
     for t in extract_elements(the_map, TARGET):
@@ -1000,16 +966,15 @@ def solve_stage3(the_map: list, player_pos: tuple,
             blocked_target = t
             break
 
-    wall_pos = find_bomb_wall(the_map, player_pos, blocked_target)
-    if wall_pos is None:
+    # 多炸弹联合规划: 一次性选出可行的 (炸弹, 墙体, 推炸弹动作).
+    # 给定 blocked_target 时优先破局; 否则退化为通用破局 (最大化可达目标 + 清墙数).
+    plan = plan_bomb(the_map, player_pos, blocked_target)
+    if plan is None and blocked_target is not None:
+        plan = plan_bomb(the_map, player_pos, None)
+    if plan is None:
         return None
 
-    # 构建推炸弹用的子地图（炸弹格清空，目标墙设为 TARGET）
-    tmp = [row[:] for row in the_map]
-    tmp[bomb_pos[0]][bomb_pos[1]] = EMPTY
-    tmp[wall_pos[0]][wall_pos[1]] = TARGET
-
-    bomb_actions = sokoban_bfs_single(tmp, player_pos, bomb_pos, wall_pos)
+    bomb_pos, wall_pos, bomb_actions = plan
     if bomb_actions is None:
         return None
 
@@ -1038,6 +1003,101 @@ def solve_stage3(the_map: list, player_pos: tuple,
         'map_after_bomb':  new_map,
         'stage1_result':   stage1_result,
     }
+
+
+def solve_full(the_map: list, player_pos: tuple,
+               box_to_target_idx: Optional[list] = None,
+               max_rounds: int = MAX_BOXES + 2) -> Optional[dict]:
+    """
+    迭代多炸弹完整求解 —— 与固件 app_game_logic 的 stage_plan/stage_execute 循环一致:
+
+      每轮:
+        1. 无箱 -> 通关
+        2. 尝试整体推箱 (有 mapping 走 Stage2, 否则 Stage1); 成功 -> 追加 push 段, 通关
+        3. 否则需炸弹:
+             - 角落死局 -> 取最近目标做 blocked_target -> plan_bomb
+             - 仍无 -> 首个不可达目标 -> plan_bomb
+             - 仍无 + 有炸弹 -> 通用破局 plan_bomb(None)
+           找不到任何炸弹计划 -> 失败 (死局复位)
+        4. 模拟"推炸弹到墙 + 3x3 爆破", 更新地图与玩家, 回到第 1 步
+
+    单次 solve_stage3 只放 1 颗炸弹, 面对"需 ≥2 颗炸弹"的图 (如先解箱体死局再开通道)
+    会失败; 本函数循环放弹直到可推箱或无解, 对应固件状态机的真实行为。
+
+    返回 {phases, is_solved, map_after, player_after}; 无解返回 None。
+    phases: 有序列表, 每项 {kind:'bomb'/'push', actions, movable, wall(仅bomb)}
+    """
+    work = [row[:] for row in the_map]
+    player = player_pos
+    phases: list = []
+
+    def nearest_target(ref):
+        best, bd = None, 1 << 30
+        for (r, c) in extract_elements(work, TARGET):
+            d = abs(r - ref[0]) + abs(c - ref[1])
+            if d < bd:
+                bd, best = d, (r, c)
+        return best
+
+    def first_unreachable():
+        for t in extract_elements(work, TARGET):
+            if nav_bfs(work, player, t) is None:
+                return t
+        return None
+
+    for _ in range(max_rounds):
+        boxes = extract_elements(work, BOX)
+        if not boxes:
+            return {'phases': phases, 'is_solved': True,
+                    'map_after': work, 'player_after': player}
+
+        # 整体推箱尝试
+        if box_to_target_idx:
+            push = solve_stage2(work, player, box_to_target_idx)
+        else:
+            push = solve_stage1(work, player)
+
+        if push is not None:
+            cur = player
+            for sub in push['sub_solutions']:
+                phases.append({
+                    'kind': 'push',
+                    'actions': sub['actions'],
+                    'movable': push['boxes'][sub['box_idx']],
+                    'player_start': cur,
+                })
+                cur = sub['player_end']
+            return {'phases': phases, 'is_solved': True,
+                    'map_after': work, 'player_after': cur}
+
+        # 需炸弹 (镜像 stage_plan_handler 决策链)
+        dead, dbox = check_deadlock(work)
+        plan = None
+        if dead:
+            bt = nearest_target(dbox)
+            if bt is not None:
+                plan = plan_bomb(work, player, bt)
+        if plan is None:
+            ut = first_unreachable()
+            if ut is not None:
+                plan = plan_bomb(work, player, ut)
+        if plan is None and extract_elements(work, BOMB):
+            plan = plan_bomb(work, player, None)
+
+        if plan is None:
+            return None     # 无可行炸弹 -> 死局复位
+
+        bomb, wall, acts = plan
+        phases.append({'kind': 'bomb', 'actions': acts,
+                       'movable': bomb, 'wall': wall, 'player_start': player})
+        pe, bend = simulate_actions(acts, player, bomb)
+        assert bend == wall, (bend, wall)
+        work[bomb[0]][bomb[1]] = EMPTY
+        apply_bomb_explosion(work, wall)
+        work[wall[0]][wall[1]] = EMPTY
+        player = pe
+
+    return None     # 轮次预算耗尽
 
 
 def flatten_stage3(raw: Optional[dict], base_map: list) -> Optional[dict]:
@@ -1082,21 +1142,19 @@ def solve_level(stage: int, the_map: list, player_pos: tuple,
                 box_to_target: Optional[list] = None,
                 require_scout: bool = True,
                 box_classes: Optional[list] = None,
-                target_classes: Optional[list] = None,
-                use_inference: bool = True) -> Optional[dict]:
+                target_classes: Optional[list] = None) -> Optional[dict]:
     """
     统一关卡求解（含 Stage2/3 侦查阶段）。
     stage: 1/2/3
     require_scout: Stage2/3 是否先跑侦查再推箱/炸弹
     box_classes / target_classes: 视觉端真值 (1..N), 仅 Stage2/3 用
         - 默认 None → 按 extract 顺序 1..N (一一对应)
-    use_inference: 启用排除法 (识别 N-1 即可推断剩余 1 个)
     """
     boxes = extract_elements(the_map, BOX)
     targets = extract_elements(the_map, TARGET)
     scout = None
     work_player = player_pos
-    inferred_mapping: Optional[list] = None
+    scout_mapping: Optional[list] = None
 
     if stage >= 2 and require_scout and boxes:
         # Stage3 默认不强求侦查全部 box+target (横墙隔断时 target 暂不可达,
@@ -1108,37 +1166,35 @@ def solve_level(stage: int, the_map: list, player_pos: tuple,
         if do_v2:
             scout = plan_scout_phase_v2(the_map, player_pos,
                                          box_classes=box_classes,
-                                         target_classes=target_classes,
-                                         use_inference=use_inference)
+                                         target_classes=target_classes)
             if not scout['all_visited']:
                 return None
             work_player = scout['player_after_scout']
-            inferred_mapping = scout.get('box_to_target_idx') or None
+            scout_mapping = scout.get('box_to_target_idx') or None
         elif stage == 3:
             # 保持旧行为: Stage3 不做侦查, 直接进炸弹+stage1
             scout = None
-            inferred_mapping = None
+            scout_mapping = None
         else:
             scout = plan_scout_phase_v2(the_map, player_pos,
                                          box_classes=box_classes,
-                                         target_classes=target_classes,
-                                         use_inference=use_inference)
+                                         target_classes=target_classes)
             if not scout['all_visited']:
                 return None
             work_player = scout['player_after_scout']
-            inferred_mapping = scout.get('box_to_target_idx') or None
+            scout_mapping = scout.get('box_to_target_idx') or None
 
     push_result = None
     if stage == 1:
         push_result = solve_stage1(the_map, work_player)
     elif stage == 2:
-        # 优先用侦查推断出的映射; 外部显式传入则覆盖
+        # 优先用侦查得到的映射; 外部显式传入则覆盖
         if box_to_target is None:
-            box_to_target = inferred_mapping or default_box_mapping(boxes, targets)
+            box_to_target = scout_mapping or default_box_mapping(boxes, targets)
         push_result = solve_stage2(the_map, work_player, box_to_target)
     elif stage == 3:
         raw3 = solve_stage3(the_map, work_player,
-                             box_to_target_idx=(box_to_target or inferred_mapping))
+                             box_to_target_idx=(box_to_target or scout_mapping))
         push_result = flatten_stage3(raw3, the_map)
     else:
         return None

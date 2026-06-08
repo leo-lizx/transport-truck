@@ -73,31 +73,28 @@ vr = sv.verify_run_script(m2, (5, 7), script, stage=1)
 assert vr['ok'], vr['message']
 print(vr['message'])
 
-# 测试8: 排除法 (V2 侦查) — N-1 推 1
-print("\n=== 测试8: 排除法 (V2 侦查) ===")
+# 测试8: V2 侦查 — 必须实地访问全部箱子/目标
+print("\n=== 测试8: V2 侦查 (全量实地访问) ===")
 m8, p8 = sv.generate_map(stage=2, box_count=3, seed=11)
-# 先跑无推断
-no_inf = sv.plan_scout_phase_v2(m8, p8, use_inference=False)
-inf    = sv.plan_scout_phase_v2(m8, p8, use_inference=True)
+scout8 = sv.plan_scout_phase_v2(m8, p8)
 total_items = 6  # 3 box + 3 target
-# 排除法: 至少最后一个 box 和最后一个 target 都能被推断 → real ≤ 4
-print(f"  无推断: real={no_inf['visited_real']} inferred={no_inf['visited_inferred']} (期望 6/0)")
-print(f"  开推断: real={inf['visited_real']}    inferred={inf['visited_inferred']}")
-assert no_inf['visited_real'] == total_items, "无推断时应实测全部"
-assert inf['visited_real'] < total_items, "推断时应少于全量"
-assert inf['all_visited'], "推断后应全部 resolved"
-assert inf['box_to_target_idx'] is not None
-print(f"  推断结果 box_classes={inf['box_classes']} target_classes={inf['target_classes']}")
-print(f"  box→target 映射: {inf['box_to_target_idx']}")
+print(f"  访问数: {scout8['visited_count']}/{total_items} (期望 6/6)")
+assert scout8['visited_count'] == total_items, "应实地访问全部物体"
+assert scout8['all_visited'], "应全部 resolved"
+assert scout8['box_to_target_idx'] is not None
+for v in scout8['visits']:
+    fd = v.get('face_dir')
+    assert fd is not None, "每个实地观察项都应有面向物体的 face_dir"
+    obs = v['observe']
+    pos = v['pos']
+    assert (obs[0] + sv.DR[fd], obs[1] + sv.DC[fd]) == pos, "face_dir 应从观察点指向物体"
+print(f"  box_classes={scout8['box_classes']} target_classes={scout8['target_classes']}")
+print(f"  box→target 映射: {scout8['box_to_target_idx']}")
 
 # 测试9: V2 + Stage2 完整求解 (走真实路径)
 print("\n=== 测试9: V2 完整求解 ===")
-sol9 = sv.solve_level(2, m8, p8, use_inference=True)
+sol9 = sv.solve_level(2, m8, p8)
 assert sol9 is not None and sol9['scout']['all_visited']
-print(f"  总步数(开推断): {sol9['total_steps']}  侦查实测+推断: "
-      f"{sol9['scout']['visited_real']}+{sol9['scout']['visited_inferred']}")
-sol9b = sv.solve_level(2, m8, p8, use_inference=False)
-print(f"  总步数(无推断): {sol9b['total_steps']}")
-assert sol9['total_steps'] <= sol9b['total_steps'], "推断应不慢于无推断"
+print(f"  总步数: {sol9['total_steps']}  侦查访问: {sol9['scout']['visited_count']}")
 print("\n=============================")
 print("所有测试通过！")

@@ -115,7 +115,7 @@ static uint32 wait_for_tick(void)
 #define MAIN_RUN_MODE_HARDCODED_MAP   (8)   /* 硬编码地图: 代码内置地图, 上电解算→暖机→跑→回 */
 
 /* ═══════════ 改下面这行切换运行模式 (0~8) ═══════════ */
-#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_POINT_NAV)  /* 当前: 状态6静态地图屏幕验证 */
+#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_SOKO_SELFTEST)  /* 当前: 状态6静态地图屏幕验证 */
 /* ═══════════ 改上面这行切换运行模式 (0~8) ═══════════ */
 
 /* OpenART1 地图链路硬件口: 若实测 UART4 走 D0/D1, 只改下面两行宏. */
@@ -1362,7 +1362,7 @@ static void main_apply_debug_wheel_pid(void)
 /* ========================================================================== */
 /*  ⬆⬆⬆ 单轮 PID 调试辅助函数结束 ⬆⬆⬆                                          */
 /* ========================================================================== */
-int main(void)
+ int main(void)
 {
     uint8 menu_render_div = 0U;
 

@@ -868,3 +868,284 @@ uint8 Sokoban_Solve_Push_Bomb(const uint8 map[MAP_ROWS][MAP_COLS],
 
     return sokoban_bfs_single(sb_sub_map, player_pos, bomb_pos, wall_pos, sol);
 }
+
+/*===========================================================================
+ *  公开 API: 多炸弹联合 (炸弹, 墙体) 规划
+ *
+ *  与旧 Sokoban_Find_Bomb_Wall 的关键区别:
+ *    - 墙体打分阶段就把"该墙能否被某颗炸弹推到"纳入硬约束 (可行性);
+ *    - 在多颗炸弹中按到墙曼哈顿距离从近到远挑选, 选到第一颗可推的即可;
+ *    - 打分时把"待推炸弹自身原格"视为已清空 (爆炸后它会离开原格),
+ *      可达性评估不再被自己堵住, 修正旧实现的悲观估计。
+ *
+ *  为控制单片机上的一次性规划耗时, 仅当某面墙的得分"有望刷新当前最优"时,
+ *  才执行 (较昂贵的) 单箱推炸弹可行性 BFS, 失败则不更新最优, 继续下一面墙。
+ *===========================================================================*/
+uint8 Sokoban_Plan_Bomb(const uint8 map[MAP_ROWS][MAP_COLS],
+                        Point_t player_pos,
+                        Point_t blocked_target,
+                        Point_t *out_bomb_pos,
+                        Point_t *out_wall_pos,
+                        SokoActionSeq_t *out_seq)
+{
+    static uint8     tmp_map[MAP_ROWS][MAP_COLS];
+    static NavPath_t tmp_path;
+    static SokoActionSeq_t try_seq;
+
+    Point_t bombs[SOKOBAN_MAX_BOXES];
+    uint8   bomb_n;
+    int32   best_score = -2147483647;
+    uint8   found = 0;
+
+    if (!out_bomb_pos || !out_wall_pos || !out_seq) return 0;
+
+    bomb_n = extract_elements(map, MAP_BOMB, bombs, SOKOBAN_MAX_BOXES);
+    if (bomb_n == 0) return 0;
+
+    /* 遍历所有内部墙体（最外圈不可炸） */
+    for (int8 r = 1; r < MAP_ROWS - 1; r++) {
+        for (int8 c = 1; c < MAP_COLS - 1; c++) {
+            uint8  cleared_walls = 0;
+            uint8  reachable_targets = 0;
+            uint16 blocked_len = 0;
+            int32  score;
+            Point_t wall;
+
+            if (map[r][c] != MAP_WALL) continue;
+
+            wall.x = c;
+            wall.y = r;
+
+            /* 假设在 (r, c) 引爆炸弹，3×3 范围清除内墙 */
+            memcpy(tmp_map, map, sizeof(tmp_map));
+            for (int8 dr = -1; dr <= 1; dr++) {
+                for (int8 dc = -1; dc <= 1; dc++) {
+                    int8 rr = r + dr, cc = c + dc;
+                    if (rr >= 1 && rr < MAP_ROWS - 1 &&
+                        cc >= 1 && cc < MAP_COLS - 1) {
+                        if (tmp_map[rr][cc] == MAP_WALL) {
+                            tmp_map[rr][cc] = MAP_EMPTY;
+                            cleared_walls++;
+                        }
+                    }
+                }
+            }
+
+            /* 统计爆炸后可达目标数量.
+             * 注意: 其余炸弹仍留在 tmp_map 上作为障碍 (Algo_Nav_BFS 视其不可通行),
+             * 这与"一次只引爆一颗"的物理一致。 */
+            for (int8 tr = (int8)CHASSIS_GRID_INNER_MIN_Y; tr <= (int8)CHASSIS_GRID_INNER_MAX_Y; tr++) {
+                for (int8 tc = (int8)CHASSIS_GRID_INNER_MIN_X; tc <= (int8)CHASSIS_GRID_INNER_MAX_X; tc++) {
+                    if (tmp_map[tr][tc] != MAP_TARGET) continue;
+                    {
+                        Point_t tp = {tc, tr};
+                        if (Algo_Nav_BFS(tmp_map, player_pos, tp, &tmp_path)) {
+                            reachable_targets++;
+                        }
+                    }
+                }
+            }
+
+            /* 破局门控: 给定 blocked_target 时, 该墙必须能恢复其可达性 */
+            if (blocked_target.x >= 0 && blocked_target.y >= 0) {
+                if (!Algo_Nav_BFS(tmp_map, player_pos, blocked_target, &tmp_path)) {
+                    continue;
+                }
+                blocked_len = tmp_path.step_count;
+            }
+
+            score = (int32)reachable_targets * 200
+                  + (int32)cleared_walls * 20
+                  - ((int32)blocked_len * (int32)blocked_len) / 50;
+
+            /* 仅当本墙有望刷新最优时才付出可行性 BFS 代价 */
+            if (found && score <= best_score) continue;
+
+            /* 可行性: 在多颗炸弹中按到墙曼哈顿距离由近到远, 取第一颗可推到 W 的 */
+            {
+                uint8 tried[SOKOBAN_MAX_BOXES] = {0};
+                int8  chosen = -1;
+                uint8 k;
+
+                for (k = 0; k < bomb_n; k++) {
+                    int8  bi = -1;
+                    int16 bd = 32767;
+                    uint8 i;
+                    for (i = 0; i < bomb_n; i++) {
+                        int16 d;
+                        if (tried[i]) continue;
+                        d = (int16)(abs(bombs[i].x - c) + abs(bombs[i].y - r));
+                        if (d < bd) { bd = d; bi = (int8)i; }
+                    }
+                    if (bi < 0) break;
+                    tried[bi] = 1;
+
+                    if (Sokoban_Solve_Push_Bomb(map, player_pos,
+                                                bombs[bi], wall, &try_seq)) {
+                        chosen = bi;
+                        break;
+                    }
+                }
+
+                if (chosen < 0) continue;   /* 没有任何炸弹能被推到这面墙 */
+
+                best_score    = score;
+                *out_wall_pos = wall;
+                *out_bomb_pos = bombs[chosen];
+                *out_seq      = try_seq;
+                found = 1;
+            }
+        }
+    }
+
+    return found;
+}
+
+/*===========================================================================
+ *  顶层迭代求解 (推箱 + 多炸弹)
+ *===========================================================================*/
+
+/** 在地图上找离 ref 曼哈顿最近的目标 */
+static uint8 sf_nearest_target(const uint8 map[MAP_ROWS][MAP_COLS],
+                               Point_t ref, Point_t *out)
+{
+    int16 best = 32767;
+    uint8 found = 0;
+    for (int8 r = (int8)CHASSIS_GRID_INNER_MIN_Y; r <= (int8)CHASSIS_GRID_INNER_MAX_Y; r++) {
+        for (int8 c = (int8)CHASSIS_GRID_INNER_MIN_X; c <= (int8)CHASSIS_GRID_INNER_MAX_X; c++) {
+            if (map[r][c] != MAP_TARGET) continue;
+            {
+                int16 d = (int16)(abs((int)c - (int)ref.x) + abs((int)r - (int)ref.y));
+                if (d < best) { best = d; out->x = c; out->y = r; found = 1; }
+            }
+        }
+    }
+    return found;
+}
+
+/** 找首个玩家走不到的目标 (炸弹破局门控用) */
+static uint8 sf_first_unreachable(const uint8 map[MAP_ROWS][MAP_COLS],
+                                  Point_t player, Point_t *out)
+{
+    static NavPath_t np;
+    for (int8 r = (int8)CHASSIS_GRID_INNER_MIN_Y; r <= (int8)CHASSIS_GRID_INNER_MAX_Y; r++) {
+        for (int8 c = (int8)CHASSIS_GRID_INNER_MIN_X; c <= (int8)CHASSIS_GRID_INNER_MAX_X; c++) {
+            if (map[r][c] != MAP_TARGET) continue;
+            {
+                Point_t t = {c, r};
+                if (!Algo_Nav_BFS(map, player, t, &np)) { *out = t; return 1; }
+            }
+        }
+    }
+    return 0;
+}
+
+uint8 Sokoban_Solve_Full(const uint8 map[MAP_ROWS][MAP_COLS],
+                         Point_t player_pos,
+                         const uint8 *box_to_target_idx,
+                         uint8 box_count,
+                         SokoPlan_t *out_plan)
+{
+    static uint8              sf_work[MAP_ROWS][MAP_COLS];
+    static SokoFullSolution_t sf_push;
+    static SokoActionSeq_t    sf_bseq;
+
+    Point_t player = player_pos;
+    uint8   round;
+
+    if (!out_plan) return 0;
+    out_plan->count     = 0;
+    out_plan->is_solved = 0;
+
+    memcpy(sf_work, map, sizeof(sf_work));
+
+    /* 轮次上限: 每轮最多消化 1 颗炸弹, 加首轮直接推箱, 留 2 余量 */
+    for (round = 0; round < (uint8)(SOKOBAN_MAX_BOXES + 2); round++) {
+        Point_t boxes_tmp[SOKOBAN_MAX_BOXES];
+        uint8   box_n;
+        uint8   push_ok;
+
+        box_n = extract_elements(sf_work, MAP_BOX, boxes_tmp, SOKOBAN_MAX_BOXES);
+        if (box_n == 0U) {
+            out_plan->is_solved = 1;
+            return 1;
+        }
+
+        /* 1) 整体推箱尝试 */
+        if (box_to_target_idx != NULL) {
+            push_ok = Sokoban_Solve_Stage2(sf_work, player, box_to_target_idx,
+                                           box_count, &sf_push);
+        } else {
+            push_ok = Sokoban_Solve_Stage1(sf_work, player, &sf_push);
+        }
+
+        if (push_ok && sf_push.is_solved) {
+            Point_t cur = player;
+            uint8 i;
+            for (i = 0U; i < sf_push.total_boxes; i++) {
+                SokoPhase_t *ph;
+                if (out_plan->count >= (uint8)SOKOBAN_MAX_PHASES) return 0;
+                ph = &out_plan->phases[out_plan->count++];
+                ph->kind         = SOKO_PHASE_PUSH;
+                ph->seq          = sf_push.sub_solutions[i];
+                ph->player_start = cur;
+                ph->movable.x    = -1; ph->movable.y = -1;
+                ph->wall.x       = -1; ph->wall.y    = -1;
+                cur = sf_push.player_end_pos[i];
+            }
+            out_plan->is_solved = 1;
+            return 1;
+        }
+
+        /* 2) 推箱失败 → 选一颗炸弹炸墙 (镜像 stage_plan_handler 决策链) */
+        {
+            Point_t bomb, wall, dead, bt;
+            uint8   planned = 0;
+
+            if (out_plan->count >= (uint8)SOKOBAN_MAX_PHASES) return 0;
+
+            if (Sokoban_Is_Deadlock(sf_work, &dead)) {
+                if (sf_nearest_target(sf_work, dead, &bt)) {
+                    if (Sokoban_Plan_Bomb(sf_work, player, bt, &bomb, &wall, &sf_bseq)) {
+                        planned = 1;
+                    }
+                }
+            }
+            if (!planned) {
+                if (sf_first_unreachable(sf_work, player, &bt)) {
+                    if (Sokoban_Plan_Bomb(sf_work, player, bt, &bomb, &wall, &sf_bseq)) {
+                        planned = 1;
+                    }
+                }
+            }
+            if (!planned) {
+                Point_t bombs_tmp[SOKOBAN_MAX_BOXES];
+                if (extract_elements(sf_work, MAP_BOMB, bombs_tmp, SOKOBAN_MAX_BOXES) > 0U) {
+                    Point_t none = {-1, -1};
+                    if (Sokoban_Plan_Bomb(sf_work, player, none, &bomb, &wall, &sf_bseq)) {
+                        planned = 1;
+                    }
+                }
+            }
+            if (!planned) return 0;   /* 无可行炸弹 → 死局复位 */
+
+            /* 追加炸弹段 */
+            {
+                SokoPhase_t *ph = &out_plan->phases[out_plan->count++];
+                ph->kind         = SOKO_PHASE_BOMB;
+                ph->seq          = sf_bseq;
+                ph->player_start = player;
+                ph->movable      = bomb;
+                ph->wall         = wall;
+            }
+
+            /* 模拟"推炸弹到墙 + 3×3 爆破", 更新 work 与 player */
+            player = simulate_actions(&sf_bseq, player, bomb);
+            sf_work[bomb.y][bomb.x] = MAP_EMPTY;
+            Sokoban_Apply_Bomb_Explosion(sf_work, wall);
+            sf_work[wall.y][wall.x] = MAP_EMPTY;
+        }
+    }
+
+    return 0;   /* 轮次预算耗尽 */
+}

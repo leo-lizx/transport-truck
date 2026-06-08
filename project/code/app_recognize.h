@@ -77,7 +77,7 @@ typedef struct
     uint8  current_class_id;    /* 当前多数票得到的 class_id (0=未确定)  */
     uint16 sample_count;        /* 已采样次数 (调试用)                   */
     uint8  visited_count;       /* 已实测访问识别完成数 (含跳过失败)     */
-    uint8  inferred_count;      /* 排除法推断数 (未走过去)               */
+    uint8  inferred_count;      /* 保留字段, 恒为 0                        */
     uint8  resolved_box;        /* 已确定 class_id 的箱子数              */
     uint8  resolved_target;     /* 已确定 class_id 的目标点数            */
 } AppRecognizeDebug_t;

@@ -165,21 +165,6 @@ static uint8 map_has_bomb(void)
     return 0;
 }
 
-static Point_t find_bomb_pos_on_map(void)
-{
-    Point_t bomb = {-1, -1};
-    for (int8 r = (int8)CHASSIS_GRID_INNER_MIN_Y; r <= (int8)CHASSIS_GRID_INNER_MAX_Y; r++) {
-        for (int8 c = (int8)CHASSIS_GRID_INNER_MIN_X; c <= (int8)CHASSIS_GRID_INNER_MAX_X; c++) {
-            if (g_game_map[r][c] == MAP_BOMB) {
-                bomb.x = c;
-                bomb.y = r;
-                return bomb;
-            }
-        }
-    }
-    return bomb;
-}
-
 static Point_t choose_nearest_target(Point_t ref)
 {
     Point_t best = {-1, -1};
@@ -379,17 +364,12 @@ static uint8 find_first_unreachable_target(Point_t *blocked_target)
 
 static uint8 build_bomb_plan(Point_t blocked_target)
 {
-    g_bomb_pos = find_bomb_pos_on_map();
-    if (g_bomb_pos.x < 0) return 0;
-
-    if (!Sokoban_Find_Bomb_Wall(g_game_map, g_player_pos,
-                                blocked_target, &g_bomb_wall_pos)) {
-        return 0;
-    }
-
-    if (!Sokoban_Solve_Push_Bomb(g_game_map, g_player_pos,
-                                 g_bomb_pos, g_bomb_wall_pos,
-                                 &g_bomb_action_seq)) {
+    /* 多炸弹联合规划: 一次性给出 (炸弹, 墙体, 推炸弹动作序列).
+     * 取代旧的 "固定推扫描序第一颗炸弹 + 墙体独立打分" 三步式, 后者在
+     * 多炸弹时常因 "最优墙体的第一颗炸弹推不过去" 而误判无解。 */
+    if (!Sokoban_Plan_Bomb(g_game_map, g_player_pos, blocked_target,
+                           &g_bomb_pos, &g_bomb_wall_pos,
+                           &g_bomb_action_seq)) {
         return 0;
     }
 
@@ -636,6 +616,20 @@ static void stage_plan_handler(void)
         build_bomb_plan(blocked_target)) {
         goto_stage(STAGE_EXECUTE_ACTION);
         return;
+    }
+
+    /* 通用炸弹兜底 (多炸弹关键补强):
+     * 推箱规划失败, 但既无角落死局、目标对玩家也都"可走到" —— 典型成因是
+     * 炸弹/内墙堵在 *箱子* 的推进通道上 (find_first_unreachable_target 只看
+     * 玩家→目标可达, 看不到箱子被堵)。此时以"最大化破局收益"为目标 (无特定
+     * blocked_target) 再尝试炸墙开路; Sokoban_Plan_Bomb 内部会确保选中的墙
+     * 确有炸弹可推, 找不到则照常进入死局复位。 */
+    if (map_has_bomb()) {
+        Point_t no_target = { -1, -1 };
+        if (build_bomb_plan(no_target)) {
+            goto_stage(STAGE_EXECUTE_ACTION);
+            return;
+        }
     }
 
     goto_stage(STAGE_DEADLOCK_RESET);

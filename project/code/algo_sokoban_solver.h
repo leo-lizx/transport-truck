@@ -239,4 +239,89 @@ uint8 Sokoban_Solve_Push_Bomb(const uint8 map[MAP_ROWS][MAP_COLS],
                              Point_t wall_pos,
                              SokoActionSeq_t *sol);
 
+/**
+ * @brief  第三阶段顶层规划 — 多炸弹联合 (炸弹, 墙体) 最优可行解搜索
+ *
+ * 旧 `Sokoban_Find_Bomb_Wall` + `find_bomb_pos_on_map()` 假设全图仅 1 颗炸弹:
+ * 墙体打分与"用哪颗炸弹"完全解耦, 且固定取扫描序第一颗炸弹去推。
+ * 多炸弹时常出现"选中的墙最优但第一颗炸弹推不过去 → 整盘判失败"的误杀。
+ *
+ * 本函数做联合搜索, 一次性给出可直接执行的完整炸弹计划:
+ *   1. 提取全部炸弹;
+ *   2. 遍历每一面内部墙体 W, 模拟 3×3 爆破后用 Algo_Nav_BFS 评估破局收益;
+ *   3. 仅对"有望刷新最优分"的墙体, 按到 W 的曼哈顿距离从近到远遍历炸弹 B,
+ *      用 Sokoban_Solve_Push_Bomb 验证 B 能否真正被推到 W;
+ *   4. 取得分最高且"存在可推炸弹"的 (B, W), 输出推炸弹动作序列。
+ *
+ * 其余炸弹在求解 B→W 时仍视为障碍 (符合"一次只引爆一颗"的物理), 多颗炸弹
+ * 由上层在每次爆炸后重新规划 (STAGE_EXECUTE → STAGE_PLAN_PATH) 逐颗消化。
+ *
+ * @param  map             当前地图
+ * @param  player_pos      玩家坐标
+ * @param  blocked_target  当前不可达目标 (用于破局门控); {x<0,y<0} 表示无特定
+ *                         目标, 退化为"最大化可达目标 + 清墙数"的通用破局
+ * @param  out_bomb_pos    [out] 选中的炸弹坐标
+ * @param  out_wall_pos    [out] 选中的爆破墙体坐标
+ * @param  out_seq         [out] 把该炸弹推到该墙体的动作序列
+ * @return 1=找到可行炸弹计划, 0=无可行解
+ */
+uint8 Sokoban_Plan_Bomb(const uint8 map[MAP_ROWS][MAP_COLS],
+                        Point_t player_pos,
+                        Point_t blocked_target,
+                        Point_t *out_bomb_pos,
+                        Point_t *out_wall_pos,
+                        SokoActionSeq_t *out_seq);
+
+/* ======================================================================
+ *  顶层迭代求解（推箱 + 多炸弹一气呵成）
+ * ====================================================================== */
+
+/** 解算段类型 */
+typedef enum {
+    SOKO_PHASE_PUSH = 0,    /* 推箱段: movable=箱子起点(可为空) */
+    SOKO_PHASE_BOMB = 1     /* 推炸弹段: 把 movable(炸弹) 推到 wall 后引爆 3×3 */
+} SokoPhaseKind_e;
+
+/** 单个解算段（按时序排列） */
+typedef struct {
+    SokoPhaseKind_e kind;
+    SokoActionSeq_t seq;            /* 该段方向动作序列 */
+    Point_t         player_start;   /* 该段起始玩家格（供 Sokoban_Actions_To_Waypoints） */
+    Point_t         movable;        /* 被推物体起点（箱子/炸弹）；push 段可为 {-1,-1} */
+    Point_t         wall;           /* 仅 BOMB 段：引爆墙体（= movable 终点） */
+} SokoPhase_t;
+
+/* 段数上限：最多 N 颗炸弹段 + N 个推箱段 */
+#define SOKOBAN_MAX_PHASES   (SOKOBAN_MAX_BOXES * 2)
+
+/** 完整解算结果（含炸弹段与推箱段） */
+typedef struct {
+    SokoPhase_t phases[SOKOBAN_MAX_PHASES];
+    uint8       count;
+    uint8       is_solved;          /* 1 = 全部箱子可入目标 */
+} SokoPlan_t;
+
+/**
+ * @brief  顶层迭代求解：推箱失败→炸墙开路→爆炸→重规划，循环至通关或无解
+ *
+ * 与固件 `app_game_logic` 的 stage_plan/stage_execute 循环等价（纯函数版）：
+ *   每轮：无箱→成功；否则整体推箱 (Stage2/Stage1)；失败则按
+ *   死局→不可达目标→通用破局 选一颗炸弹炸墙，模拟"推到墙+3×3 爆破"后重算。
+ *
+ * 解决「单次 Stage3 只放 1 颗炸弹」无法应对**需 ≥2 颗炸弹**的关卡
+ * （例如：先炸开夹死某箱子的墙，再炸通另一目标的走廊）。
+ *
+ * @param  map                当前地图（不被修改）
+ * @param  player_pos         玩家起点
+ * @param  box_to_target_idx  箱→目标映射（NULL ⇒ Stage1 任意配对，自测/第 1 关用）
+ * @param  box_count          mapping 非空时用于校验箱子数
+ * @param  out_plan           [out] 有序解算段（炸弹段 + 推箱段）
+ * @return 1=可通关, 0=无解（应进入死局复位）
+ */
+uint8 Sokoban_Solve_Full(const uint8 map[MAP_ROWS][MAP_COLS],
+                         Point_t player_pos,
+                         const uint8 *box_to_target_idx,
+                         uint8 box_count,
+                         SokoPlan_t *out_plan);
+
 #endif /* _ALGO_SOKOBAN_SOLVER_H_ */
