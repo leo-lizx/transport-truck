@@ -373,7 +373,7 @@
  *   1.20 m/s 时单轮峰值电流超 TB6612 过流阈值 → 驱动器关断 → 轮停.
  *   麦轮斜走单轮最坏 = 1.20×√2≈1.70 m/s, 冲击更大.
  *   0.70 m/s: d_stop=0.70²/(2×2.10)=0.117m, BRAKE_DIST=0.25m ✓ 有裕量. */
-#define CHASSIS_MAX_LINEAR_SPEED_MPS    (2.0f)
+#define CHASSIS_MAX_LINEAR_SPEED_MPS    (1.50f)
 
 /* CHASSIS_MAX_YAW_SPEED_DPS 已移到文件顶部“用户常调参数区”。 */
 
@@ -397,10 +397,10 @@
  * 取值: 当前 MAX_LINEAR=1.35 + MAX_YAW=90dps 上游限住单轮最坏 ≈1.65 m/s,
  * 兑底设 16 m/s 留 ~10 倍裕量, 平时不触发, 仅在多指令叠加暴冲时生效。
  */
-#define CHASSIS_WHEEL_SPEED_CAP_MPS     (1.0f)
+#define CHASSIS_WHEEL_SPEED_CAP_MPS     (4.0f)
 
 /** 在线调参时允许的线速度上限硬限制（m/s） */
-#define CHASSIS_TUNE_MAX_LINEAR_SPEED_LIMIT_MPS  (3.50f)
+#define CHASSIS_TUNE_MAX_LINEAR_SPEED_LIMIT_MPS  (4.0f)
 
 /** 在线调参时允许的角速度上限硬限制（°/s） */
 #define CHASSIS_TUNE_MAX_YAW_SPEED_LIMIT_DPS     (360.0f)
