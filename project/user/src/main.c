@@ -102,7 +102,7 @@ static uint32 wait_for_tick(void)
  *   5   MAIN_RUN_MODE_SOLVE_VERIFY          ❌    摄像头 UART4     解算验证: 收图→解算→虚拟走比赛流程, 车不动仅验算法
  *   6   MAIN_RUN_MODE_STATIC_VERIFY         ❌    代码内置          静态验证: 内置地图→解算→屏幕慢速播放, 车不动
  *   7   MAIN_RUN_MODE_LEVEL1_TEST           ✅    OpenART 串口     第一关完整流程: 收图→等人发车→推箱→回发车区
- *   8   MAIN_RUN_MODE_HARDCODED_MAP         ✅    代码内置          硬编码地图: 上电即解算→暖机→自动推箱→回库
+ *   8   MAIN_RUN_MODE_HARDCODED_MAP         ✅    代码内置          固定发车: 上电解算→Y轴平移发车→推箱→回库
  *=========================================================================*/
 #define MAIN_RUN_MODE_GAME            (0)   /* 正式比赛: 完整视觉+推箱+底盘闭环 */
 #define MAIN_RUN_MODE_YAW_HOLD        (1)   /* 航向保持: 车不动, IMU 锁角度调 yaw PID */
@@ -112,10 +112,10 @@ static uint32 wait_for_tick(void)
 #define MAIN_RUN_MODE_SOLVE_VERIFY    (5)   /* 解算验证: 收图→解算→虚拟跑流程显示, 车不动 */
 #define MAIN_RUN_MODE_STATIC_VERIFY   (6)   /* 静态验证: 内置地图→解算→屏幕慢速播放, 车不动 */
 #define MAIN_RUN_MODE_LEVEL1_TEST     (7)   /* 第一关测试: 收图→等发车→推箱→回库 (最接近比赛) */
-#define MAIN_RUN_MODE_HARDCODED_MAP   (8)   /* 硬编码地图: 代码内置地图, 上电解算→暖机→跑→回 */
+#define MAIN_RUN_MODE_HARDCODED_MAP   (8)   /* 硬编码地图: 上电解算→Y轴平移发车→跑→回发车点 */
 
 /* ═══════════ 改下面这行切换运行模式 (0~8) ═══════════ */
-#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_POINT_NAV)  /* 当前: 状态6静态地图屏幕验证 */
+#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_HARDCODED_MAP)  /* 当前: 模式8固定发车跑第一关 */
 /* ═══════════ 改上面这行切换运行模式 (0~8) ═══════════ */
 
 /* OpenART1 地图链路硬件口: 若实测 UART4 走 D0/D1, 只改下面两行宏. */
@@ -125,10 +125,21 @@ static uint32 wait_for_tick(void)
 
 /* ========================================================================== */
 /* 位置/起点宏（上提至所有调试模式之前, 避免 LEVEL1_TEST/HARDCODED_MAP 等
- * 模式内引用时未定义）. 起点 (1, 5.5) 是发车区中心, 由顶层 chassis_ctrl_set_pose 写死. */
+ * 模式内引用时未定义）.
+ *
+ * 模式8实车从 (1,5.5) 上电, 暖机后先沿 Y 轴固定平移到 (1,5),
+ * 再从 (1,5) 对应的整数格开始按 Stage1 航点跑完整关. */
 /* ========================================================================== */
 #define MAIN_POS_NAV_START_X_GRID     (1.0f)
 #define MAIN_POS_NAV_START_Y_GRID     (5.5f)
+
+#define MAIN_POS_HCM_HOME_X_GRID      (MAIN_POS_NAV_START_X_GRID)
+#define MAIN_POS_HCM_HOME_Y_GRID      (MAIN_POS_NAV_START_Y_GRID)
+
+#define MAIN_POS_HCM_LAUNCH_TARGET_X_GRID  (MAIN_POS_HCM_HOME_X_GRID)
+#define MAIN_POS_HCM_LAUNCH_TARGET_Y_GRID  (5.0f)
+#define MAIN_POS_HCM_SOLVE_START_X_GRID    (1)
+#define MAIN_POS_HCM_SOLVE_START_Y_GRID    (5)
 
 #define MAIN_POS_GRID_TO_M_X(g)       (((float)(g) - 0.5f) * CHASSIS_GRID_STEP_X_M)
 #define MAIN_POS_GRID_TO_M_Y(g)       (((float)(g) - 0.5f) * CHASSIS_GRID_STEP_Y_M)
@@ -460,13 +471,14 @@ static void main_run_level1_test_log_50ms(void)
 #endif /* MAIN_RUN_MODE_LEVEL1_TEST */
 
 /* ============================================================================
- *  HARDCODED_MAP 模式: 硬编码地图 → 上电直接解算 → 暖机 → 跑航点 → 回发车区
+ *  HARDCODED_MAP 模式: 硬编码地图 → 上电直接解算 → 暖机 → Y轴平移发车 → 跑航点 → 回发车区
  *  流程:
  *    1. SOLVE        — 上电后立即用编译期字面量地图解算推箱子路径
  *    2. WARMUP       — 解算成功后暖机 1s (IMU/编码器稳定)
- *    3. PUSH_BOXES   — 逐子箱跑航点 (纯里程计导航)
- *    4. RETURN_HOME  — 推完后回发车区起点
- *    5. DONE         — 驻停
+ *    3. LAUNCH       — 从固定发车点沿 Y 轴平移到解算起点
+ *    4. PUSH_BOXES   — 逐子箱跑航点 (纯里程计导航)
+ *    5. RETURN_HOME  — 推完后回固定发车点
+ *    6. DONE         — 驻停
  *
  *  使用方法:
  *    - 直接修改 s_soko_selftest_map 中的地图内容
@@ -478,8 +490,9 @@ static void main_run_level1_test_log_50ms(void)
 typedef enum {
     HCM_PHASE_SOLVE = 0,     /* 上电立即解算 */
     HCM_PHASE_WARMUP,        /* 暖机等待 IMU/编码器稳定 */
+    HCM_PHASE_LAUNCH_FIXED,  /* 固定发车点沿 Y 轴平移到解算起点 */
     HCM_PHASE_PUSH_BOXES,    /* 逐航点推箱 */
-    HCM_PHASE_RETURN_HOME,   /* 回发车区起点 */
+    HCM_PHASE_RETURN_HOME,   /* 回固定发车点 */
     HCM_PHASE_DONE           /* 完成驻停 */
 } hcm_phase_e;
 
@@ -501,8 +514,8 @@ static void main_hcm_solve(void)
     Point_t start_pos;
     uint8 r, c;
 
-    start_pos.x = (int8)MAIN_POS_NAV_START_X_GRID;   /* 1 */
-    start_pos.y = (int8)MAIN_POS_NAV_START_Y_GRID;   /* 5 (5.5 截位) */
+    start_pos.x = (int8)MAIN_POS_HCM_SOLVE_START_X_GRID;
+    start_pos.y = (int8)MAIN_POS_HCM_SOLVE_START_Y_GRID;
 
     /* 字面量地图 → uint8 数组 */
     for (r = 0U; r < MAP_ROWS; r++)
@@ -521,8 +534,8 @@ static void main_hcm_solve(void)
     }
     printf("HCM_MAP_END\n");
     printf("HCM_PLAYER_START=%.2f,%.2f (grid=%d,%d)\n",
-           (double)MAIN_POS_NAV_START_X_GRID,
-           (double)MAIN_POS_NAV_START_Y_GRID,
+           (double)MAIN_POS_HCM_LAUNCH_TARGET_X_GRID,
+           (double)MAIN_POS_HCM_LAUNCH_TARGET_Y_GRID,
            (int)start_pos.x, (int)start_pos.y);
 
     /* 调用求解器 */
@@ -579,7 +592,21 @@ static void main_run_hardcoded_map_5ms(void)
         /* 暖机: 等 IMU/编码器稳定 */
         if (++s_hcm_warmup_ticks >= MAIN_POINT_NAV_WARMUP_TICKS)
         {
-            printf("HCM_WARMUP_DONE start pushing\n");
+            printf("HCM_WARMUP_DONE launch along y to solve start\n");
+            s_hcm_phase = HCM_PHASE_LAUNCH_FIXED;
+            chassis_ctrl_move_to_m(
+                MAIN_POS_GRID_TO_M_X(MAIN_POS_HCM_LAUNCH_TARGET_X_GRID),
+                MAIN_POS_GRID_TO_M_Y(MAIN_POS_HCM_LAUNCH_TARGET_Y_GRID),
+                0.0f);
+            s_hcm_navigating = 1U;
+        }
+        return;
+
+    case HCM_PHASE_LAUNCH_FIXED:
+        if (chassis_ctrl_is_arrived())
+        {
+            printf("HCM_LAUNCH_DONE start pushing\n");
+            s_hcm_navigating = 0U;
             s_hcm_phase = HCM_PHASE_PUSH_BOXES;
         }
         return;
@@ -598,8 +625,8 @@ static void main_run_hardcoded_map_5ms(void)
                     printf("HCM_ALL_BOXES_DONE, returning home\n");
                     s_hcm_phase = HCM_PHASE_RETURN_HOME;
                     chassis_ctrl_move_to_m(
-                        MAIN_POS_GRID_TO_M_X(MAIN_POS_NAV_START_X_GRID),
-                        MAIN_POS_GRID_TO_M_Y(MAIN_POS_NAV_START_Y_GRID),
+                        MAIN_POS_GRID_TO_M_X(MAIN_POS_HCM_HOME_X_GRID),
+                        MAIN_POS_GRID_TO_M_Y(MAIN_POS_HCM_HOME_Y_GRID),
                         0.0f);
                     s_hcm_navigating = 1U;
                     return;
@@ -1399,11 +1426,17 @@ static void main_apply_debug_wheel_pid(void)
     // ------------------------------------------------------------------
     chassis_ctrl_init();
     chassis_menu_init();
-    /* 发车位: 整数格约定 (0.5, 5.5) → 自动换算成米送入里程计原点.
-     * 半整数表示发车区中心 (距左墙半格, 距上墙 5.5 格), 与实车摆放吻合. */
+#if (MAIN_RUN_MODE == MAIN_RUN_MODE_HARDCODED_MAP)
+    /* 模式8固定发车: 上电先把里程计放在 (1,5.5), 暖机后沿 Y 轴平移到 (1,5). */
+    chassis_ctrl_set_pose(MAIN_POS_GRID_TO_M_X(MAIN_POS_HCM_HOME_X_GRID),
+                          MAIN_POS_GRID_TO_M_Y(MAIN_POS_HCM_HOME_Y_GRID),
+                          0.0f);
+#else
+    /* 解算/导航起点: 整数格约定 (1, 5.5) → 自动换算成米送入里程计原点. */
     chassis_ctrl_set_pose(MAIN_POS_GRID_TO_M_X(MAIN_POS_NAV_START_X_GRID),
                           MAIN_POS_GRID_TO_M_Y(MAIN_POS_NAV_START_Y_GRID),
                           0.0f);
+#endif
 
 #if (MAIN_RUN_MODE == MAIN_RUN_MODE_SINGLE_WHEEL)
     /* ⬇⬇⬇ 单轮 PID 调试启动逻辑, 姿态调试阶段这里被 #if 屏蔽 ⬇⬇⬇ */
