@@ -322,7 +322,7 @@ while(True):
 
     img_w, img_h = img.width(), img.height()
     map_list = []
-    car_x, car_y = 0, 0
+    car_x, car_y = 225, 225    #没识别到小车时，发送无效坐标，以防止主控误判车的位置
     car_found = False
     tl_pt = tr_pt = bl_pt = br_pt = None
 
