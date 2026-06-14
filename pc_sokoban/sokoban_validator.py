@@ -650,7 +650,7 @@ def build_sub_map(base_map: list, boxes: list, targets: list,
 # Stage 1 求解 — 贪心（任意箱→任意目标）
 # ============================================================
 
-def solve_stage1(the_map: list, player_pos: tuple) -> Optional[dict]:
+def _solve_stage1_greedy(the_map: list, player_pos: tuple) -> Optional[dict]:
     """
     贪心求解：每轮选最近未完成箱子，为其匹配最近未使用目标。
     返回解算结果字典，无解返回 None。
@@ -714,8 +714,8 @@ def solve_stage1(the_map: list, player_pos: tuple) -> Optional[dict]:
 # Stage 2 求解 — 指定箱→目标映射
 # ============================================================
 
-def solve_stage2(the_map: list, player_pos: tuple,
-                 box_to_target_idx: list) -> Optional[dict]:
+def _solve_stage2_greedy(the_map: list, player_pos: tuple,
+                         box_to_target_idx: list) -> Optional[dict]:
     """
     指定映射求解：box_to_target_idx[i] 表示第 i 个箱子→第几号目标。
     对应 C 代码 Sokoban_Solve_Stage2()。
@@ -769,6 +769,139 @@ def solve_stage2(the_map: list, player_pos: tuple,
 # ============================================================
 # Stage 3 辅助 — 死局检测
 # ============================================================
+
+OPT_EXACT_BOX_LIMIT = 3
+OPT_BRANCH_BOX_LIMIT = 5
+OPT_STAGE1_NODE_LIMIT_5 = 1024
+
+
+def _solution_cost(sol: Optional[dict]) -> int:
+    if not sol:
+        return 10 ** 9
+    return int(sol.get('total_steps', 10 ** 9))
+
+
+def _mapping_valid(mapping: list, box_n: int, target_n: int) -> bool:
+    if mapping is None or len(mapping) != box_n:
+        return False
+    used = set()
+    for ti in mapping:
+        if ti < 0 or ti >= target_n or ti in used:
+            return False
+        used.add(ti)
+    return True
+
+
+def _pair_heuristic(player: tuple, box: tuple, target: tuple) -> int:
+    return (abs(box[0] - player[0]) + abs(box[1] - player[1])
+            + abs(target[0] - box[0]) + abs(target[1] - box[1]))
+
+
+def _solve_stage_opt(the_map: list, player_pos: tuple,
+                     box_to_target_idx: Optional[list],
+                     fallback: Optional[dict]) -> Optional[dict]:
+    boxes = extract_elements(the_map, BOX)
+    targets = extract_elements(the_map, TARGET)
+    n = len(boxes)
+    fixed_mapping = box_to_target_idx is not None
+
+    if n == 0 or n != len(targets):
+        return fallback
+    if n > OPT_BRANCH_BOX_LIMIT:
+        return fallback
+    if fixed_mapping and not _mapping_valid(box_to_target_idx, n, len(targets)):
+        return None
+
+    best = fallback
+    best_cost = _solution_cost(fallback)
+    cur_solutions: list = []
+    node_limit = 0 if (fixed_mapping or n <= OPT_EXACT_BOX_LIMIT) else OPT_STAGE1_NODE_LIMIT_5
+    node_count = 0
+    hit_limit = False
+
+    def dfs(solved_mask: int, used_target_mask: int,
+            cur_player: tuple, cost: int) -> None:
+        nonlocal best, best_cost, node_count, hit_limit
+
+        depth = len(cur_solutions)
+        if cost >= best_cost:
+            return
+        if hit_limit:
+            return
+        if depth >= n:
+            best = {
+                'sub_solutions': [dict(s) for s in cur_solutions],
+                'boxes':         boxes,
+                'targets':       targets,
+                'total_steps':   cost,
+            }
+            best_cost = cost
+            return
+
+        candidates = []
+        for bi in range(n):
+            if solved_mask & (1 << bi):
+                continue
+            if fixed_mapping:
+                ti = box_to_target_idx[bi]
+                candidates.append((bi, ti, _pair_heuristic(cur_player, boxes[bi], targets[ti])))
+            else:
+                for ti in range(n):
+                    if used_target_mask & (1 << ti):
+                        continue
+                    candidates.append((bi, ti, _pair_heuristic(cur_player, boxes[bi], targets[ti])))
+        candidates.sort(key=lambda x: x[2])
+
+        solved = [False] * n
+        for i in range(n):
+            solved[i] = bool(solved_mask & (1 << i))
+
+        for bi, ti, _ in candidates:
+            if node_limit:
+                if node_count >= node_limit:
+                    hit_limit = True
+                    return
+                node_count += 1
+            sub = build_sub_map(the_map, boxes, targets, solved, bi, ti)
+            sol = sokoban_bfs_single(sub, cur_player, boxes[bi], targets[ti])
+            if sol is None:
+                continue
+            next_cost = cost + len(sol)
+            if next_cost >= best_cost:
+                continue
+            next_player, _ = simulate_actions(sol, cur_player, boxes[bi])
+            cur_solutions.append({
+                'actions':    sol,
+                'box_idx':    bi,
+                'target_idx': ti,
+                'player_end': next_player,
+            })
+            dfs(solved_mask | (1 << bi),
+                used_target_mask | (1 << ti),
+                next_player,
+                next_cost)
+            cur_solutions.pop()
+            if hit_limit:
+                return
+
+    dfs(0, 0, player_pos, 0)
+    return best
+
+
+def solve_stage1(the_map: list, player_pos: tuple) -> Optional[dict]:
+    fallback = _solve_stage1_greedy(the_map, player_pos)
+    return _solve_stage_opt(the_map, player_pos, None, fallback)
+
+
+def solve_stage2(the_map: list, player_pos: tuple,
+                 box_to_target_idx: list) -> Optional[dict]:
+    box_n = len(extract_elements(the_map, BOX))
+    target_n = len(extract_elements(the_map, TARGET))
+    if not _mapping_valid(box_to_target_idx, box_n, target_n):
+        return None
+    fallback = _solve_stage2_greedy(the_map, player_pos, box_to_target_idx)
+    return _solve_stage_opt(the_map, player_pos, box_to_target_idx, fallback)
+
 
 def is_blocker(the_map: list, r: int, c: int) -> bool:
     if not is_inner(r, c):
