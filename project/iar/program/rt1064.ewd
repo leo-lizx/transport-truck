@@ -36,7 +36,7 @@
                 </option>
                 <option>
                     <name>MacFile</name>
-                    <state>D:\professional software\IAR8.3\arm\config\flashloader\NXP\SEEKFREE_W25Q256JV_QSPI_32M.mac</state>
+                    <state>$TOOLKIT_DIR$\config\flashloader\NXP\FlashIMXRT1060_FlexSPI.mac</state>
                 </option>
                 <option>
                     <name>MemOverride</name>

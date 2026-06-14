@@ -373,7 +373,7 @@
  *   1.20 m/s 时单轮峰值电流超 TB6612 过流阈值 → 驱动器关断 → 轮停.
  *   麦轮斜走单轮最坏 = 1.20×√2≈1.70 m/s, 冲击更大.
  *   0.70 m/s: d_stop=0.70²/(2×2.10)=0.117m, BRAKE_DIST=0.25m ✓ 有裕量. */
-#define CHASSIS_MAX_LINEAR_SPEED_MPS    (1.50f)
+#define CHASSIS_MAX_LINEAR_SPEED_MPS    (1.10f)
 
 /* CHASSIS_MAX_YAW_SPEED_DPS 已移到文件顶部“用户常调参数区”。 */
 
@@ -423,7 +423,7 @@
 /** 位置环沿程方向积分增益 (m/s per m·s).
  * 消除静摩擦/坡面等引起的稳态位置残差.
  * 建议从 0 开始调, 每次 +0.05; 过大时车到位后缓慢漂移/越界. 设 0 即关闭. */
-#define CHASSIS_POS_KI                  (0.13f)
+#define CHASSIS_POS_KI                  (0.2f)
 
 /* ----------------------------------------------------------------------
  *  位置环自动推导 / 内部固定常量 (用户一般无需修改)
@@ -456,11 +456,11 @@
 
 /** 积分输出上限比例: i_limit = max_linear_speed × 该值.
  *  原 0.5 (贡献一半速度), 降低以抑制积分过冲 → 震荡. */
-#define CHASSIS_POS_I_LIMIT_RATIO       (0.15f)
+#define CHASSIS_POS_I_LIMIT_RATIO       (0.20f)
 
 /** 条件积分带宽比例: i_band = brake_dist × 该值 (只在减速区内累积积分).
  *  原 0.8, 缩小以推迟积分介入, 近端才发力, 避免远距离积分卷绕 → 震荡. */
-#define CHASSIS_POS_I_BAND_RATIO        (0.4f)
+#define CHASSIS_POS_I_BAND_RATIO        (0.8f)
 
 /** 切轴门限比例: switch_tol = EPSILON × 该值 (切轴精度略严于到位精度). */
 #define CHASSIS_POS_AXIS_SWITCH_RATIO   (0.6f)
@@ -475,7 +475,7 @@
  * P0-修复 2026-06-07: 原保持轴无死区, 编码器噪声被 sqrt_controller
  * 放大成 0.06~0.12 m/s 的修正脉冲 → Y 方向持续微幅震荡.
  */
-#define CHASSIS_POS_HOLD_DEAD_ZONE_M     (0.005f)
+#define CHASSIS_POS_HOLD_DEAD_ZONE_M     (0.002f)
 
 /**
  * D 项低通滤波系数 α (一阶 IIR, Tesla/Waymo 标准做法).
@@ -487,7 +487,7 @@
  * brake_cap 末段最小有效速度 (m/s).
  * 保证 sqrt 减速曲线末段输出仍足以克服静摩擦, 车始终能推进到 EPSILON 内.
  * 只与轮端静摩擦特性相关, 与 0.05 的轮端 ff 起步阈值同量级. */
-#define CHASSIS_POS_BRAKE_FLOOR_MPS      (0.20f)
+#define CHASSIS_POS_BRAKE_FLOOR_MPS      (0.320f)
 
 /* ----------------------------------------------------------------------
  *  航向环实现: sqrt_ctrl + P-only 速率阻尼
@@ -750,7 +750,7 @@
  *  大 -> KF 几乎不信, 仅做长期纠偏 (推荐); 小 -> KF 信任高, 打滑会污染.
  *  100 (= 10° std) 大约 1 分钟才把 1° 真实漂移拉一半, 既能压住 IMU 长期累积,
  *  又不会被瞬间打滑(常 < 5°)拉走. */
-#define CHASSIS_ODOM_YAW_R_DEG2          (20.0f)
+#define CHASSIS_ODOM_YAW_R_DEG2          (40.0f)
 
 /** odom yaw 与 IMU yaw 偏差超过此值视为打滑 / 重定位事件,
  *  本拍跳过这次观测 (避免单次大跳跃污染 KF) */
