@@ -41,7 +41,7 @@
 /** 角速度 P-only 阻尼: 越大越稳, 过大可能发闷.
  * P0-调 2026-06-07: 0.05 几乎没阻尼, yaw 来回摆 → 车一直抖.
  * 提到 0.25 加 5 倍阻尼, 抑制 yaw 震荡. */
-#define CHASSIS_YAW_RATE_KP             (0.25f)
+#define CHASSIS_YAW_RATE_KP             (0.35f)
 
 /** 最大旋转速度 (°/s): 限制原地转向和导航修正的最高角速度 */
 #define CHASSIS_MAX_YAW_SPEED_DPS       (170.0f)
@@ -50,7 +50,7 @@
 #define CHASSIS_CMD_ACCEL_LIMIT_DPS2    (720.0f)
 
 /** 进入在位锁的角度阈值 (°): 越小锁得越准, 越大越不抖 */
-#define CHASSIS_YAW_INPOS_ENTER_DEG     (0.50f)
+#define CHASSIS_YAW_INPOS_ENTER_DEG     (0.30f)
 
 /* ======================================================================
  *  数学常量
@@ -113,10 +113,10 @@
 #define CHASSIS_GRID_INNER_ROWS         (CHASSIS_GRID_INNER_MAX_Y - CHASSIS_GRID_INNER_MIN_Y + 1U)
 
 /** 可通行区域物理宽度（米） */
-#define CHASSIS_MAP_WIDTH_M             (3.20f)
+#define CHASSIS_MAP_WIDTH_M             (2.80f)
 
 /** 可通行区域物理高度（米） */
-#define CHASSIS_MAP_HEIGHT_M            (2.40f)
+#define CHASSIS_MAP_HEIGHT_M            (2.00f)
 
 /** X 方向单步步长（米）= 3.2 / 14 */
 #define CHASSIS_GRID_STEP_X_M           (CHASSIS_MAP_WIDTH_M / (float)CHASSIS_GRID_INNER_COLS)
@@ -139,14 +139,14 @@
  *   dist = sqrt(dx² + dy²) <= EPSILON 立即置 s_arrived=1.
  * 不再叠加速度稳定帧 / dwell 等待 / yaw 条件, 避免车已在误差范围内但上层迟迟不切点.
  */
-#define CHASSIS_TARGET_REACHED_EPSILON_M  (0.015f)
+#define CHASSIS_TARGET_REACHED_EPSILON_M  (0.018f)
 
 /**
  * 到位后的 Schmitt 滞后释放阈值（米）.
  * 已到位状态下, 只有被推出此距离才重新开启位置驱动.
  * 10cm 足够覆盖停车后几厘米的惯性滑移, 又不会让位置闭环在大范围内失效.
  */
-#define CHASSIS_POS_HOLD_EXIT_M           (0.10f)
+#define CHASSIS_POS_HOLD_EXIT_M           (0.15f)
 
 /* 注:
  *   原扰动恢复 (RECOVERY_*)、轴保持速度上限 (AXIS_HOLD_MAX_SPEED)、
@@ -173,7 +173,7 @@
  *   超出容忍带后由 yaw sqrt_ctrl + P-only 阻尼实时拉回.
  * P0-修复 2026-06-07: 0.5°→0.2°. 0.5°下每米漂 8.7mm, 与保持轴 1cm 死区
  *   叠加形成盲区 → 小 yaw 偏差无人管 → 车走不直. 0.2°每米仅漂 3.5mm. */
-#define CHASSIS_YAW_GOAL_TOLERANCE_DEG    (0.3f)
+#define CHASSIS_YAW_GOAL_TOLERANCE_DEG    (0.10f)
 
 /* ======================================================================
  *  OpenART 视觉位姿融合（事件驱动 Snap 为主，连续融合为辅）
@@ -334,7 +334,7 @@
  * 发车区下沿 (Y 较大那条边) 距场地下边界的距离 (米).
  * 规则: "距场地下边界 1m" → 发车区底边 y = H - 1.0m, 顶边 y = H - 1.3m.
  */
-#define CHASSIS_LAUNCH_ZONE_BOTTOM_OFFSET_M  (1.00f)
+#define CHASSIS_LAUNCH_ZONE_BOTTOM_OFFSET_M  (1.0f)
 
 /** 车体外接半径 (米), 用于"完全离开发车区" / "出界" 几何判定 */
 #define CHASSIS_BODY_RADIUS_M           (0.175f)
@@ -397,7 +397,7 @@
  * 取值: 当前 MAX_LINEAR=1.35 + MAX_YAW=90dps 上游限住单轮最坏 ≈1.65 m/s,
  * 兑底设 16 m/s 留 ~10 倍裕量, 平时不触发, 仅在多指令叠加暴冲时生效。
  */
-#define CHASSIS_WHEEL_SPEED_CAP_MPS     (4.0f)
+#define CHASSIS_WHEEL_SPEED_CAP_MPS     (2.70f)
 
 /** 在线调参时允许的线速度上限硬限制（m/s） */
 #define CHASSIS_TUNE_MAX_LINEAR_SPEED_LIMIT_MPS  (4.0f)
@@ -418,12 +418,12 @@
  * 只有 2.7cm 内是线性段, 稍远就切 sqrt 段大速度, 车高速冲入 EPSILON
  * 后 brake_cap 来不及刹停, 穿越后反弹. 恢复 4.5 使 linear_dist≈0.15m,
  * 近场仍保持 P 线性响应, 配合 BRAKE_DIST=0.25 可以平滑停车. */
-#define CHASSIS_POS_KP                  (8.0f)
+#define CHASSIS_POS_KP                  (8.5f)
 
 /** 位置环沿程方向积分增益 (m/s per m·s).
  * 消除静摩擦/坡面等引起的稳态位置残差.
  * 建议从 0 开始调, 每次 +0.05; 过大时车到位后缓慢漂移/越界. 设 0 即关闭. */
-#define CHASSIS_POS_KI                  (0.1f)
+#define CHASSIS_POS_KI                  (0.13f)
 
 /* ----------------------------------------------------------------------
  *  位置环自动推导 / 内部固定常量 (用户一般无需修改)
@@ -452,15 +452,15 @@
 #define CHASSIS_POS_HOLD_KD_RATIO       (2.0f)
 
 /** brake_dist 安全裕量 (m): brake_dist = d_stop + EPSILON + 该值. */
-#define CHASSIS_POS_BRAKE_MARGIN_M      (0.03f)
+#define CHASSIS_POS_BRAKE_MARGIN_M      (-0.006f)
 
 /** 积分输出上限比例: i_limit = max_linear_speed × 该值.
  *  原 0.5 (贡献一半速度), 降低以抑制积分过冲 → 震荡. */
-#define CHASSIS_POS_I_LIMIT_RATIO       (0.12f)
+#define CHASSIS_POS_I_LIMIT_RATIO       (0.15f)
 
 /** 条件积分带宽比例: i_band = brake_dist × 该值 (只在减速区内累积积分).
  *  原 0.8, 缩小以推迟积分介入, 近端才发力, 避免远距离积分卷绕 → 震荡. */
-#define CHASSIS_POS_I_BAND_RATIO        (0.5f)
+#define CHASSIS_POS_I_BAND_RATIO        (0.4f)
 
 /** 切轴门限比例: switch_tol = EPSILON × 该值 (切轴精度略严于到位精度). */
 #define CHASSIS_POS_AXIS_SWITCH_RATIO   (0.6f)
@@ -487,7 +487,7 @@
  * brake_cap 末段最小有效速度 (m/s).
  * 保证 sqrt 减速曲线末段输出仍足以克服静摩擦, 车始终能推进到 EPSILON 内.
  * 只与轮端静摩擦特性相关, 与 0.05 的轮端 ff 起步阈值同量级. */
-#define CHASSIS_POS_BRAKE_FLOOR_MPS      (0.05f)
+#define CHASSIS_POS_BRAKE_FLOOR_MPS      (0.20f)
 
 /* ----------------------------------------------------------------------
  *  航向环实现: sqrt_ctrl + P-only 速率阻尼
@@ -640,7 +640,7 @@
  * Yaw 角速度死区（°/s）。
  * 抑制静止抖动，过大将导致小角速度被吞掉。
  */
-#define CHASSIS_IMU_GYRO_DEADZONE_DPS    (1.8f)
+#define CHASSIS_IMU_GYRO_DEADZONE_DPS    (0.8f)
 
 /**
  * Yaw 角速度一阶低通系数，范围 (0, 1]。
@@ -750,7 +750,7 @@
  *  大 -> KF 几乎不信, 仅做长期纠偏 (推荐); 小 -> KF 信任高, 打滑会污染.
  *  100 (= 10° std) 大约 1 分钟才把 1° 真实漂移拉一半, 既能压住 IMU 长期累积,
  *  又不会被瞬间打滑(常 < 5°)拉走. */
-#define CHASSIS_ODOM_YAW_R_DEG2          (90.0f)
+#define CHASSIS_ODOM_YAW_R_DEG2          (20.0f)
 
 /** odom yaw 与 IMU yaw 偏差超过此值视为打滑 / 重定位事件,
  *  本拍跳过这次观测 (避免单次大跳跃污染 KF) */
@@ -804,7 +804,7 @@
 
 /** X 方向里程计缩放系数 */
 //#define CHASSIS_ODOM_SCALE_X            (0.468539f)
-#define CHASSIS_ODOM_SCALE_X            (0.405f)
+#define CHASSIS_ODOM_SCALE_X            (0.3970f)
 
 /** Y 方向里程计缩放系数 */
 #define CHASSIS_ODOM_SCALE_Y            (0.420f)
