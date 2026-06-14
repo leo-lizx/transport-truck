@@ -584,9 +584,9 @@ static void build_sub_map(const uint8 base_map[MAP_ROWS][MAP_COLS],
 /*===========================================================================
  *  公开 API: 第一阶段求解
  *===========================================================================*/
-uint8 Sokoban_Solve_Stage1(const uint8 map[MAP_ROWS][MAP_COLS],
-                           Point_t player_pos,
-                           SokoFullSolution_t *result)
+static uint8 sokoban_solve_stage1_greedy(const uint8 map[MAP_ROWS][MAP_COLS],
+                                         Point_t player_pos,
+                                         SokoFullSolution_t *result)
 {
     Point_t boxes[SOKOBAN_MAX_BOXES];
     Point_t targets[SOKOBAN_MAX_BOXES];
@@ -655,11 +655,11 @@ uint8 Sokoban_Solve_Stage1(const uint8 map[MAP_ROWS][MAP_COLS],
 /*===========================================================================
  *  公开 API: 第二阶段求解
  *===========================================================================*/
-uint8 Sokoban_Solve_Stage2(const uint8 map[MAP_ROWS][MAP_COLS],
-                           Point_t player_pos,
-                           const uint8 box_to_target_idx[],
-                           uint8 box_count_in,
-                           SokoFullSolution_t *result)
+static uint8 sokoban_solve_stage2_greedy(const uint8 map[MAP_ROWS][MAP_COLS],
+                                         Point_t player_pos,
+                                         const uint8 box_to_target_idx[],
+                                         uint8 box_count_in,
+                                         SokoFullSolution_t *result)
 {
     Point_t boxes[SOKOBAN_MAX_BOXES];
     Point_t targets[SOKOBAN_MAX_BOXES];
@@ -709,9 +709,333 @@ uint8 Sokoban_Solve_Stage2(const uint8 map[MAP_ROWS][MAP_COLS],
     return 1;
 }
 
-/*===========================================================================
- *  公开 API: 炸弹墙体搜索
- *===========================================================================*/
+/* ==========================================================================
+ *  Stage1/2 稳健优化层
+ *
+ *  策略:
+ *    1) 先跑旧贪心, 得到一个可行上界;
+ *    2) 3 箱精确搜索, 5 箱分支限界搜索;
+ *    3) 搜索失败/超限时保留贪心解, 不让规划层退化为无解。
+ * ========================================================================== */
+
+#define SOKO_OPT_EXACT_BOX_LIMIT       (3U)
+#define SOKO_OPT_BRANCH_BOX_LIMIT      (5U)
+#define SOKO_OPT_STAGE1_NODE_LIMIT_5   (1024UL)
+#define SOKO_OPT_INF_COST              (0xFFFFU)
+
+typedef struct {
+    uint8 b;
+    uint8 t;
+    int16 h;
+} SokoOptCandidate_t;
+
+typedef struct {
+    const uint8 (*map)[MAP_COLS];
+    Point_t boxes[SOKOBAN_MAX_BOXES];
+    Point_t targets[SOKOBAN_MAX_BOXES];
+    uint8 box_n;
+    uint8 target_n;
+    const uint8 *mapping;
+    uint8 fixed_mapping;
+
+    uint32 node_count;
+    uint32 node_limit;
+    uint8  hit_limit;
+    uint8  best_valid;
+    uint16 best_cost;
+
+    SokoActionSeq_t cur_seq[SOKOBAN_MAX_BOXES];
+    Point_t         cur_end[SOKOBAN_MAX_BOXES];
+    SokoFullSolution_t *out;
+} SokoOptContext_t;
+
+static SokoOptContext_t s_soko_opt;
+
+static int16 soko_abs_i16(int16 v)
+{
+    return (v < 0) ? (int16)-v : v;
+}
+
+static uint16 soko_solution_cost(const SokoFullSolution_t *sol)
+{
+    uint16 cost = 0U;
+    if (!sol || !sol->is_solved) return SOKO_OPT_INF_COST;
+    for (uint8 i = 0U; i < sol->total_boxes; ++i) {
+        if ((uint16)(SOKO_OPT_INF_COST - cost) < sol->sub_solutions[i].count) {
+            return SOKO_OPT_INF_COST;
+        }
+        cost = (uint16)(cost + sol->sub_solutions[i].count);
+    }
+    return cost;
+}
+
+static uint8 soko_mapping_is_valid(const uint8 mapping[], uint8 box_n, uint8 target_n)
+{
+    uint8 used = 0U;
+    if (!mapping) return 0U;
+
+    for (uint8 i = 0U; i < box_n; ++i) {
+        uint8 ti = mapping[i];
+        uint8 bit;
+        if (ti >= target_n || ti >= 8U) return 0U;
+        bit = (uint8)(1U << ti);
+        if (used & bit) return 0U;
+        used = (uint8)(used | bit);
+    }
+    return 1U;
+}
+
+static void soko_flags_from_mask(uint8 mask, uint8 flags[], uint8 n)
+{
+    for (uint8 i = 0U; i < n; ++i) {
+        flags[i] = (uint8)((mask & (uint8)(1U << i)) ? 1U : 0U);
+    }
+}
+
+static int16 soko_pair_heuristic(Point_t player, Point_t box, Point_t target)
+{
+    int16 d1 = (int16)(soko_abs_i16((int16)(box.x - player.x))
+                     + soko_abs_i16((int16)(box.y - player.y)));
+    int16 d2 = (int16)(soko_abs_i16((int16)(target.x - box.x))
+                     + soko_abs_i16((int16)(target.y - box.y)));
+    return (int16)(d1 + d2);
+}
+
+static void soko_sort_candidates(SokoOptCandidate_t cand[], uint8 n)
+{
+    for (uint8 i = 1U; i < n; ++i) {
+        SokoOptCandidate_t key = cand[i];
+        int8 j = (int8)i - 1;
+        while (j >= 0 && cand[j].h > key.h) {
+            cand[j + 1] = cand[j];
+            --j;
+        }
+        cand[j + 1] = key;
+    }
+}
+
+static void soko_opt_save_best(uint8 depth, uint16 cost)
+{
+    s_soko_opt.out->total_boxes = s_soko_opt.box_n;
+    s_soko_opt.out->is_solved = 1U;
+    for (uint8 i = 0U; i < depth; ++i) {
+        s_soko_opt.out->sub_solutions[i] = s_soko_opt.cur_seq[i];
+        s_soko_opt.out->player_end_pos[i] = s_soko_opt.cur_end[i];
+    }
+    s_soko_opt.best_cost = cost;
+    s_soko_opt.best_valid = 1U;
+}
+
+static uint8 soko_opt_solve_pair(uint8 solved_mask,
+                                 uint8 box_idx,
+                                 uint8 target_idx,
+                                 Point_t cur_player,
+                                 SokoActionSeq_t *seq,
+                                 Point_t *end_player)
+{
+    uint8 solved_flags[SOKOBAN_MAX_BOXES];
+
+    soko_flags_from_mask(solved_mask, solved_flags, s_soko_opt.box_n);
+    build_sub_map(s_soko_opt.map,
+                  s_soko_opt.boxes,
+                  s_soko_opt.targets,
+                  s_soko_opt.box_n,
+                  s_soko_opt.target_n,
+                  solved_flags,
+                  box_idx,
+                  target_idx,
+                  sb_sub_map);
+
+    if (!sokoban_bfs_single(sb_sub_map,
+                            cur_player,
+                            s_soko_opt.boxes[box_idx],
+                            s_soko_opt.targets[target_idx],
+                            seq)) {
+        return 0U;
+    }
+
+    *end_player = simulate_actions(seq, cur_player, s_soko_opt.boxes[box_idx]);
+    return 1U;
+}
+
+static void soko_opt_dfs(uint8 depth,
+                         uint8 solved_mask,
+                         uint8 used_target_mask,
+                         Point_t cur_player,
+                         uint16 cost)
+{
+    SokoOptCandidate_t cand[SOKOBAN_MAX_BOXES * SOKOBAN_MAX_BOXES];
+    uint8 cand_n = 0U;
+
+    if (s_soko_opt.best_valid && cost >= s_soko_opt.best_cost) return;
+    if (s_soko_opt.hit_limit) return;
+    if (depth >= s_soko_opt.box_n) {
+        soko_opt_save_best(depth, cost);
+        return;
+    }
+
+    for (uint8 bi = 0U; bi < s_soko_opt.box_n; ++bi) {
+        if (solved_mask & (uint8)(1U << bi)) continue;
+
+        if (s_soko_opt.fixed_mapping) {
+            uint8 ti = s_soko_opt.mapping[bi];
+            cand[cand_n].b = bi;
+            cand[cand_n].t = ti;
+            cand[cand_n].h = soko_pair_heuristic(cur_player,
+                                                  s_soko_opt.boxes[bi],
+                                                  s_soko_opt.targets[ti]);
+            ++cand_n;
+        } else {
+            for (uint8 ti = 0U; ti < s_soko_opt.target_n; ++ti) {
+                if (used_target_mask & (uint8)(1U << ti)) continue;
+                cand[cand_n].b = bi;
+                cand[cand_n].t = ti;
+                cand[cand_n].h = soko_pair_heuristic(cur_player,
+                                                      s_soko_opt.boxes[bi],
+                                                      s_soko_opt.targets[ti]);
+                ++cand_n;
+            }
+        }
+    }
+
+    soko_sort_candidates(cand, cand_n);
+
+    for (uint8 ci = 0U; ci < cand_n; ++ci) {
+        uint8 bi = cand[ci].b;
+        uint8 ti = cand[ci].t;
+        uint16 next_cost;
+
+        if (s_soko_opt.hit_limit) return;
+        if (s_soko_opt.node_limit != 0UL) {
+            if (s_soko_opt.node_count >= s_soko_opt.node_limit) {
+                s_soko_opt.hit_limit = 1U;
+                return;
+            }
+            ++s_soko_opt.node_count;
+        }
+        if (!soko_opt_solve_pair(solved_mask,
+                                 bi,
+                                 ti,
+                                 cur_player,
+                                 &s_soko_opt.cur_seq[depth],
+                                 &s_soko_opt.cur_end[depth])) {
+            continue;
+        }
+
+        if ((uint16)(SOKO_OPT_INF_COST - cost) < s_soko_opt.cur_seq[depth].count) {
+            continue;
+        }
+        next_cost = (uint16)(cost + s_soko_opt.cur_seq[depth].count);
+        if (s_soko_opt.best_valid && next_cost >= s_soko_opt.best_cost) {
+            continue;
+        }
+
+        soko_opt_dfs((uint8)(depth + 1U),
+                     (uint8)(solved_mask | (uint8)(1U << bi)),
+                     (uint8)(used_target_mask | (uint8)(1U << ti)),
+                     s_soko_opt.cur_end[depth],
+                     next_cost);
+    }
+}
+
+static uint8 soko_opt_prepare(const uint8 map[MAP_ROWS][MAP_COLS],
+                              const uint8 mapping[],
+                              uint8 fixed_mapping,
+                              SokoFullSolution_t *result,
+                              uint8 fallback_ok)
+{
+    memset(&s_soko_opt, 0, sizeof(s_soko_opt));
+    s_soko_opt.map = map;
+    s_soko_opt.box_n = extract_elements(map, MAP_BOX,
+                                        s_soko_opt.boxes,
+                                        SOKOBAN_MAX_BOXES);
+    s_soko_opt.target_n = extract_elements(map, MAP_TARGET,
+                                           s_soko_opt.targets,
+                                           SOKOBAN_MAX_BOXES);
+    s_soko_opt.mapping = mapping;
+    s_soko_opt.fixed_mapping = fixed_mapping;
+    s_soko_opt.out = result;
+    s_soko_opt.best_valid = fallback_ok ? 1U : 0U;
+    s_soko_opt.best_cost = fallback_ok ? soko_solution_cost(result) : SOKO_OPT_INF_COST;
+
+    if (s_soko_opt.box_n == 0U || s_soko_opt.box_n != s_soko_opt.target_n) {
+        return 0U;
+    }
+    if (fixed_mapping && !soko_mapping_is_valid(mapping,
+                                                s_soko_opt.box_n,
+                                                s_soko_opt.target_n)) {
+        return 0U;
+    }
+    if (s_soko_opt.box_n > SOKO_OPT_BRANCH_BOX_LIMIT) {
+        return 0U;
+    }
+
+    if (!fixed_mapping && s_soko_opt.box_n > SOKO_OPT_EXACT_BOX_LIMIT) {
+        s_soko_opt.node_limit = SOKO_OPT_STAGE1_NODE_LIMIT_5;
+    } else {
+        s_soko_opt.node_limit = 0UL;    /* 3 箱 Stage1 / 5 箱 Stage2 全量精确搜索 */
+    }
+    return 1U;
+}
+
+uint8 Sokoban_Solve_Stage1(const uint8 map[MAP_ROWS][MAP_COLS],
+                           Point_t player_pos,
+                           SokoFullSolution_t *result)
+{
+    uint8 fallback_ok;
+
+    if (result == 0) return 0U;
+    fallback_ok = sokoban_solve_stage1_greedy(map, player_pos, result);
+
+    if (!soko_opt_prepare(map, 0, 0U, result, fallback_ok)) {
+        return fallback_ok;
+    }
+
+    soko_opt_dfs(0U, 0U, 0U, player_pos, 0U);
+    return s_soko_opt.best_valid ? 1U : fallback_ok;
+}
+
+uint8 Sokoban_Solve_Stage2(const uint8 map[MAP_ROWS][MAP_COLS],
+                           Point_t player_pos,
+                           const uint8 box_to_target_idx[],
+                           uint8 box_count_in,
+                           SokoFullSolution_t *result)
+{
+    uint8 fallback_ok;
+    Point_t check_boxes[SOKOBAN_MAX_BOXES];
+    Point_t check_targets[SOKOBAN_MAX_BOXES];
+    uint8 check_box_n;
+    uint8 check_target_n;
+
+    if (result == 0 || box_to_target_idx == 0) return 0U;
+    result->is_solved = 0U;
+    result->total_boxes = 0U;
+
+    check_box_n = extract_elements(map, MAP_BOX, check_boxes, SOKOBAN_MAX_BOXES);
+    check_target_n = extract_elements(map, MAP_TARGET, check_targets, SOKOBAN_MAX_BOXES);
+    if (check_box_n == 0U ||
+        check_box_n != box_count_in ||
+        check_box_n != check_target_n ||
+        !soko_mapping_is_valid(box_to_target_idx, check_box_n, check_target_n)) {
+        return 0U;
+    }
+
+    fallback_ok = sokoban_solve_stage2_greedy(map, player_pos,
+                                             box_to_target_idx,
+                                             box_count_in,
+                                             result);
+
+    if (!soko_opt_prepare(map, box_to_target_idx, 1U, result, fallback_ok)) {
+        return fallback_ok;
+    }
+    if (s_soko_opt.box_n != box_count_in) {
+        return fallback_ok;
+    }
+
+    soko_opt_dfs(0U, 0U, 0U, player_pos, 0U);
+    return s_soko_opt.best_valid ? 1U : fallback_ok;
+}
+
 /* ==========================================================================
  *  § 6. 炸弹策略 — 寻炸墙 / 应用爆炸 / 推炸弹策略求解
  * ========================================================================== */
