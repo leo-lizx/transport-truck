@@ -24,7 +24,7 @@ sensor.skip_frames(time = 2000)        # 让感光元件稳定
 # 【关键物理防御】：锁定感光参数，拒绝环境光干扰
 sensor.set_auto_gain(False)            # 关闭自动增益，防止暗处噪点放大
 sensor.set_auto_whitebal(False)        # 关闭白平衡，防止色温漂移导致“认错颜色”
-sensor.set_auto_exposure(False, exposure_us=900) # 手动锁定曝光时间(8ms)
+sensor.set_auto_exposure(False, exposure_us=750) # 手动锁定曝光时间(8ms)
                                        # 注意：如果场地极亮可调小至6000，极暗调大至12000
                                        # 这能大幅抑制 PVC 场地的反光亮斑
 
@@ -87,6 +87,12 @@ def send_heartbeat_if_due():
         except: pass
         _last_hb_ms = now
 
+
+# 调试开关：控制是否绘制采样 ROI 的矩形边框用于视觉调试
+# - 在比赛或正式运行时建议设为 False 以节省绘制开销
+# - 在开发或现场标定时设为 True 便于观察每个网格的采样区域
+DEBUG_DRAW_ROI = True
+
 # ----------------------------------------------------------------------
 # 3. 网格采样与逆透视映射
 # ----------------------------------------------------------------------
@@ -94,10 +100,10 @@ ROWS, COLS = 12, 16
 
 # 场地四角外侧格子的中心点坐标（需根据实际场地微调）
 GRID_CORNERS = {
-    "tl": (36.5, 35.5),  # 左上
-    "tr": (282.6, 28.5), # 右上
-    "bl": (45.0, 223.0), # 左下
-    "br": (280.8, 220.5),# 右下
+    "tl": (36.5, 51.0),  # 左上
+    "tr": (282.6, 43.0), # 右上
+    "bl": (40.0, 238.0), # 左下
+    "br": (286.8, 238.0),# 右下
 }
 
 GRID_K1 = +0.000000
@@ -162,14 +168,14 @@ def vote_car_position(found, x, y):
 
 
 # ----------------------------------------------------------------------
-# 4. 颜色特征库与极速特征匹配算法 (全新优化核心)
+# 4. 颜色特征库与极速特征匹配算法 (全新优化核心 - 多维统计特征法)
 # ----------------------------------------------------------------------
 # ！！这部分 RGB 值依然需要你在比赛现场根据实际光照进行重新采样修改！！
 CAR_HEAD_DARK_RGB = (25, 152, 0)      # 车头（H）
-CAR_HEAD_BRIGHT_RGB = (74, 225, 239)
+CAR_HEAD_BRIGHT_RGB = (30, 255, 255)
 CAR_TAIL_DARK_RGB = (0, 152, 195)     # 车尾（T）
-CAR_TAIL_BRIGHT_RGB = (107, 255, 33)
-WALL_DARK_RGB = (50, 85, 125)         # 墙壁（#）
+CAR_TAIL_BRIGHT_RGB = (58, 247, 16)
+WALL_DARK_RGB = (41, 61, 66)          # 墙壁（#）
 WALL_BRIGHT_RGB = (107, 170, 255)
 FLOOR_DARK_RGB = (33, 12, 255)        # 空地（-）
 FLOOR_BRIGHT_RGB = (49, 97, 255)
@@ -180,14 +186,15 @@ BOX_BRIGHT_RGB = (247, 255, 66)
 BOMB_DARK_RGB = (181, 28, 58)         # 炸弹（*）
 BOMB_BRIGHT_RGB = (255, 40, 82)
 
+# 【架构保留】：依然保留所有靶点字典，作为纯色匹配和特征检测失败时的安全垫 (Fallback)
 SYMBOL_MAP_RGB = {
     "#": (WALL_DARK_RGB, WALL_BRIGHT_RGB),
     "-": (FLOOR_DARK_RGB, FLOOR_BRIGHT_RGB),
     ".": (GOAL_DARK_RGB, GOAL_BRIGHT_RGB),
     "$": (BOX_DARK_RGB, BOX_BRIGHT_RGB),
     "*": (BOMB_DARK_RGB, BOMB_BRIGHT_RGB),
-    "H": (CAR_HEAD_DARK_RGB, CAR_HEAD_BRIGHT_RGB),
-    "T": (CAR_TAIL_DARK_RGB, CAR_TAIL_BRIGHT_RGB),
+    # "H": (CAR_HEAD_DARK_RGB, CAR_HEAD_BRIGHT_RGB),
+    # "T": (CAR_TAIL_DARK_RGB, CAR_TAIL_BRIGHT_RGB),
 }
 
 def _pivot_rgb_to_linear(c):
@@ -217,11 +224,11 @@ SYMBOL_MAP_LABTarget = {}
 for sym, tpls in SYMBOL_MAP_RGB.items():
     SYMBOL_MAP_LABTarget[sym] = [rgb_to_lab(rgb) for rgb in tpls]
 
+
 def find_best_symbol_by_mode(l_mode, a_mode, b_mode):
     """
-    【核心优化算子】：计算实测区域色彩与模板库的加权欧氏距离。
-    因为 L(亮度) 最容易受反光影响导致误判，故将其权重压低至 0.2，
-    强迫算法更关注 A(红绿) 和 B(蓝黄) 这两个真实的色彩维度。
+    【核心优化算子】：纯色物体的靶向匹配（箱子、炸弹、终点、空地）
+    计算实测区域色彩与模板库的加权欧氏距离。保留了 L 通道 0.2 的降权处理。
     """
     best_sym = "-"
     min_dist = 999999.0
@@ -229,25 +236,24 @@ def find_best_symbol_by_mode(l_mode, a_mode, b_mode):
     for sym, lab_targets in SYMBOL_MAP_LABTarget.items():
         for target in lab_targets:
             tl, ta, tb = target
-            # 计算加权欧氏距离（L降权处理）
+            # 计算加权欧氏距离（L降权处理，抵抗光斑）
             dist = math.sqrt(0.2 * (l_mode - tl)**2 + (a_mode - ta)**2 + (b_mode - tb)**2)
 
             if dist < min_dist:
                 min_dist = dist
                 best_sym = sym
 
-    # 距离阈值保护：如果算出来的色彩偏差极大，说明可能采样到赛道外部的桌子或背景了，算作空地
-    if min_dist > 60:
+    # 距离阈值保护：如果偏离所有已知色块过大，判定为背景空地
+    if min_dist > 100:
         return "-"
 
     return best_sym
 
 def classify_cell(img, x, y, img_w, img_h):
     """
-    【算力解放入口】：
-    摒弃极度消耗 CPU 的 Python 双层遍历循环。直接使用 C 底层的 img.get_statistics()
-    瞬间提取 11x11 像素框内的所有色彩数据，并直接取出现频率最高的“众数 (mode)”。
-    天然无视高光亮点和噪点！
+    【算力解放入口】：多维统计特征判别器 (O(1) 复杂度)
+    彻底废弃 Python 层面的像素遍历！利用底层硬件加速，通过标准差(stdev)和众数(mode)
+    实现对“纹理”、“双色”和“纯色”的降维打击分类。
     """
     radius = 5  # 采样半径 5 = 11x11 范围 (共 121 个像素点一起统计)
 
@@ -262,37 +268,73 @@ def classify_cell(img, x, y, img_w, img_h):
     if w <= 0 or h <= 0:
         return "-"
 
-    # 极速底层 API 调用
+    # 【一次提取，全部搞定】：极速底层 API 调用，获取该 ROI 内的所有统计学特征
     stats = img.get_statistics(roi=(x_min, y_min, w, h))
 
-    # 获取众数（该区域最主流的色彩），有效过滤掉个别反光白点
+    # 调试可视化：在 ROI 周围绘制方框边界
+    if DEBUG_DRAW_ROI:
+        try:
+            img.draw_rectangle(x_min, y_min, w, h, color=(255, 255, 255))
+        except Exception:
+            try:
+                img.draw_line(x_min, y_min, x_min + w - 1, y_min, color=(255, 255, 255))
+                img.draw_line(x_min + w - 1, y_min, x_min + w - 1, y_min + h - 1, color=(255, 255, 255))
+                img.draw_line(x_min + w - 1, y_min + h - 1, x_min, y_min + h - 1, color=(255, 255, 255))
+                img.draw_line(x_min, y_min + h - 1, x_min, y_min, color=(255, 255, 255))
+            except Exception:
+                pass
+
+    # ======================================================================
+    # 【高阶特征判别树】：优先级与双重校验优化版
+    # ======================================================================
+
+    # 提前获取众数（无论走哪个分支都会用到，放前面不浪费算力）
     l_mode = stats.l_mode()
     a_mode = stats.a_mode()
     b_mode = stats.b_mode()
 
-    # 丢给距离函数进行最终判别
-    return find_best_symbol_by_mode(l_mode, a_mode, b_mode)
+    # 【防误判策略 1：优先级反转 + 严苛指纹】-> 唯一合法的小车判定点
+    # 解释：
+    # 1. a_mean < -5   : 整体必须偏青/绿
+    # 2. b_stdev > 15  : 必须同时跨越蓝色(青)和黄色(绿)，产生极大离散
+    # 3. a_stdev > 5   : 青色和绿色在 A 通道上也有一定差异，防止单色伪装
+    # 4. l_mean > 25   : 亮度不能太暗！墙角的纯黑噪点极容易产生极端的离散值，直接过滤！
+
+    if stats.a_mean() < -5 and stats.b_stdev() > 15 and stats.a_stdev() > 5 and stats.l_mean() > 25:
+        return "H"
+
+    # 【防误判策略 2：主色调双重校验】-> 严格锁定围墙 (#)
+    if stats.l_stdev() > 15:
+        # 核心修复：如果是压在“黄箱子/蓝空地”的交界处，l_stdev 也会很大
+        # 但交界处的“主导颜色（众数）”一定会是黄色或蓝色，而绝对不会是墙壁的黑灰色！
+        # 所以我们用 find_best_symbol_by_mode 测一下它的底色
+        wall_check_sym = find_best_symbol_by_mode(l_mode, a_mode, b_mode)
+
+        # 只有当明暗离散度大，且主色调确实像墙壁时，才判定为墙壁
+        if wall_check_sym == "#":
+            return "#"
+        # 如果 l_stdev > 18 但颜色不像墙，说明是“伪装成墙的色块交界处”，不 return，继续往下走
+
+    # ======================================================================
+    # 【特征 3：纯色靶向匹配】
+    # 如果不是车，也不是真的墙，或者是交界处的残影，统统交给纯色欧氏距离去收底
+    # ======================================================================
+    primary_sym = find_best_symbol_by_mode(l_mode, a_mode, b_mode)
+
+    return primary_sym
 
 
 # ----------------------------------------------------------------------
-# 5. 车辆坐标成对解析逻辑
+# 5. 车辆坐标解析逻辑（单点识别，整张地图仅允许一辆车）
 # ----------------------------------------------------------------------
-def find_car_pair(map_list):
-    """在16x12网格中寻找相邻的车头(H)/车尾(T)"""
-    grid = [map_list[r * COLS:(r + 1) * COLS] for r in range(ROWS)]
-    neighbors = ((1, 0), (-1, 0), (0, 1), (0, -1))
-
-    for y in range(ROWS):
-        for x in range(COLS):
-            if grid[y][x] != "H": continue
-            for dx, dy in neighbors:
-                nx, ny = x + dx, y + dy
-                if 0 <= nx < COLS and 0 <= ny < ROWS and grid[ny][nx] == "T":
-                    return (x, y, nx, ny)
-    return None
-
 def find_car_single(map_list):
-    """容错回退：未能配对时，只要找到其中一个就算车"""
+    """
+    在16x12网格中寻找车辆：不再要求车头(H)和车尾(T)相邻，
+    只要识别到任意一个 H 或 T 即判定为车辆位置。
+
+    整张地图只允许一辆车；如果检测到多个 H/T，按行优先
+    （从左上到右下）选择第一个作为车辆位置。
+    """
     for y in range(ROWS):
         for x in range(COLS):
             ch = map_list[y * COLS + x]
@@ -336,21 +378,15 @@ while(True):
                 # 获取该点 11x11 范围的元素分类
                 char = classify_cell(img, tx, ty, img_w, img_h)
                 map_list.append(char)
-                # 画出采样中心点（白色实心点），方便你在 IDE 中对准场地格子
-                img.draw_circle(tx, ty, 2, color=(255, 255, 255), fill=True)
             else:
                 map_list.append("-")
 
     # --- 阶段 B：坐标解算 ---
-    car_pair = find_car_pair(map_list)
-    if car_pair is not None:
-        car_x, car_y = car_pair[0], car_pair[1]
+    # 新逻辑：不再寻找相邻的 H/T 配对，只要检测到 H 或 T 即判定为车辆（整张地图只允许一辆车）
+    car_single = find_car_single(map_list)
+    if car_single is not None:
+        car_x, car_y = car_single
         car_found = True
-    else:
-        car_single = find_car_single(map_list)
-        if car_single is not None:
-            car_x, car_y = car_single
-            car_found = True
 
     # 绘制外圈标定线框
     if CALIB_SHOW_CORNERS:
