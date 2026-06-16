@@ -21,7 +21,7 @@
 // 说明：
 // 1. HAL_CHASSIS_MOVE_TO: 下发网格坐标目标点。
 // 2. HAL_CHASSIS_IS_ARRIVED: 查询是否已到达目标点。
-// 3. HAL_VISION_GET_BOX_CLASS_ID: 视觉分类结果仍为占位，后续接入串口协议。
+// 3. 分类识别已改由 app_recognize 读取 OpenART2 BOX_CLASS 快照。
 // ==========================================
 
 /*
@@ -55,19 +55,7 @@
  */
 #define HAL_CHASSIS_IS_ARRIVED()       (chassis_ctrl_is_arrived())
 
-/*
- * 宏名称: HAL_VISION_GET_BOX_CLASS_ID()
- * 功能说明:
- * 1) 获取前向视觉识别到的箱子类别编号。
- * 2) 当前为占位实现，固定返回 0，表示“未识别到有效类别”。
- * 参数说明:
- * 1) 无参数。
- * 返回值:
- * 1) 0: 无有效识别结果/背景。
- * 2) >0: 预留为后续真实类别 ID。
- * 后续接入建议:
- * 1) 对接 OpenART 串口协议后，在此宏映射到实际解析结果变量。
- */
+/* Legacy placeholder. New code reads OpenART2 BOX_CLASS via app_recognize/app_link. */
 #define HAL_VISION_GET_BOX_CLASS_ID()  (0)
 // ==========================================
 
@@ -92,8 +80,10 @@ void Game_Logic_Task_Run(void);
 /* ==================================================================
  * 【P0-2】链路状态查询接口
  * Game_Link_Is_Alive():
- *   1: 视觉端心跳 / MAP 帧在 LINK_LOSS_MS 内仍可见
- *   0: 链路已超时, 状态机已进入 STAGE_PAUSE_ON_LINK_LOSS
+ *   1: 当前阶段所需视觉链路在线
+ *      - 普通阶段: OpenART1 MAP/heartbeat 在线
+ *      - 识别阶段: 需要分类时 OpenART1 + OpenART2 均在线
+ *   0: 所需链路已超时, 状态机已进入 STAGE_PAUSE_ON_LINK_LOSS
  * 用途: 菜单 / IPS 显示、调试上位机查询。
  * ================================================================== */
 uint8 Game_Link_Is_Alive(void);

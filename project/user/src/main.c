@@ -103,6 +103,7 @@ static uint32 wait_for_tick(void)
  *   6   MAIN_RUN_MODE_STATIC_VERIFY         ❌    代码内置          静态验证: 内置地图→解算→屏幕慢速播放, 车不动
  *   7   MAIN_RUN_MODE_LEVEL1_TEST           ✅    OpenART 串口     第一关完整流程: 收图→等人发车→推箱→回发车区
  *   8   MAIN_RUN_MODE_HARDCODED_MAP         ✅    代码内置          固定发车: 上电解算→Y轴平移发车→推箱→回库
+ *   9   MAIN_RUN_MODE_OPENART2_TEST         ❌    OpenART2 UART1   分类链路自测: 只显示 BOX_CLASS, 车不动
  *=========================================================================*/
 #define MAIN_RUN_MODE_GAME            (0)   /* 正式比赛: 完整视觉+推箱+底盘闭环 */
 #define MAIN_RUN_MODE_YAW_HOLD        (1)   /* 航向保持: 车不动, IMU 锁角度调 yaw PID */
@@ -113,15 +114,21 @@ static uint32 wait_for_tick(void)
 #define MAIN_RUN_MODE_STATIC_VERIFY   (6)   /* 静态验证: 内置地图→解算→屏幕慢速播放, 车不动 */
 #define MAIN_RUN_MODE_LEVEL1_TEST     (7)   /* 第一关测试: 收图→等发车→推箱→回库 (最接近比赛) */
 #define MAIN_RUN_MODE_HARDCODED_MAP   (8)   /* 硬编码地图: 上电解算→Y轴平移发车→跑→回发车点 */
+#define MAIN_RUN_MODE_OPENART2_TEST   (9)   /* OpenART2 分类链路测试: 屏幕显示 BOX/TARGET/NONE, 车不动 */
 
-/* ═══════════ 改下面这行切换运行模式 (0~8) ═══════════ */
-#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_HARDCODED_MAP)  /* 当前: 模式8固定发车跑第一关 */
-/* ═══════════ 改上面这行切换运行模式 (0~8) ═══════════ */
+/* ═══════════ 改下面这行切换运行模式 (0~9) ═══════════ */
+#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_OPENART2_TEST)  /* mode 9: OpenART2 BOX_CLASS screen test */
+/* ═══════════ 改上面这行切换运行模式 (0~9) ═══════════ */
 
 /* OpenART1 地图链路硬件口: 若实测 UART4 走 D0/D1, 只改下面两行宏. */
 #define MAIN_OPENART1_UART            (UART_4)
 #define MAIN_OPENART1_UART_TX         (UART4_TX_C16)
 #define MAIN_OPENART1_UART_RX         (UART4_RX_C17)
+
+/* OpenART2 分类链路硬件口: UART1 接分类摄像头 BOX_CLASS/HEARTBEAT 帧. */
+#define MAIN_OPENART2_UART            (UART_1)
+#define MAIN_OPENART2_UART_TX         (UART1_TX_B12)
+#define MAIN_OPENART2_UART_RX         (UART1_RX_B13)
 
 /* ========================================================================== */
 /* 位置/起点宏（上提至所有调试模式之前, 避免 LEVEL1_TEST/HARDCODED_MAP 等
@@ -198,11 +205,11 @@ static uint8 main_selftest_char_to_map(char ch)
  *  LEVEL1_TEST 模式: 第一关完整测试
  *  流程:
  *    1. WAIT_MAP     — 等待 OpenART 通过 UART4 发来地图帧
- *    2. SOLVE        — 收到地图后立即解算推箱子路径 (Stage1)
- *    3. WAIT_LEAVE   — 解算成功后等待车被推出发车区 (人工发车)
- *    4. WARMUP       — 离开发车区后暖机 1s (IMU/编码器稳定)
+ *    2. SOLVE        — 冻结该地图后解算推箱子路径 (Stage1)
+ *    3. WARMUP       — 解算成功后暖机 1s (IMU/编码器稳定)
+ *    4. LAUNCH_FIXED — 与模式8一致, 从固定发车点平移到解算起点
  *    5. PUSH_BOXES   — 逐子箱跑航点 (不使用视觉矫正, 纯里程计)
- *    6. RETURN_HOME  — 推完后回发车区起点
+ *    6. RETURN_HOME  — 推完后回固定发车点
  *    7. DONE         — 驻停
  *
  *  关键约束:
@@ -215,8 +222,8 @@ static uint8 main_selftest_char_to_map(char ch)
 typedef enum {
     L1_PHASE_WAIT_MAP = 0,   /* 等待 OpenART 地图帧 */
     L1_PHASE_SOLVE,          /* 解算 (瞬时, 同一 tick 内完成) */
-    L1_PHASE_WAIT_LEAVE,     /* 等待完全离开发车区 (人工发车) */
     L1_PHASE_WARMUP,         /* 暖机等待 IMU/编码器稳定 */
+    L1_PHASE_LAUNCH_FIXED,   /* same as mode 8: fixed launch to solve start */
     L1_PHASE_PUSH_BOXES,     /* 逐航点推箱 */
     L1_PHASE_RETURN_HOME,    /* 回发车区起点 */
     L1_PHASE_DONE            /* 完成驻停 */
@@ -241,8 +248,8 @@ static void main_l1_solve(void)
     Point_t start_pos;
     uint8 r;
 
-    start_pos.x = (int8)MAIN_POS_NAV_START_X_GRID;   /* 1 */
-    start_pos.y = (int8)MAIN_POS_NAV_START_Y_GRID;   /* 5 (5.5 截位) */
+    start_pos.x = (int8)MAIN_POS_HCM_SOLVE_START_X_GRID;
+    start_pos.y = (int8)MAIN_POS_HCM_SOLVE_START_Y_GRID;
 
     printf("L1_MAP_BEGIN\n");
     for (r = 0U; r < MAP_ROWS; r++)
@@ -265,8 +272,8 @@ static void main_l1_solve(void)
     }
     printf("L1_MAP_END\n");
     printf("L1_PLAYER_START=%.2f,%.2f (grid=%d,%d)\n",
-           (double)MAIN_POS_NAV_START_X_GRID,
-           (double)MAIN_POS_NAV_START_Y_GRID,
+           (double)MAIN_POS_HCM_LAUNCH_TARGET_X_GRID,
+           (double)MAIN_POS_HCM_LAUNCH_TARGET_Y_GRID,
            (int)start_pos.x, (int)start_pos.y);
 
     memset(&s_l1_solution, 0, sizeof(s_l1_solution));
@@ -318,17 +325,12 @@ static void main_l1_wait_map_5ms(void)
                (unsigned long)g_link_stats.frames_crc_err,
                (unsigned long)g_link_stats.frames_len_err);
 
-        /* 立即解算 */
-        main_l1_solve();
-        if (s_l1_solve_ok)
-        {
-            /* 锁定地图, 不再接受新帧 */
-            uart_rx_interrupt(MAIN_OPENART1_UART, 0);
-            printf("L1_MAP_LOCKED\n");
-            s_l1_phase = L1_PHASE_WAIT_LEAVE;
-            printf("L1_WAIT_LEAVE (push car out of launch zone)\n");
-        }
-        /* 解算失败: 留在 WAIT_MAP, 等上位机重发 */
+        /* Freeze this OpenART1 map before solving. Later frames cannot change this run. */
+        uart_rx_interrupt(MAIN_OPENART1_UART, 0);
+        app_link_inject_static_map(s_l1_map);
+        s_l1_map_recv_ms = g_link_last_map_ms;
+        printf("L1_MAP_LOCKED\n");
+        s_l1_phase = L1_PHASE_SOLVE;
         return;
     }
 
@@ -355,33 +357,46 @@ static void main_run_level1_test_5ms(void)
         return;
 
     case L1_PHASE_SOLVE:
-        /* 解算在 WAIT_MAP 内同步完成, 此状态仅作占位 */
-        return;
-
-    case L1_PHASE_WAIT_LEAVE:
-        /* 等待车完全离开发车区 (人工推车发车) */
-        chassis_zone_tick();
-        if (chassis_zone_is_fully_outside_launch(LAUNCH_ZONE_LEFT))
+        main_l1_solve();
+        if (s_l1_solve_ok)
         {
-            printf("L1_LEFT_LAUNCH\n");
             s_l1_phase = L1_PHASE_WARMUP;
             s_l1_warmup_ticks = 0U;
+            printf("L1_WARMUP start\n");
+        }
+        else
+        {
+            /* Bad/partial map: unlock UART and wait for the next OpenART1 frame. */
+            uart_rx_interrupt(MAIN_OPENART1_UART, 1);
+            s_l1_phase = L1_PHASE_WAIT_MAP;
+            printf("L1_UNLOCK_MAP wait next MAP\n");
         }
         return;
 
     case L1_PHASE_WARMUP:
         /* 暖机: 等 IMU/编码器稳定 */
-        chassis_zone_tick();
         if (++s_l1_warmup_ticks >= MAIN_POINT_NAV_WARMUP_TICKS)
         {
-            printf("L1_WARMUP_DONE start pushing\n");
+            printf("L1_WARMUP_DONE launch along y to solve start\n");
+            s_l1_phase = L1_PHASE_LAUNCH_FIXED;
+            chassis_ctrl_move_to_m(
+                MAIN_POS_GRID_TO_M_X(MAIN_POS_HCM_LAUNCH_TARGET_X_GRID),
+                MAIN_POS_GRID_TO_M_Y(MAIN_POS_HCM_LAUNCH_TARGET_Y_GRID),
+                0.0f);
+            s_l1_navigating = 1U;
+        }
+        return;
+
+    case L1_PHASE_LAUNCH_FIXED:
+        if (chassis_ctrl_is_arrived())
+        {
+            printf("L1_LAUNCH_DONE start pushing\n");
+            s_l1_navigating = 0U;
             s_l1_phase = L1_PHASE_PUSH_BOXES;
         }
         return;
 
     case L1_PHASE_PUSH_BOXES:
-        chassis_zone_tick();
-
         if (!s_l1_navigating)
         {
             /* 检查当前子箱航点是否已跑完 */
@@ -395,8 +410,8 @@ static void main_run_level1_test_5ms(void)
                     printf("L1_ALL_BOXES_DONE, returning home\n");
                     s_l1_phase = L1_PHASE_RETURN_HOME;
                     chassis_ctrl_move_to_m(
-                        MAIN_POS_GRID_TO_M_X(MAIN_POS_NAV_START_X_GRID),
-                        MAIN_POS_GRID_TO_M_Y(MAIN_POS_NAV_START_Y_GRID),
+                        MAIN_POS_GRID_TO_M_X(MAIN_POS_HCM_HOME_X_GRID),
+                        MAIN_POS_GRID_TO_M_Y(MAIN_POS_HCM_HOME_Y_GRID),
                         0.0f);
                     s_l1_navigating = 1U;
                     return;
@@ -430,7 +445,6 @@ static void main_run_level1_test_5ms(void)
         return;
 
     case L1_PHASE_RETURN_HOME:
-        chassis_zone_tick();
         if (chassis_ctrl_is_arrived())
         {
             chassis_ctrl_stop();
@@ -1366,6 +1380,221 @@ static void main_mode5_render_100ms(void)
 /* 菜单渲染分频 (主循环 5ms tick * N), N=20 => 100ms 刷一次 */
 #define MAIN_MENU_RENDER_DIV          (20U)
 
+#if (MAIN_RUN_MODE == MAIN_RUN_MODE_OPENART2_TEST)
+#define OA2_TEST_STALE_MS             (500U)
+
+typedef enum
+{
+    OA2_PHASE_WAIT_LINK = 0,
+    OA2_PHASE_WAIT_FRAME,
+    OA2_PHASE_SHOW_BOX,
+    OA2_PHASE_SHOW_TARGET,
+    OA2_PHASE_SHOW_NONE,
+    OA2_PHASE_STALE
+} oa2_test_phase_e;
+
+static oa2_test_phase_e s_oa2_phase = OA2_PHASE_WAIT_LINK;
+static uint32 s_oa2_last_frame_id = 0U;
+static uint32 s_oa2_box_count = 0U;
+static uint32 s_oa2_target_count = 0U;
+static uint32 s_oa2_none_count = 0U;
+
+static const char *main_oa2_phase_name(oa2_test_phase_e phase)
+{
+    switch (phase)
+    {
+    case OA2_PHASE_WAIT_LINK:   return "WAIT LINK";
+    case OA2_PHASE_WAIT_FRAME:  return "WAIT FRAME";
+    case OA2_PHASE_SHOW_BOX:    return "BOX";
+    case OA2_PHASE_SHOW_TARGET: return "TARGET";
+    case OA2_PHASE_SHOW_NONE:   return "NONE";
+    case OA2_PHASE_STALE:
+    default:                    return "STALE";
+    }
+}
+
+static const char *main_oa2_kind_name(uint8 kind, uint8 class_id)
+{
+    if (class_id == APP_LINK_CLASS_ID_NONE)
+    {
+        return "NONE";
+    }
+    if (kind == APP_LINK_OBJ_KIND_BOX)
+    {
+        return "BOX";
+    }
+    if (kind == APP_LINK_OBJ_KIND_TARGET)
+    {
+        return "TARGET";
+    }
+    return "BAD";
+}
+
+static void main_run_openart2_test_5ms(void)
+{
+    app_link_box_class_snapshot_t snap;
+    uint32 now_ms = app_link_get_ms();
+    uint32 link_ms = g_link_last_class_link_ms;
+
+    chassis_ctrl_stop();
+    app_link_get_box_class_snapshot(&snap);
+
+    if (link_ms == 0U)
+    {
+        s_oa2_phase = OA2_PHASE_WAIT_LINK;
+        return;
+    }
+    if ((now_ms - link_ms) > OA2_TEST_STALE_MS)
+    {
+        s_oa2_phase = OA2_PHASE_STALE;
+        return;
+    }
+    if (snap.valid == 0U)
+    {
+        s_oa2_phase = OA2_PHASE_WAIT_FRAME;
+        return;
+    }
+    if ((now_ms - snap.stamp_ms) > OA2_TEST_STALE_MS)
+    {
+        s_oa2_phase = OA2_PHASE_STALE;
+        return;
+    }
+
+    if (snap.frame_id != s_oa2_last_frame_id)
+    {
+        s_oa2_last_frame_id = snap.frame_id;
+        if (snap.class_id == APP_LINK_CLASS_ID_NONE)
+        {
+            s_oa2_none_count++;
+        }
+        else if (snap.obj_kind == APP_LINK_OBJ_KIND_BOX)
+        {
+            s_oa2_box_count++;
+        }
+        else if (snap.obj_kind == APP_LINK_OBJ_KIND_TARGET)
+        {
+            s_oa2_target_count++;
+        }
+    }
+
+    if (snap.class_id == APP_LINK_CLASS_ID_NONE)
+    {
+        s_oa2_phase = OA2_PHASE_SHOW_NONE;
+    }
+    else if (snap.obj_kind == APP_LINK_OBJ_KIND_BOX)
+    {
+        s_oa2_phase = OA2_PHASE_SHOW_BOX;
+    }
+    else if (snap.obj_kind == APP_LINK_OBJ_KIND_TARGET)
+    {
+        s_oa2_phase = OA2_PHASE_SHOW_TARGET;
+    }
+    else
+    {
+        s_oa2_phase = OA2_PHASE_STALE;
+    }
+}
+
+static void main_openart2_test_render_100ms(void)
+{
+    app_link_box_class_snapshot_t snap;
+    uint32 now_ms = app_link_get_ms();
+    uint32 link_age = (g_link_last_class_link_ms == 0U) ? 0U : (now_ms - g_link_last_class_link_ms);
+    uint32 frame_age = 0U;
+    uint16 title_color = RGB565_CYAN;
+
+    app_link_get_box_class_snapshot(&snap);
+    if (snap.valid != 0U)
+    {
+        frame_age = now_ms - snap.stamp_ms;
+    }
+
+    if ((s_oa2_phase == OA2_PHASE_SHOW_BOX) || (s_oa2_phase == OA2_PHASE_SHOW_TARGET))
+    {
+        title_color = RGB565_GREEN;
+    }
+    else if ((s_oa2_phase == OA2_PHASE_STALE) || (s_oa2_phase == OA2_PHASE_WAIT_LINK))
+    {
+        title_color = RGB565_RED;
+    }
+    else
+    {
+        title_color = RGB565_YELLOW;
+    }
+
+    ips200_full(RGB565_BLACK);
+    ips200_set_color(title_color, RGB565_BLACK);
+    ips200_show_string(0U, 0U, "OPENART2 CLASS TEST");
+
+    ips200_set_color(RGB565_WHITE, RGB565_BLACK);
+    ips200_show_string(0U, 24U, "STATE:");
+    ips200_show_string(64U, 24U, (char *)main_oa2_phase_name(s_oa2_phase));
+
+    ips200_show_string(0U, 48U, "UART1 AGE:");
+    ips200_show_uint(96U, 48U, link_age, 5U);
+    ips200_show_string(144U, 48U, "ms");
+
+    ips200_show_string(0U, 72U, "FRAME AGE:");
+    if (snap.valid != 0U)
+    {
+        ips200_show_uint(96U, 72U, frame_age, 5U);
+        ips200_show_string(144U, 72U, "ms");
+    }
+    else
+    {
+        ips200_show_string(96U, 72U, "----- ms");
+    }
+
+    ips200_show_string(0U, 104U, "OBJ:");
+    if (snap.valid != 0U)
+    {
+        ips200_show_string(48U, 104U, (char *)main_oa2_kind_name(snap.obj_kind, snap.class_id));
+    }
+    else
+    {
+        ips200_show_string(48U, 104U, "--");
+    }
+
+    ips200_show_string(0U, 128U, "CLASS:");
+    if ((snap.valid != 0U) && (snap.class_id != APP_LINK_CLASS_ID_NONE))
+    {
+        ips200_show_uint(64U, 128U, snap.class_id, 2U);
+    }
+    else
+    {
+        ips200_show_string(64U, 128U, "--");
+    }
+    ips200_show_string(112U, 128U, "SEQ:");
+    if (snap.valid != 0U)
+    {
+        ips200_show_uint(152U, 128U, snap.vision_seq, 3U);
+    }
+    else
+    {
+        ips200_show_string(152U, 128U, "---");
+    }
+
+    ips200_show_string(0U, 152U, "FID:");
+    ips200_show_uint(48U, 152U, snap.valid ? snap.frame_id : 0U, 6U);
+
+    ips200_show_string(0U, 176U, "CNT B:");
+    ips200_show_uint(56U, 176U, s_oa2_box_count, 4U);
+    ips200_show_string(112U, 176U, "T:");
+    ips200_show_uint(136U, 176U, s_oa2_target_count, 4U);
+    ips200_show_string(192U, 176U, "N:");
+    ips200_show_uint(216U, 176U, s_oa2_none_count, 4U);
+
+    ips200_show_string(0U, 208U, "OK:");
+    ips200_show_uint(32U, 208U, g_link_class_stats.frames_ok, 5U);
+    ips200_show_string(88U, 208U, "CRC:");
+    ips200_show_uint(128U, 208U, g_link_class_stats.frames_crc_err, 4U);
+    ips200_show_string(176U, 208U, "LEN:");
+    ips200_show_uint(216U, 208U, g_link_class_stats.frames_len_err, 4U);
+    ips200_show_string(264U, 208U, "SQ:");
+    ips200_show_uint(288U, 208U, g_link_class_stats.frames_seq_drop, 3U);
+}
+#endif
+
 /* ========================================================================== */
 /*  ⬇⬇⬇ 单轮 PID 调试辅助函数, 仅 SINGLE_WHEEL 模式下编译 ⬇⬇⬇              */
 /* ========================================================================== */
@@ -1403,6 +1632,15 @@ static void main_apply_debug_wheel_pid(void)
 #if ((MAIN_RUN_MODE == MAIN_RUN_MODE_GAME) || (MAIN_RUN_MODE == MAIN_RUN_MODE_SOKO_SELFTEST) || (MAIN_RUN_MODE == MAIN_RUN_MODE_SOLVE_VERIFY) || (MAIN_RUN_MODE == MAIN_RUN_MODE_LEVEL1_TEST))
     uart_init(MAIN_OPENART1_UART, 115200, MAIN_OPENART1_UART_TX, MAIN_OPENART1_UART_RX);
     uart_rx_interrupt(MAIN_OPENART1_UART, 1);
+#endif
+
+    // OpenART2: 分类识别模块, 通过 UART1 上报 BOX_CLASS/HEARTBEAT 帧.
+#if ((MAIN_RUN_MODE == MAIN_RUN_MODE_GAME) || (MAIN_RUN_MODE == MAIN_RUN_MODE_OPENART2_TEST))
+    uart_init(MAIN_OPENART2_UART, 115200, MAIN_OPENART2_UART_TX, MAIN_OPENART2_UART_RX);
+    uart_rx_interrupt(MAIN_OPENART2_UART, 1);
+#endif
+
+#if ((MAIN_RUN_MODE == MAIN_RUN_MODE_GAME) || (MAIN_RUN_MODE == MAIN_RUN_MODE_SOKO_SELFTEST) || (MAIN_RUN_MODE == MAIN_RUN_MODE_SOLVE_VERIFY) || (MAIN_RUN_MODE == MAIN_RUN_MODE_LEVEL1_TEST) || (MAIN_RUN_MODE == MAIN_RUN_MODE_OPENART2_TEST))
     app_link_init();                /* P0-1: 协议解析层初始化, 必须在 uart_rx_interrupt 之后 */
 #endif
 
@@ -1426,8 +1664,8 @@ static void main_apply_debug_wheel_pid(void)
     // ------------------------------------------------------------------
     chassis_ctrl_init();
     chassis_menu_init();
-#if (MAIN_RUN_MODE == MAIN_RUN_MODE_HARDCODED_MAP)
-    /* 模式8固定发车: 上电先把里程计放在 (1,5.5), 暖机后沿 Y 轴平移到 (1,5). */
+#if (MAIN_RUN_MODE == MAIN_RUN_MODE_LEVEL1_TEST) || (MAIN_RUN_MODE == MAIN_RUN_MODE_HARDCODED_MAP)
+    /* 模式7/8固定发车: 上电先把里程计放在 (1,5.5), 暖机后沿 Y 轴平移到 (1,5). */
     chassis_ctrl_set_pose(MAIN_POS_GRID_TO_M_X(MAIN_POS_HCM_HOME_X_GRID),
                           MAIN_POS_GRID_TO_M_Y(MAIN_POS_HCM_HOME_Y_GRID),
                           0.0f);
@@ -1469,10 +1707,13 @@ static void main_apply_debug_wheel_pid(void)
 #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_STATIC_VERIFY)
     printf("M6_BOOT static map solver screen verify...\n");
     chassis_ctrl_stop();
+#elif (MAIN_RUN_MODE == MAIN_RUN_MODE_OPENART2_TEST)
+    printf("OA2_BOOT wait BOX_CLASS from OpenART2 (UART1)...\n");
+    chassis_ctrl_stop();
 #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_LEVEL1_TEST)
     /* 第一关测试模式:
-     *   等待 OpenART 发来地图 → 解算 → 等人工发车 → 跑航点 → 回发车区.
-     *   上电后车停在发车区不动, 直到收到地图且解算成功后才允许发车. */
+     *   等待 OpenART1 发来地图 → 冻结该地图 → 解算 → 固定发车 → 跑航点 → 回固定发车点.
+     *   上电后车停在发车区不动, 直到收到地图且解算成功后才自动发车. */
     printf("L1_BOOT wait MAP from OpenART (UART4)...\n");
     chassis_ctrl_hold_yaw(0.0f);
 #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_HARDCODED_MAP)
@@ -1724,6 +1965,8 @@ static void main_apply_debug_wheel_pid(void)
         main_run_solve_verify_5ms();
     #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_STATIC_VERIFY)
         main_run_static_verify_5ms();
+    #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_OPENART2_TEST)
+        main_run_openart2_test_5ms();
     #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_LEVEL1_TEST)
         main_run_level1_test_5ms();
         main_run_level1_test_log_50ms();
@@ -1739,12 +1982,16 @@ static void main_apply_debug_wheel_pid(void)
         if (menu_render_div >= MAIN_MENU_RENDER_DIV)
         {
             menu_render_div = 0U;
+#if (MAIN_RUN_MODE == MAIN_RUN_MODE_OPENART2_TEST)
+            main_openart2_test_render_100ms();
+#else
             chassis_menu_render_100ms();
 #if (MAIN_RUN_MODE == MAIN_RUN_MODE_STATIC_VERIFY)
             main_mode6_render_100ms();
 #endif
 #if (MAIN_RUN_MODE == MAIN_RUN_MODE_SOLVE_VERIFY)
             main_mode5_render_100ms();   /* 叠加解算进度文字到菜单下方 */
+#endif
 #endif
         }
 

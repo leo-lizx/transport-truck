@@ -1,5 +1,5 @@
 #include "app_game_logic.h"
-#include "app_link.h"      /* P0-2: 读取 g_link_last_hb_ms 判断链路是否在线; P0-3: 拷贝 seq-lock 地图快照 */
+#include "app_link.h"      /* P0-2: 读取 OpenART1/2 链路时戳; P0-3: 拷贝 seq-lock 地图快照 */
 #include "app_vision_fusion.h"
 #include "app_recognize.h"
 
@@ -39,6 +39,15 @@ static uint8 is_navigating = 0;
 static uint8        s_link_alive       = 0U;     /* 当前链路状态: 1=在线 0=离线/未启动 */
 static uint8        s_link_ever_alive  = 0U;     /* 是否曾经在线过 (开机直接没数据时, 保持 WAIT 而非 LOSS) */
 static GameStage_e  s_stage_resume     = STAGE_WAIT_START; /* LOSS 触发时保存原状态, 恢复时回到该状态 */
+
+typedef enum
+{
+    LINK_PAUSE_NONE = 0,
+    LINK_PAUSE_MAP,
+    LINK_PAUSE_CLASS
+} LinkPauseReason_e;
+
+static LinkPauseReason_e s_link_pause_reason = LINK_PAUSE_NONE;
 
 /* ----- 【P0-8】OOB / 发车 / 死局静止 相关静态变量 ------------------
  * s_failure_reason   : 比赛失败原因, 触发后状态机锁死在 STAGE_DONE
@@ -728,10 +737,12 @@ static void stage_done_handler(void)
  * ----------------------------------------------------------------
  * update_link_state():
  *   每个调度 tick 在 Game_Logic_Task_Run 入口被调用一次
- *   - 用 (now - g_link_last_hb_ms) 与 LINK_LOSS_MS / LINK_OK_MS 做迟滞判定
+ *   - OpenART1 MAP 链路是全局必需链路
+ *   - OpenART2 BOX_CLASS 链路只在需要分类识别的 RECOGNIZE_MAP 阶段必需
+ *   - 用 LINK_LOSS_MS / LINK_OK_MS 做迟滞判定
  *   - 状态翻转时:
  *       OK  -> LOSS : 保存 current_stage 到 s_stage_resume, 切到 PAUSE, 立即 chassis_ctrl_stop()
- *       LOSS-> OK   : current_stage 还原为 s_stage_resume, 状态机自然续跑
+ *       LOSS-> OK   : 重新进入 RECOGNIZE_MAP, 避免用掉线前的陈旧识别结果继续执行
  *
  * stage_pause_on_link_loss_handler():
  *   PAUSE 状态下不做任何业务逻辑, 只是周期性确保电机维持在停车状态
@@ -794,52 +805,103 @@ static void check_out_of_bounds(void)
     }
 }
 
+static uint32 link_silence_ms(uint32 now_ms, uint32 last_ms)
+{
+    if (last_ms == 0U)
+    {
+        return 0xFFFFFFFFUL;
+    }
+    return (now_ms >= last_ms) ? (now_ms - last_ms) : 0U;
+}
+
+static uint8 recognize_stage_needs_class_link(void)
+{
+    if (current_stage != STAGE_RECOGNIZE_MAP)
+    {
+        return 0U;
+    }
+    if ((g_current_level <= 1U) && (map_has_bomb() == 0U))
+    {
+        return 0U;
+    }
+    return 1U;
+}
+
+static void enter_link_pause(LinkPauseReason_e reason)
+{
+    s_link_alive = 0U;
+    s_link_pause_reason = reason;
+    if (current_stage != STAGE_PAUSE_ON_LINK_LOSS)
+    {
+        s_stage_resume = current_stage;
+        current_stage  = STAGE_PAUSE_ON_LINK_LOSS;
+        chassis_ctrl_stop();
+        is_navigating = 0U;
+    }
+}
+
+static void recover_from_link_pause(void)
+{
+    s_link_alive = 1U;
+    s_link_pause_reason = LINK_PAUSE_NONE;
+    if (current_stage == STAGE_PAUSE_ON_LINK_LOSS)
+    {
+        chassis_ctrl_stop();
+        is_navigating  = 0U;
+        s_map_freeze   = 1U;
+        memset(g_box_to_target, 0, sizeof(g_box_to_target));
+        current_stage  = STAGE_RECOGNIZE_MAP;
+        App_Recognize_Reset();
+        (void)s_stage_resume;
+    }
+}
+
 static void update_link_state(void)
 {
-    /* 32 位字段在 M7 上读取原子, 无需临界区                                       */
-    uint32 last_ok = g_link_last_hb_ms;
-    uint32 now_ms  = app_link_get_ms();    /* 与 g_link_last_hb_ms 同源时基, 步长一致  */
-    uint32 silence_ms = (now_ms >= last_ok) ? (now_ms - last_ok) : 0U;
+    uint32 now_ms = app_link_get_ms();
+    uint32 map_silence_ms = link_silence_ms(now_ms, g_link_last_map_link_ms);
+    uint32 class_silence_ms = link_silence_ms(now_ms, g_link_last_class_link_ms);
+    uint8 map_seen = (g_link_last_map_link_ms != 0U) ? 1U : 0U;
+    uint8 class_seen = (g_link_last_class_link_ms != 0U) ? 1U : 0U;
+    uint8 map_loss = (uint8)((map_seen != 0U) && (map_silence_ms > LINK_LOSS_MS));
+    uint8 map_recovered = (uint8)((map_seen != 0U) && (map_silence_ms < LINK_OK_MS));
+    uint8 class_loss = (uint8)(((class_seen == 0U) || (class_silence_ms > LINK_LOSS_MS)) &&
+                               (recognize_stage_needs_class_link() != 0U));
+    uint8 class_recovered = (uint8)((class_seen != 0U) && (class_silence_ms < LINK_OK_MS));
 
     if (!s_link_ever_alive) {
-        /* 上电后还没收到过任何帧: 不进入 LOSS 状态, 让用户看到的是 WAIT_START */
-        if (last_ok != 0U) {
+        /* OpenART1/MAP is the global map authority; class-only traffic does not start the game link. */
+        if (map_seen != 0U) {
             s_link_ever_alive  = 1U;
             s_link_alive       = 1U;
+            s_link_pause_reason = LINK_PAUSE_NONE;
         }
         return;
     }
 
     if (s_link_alive) {
-        /* 在线 -> 检查是否需要触发 LOSS                                          */
-        if (silence_ms > LINK_LOSS_MS) {
-            s_link_alive = 0U;
-            if (current_stage != STAGE_PAUSE_ON_LINK_LOSS) {
-                s_stage_resume = current_stage;     /* 保存恢复点                  */
-                current_stage  = STAGE_PAUSE_ON_LINK_LOSS;
-                chassis_ctrl_stop();                /* 立即刹停 (force_stop)        */
-                is_navigating = 0U;
-            }
+        if (map_loss != 0U) {
+            enter_link_pause(LINK_PAUSE_MAP);
+        }
+        else if (class_loss != 0U) {
+            enter_link_pause(LINK_PAUSE_CLASS);
         }
     } else {
-        /* 离线 -> 检查是否恢复 (用 LINK_OK_MS 做迟滞)                            */
-        if (silence_ms < LINK_OK_MS) {
-            s_link_alive = 1U;
-            if (current_stage == STAGE_PAUSE_ON_LINK_LOSS) {
-                /* 安全策略: 链路恢复后强制重新识别地图, 避免基于陈旧地图直接执行  */
-                /* B4: 恢复瞬间显式刹停 + 清 is_navigating, 防 5ms 窗口车按旧目标继续滑行 */
-                chassis_ctrl_stop();
-                is_navigating  = 0U;
-                /* Issue B: 与 stage_wait_start_handler→RECOGNIZE 路径保持一致,
-                 * 进 RECOGNIZE 期间冻结地图, 防 s_items[] 与新快照错位 */
-                s_map_freeze   = 1U;
-                /* Issue C: 清陈旧映射, 准备让 RECOGNIZE 重新写入 */
-                memset(g_box_to_target, 0, sizeof(g_box_to_target));
-                current_stage  = STAGE_RECOGNIZE_MAP;
-                App_Recognize_Reset();          /* 链路恢复后重新跑一遍识别 tour */
-                /* s_stage_resume 已不再使用, 但保留供调试观察 */
-                (void)s_stage_resume;
-            }
+        if ((s_link_pause_reason == LINK_PAUSE_CLASS) && (map_loss != 0U)) {
+            s_link_pause_reason = LINK_PAUSE_MAP;
+            return;
+        }
+
+        if ((s_link_pause_reason == LINK_PAUSE_MAP) && (map_recovered != 0U)) {
+            recover_from_link_pause();
+        }
+        else if ((s_link_pause_reason == LINK_PAUSE_CLASS) &&
+                 (map_loss == 0U) &&
+                 (class_recovered != 0U)) {
+            recover_from_link_pause();
+        }
+        else if ((s_link_pause_reason == LINK_PAUSE_NONE) && (map_recovered != 0U)) {
+            recover_from_link_pause();
         }
     }
 }

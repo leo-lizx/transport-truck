@@ -63,8 +63,8 @@
 /** 从 SOKOBAN_MAX_BOXES 借用的目标列表上限 (理论上 boxes==targets) */
 #define RECOG_MAX_TARGETS              (SOKOBAN_MAX_BOXES)
 
-/** class_id 的有效编号上限 (1..N), 设为 8 满足赛规已知箱子类别数 */
-#define RECOG_CLASS_ID_MAX             (8U)
+/** class_id 的有效编号上限 (1..N), 对齐 openart2 的 10 类箱子/目标 */
+#define RECOG_CLASS_ID_MAX             (10U)
 
 /*===================================================================================================================
  * 内部数据结构

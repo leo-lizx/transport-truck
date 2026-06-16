@@ -84,16 +84,16 @@ void PIT_IRQHandler(void)
 
 void LPUART1_IRQHandler(void)
 { /* P0-1 改造说明:
-     *   LPUART1 (B12/B13) 同时承担 debug 输出与 OpenART 视觉数据接收。
+     *   LPUART1 (B12/B13) 现在用于 OpenART2 分类数据接收；debug 已切到 UART8。
      *   debug 模块只用 TX, RX 由本协议层独占, 因此这里直接把字节交给
-     *   app_link_isr_feed_byte() 而不再喂 debug 环形缓冲 (避免 64B 缓冲溢出).
+     *   app_link_isr_feed_class_byte() 而不再喂 debug 环形缓冲 (避免 64B 缓冲溢出).
      *   ─ 字节级零拷贝, 单次中断耗时 < 5 ?s.
      *   ─ 状态机内部已做溢出/超时/同步保护, 不会卡死.
      */
     if(kLPUART_RxDataRegFullFlag & LPUART_GetStatusFlags(LPUART1))
     {
         uint8 rx_byte = uart_read_byte(UART_1);         /* 读 LPUART1 数据寄存器并清 RDRF */
-        app_link_isr_feed_byte(rx_byte);
+        app_link_isr_feed_class_byte(rx_byte);
     }
 
         
@@ -128,7 +128,7 @@ void LPUART4_IRQHandler(void)
     if(kLPUART_RxDataRegFullFlag & LPUART_GetStatusFlags(LPUART4))
     {
         uint8 rx_byte = uart_read_byte(UART_4);
-        app_link_isr_feed_byte(rx_byte);
+        app_link_isr_feed_map_byte(rx_byte);
     }
         
     LPUART_ClearStatusFlags(LPUART4, kLPUART_RxOverrunFlag);    // 不允许删除

@@ -1,6 +1,7 @@
 #include "chassis_menu.h"
 
 #include "algo_sokoban_solver.h"
+#include "app_game_logic.h"
 #include "app_link.h"
 #include "chassis_ctrl.h"
 #include "chassis_imu.h"
@@ -39,6 +40,9 @@ typedef struct
 #define MENU_CELL_GAP                  (1U)
 #define MENU_MAP_W                     (APP_LINK_MAP_COLS * MENU_CELL_SIZE)
 #define MENU_MAP_H                     (APP_LINK_MAP_ROWS * MENU_CELL_SIZE)
+#define MENU_SIDE_X                    (216U)
+#define MENU_SIDE_W                    (104U)
+#define MENU_RECOG_Y                   (152U)
 
 #define MENU_RGB565(r, g, b)           (uint16)((((uint16)(r) & 0xF8U) << 8) | \
                                                 (((uint16)(g) & 0xF8U) << 3) | \
@@ -119,6 +123,49 @@ static void menu_clear_text_line(uint16 y)
     ips200_show_string(0U, y, "                                        ");
 }
 
+static void menu_draw_recognize_object(void)
+{
+    AppRecognizeDebug_t recog;
+    const char *kind = "--";
+
+    Game_Get_Recognize_Debug(&recog);
+
+    menu_fill_rect(MENU_SIDE_X, MENU_RECOG_Y, MENU_SIDE_W, 32U, MENU_COLOR_BG);
+    ips200_set_color(MENU_COLOR_TEXT, MENU_COLOR_BG);
+
+    if ((recog.total_targets == 0U) || (recog.current_idx >= recog.total_targets))
+    {
+        ips200_show_string(MENU_SIDE_X, MENU_RECOG_Y, "OBJ: --");
+        ips200_show_string(MENU_SIDE_X, MENU_RECOG_Y + 16U, "I:--/-- C:--");
+        return;
+    }
+
+    if (recog.current_kind == APP_LINK_OBJ_KIND_BOX)
+    {
+        kind = "BOX";
+    }
+    else if (recog.current_kind == APP_LINK_OBJ_KIND_TARGET)
+    {
+        kind = "TARGET";
+    }
+
+    ips200_show_string(MENU_SIDE_X, MENU_RECOG_Y, "OBJ: ");
+    ips200_show_string(MENU_SIDE_X + 40U, MENU_RECOG_Y, kind);
+    ips200_show_string(MENU_SIDE_X, MENU_RECOG_Y + 16U, "I:");
+    ips200_show_uint(MENU_SIDE_X + 16U, MENU_RECOG_Y + 16U, (uint32)(recog.current_idx + 1U), 2U);
+    ips200_show_string(MENU_SIDE_X + 34U, MENU_RECOG_Y + 16U, "/");
+    ips200_show_uint(MENU_SIDE_X + 42U, MENU_RECOG_Y + 16U, (uint32)recog.total_targets, 2U);
+    ips200_show_string(MENU_SIDE_X + 64U, MENU_RECOG_Y + 16U, "C:");
+    if (recog.current_class_id == 0U)
+    {
+        ips200_show_string(MENU_SIDE_X + 80U, MENU_RECOG_Y + 16U, "--");
+    }
+    else
+    {
+        ips200_show_uint(MENU_SIDE_X + 80U, MENU_RECOG_Y + 16U, (uint32)recog.current_class_id, 2U);
+    }
+}
+
 static uint8 menu_map_frame_is_fresh(uint32 *age_ms_out)
 {
     uint32 now_ms = app_link_get_ms();
@@ -197,7 +244,7 @@ static void menu_draw_static_layout(uint8 map_ready)
     ips200_show_string(0U, 0U, "VISUAL MAP MONITOR");
 
     ips200_set_color(MENU_COLOR_TEXT, MENU_COLOR_BG);
-    ips200_show_string(216U, 32U, "LEGEND");
+    ips200_show_string(MENU_SIDE_X, 32U, "LEGEND");
     ips200_show_string(234U, 52U, "WALL");
     ips200_show_string(234U, 72U, "BOX");
     ips200_show_string(234U, 92U, "TARGET");
@@ -209,6 +256,9 @@ static void menu_draw_static_layout(uint8 map_ready)
     menu_fill_rect(216U, 92U, 12U, 12U, MENU_COLOR_TARGET);
     menu_fill_rect(216U, 112U, 12U, 12U, MENU_COLOR_BOMB);
     menu_fill_rect(216U, 132U, 12U, 12U, MENU_COLOR_CAR);
+
+    ips200_show_string(MENU_SIDE_X, MENU_RECOG_Y, "OBJ: --");
+    ips200_show_string(MENU_SIDE_X, MENU_RECOG_Y + 16U, "I:--/-- C:--");
 
     menu_fill_rect(MENU_MAP_ORIGIN_X, MENU_MAP_ORIGIN_Y, MENU_MAP_W, MENU_MAP_H, MENU_COLOR_BG);
     menu_draw_grid_lines();
@@ -326,6 +376,8 @@ static void menu_draw_dynamic_text(uint8 map_ready, uint32 map_age_ms, const app
     ips200_show_float(144U, 206U, pose.y_m, 3U, 2U);
     ips200_show_string(200U, 206U, "IMU:");
     ips200_show_float(240U, 206U, imu_yaw_deg, 5U, 1U);
+
+    menu_draw_recognize_object();
 }
 
 void chassis_menu_init(void)

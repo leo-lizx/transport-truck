@@ -7,9 +7,10 @@
  *   1. 状态机式逐字节解析, 任意非法字节均 fallback 到等 SOF1, 不会卡死
  *   2. CRC8 查表实现 (256 B ROM), 单帧 (194B) 校验 < 50 µs
  *   3. 字节超时: 50 ms 内未收到下一字节 → 状态机复位 (防止半截帧污染下一帧)
- *   4. MAP 帧: 兼容 LEN=192 纯地图与 LEN=194 地图+车辆坐标; 地图字符非法则丢弃
- *   5. 写 g_game_map 用 const 字符 → 枚举的查表映射, 与 app_game_logic.h 中 MAP_* 枚举对齐
- *   6. 不调用任何阻塞 API, 不分配堆内存
+ *   4. OpenART1/UART4 只接收 MAP/HEARTBEAT; OpenART2/UART1 只接收 BOX_CLASS/HEARTBEAT
+ *   5. MAP 帧: 兼容 LEN=192 纯地图与 LEN=194 地图+车辆坐标; 地图字符非法则丢弃
+ *   6. 写 g_game_map 用 const 字符 → 枚举的查表映射, 与 app_game_logic.h 中 MAP_* 枚举对齐
+ *   7. 不调用任何阻塞 API, 不分配堆内存
  *********************************************************************************************************************/
 
 #include "app_link.h"
@@ -25,7 +26,7 @@
  *   § 4. CRC8 查表 + 累加 + ms 读取 API                            [L 178±]
  *   § 5. MAP 帧落地 (ascii_to_map_cell / commit_map_frame)            [L 218±]
  *   § 6. 地图快照读 (app_link_get_map_snapshot, seq-lock retry ×8)  [L 297±]
- *   § 7. 帧分发 (dispatch_frame: MAP / HEARTBEAT)                    [L 328±]
+ *   § 7. 帧分发 (dispatch_frame: MAP / BOX_CLASS / HEARTBEAT)        [L 328±]
  *   § 8. 解析器复位 / 对外 API (init / isr_feed_byte / tick)         [L 388±]
  *=================================================================================================================*/
 
@@ -35,12 +36,26 @@
 #define APP_LINK_BYTE_TIMEOUT_MS    (50U)       /* 字节间超时门槛 (ms)                  */
 
 /*-- 解析器上下文 (volatile: ISR 写, 主循环可观测) ---------------------------------------------------------------*/
-static volatile app_link_state_e s_state          = APP_LINK_STATE_WAIT_SOF1;
-static volatile uint8            s_rx_type        = 0U;
-static volatile uint8            s_rx_len         = 0U;
-static volatile uint8            s_rx_idx         = 0U;
-static volatile uint8            s_rx_crc_calc    = 0U;     /* 边收边算的 CRC8 累加值 */
-static          uint8            s_rx_payload[APP_LINK_MAX_PAYLOAD];
+typedef enum
+{
+    APP_LINK_PORT_MAP = 0,
+    APP_LINK_PORT_CLASS
+} app_link_port_e;
+
+typedef struct
+{
+    volatile app_link_state_e state;
+    volatile uint8            rx_type;
+    volatile uint8            rx_len;
+    volatile uint8            rx_idx;
+    volatile uint8            rx_crc_calc;
+    volatile uint32           byte_last_ms;
+    uint8                     rx_payload[APP_LINK_MAX_PAYLOAD];
+} app_link_parser_t;
+
+/* One parser per physical vision UART. */
+static app_link_parser_t s_map_parser   = { APP_LINK_STATE_WAIT_SOF1, 0U, 0U, 0U, 0U, 0U, {0U} };
+static app_link_parser_t s_class_parser = { APP_LINK_STATE_WAIT_SOF1, 0U, 0U, 0U, 0U, 0U, {0U} };
 
 /*===================================================================================================================
  * 全局可观测变量定义
@@ -48,10 +63,17 @@ static          uint8            s_rx_payload[APP_LINK_MAX_PAYLOAD];
 volatile uint32   g_link_last_map_ms   = 0U;
 volatile uint32   g_link_last_car_ms   = 0U;
 volatile uint32   g_link_last_hb_ms    = 0U;
+volatile uint32   g_link_last_map_link_ms   = 0U;
+volatile uint32   g_link_last_class_link_ms = 0U;
+volatile uint32   g_link_last_box_class_ms  = 0U;
 volatile uint32   g_link_byte_last_ms  = 0U;
+volatile uint32   g_link_map_byte_last_ms   = 0U;
+volatile uint32   g_link_class_byte_last_ms = 0U;
 volatile uint8    g_link_car_x         = 0U;
 volatile uint8    g_link_car_y         = 0U;
 app_link_stats_t  g_link_stats         = {0};
+app_link_stats_t  g_link_map_stats     = {0};
+app_link_stats_t  g_link_class_stats   = {0};
 
 /*-- ms 时基 (由 app_link_tick 累加, 仅 app_link.c 内部使用) ----------------------------------------------------*/
 static volatile uint32 s_ms_now = 0U;
@@ -92,6 +114,10 @@ static volatile uint8  s_box_cls_vseq     = 0U;
 static volatile uint32 s_box_cls_ms       = 0U;
 static volatile uint32 s_box_cls_frame_id = 0U;
 static volatile uint8  s_box_cls_valid    = 0U;
+static volatile uint8  s_box_cls_last_vseq = 0U;
+static volatile uint8  s_box_cls_vseq_seen = 0U;
+
+static inline void stats_inc_seq_drop(app_link_port_e port);
 
 /*-------------------------------------------------------------------------------------------------------------------
  * ISR 内调用: MAP 载荷已合法写入地图后，再提交车辆坐标（与地图同一帧语义一致）
@@ -143,6 +169,14 @@ void app_link_get_car_snapshot(app_link_car_snapshot_t *out)
  *-----------------------------------------------------------------------------------------------------------------*/
 static void commit_box_class_frame(uint8 obj_kind, uint8 class_id, uint8 vision_seq)
 {
+    if ((s_box_cls_vseq_seen != 0U) &&
+        (vision_seq != (uint8)(s_box_cls_last_vseq + 1U)))
+    {
+        stats_inc_seq_drop(APP_LINK_PORT_CLASS);
+    }
+    s_box_cls_last_vseq = vision_seq;
+    s_box_cls_vseq_seen = 1U;
+
     s_box_cls_seq++;
     __DMB();
     s_box_cls_kind     = obj_kind;
@@ -257,6 +291,87 @@ uint32 app_link_get_ms(void)
     return s_ms_now;
 }
 
+static inline app_link_stats_t *port_stats(app_link_port_e port)
+{
+    return (port == APP_LINK_PORT_MAP) ? &g_link_map_stats : &g_link_class_stats;
+}
+
+static void stats_clear(app_link_stats_t *stats)
+{
+    if (stats == NULL) { return; }
+    stats->frames_ok           = 0U;
+    stats->frames_crc_err      = 0U;
+    stats->frames_len_err      = 0U;
+    stats->frames_byte_timeout = 0U;
+    stats->frames_unknown_type = 0U;
+    stats->frames_seq_drop     = 0U;
+    stats->sync_drops          = 0U;
+    stats->last_hb_seq         = 0U;
+    stats->hb_cnt              = 0U;
+}
+
+static inline void stats_inc_ok(app_link_port_e port)
+{
+    ++port_stats(port)->frames_ok;
+    ++g_link_stats.frames_ok;
+}
+
+static inline void stats_inc_crc_err(app_link_port_e port)
+{
+    ++port_stats(port)->frames_crc_err;
+    ++g_link_stats.frames_crc_err;
+}
+
+static inline void stats_inc_len_err(app_link_port_e port)
+{
+    ++port_stats(port)->frames_len_err;
+    ++g_link_stats.frames_len_err;
+}
+
+static inline void stats_inc_byte_timeout(app_link_port_e port)
+{
+    ++port_stats(port)->frames_byte_timeout;
+    ++g_link_stats.frames_byte_timeout;
+}
+
+static inline void stats_inc_unknown_type(app_link_port_e port)
+{
+    ++port_stats(port)->frames_unknown_type;
+    ++g_link_stats.frames_unknown_type;
+}
+
+static inline void stats_inc_seq_drop(app_link_port_e port)
+{
+    ++port_stats(port)->frames_seq_drop;
+    ++g_link_stats.frames_seq_drop;
+}
+
+static inline void stats_inc_sync_drop(app_link_port_e port)
+{
+    ++port_stats(port)->sync_drops;
+    ++g_link_stats.sync_drops;
+}
+
+static inline void stats_accept_heartbeat(app_link_port_e port, uint8 seq)
+{
+    app_link_stats_t *stats = port_stats(port);
+
+    ++stats->hb_cnt;
+    stats->last_hb_seq = seq;
+    ++g_link_stats.hb_cnt;
+    g_link_stats.last_hb_seq = seq;
+
+    if (port == APP_LINK_PORT_MAP)
+    {
+        g_link_last_map_link_ms = s_ms_now;
+    }
+    else
+    {
+        g_link_last_class_link_ms = s_ms_now;
+    }
+    g_link_last_hb_ms = s_ms_now;
+}
+
 /*===================================================================================================================
  * MAP 帧落地: ASCII 字符 → MAP_* 枚举 → g_game_map
  *=================================================================================================================*/
@@ -330,7 +445,7 @@ static uint8 commit_map_frame(const uint8 *payload)
  * 函数: app_link_get_map_snapshot
  * 功能: seq-lock 读, 把 s_map_authoritative 拷贝给调用方 (主循环 / 任意 ISR 均可)
  * 备注:
- *   1. 写者本身只在 LPUART1 ISR 内, 单次写 ~3µs; 读者最多重试 8 次仍碰撞才放弃
+ *   1. 写者本身只在 OpenART1/UART4 MAP parser 内, 单次写 ~3µs; 读者最多重试 8 次仍碰撞才放弃
  *   2. 放弃时 dst 内容可能含部分上次拷贝/部分新数据; 调用方应忽略本帧 (此处不主动清零, 避免覆盖上次有效快照)
  *-----------------------------------------------------------------------------------------------------------------*/
 void app_link_get_map_snapshot(uint8 dst[APP_LINK_MAP_ROWS][APP_LINK_MAP_COLS])
@@ -384,7 +499,9 @@ void app_link_inject_static_map(const uint8 map[APP_LINK_MAP_ROWS][APP_LINK_MAP_
     uint32 r, c;
 
     /* 用当前 ms 时基标记地图落点时刻，让菜单 freshness 检查通过 */
-    g_link_last_map_ms = s_ms_now;
+    g_link_last_map_ms      = s_ms_now;
+    g_link_last_map_link_ms = s_ms_now;
+    g_link_last_hb_ms       = s_ms_now;
 
     s_map_seq++;
     __DMB();
@@ -402,9 +519,9 @@ void app_link_inject_static_map(const uint8 map[APP_LINK_MAP_ROWS][APP_LINK_MAP_
 /*===================================================================================================================
  * 帧分发
  *=================================================================================================================*/
-static void dispatch_frame(void)
+static void dispatch_frame(app_link_port_e port, const app_link_parser_t *parser)
 {
-    switch ((app_link_type_e)s_rx_type)
+    switch ((app_link_type_e)parser->rx_type)
     {
         case APP_LINK_TYPE_MAP:
         {
@@ -412,50 +529,54 @@ static void dispatch_frame(void)
             uint8 cx        = 0U;
             uint8 cy        = 0U;
 
-            if ((s_rx_len != (uint8)APP_LINK_MAP_PAYLOAD_LEN) &&
-                (s_rx_len != (uint8)APP_LINK_MAP_WITH_POS_LEN))
+            if (port != APP_LINK_PORT_MAP)
             {
-                ++g_link_stats.frames_len_err;
+                stats_inc_unknown_type(port);
                 break;
             }
-            if (s_rx_len == (uint8)APP_LINK_MAP_WITH_POS_LEN)
+            if ((parser->rx_len != (uint8)APP_LINK_MAP_PAYLOAD_LEN) &&
+                (parser->rx_len != (uint8)APP_LINK_MAP_WITH_POS_LEN))
             {
-                cx = s_rx_payload[APP_LINK_MAP_PAYLOAD_LEN];
-                cy = s_rx_payload[APP_LINK_MAP_PAYLOAD_LEN + 1U];
+                stats_inc_len_err(port);
+                break;
+            }
+            if (parser->rx_len == (uint8)APP_LINK_MAP_WITH_POS_LEN)
+            {
+                cx = parser->rx_payload[APP_LINK_MAP_PAYLOAD_LEN];
+                cy = parser->rx_payload[APP_LINK_MAP_PAYLOAD_LEN + 1U];
                 if ((cx >= (uint8)APP_LINK_MAP_COLS) || (cy >= (uint8)APP_LINK_MAP_ROWS))
                 {
-                    ++g_link_stats.frames_len_err;
+                    stats_inc_len_err(port);
                     break;
                 }
                 car_ready = 1U;
             }
             /* 先落地地图，成功后再提交车辆坐标，避免地图被拒而车位已更新的撕裂 */
-            if (commit_map_frame((const uint8 *)s_rx_payload) == 0U)
+            if (commit_map_frame((const uint8 *)parser->rx_payload) == 0U)
             {
-                ++g_link_stats.frames_len_err;
+                stats_inc_len_err(port);
                 break;
             }
             if (car_ready != 0U)
             {
                 commit_car_snapshot(cx, cy);
             }
-            ++g_link_stats.frames_ok;
-            g_link_last_map_ms = s_ms_now;
-            g_link_last_hb_ms  = s_ms_now;
+            stats_inc_ok(port);
+            g_link_last_map_ms      = s_ms_now;
+            g_link_last_map_link_ms = s_ms_now;
+            g_link_last_hb_ms       = s_ms_now;
             break;
         }
 
         case APP_LINK_TYPE_HEARTBEAT:
         {
-            if (s_rx_len != 1U)
+            if (parser->rx_len != 1U)
             {
-                ++g_link_stats.frames_len_err;
+                stats_inc_len_err(port);
                 break;
             }
-            ++g_link_stats.frames_ok;
-            ++g_link_stats.hb_cnt;
-            g_link_stats.last_hb_seq = s_rx_payload[0];
-            g_link_last_hb_ms = s_ms_now;
+            stats_inc_ok(port);
+            stats_accept_heartbeat(port, parser->rx_payload[0]);
             break;
         }
 
@@ -465,29 +586,36 @@ static void dispatch_frame(void)
             uint8 class_id;
             uint8 vision_seq;
 
-            if (s_rx_len != (uint8)APP_LINK_BOX_CLASS_PAYLOAD_LEN)
+            if (port != APP_LINK_PORT_CLASS)
             {
-                ++g_link_stats.frames_len_err;
+                stats_inc_unknown_type(port);
                 break;
             }
-            obj_kind   = s_rx_payload[0];
-            class_id   = s_rx_payload[1];
-            vision_seq = s_rx_payload[2];
+            if (parser->rx_len != (uint8)APP_LINK_BOX_CLASS_PAYLOAD_LEN)
+            {
+                stats_inc_len_err(port);
+                break;
+            }
+            obj_kind   = parser->rx_payload[0];
+            class_id   = parser->rx_payload[1];
+            vision_seq = parser->rx_payload[2];
             if ((obj_kind != APP_LINK_OBJ_KIND_BOX) &&
                 (obj_kind != APP_LINK_OBJ_KIND_TARGET))
             {
-                ++g_link_stats.frames_len_err;
+                stats_inc_len_err(port);
                 break;
             }
             commit_box_class_frame(obj_kind, class_id, vision_seq);
-            ++g_link_stats.frames_ok;
-            g_link_last_hb_ms = s_ms_now;     /* 任何有效帧都视为链路活跃 */
+            stats_inc_ok(port);
+            g_link_last_box_class_ms  = s_ms_now;
+            g_link_last_class_link_ms = s_ms_now;
+            g_link_last_hb_ms         = s_ms_now;
             break;
         }
 
         default:
         {
-            ++g_link_stats.frames_unknown_type;
+            stats_inc_unknown_type(port);
             break;
         }
     }
@@ -496,13 +624,15 @@ static void dispatch_frame(void)
 /*===================================================================================================================
  * 解析器复位
  *=================================================================================================================*/
-static inline void parser_reset(void)
+static inline void parser_reset(app_link_parser_t *parser)
 {
-    s_state       = APP_LINK_STATE_WAIT_SOF1;
-    s_rx_type     = 0U;
-    s_rx_len      = 0U;
-    s_rx_idx      = 0U;
-    s_rx_crc_calc = 0U;
+    if (parser == NULL) { return; }
+    parser->state       = APP_LINK_STATE_WAIT_SOF1;
+    parser->rx_type     = 0U;
+    parser->rx_len      = 0U;
+    parser->rx_idx      = 0U;
+    parser->rx_crc_calc = 0U;
+    parser->byte_last_ms = 0U;
 }
 
 /*===================================================================================================================
@@ -511,12 +641,18 @@ static inline void parser_reset(void)
 
 void app_link_init(void)
 {
-    parser_reset();
+    parser_reset(&s_map_parser);
+    parser_reset(&s_class_parser);
 
     g_link_last_map_ms  = 0U;
     g_link_last_car_ms  = 0U;
     g_link_last_hb_ms   = 0U;
+    g_link_last_map_link_ms   = 0U;
+    g_link_last_class_link_ms = 0U;
+    g_link_last_box_class_ms  = 0U;
     g_link_byte_last_ms = 0U;
+    g_link_map_byte_last_ms   = 0U;
+    g_link_class_byte_last_ms = 0U;
     g_link_car_x        = 0U;
     g_link_car_y        = 0U;
     s_ms_now            = 0U;
@@ -541,17 +677,14 @@ void app_link_init(void)
     s_box_cls_ms       = 0U;
     s_box_cls_frame_id = 0U;
     s_box_cls_valid    = 0U;
+    s_box_cls_last_vseq = 0U;
+    s_box_cls_vseq_seen = 0U;
     __DMB();
     s_box_cls_seq++;
 
-    g_link_stats.frames_ok           = 0U;
-    g_link_stats.frames_crc_err      = 0U;
-    g_link_stats.frames_len_err      = 0U;
-    g_link_stats.frames_byte_timeout = 0U;
-    g_link_stats.frames_unknown_type = 0U;
-    g_link_stats.sync_drops          = 0U;
-    g_link_stats.last_hb_seq         = 0U;
-    g_link_stats.hb_cnt              = 0U;
+    stats_clear(&g_link_stats);
+    stats_clear(&g_link_map_stats);
+    stats_clear(&g_link_class_stats);
 
     /* P0-3: seq-lock 计数与权威副本归零 */
     g_link_map_snapshot_retry_giveup = 0U;
@@ -576,21 +709,32 @@ void app_link_init(void)
 /*-------------------------------------------------------------------------------------------------------------------
  * ISR 入口: 单字节状态机
  *-----------------------------------------------------------------------------------------------------------------*/
-void app_link_isr_feed_byte(uint8 byte)
+static void parser_feed_byte(app_link_port_e port, app_link_parser_t *parser, uint8 byte)
 {
-    g_link_byte_last_ms = s_ms_now;
+    if (parser == NULL) { return; }
 
-    switch (s_state)
+    parser->byte_last_ms = s_ms_now;
+    g_link_byte_last_ms = s_ms_now;
+    if (port == APP_LINK_PORT_MAP)
+    {
+        g_link_map_byte_last_ms = s_ms_now;
+    }
+    else
+    {
+        g_link_class_byte_last_ms = s_ms_now;
+    }
+
+    switch (parser->state)
     {
         case APP_LINK_STATE_WAIT_SOF1:
         {
             if (byte == APP_LINK_SOF1)
             {
-                s_state = APP_LINK_STATE_WAIT_SOF2;
+                parser->state = APP_LINK_STATE_WAIT_SOF2;
             }
             else
             {
-                ++g_link_stats.sync_drops;          /* 同步前的散字节, 计数即可 */
+                stats_inc_sync_drop(port);          /* 同步前的散字节, 计数即可 */
             }
             break;
         }
@@ -599,7 +743,7 @@ void app_link_isr_feed_byte(uint8 byte)
         {
             if (byte == APP_LINK_SOF2)
             {
-                s_state = APP_LINK_STATE_WAIT_TYPE;
+                parser->state = APP_LINK_STATE_WAIT_TYPE;
             }
             else if (byte == APP_LINK_SOF1)
             {
@@ -607,17 +751,17 @@ void app_link_isr_feed_byte(uint8 byte)
             }
             else
             {
-                ++g_link_stats.sync_drops;
-                parser_reset();
+                stats_inc_sync_drop(port);
+                parser_reset(parser);
             }
             break;
         }
 
         case APP_LINK_STATE_WAIT_TYPE:
         {
-            s_rx_type     = byte;
-            s_rx_crc_calc = crc8_accum(0x00U, byte);
-            s_state       = APP_LINK_STATE_WAIT_LEN;
+            parser->rx_type     = byte;
+            parser->rx_crc_calc = crc8_accum(0x00U, byte);
+            parser->state       = APP_LINK_STATE_WAIT_LEN;
             break;
         }
 
@@ -626,66 +770,93 @@ void app_link_isr_feed_byte(uint8 byte)
             if (byte > (uint8)APP_LINK_MAX_PAYLOAD)
             {
                 /* LEN 越界: 视为错帧, 复位重新等同步                                     */
-                ++g_link_stats.frames_len_err;
-                parser_reset();
+                stats_inc_len_err(port);
+                parser_reset(parser);
                 break;
             }
-            s_rx_len      = byte;
-            s_rx_crc_calc = crc8_accum(s_rx_crc_calc, byte);
-            s_rx_idx      = 0U;
-            s_state       = (s_rx_len == 0U)
-                            ? APP_LINK_STATE_WAIT_CRC
-                            : APP_LINK_STATE_WAIT_PAYLOAD;
+            parser->rx_len      = byte;
+            parser->rx_crc_calc = crc8_accum(parser->rx_crc_calc, byte);
+            parser->rx_idx      = 0U;
+            parser->state       = (parser->rx_len == 0U)
+                                  ? APP_LINK_STATE_WAIT_CRC
+                                  : APP_LINK_STATE_WAIT_PAYLOAD;
             break;
         }
 
         case APP_LINK_STATE_WAIT_PAYLOAD:
         {
-            s_rx_payload[s_rx_idx++] = byte;
-            s_rx_crc_calc = crc8_accum(s_rx_crc_calc, byte);
-            if (s_rx_idx >= s_rx_len)
+            parser->rx_payload[parser->rx_idx++] = byte;
+            parser->rx_crc_calc = crc8_accum(parser->rx_crc_calc, byte);
+            if (parser->rx_idx >= parser->rx_len)
             {
-                s_state = APP_LINK_STATE_WAIT_CRC;
+                parser->state = APP_LINK_STATE_WAIT_CRC;
             }
             break;
         }
 
         case APP_LINK_STATE_WAIT_CRC:
         {
-            if (byte == s_rx_crc_calc)
+            if (byte == parser->rx_crc_calc)
             {
-                dispatch_frame();
+                dispatch_frame(port, parser);
             }
             else
             {
-                ++g_link_stats.frames_crc_err;
+                stats_inc_crc_err(port);
             }
-            parser_reset();
+            parser_reset(parser);
             break;
         }
 
         default:
         {
-            parser_reset();
+            parser_reset(parser);
             break;
         }
     }
 }
 
 /*-------------------------------------------------------------------------------------------------------------------
- * 时基钩子: 累加 ms 计数 + 字节超时检测
+ * ISR feed entry points
+ *-----------------------------------------------------------------------------------------------------------------*/
+void app_link_isr_feed_map_byte(uint8 byte)
+{
+    parser_feed_byte(APP_LINK_PORT_MAP, &s_map_parser, byte);
+}
+
+void app_link_isr_feed_class_byte(uint8 byte)
+{
+    parser_feed_byte(APP_LINK_PORT_CLASS, &s_class_parser, byte);
+}
+
+void app_link_isr_feed_byte(uint8 byte)
+{
+    app_link_isr_feed_map_byte(byte);
+}
+
+/*-------------------------------------------------------------------------------------------------------------------
+ * Timebase hook: accumulate ms and check per-parser byte timeout.
  *-----------------------------------------------------------------------------------------------------------------*/
 void app_link_tick(uint32 elapsed_ms)
 {
     s_ms_now += elapsed_ms;
 
     /* 字节超时: 状态机已离开等同步, 但长时间没下一字节 → 复位                          */
-    if (s_state != APP_LINK_STATE_WAIT_SOF1)
+    if (s_map_parser.state != APP_LINK_STATE_WAIT_SOF1)
     {
-        if ((s_ms_now - g_link_byte_last_ms) > APP_LINK_BYTE_TIMEOUT_MS)
+        if ((s_ms_now - s_map_parser.byte_last_ms) > APP_LINK_BYTE_TIMEOUT_MS)
         {
-            ++g_link_stats.frames_byte_timeout;
-            parser_reset();
+            stats_inc_byte_timeout(APP_LINK_PORT_MAP);
+            parser_reset(&s_map_parser);
+        }
+    }
+
+    if (s_class_parser.state != APP_LINK_STATE_WAIT_SOF1)
+    {
+        if ((s_ms_now - s_class_parser.byte_last_ms) > APP_LINK_BYTE_TIMEOUT_MS)
+        {
+            stats_inc_byte_timeout(APP_LINK_PORT_CLASS);
+            parser_reset(&s_class_parser);
         }
     }
 }

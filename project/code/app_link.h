@@ -83,6 +83,7 @@ typedef struct
     uint32 frames_len_err;      /* LEN 字段非法或与 TYPE 不匹配丢弃数   */
     uint32 frames_byte_timeout; /* 字节间超时导致解析器复位次数         */
     uint32 frames_unknown_type; /* 未知 TYPE 丢弃数                     */
+    uint32 frames_seq_drop;     /* 业务 seq 非连续次数                  */
     uint32 sync_drops;          /* 状态机 fallback 到等 SOF1 的字节数  */
     uint8  last_hb_seq;         /* 最近一次收到的心跳 seq               */
     uint32 hb_cnt;              /* 心跳累计次数                         */
@@ -94,10 +95,17 @@ typedef struct
 extern volatile uint32 g_link_last_map_ms;     /* 最近一次有效 MAP 帧落地时刻 (ms 时基: PIT 心跳累加)            */
 extern volatile uint32 g_link_last_car_ms;     /* 最近一次有效 MAP 坐标落地时刻 (ms 时基: PIT 心跳累加)           */
 extern volatile uint32 g_link_last_hb_ms;      /* 最近一次心跳 / 任意有效帧时刻, 供 P0-2 链路超时回退使用       */
+extern volatile uint32 g_link_last_map_link_ms;   /* OpenART1 MAP/heartbeat 最近活跃时刻                           */
+extern volatile uint32 g_link_last_class_link_ms; /* OpenART2 BOX_CLASS/heartbeat 最近活跃时刻                     */
+extern volatile uint32 g_link_last_box_class_ms;  /* 最近一次有效 BOX_CLASS 帧落地时刻                             */
 extern volatile uint32 g_link_byte_last_ms;    /* 最近一次收到任意字节的时刻, 供字节超时复位                    */
+extern volatile uint32 g_link_map_byte_last_ms;   /* OpenART1 最近收到任意字节的时刻                               */
+extern volatile uint32 g_link_class_byte_last_ms; /* OpenART2 最近收到任意字节的时刻                               */
 extern volatile uint8  g_link_car_x;           /* 最近一次 OpenART1 识别到的车辆 X 坐标 (0~15)                  */
 extern volatile uint8  g_link_car_y;           /* 最近一次 OpenART1 识别到的车辆 Y 坐标 (0~11)                  */
 extern app_link_stats_t g_link_stats;          /* 统计计数 (P0-1 不要求原子读, 接受偶发撕裂)                    */
+extern app_link_stats_t g_link_map_stats;      /* OpenART1/UART4 MAP 解析统计                                  */
+extern app_link_stats_t g_link_class_stats;    /* OpenART2/UART1 BOX_CLASS 解析统计                            */
 
 /*-- P0-3: seq-lock 读端重试达到上限的累计次数, 长期保持 0 即说明并发保护无碰撞 --------------------------------*/
 extern volatile uint32 g_link_map_snapshot_retry_giveup;
@@ -128,12 +136,14 @@ void app_link_init(void);
 
 /*-------------------------------------------------------------------------------------------------------------------
  * 函数: app_link_isr_feed_byte
- * 功能: 由 LPUART1 接收中断调用, 把单个字节喂给状态机
+ * 功能: 兼容旧调用, 默认把单个字节喂给 OpenART1/MAP 状态机
  * 参数: byte —— 串口最新接收到的 1 字节
  * 返回: 无
  * 备注: 函数内部不分配内存, 不调用阻塞接口, 整体执行时间 < 5 µs
  *-----------------------------------------------------------------------------------------------------------------*/
 void app_link_isr_feed_byte(uint8 byte);
+void app_link_isr_feed_map_byte(uint8 byte);
+void app_link_isr_feed_class_byte(uint8 byte);
 
 /*-------------------------------------------------------------------------------------------------------------------
  * 函数: app_link_tick_1ms
@@ -154,10 +164,10 @@ uint8 app_link_compute_crc8(const uint8 *data, uint32 len);
 
 /*-------------------------------------------------------------------------------------------------------------------
  * 函数: app_link_get_ms
- * 功能: 读取协议层 ms 时基 (由 app_link_tick 累加, 与 g_link_last_hb_ms / g_link_last_map_ms 同源)
+ * 功能: 读取协议层 ms 时基 (由 app_link_tick 累加, 与各链路时间戳同源)
  * 参数: 无
  * 返回: 当前 ms 计数 (上电累加, 49.7 天回环)
- * 用途: 业务层做 (now - g_link_last_hb_ms) 静默时长判定时, 必须用本接口而不是另起一套时基,
+ * 用途: 业务层做 (now - g_link_last_*_ms) 静默时长判定时, 必须用本接口而不是另起一套时基,
  *       否则两套计数步长不一致会导致超时阈值漂移。
  *-----------------------------------------------------------------------------------------------------------------*/
 uint32 app_link_get_ms(void);
