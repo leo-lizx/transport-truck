@@ -26,6 +26,7 @@ sensor.skip_frames(time = 2000)
 sensor.set_framerate(60)
 sensor.set_auto_gain(False)
 sensor.set_auto_whitebal(False)
+sensor.set_auto_exposure(False, exposure_us=750) # 手动锁定曝光时间(8ms)
 clock = time.clock()
 
 # ----------------------------------------------------------------------
