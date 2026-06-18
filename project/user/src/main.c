@@ -104,6 +104,7 @@ static uint32 wait_for_tick(void)
  *   7   MAIN_RUN_MODE_LEVEL1_TEST           ✅    OpenART 串口     第一关完整流程: 收图→等人发车→推箱→回发车区
  *   8   MAIN_RUN_MODE_HARDCODED_MAP         ✅    代码内置          固定发车: 上电解算→Y轴平移发车→推箱→回库
  *   9   MAIN_RUN_MODE_OPENART2_TEST         ❌    OpenART2 UART1   分类链路自测: 只显示 BOX_CLASS, 车不动
+ *   10  MAIN_RUN_MODE_LEVEL2_TEST           ✅    OpenART1+2       第二关单测: 收图→发车→分类→Stage2推箱→回库
  *=========================================================================*/
 #define MAIN_RUN_MODE_GAME            (0)   /* 正式比赛: 完整视觉+推箱+底盘闭环 */
 #define MAIN_RUN_MODE_YAW_HOLD        (1)   /* 航向保持: 车不动, IMU 锁角度调 yaw PID */
@@ -115,10 +116,11 @@ static uint32 wait_for_tick(void)
 #define MAIN_RUN_MODE_LEVEL1_TEST     (7)   /* 第一关测试: 收图→等发车→推箱→回库 (最接近比赛) */
 #define MAIN_RUN_MODE_HARDCODED_MAP   (8)   /* 硬编码地图: 上电解算→Y轴平移发车→跑→回发车点 */
 #define MAIN_RUN_MODE_OPENART2_TEST   (9)   /* OpenART2 分类链路测试: 屏幕显示 BOX/TARGET/NONE, 车不动 */
+#define MAIN_RUN_MODE_LEVEL2_TEST     (10)  /* 第二关测试: 收图→固定发车→分类识别→Stage2推箱→回库 */
 
-/* ═══════════ 改下面这行切换运行模式 (0~9) ═══════════ */
-#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_OPENART2_TEST)  /* mode 9: OpenART2 BOX_CLASS screen test */
-/* ═══════════ 改上面这行切换运行模式 (0~9) ═══════════ */
+/* ═══════════ 改下面这行切换运行模式 (0~10) ═══════════ */
+#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_LEVEL2_TEST)  /* mode 10: level 2 standalone test */
+/* ═══════════ 改上面这行切换运行模式 (0~10) ═══════════ */
 
 /* OpenART1 地图链路硬件口: 若实测 UART4 走 D0/D1, 只改下面两行宏. */
 #define MAIN_OPENART1_UART            (UART_4)
@@ -483,6 +485,369 @@ static void main_run_level1_test_log_50ms(void)
 }
 
 #endif /* MAIN_RUN_MODE_LEVEL1_TEST */
+
+/* ============================================================================
+ * LEVEL2_TEST mode (10): standalone Stage2 flow.
+ *   WAIT_MAP -> WARMUP -> fixed launch -> classify tour -> Stage2 solve
+ *   -> push boxes -> return home -> DONE.
+ * ============================================================================ */
+#if (MAIN_RUN_MODE == MAIN_RUN_MODE_LEVEL2_TEST)
+
+typedef enum {
+    L2_PHASE_WAIT_MAP = 0,
+    L2_PHASE_WARMUP,
+    L2_PHASE_LAUNCH_FIXED,
+    L2_PHASE_RECOGNIZE,
+    L2_PHASE_SOLVE,
+    L2_PHASE_PUSH_BOXES,
+    L2_PHASE_RETURN_HOME,
+    L2_PHASE_DONE,
+    L2_PHASE_FAIL
+} l2_phase_e;
+
+static SokoFullSolution_t  s_l2_solution;
+static SokoWaypointPath_t  s_l2_waypoints;
+static uint8               s_l2_map[MAP_ROWS][MAP_COLS];
+static uint8               s_l2_box_to_target[SOKOBAN_MAX_BOXES];
+static l2_phase_e          s_l2_phase        = L2_PHASE_WAIT_MAP;
+static uint8               s_l2_solve_ok     = 0U;
+static uint8               s_l2_sub_idx      = 0U;
+static uint16              s_l2_wp_idx       = 0U;
+static uint8               s_l2_navigating   = 0U;
+static uint8               s_l2_recog_started = 0U;
+static uint16              s_l2_warmup_ticks = 0U;
+static uint32              s_l2_map_recv_ms  = 0U;
+
+static Point_t main_l2_current_grid(void)
+{
+    chassis_pose_t pose = chassis_ctrl_get_pose();
+    Point_t p;
+    p.x = (int8)chassis_m_to_grid_x(pose.x_m);
+    p.y = (int8)chassis_m_to_grid_y(pose.y_m);
+    return p;
+}
+
+static uint8 main_l2_map_has_bomb(void)
+{
+    uint8 r, c;
+    for (r = 0U; r < MAP_ROWS; ++r)
+    {
+        for (c = 0U; c < MAP_COLS; ++c)
+        {
+            if (s_l2_map[r][c] == MAP_BOMB)
+            {
+                return 1U;
+            }
+        }
+    }
+    return 0U;
+}
+
+static uint8 main_l2_box_count(void)
+{
+    uint8 r, c, count = 0U;
+    for (r = 0U; r < MAP_ROWS; ++r)
+    {
+        for (c = 0U; c < MAP_COLS; ++c)
+        {
+            if (s_l2_map[r][c] == MAP_BOX)
+            {
+                ++count;
+            }
+        }
+    }
+    return count;
+}
+
+static void main_l2_print_map(void)
+{
+    uint8 r, c;
+    printf("L2_MAP_BEGIN\n");
+    for (r = 0U; r < MAP_ROWS; ++r)
+    {
+        char line[MAP_COLS + 1];
+        for (c = 0U; c < MAP_COLS; ++c)
+        {
+            switch (s_l2_map[r][c])
+            {
+            case MAP_WALL:   line[c] = '#'; break;
+            case MAP_TARGET: line[c] = '.'; break;
+            case MAP_BOX:    line[c] = '$'; break;
+            case MAP_BOMB:   line[c] = '*'; break;
+            default:         line[c] = '-'; break;
+            }
+        }
+        line[MAP_COLS] = '\0';
+        printf("%s\n", line);
+    }
+    printf("L2_MAP_END\n");
+}
+
+static void main_l2_wait_map_5ms(void)
+{
+    static uint16 s_div = 0U;
+    uint32 now_recv_ms = g_link_last_map_ms;
+
+    if (now_recv_ms != 0U && now_recv_ms != s_l2_map_recv_ms)
+    {
+        s_l2_map_recv_ms = now_recv_ms;
+        app_link_get_map_snapshot(s_l2_map);
+        printf("L2_MAP_RECV ms=%lu ok=%lu crc=%lu len=%lu\n",
+               (unsigned long)now_recv_ms,
+               (unsigned long)g_link_stats.frames_ok,
+               (unsigned long)g_link_stats.frames_crc_err,
+               (unsigned long)g_link_stats.frames_len_err);
+        main_l2_print_map();
+
+        uart_rx_interrupt(MAIN_OPENART1_UART, 0);
+        app_link_inject_static_map(s_l2_map);
+        s_l2_map_recv_ms = g_link_last_map_ms;
+        memset(s_l2_box_to_target, 0, sizeof(s_l2_box_to_target));
+        App_Recognize_Reset();
+        s_l2_recog_started = 0U;
+        s_l2_phase = L2_PHASE_WARMUP;
+        s_l2_warmup_ticks = 0U;
+        printf("L2_MAP_LOCKED warmup\n");
+        return;
+    }
+
+    if (++s_div >= 200U)
+    {
+        s_div = 0U;
+        printf("L2_WAIT_MAP hb=%lu ok=%lu crc=%lu class_hb=%lu class_ok=%lu\n",
+               (unsigned long)g_link_stats.hb_cnt,
+               (unsigned long)g_link_stats.frames_ok,
+               (unsigned long)g_link_stats.frames_crc_err,
+               (unsigned long)g_link_class_stats.hb_cnt,
+               (unsigned long)g_link_class_stats.frames_ok);
+    }
+}
+
+static void main_l2_recognize_5ms(void)
+{
+    AppRecognizeStatus_e r;
+    Point_t cur = main_l2_current_grid();
+
+    if (s_l2_recog_started == 0U)
+    {
+        memset(s_l2_box_to_target, 0, sizeof(s_l2_box_to_target));
+        App_Recognize_Reset();
+        s_l2_recog_started = 1U;
+        printf("L2_RECOG_START grid=%d,%d boxes=%d\n",
+               (int)cur.x, (int)cur.y, (int)main_l2_box_count());
+    }
+
+    r = App_Recognize_Tick(s_l2_map, cur, main_l2_map_has_bomb(),
+                           2U, s_l2_box_to_target);
+    if ((r == APP_RECOG_DONE_OK) || (r == APP_RECOG_DONE_NO_NEED))
+    {
+        uint8 i, box_count = main_l2_box_count();
+        printf("L2_RECOG_DONE map:");
+        for (i = 0U; i < box_count && i < (uint8)SOKOBAN_MAX_BOXES; ++i)
+        {
+            printf(" %d->%d", (int)i, (int)s_l2_box_to_target[i]);
+        }
+        printf("\n");
+        s_l2_phase = L2_PHASE_SOLVE;
+        return;
+    }
+    if (r == APP_RECOG_FAIL)
+    {
+        AppRecognizeDebug_t dbg;
+        App_Recognize_Get_Debug(&dbg);
+        chassis_ctrl_stop();
+        printf("L2_RECOG_FAIL sub=%d cur=%d visited=%d rb=%d rt=%d sample=%d\n",
+               (int)dbg.sub_state,
+               (int)dbg.current_idx,
+               (int)dbg.visited_count,
+               (int)dbg.resolved_box,
+               (int)dbg.resolved_target,
+               (int)dbg.sample_count);
+        s_l2_phase = L2_PHASE_FAIL;
+    }
+}
+
+static void main_l2_solve(void)
+{
+    Point_t start_pos = main_l2_current_grid();
+    uint8 box_count = main_l2_box_count();
+
+    printf("L2_SOLVE_START grid=%d,%d boxes=%d\n",
+           (int)start_pos.x, (int)start_pos.y, (int)box_count);
+
+    memset(&s_l2_solution, 0, sizeof(s_l2_solution));
+    if ((box_count == 0U) ||
+        !Sokoban_Solve_Stage2(s_l2_map, start_pos, s_l2_box_to_target,
+                              box_count, &s_l2_solution) ||
+        (s_l2_solution.is_solved == 0U) ||
+        (s_l2_solution.total_boxes == 0U))
+    {
+        printf("L2_ERR=NO_STAGE2_SOLUTION solved=%d boxes=%d\n",
+               (int)s_l2_solution.is_solved,
+               (int)s_l2_solution.total_boxes);
+        s_l2_solve_ok = 0U;
+        return;
+    }
+
+    s_l2_sub_idx = 0U;
+    Sokoban_Actions_To_Waypoints(s_l2_solution.sub_solutions[0].actions,
+                                 s_l2_solution.sub_solutions[0].count,
+                                 start_pos,
+                                 &s_l2_waypoints);
+    s_l2_wp_idx = 0U;
+    s_l2_navigating = 0U;
+    s_l2_solve_ok = 1U;
+
+    printf("L2_SOLVED=1 boxes=%d wp0=%d\n",
+           (int)s_l2_solution.total_boxes,
+           (int)s_l2_waypoints.count);
+}
+
+static void main_run_level2_test_5ms(void)
+{
+    switch (s_l2_phase)
+    {
+    case L2_PHASE_WAIT_MAP:
+        main_l2_wait_map_5ms();
+        return;
+
+    case L2_PHASE_WARMUP:
+        if (++s_l2_warmup_ticks >= MAIN_POINT_NAV_WARMUP_TICKS)
+        {
+            printf("L2_WARMUP_DONE launch along y to solve start\n");
+            s_l2_phase = L2_PHASE_LAUNCH_FIXED;
+            chassis_ctrl_move_to_m(
+                MAIN_POS_GRID_TO_M_X(MAIN_POS_HCM_LAUNCH_TARGET_X_GRID),
+                MAIN_POS_GRID_TO_M_Y(MAIN_POS_HCM_LAUNCH_TARGET_Y_GRID),
+                0.0f);
+            s_l2_navigating = 1U;
+        }
+        return;
+
+    case L2_PHASE_LAUNCH_FIXED:
+        if (chassis_ctrl_is_arrived())
+        {
+            printf("L2_LAUNCH_DONE start classify tour\n");
+            s_l2_navigating = 0U;
+            s_l2_recog_started = 0U;
+            s_l2_phase = L2_PHASE_RECOGNIZE;
+        }
+        return;
+
+    case L2_PHASE_RECOGNIZE:
+        main_l2_recognize_5ms();
+        return;
+
+    case L2_PHASE_SOLVE:
+        main_l2_solve();
+        if (s_l2_solve_ok)
+        {
+            s_l2_phase = L2_PHASE_PUSH_BOXES;
+            printf("L2_PUSH_START\n");
+        }
+        else
+        {
+            chassis_ctrl_stop();
+            s_l2_phase = L2_PHASE_FAIL;
+        }
+        return;
+
+    case L2_PHASE_PUSH_BOXES:
+        if (!s_l2_navigating)
+        {
+            if (s_l2_wp_idx >= s_l2_waypoints.count)
+            {
+                s_l2_sub_idx++;
+                if (s_l2_sub_idx >= s_l2_solution.total_boxes)
+                {
+                    printf("L2_ALL_BOXES_DONE, returning home\n");
+                    s_l2_phase = L2_PHASE_RETURN_HOME;
+                    chassis_ctrl_move_to_m(
+                        MAIN_POS_GRID_TO_M_X(MAIN_POS_HCM_HOME_X_GRID),
+                        MAIN_POS_GRID_TO_M_Y(MAIN_POS_HCM_HOME_Y_GRID),
+                        0.0f);
+                    s_l2_navigating = 1U;
+                    return;
+                }
+
+                Sokoban_Actions_To_Waypoints(
+                    s_l2_solution.sub_solutions[s_l2_sub_idx].actions,
+                    s_l2_solution.sub_solutions[s_l2_sub_idx].count,
+                    s_l2_solution.player_end_pos[s_l2_sub_idx - 1U],
+                    &s_l2_waypoints);
+                s_l2_wp_idx = 0U;
+                printf("L2_NEXT_BOX sub=%d wp=%d\n",
+                       (int)s_l2_sub_idx, (int)s_l2_waypoints.count);
+            }
+            {
+                Point_t next = s_l2_waypoints.points[s_l2_wp_idx];
+                chassis_ctrl_move_to_grid((uint8)next.x, (uint8)next.y);
+                s_l2_navigating = 1U;
+            }
+            return;
+        }
+
+        if (!chassis_ctrl_is_arrived())
+        {
+            return;
+        }
+        s_l2_navigating = 0U;
+        s_l2_wp_idx++;
+        return;
+
+    case L2_PHASE_RETURN_HOME:
+        if (chassis_ctrl_is_arrived())
+        {
+            chassis_ctrl_stop();
+            printf("L2_DONE returned to launch zone\n");
+            s_l2_phase = L2_PHASE_DONE;
+        }
+        return;
+
+    case L2_PHASE_DONE:
+    case L2_PHASE_FAIL:
+    default:
+        chassis_ctrl_stop();
+        return;
+    }
+}
+
+static void main_run_level2_test_log_50ms(void)
+{
+    static uint8 s_div = 0U;
+    if (++s_div < 10U) return;
+    s_div = 0U;
+    {
+        chassis_pose_t pose = chassis_ctrl_get_pose();
+        float tgt_x = 0.0f, tgt_y = 0.0f;
+        chassis_ctrl_get_point_nav_target_m(&tgt_x, &tgt_y);
+        printf("L2: phase=%d sub=%d/%d wp=%d/%d pos=%.3f,%.3f tgt=%.3f,%.3f arr=%d\n",
+               (int)s_l2_phase,
+               (int)s_l2_sub_idx, (int)(s_l2_solve_ok ? s_l2_solution.total_boxes : 0),
+               (int)s_l2_wp_idx, (int)s_l2_waypoints.count,
+               pose.x_m, pose.y_m,
+               tgt_x, tgt_y,
+               (int)chassis_ctrl_is_arrived());
+
+        if (s_l2_phase == L2_PHASE_RECOGNIZE)
+        {
+            AppRecognizeDebug_t dbg;
+            App_Recognize_Get_Debug(&dbg);
+            printf("L2_RECOG: sub=%d cur=%d/%d kind=%d cls=%d sample=%d visited=%d rb=%d rt=%d\n",
+                   (int)dbg.sub_state,
+                   (int)dbg.current_idx,
+                   (int)dbg.total_targets,
+                   (int)dbg.current_kind,
+                   (int)dbg.current_class_id,
+                   (int)dbg.sample_count,
+                   (int)dbg.visited_count,
+                   (int)dbg.resolved_box,
+                   (int)dbg.resolved_target);
+        }
+    }
+}
+
+#endif /* MAIN_RUN_MODE_LEVEL2_TEST */
 
 /* ============================================================================
  *  HARDCODED_MAP 模式: 硬编码地图 → 上电直接解算 → 暖机 → Y轴平移发车 → 跑航点 → 回发车区
@@ -1629,18 +1994,18 @@ static void main_apply_debug_wheel_pid(void)
     // 1. 通信外设初始化
     // ------------------------------------------------------------------
     // OpenART1: 地图识别模块, 通过 UART4 上报 MAP/HEARTBEAT 帧.
-#if ((MAIN_RUN_MODE == MAIN_RUN_MODE_GAME) || (MAIN_RUN_MODE == MAIN_RUN_MODE_SOKO_SELFTEST) || (MAIN_RUN_MODE == MAIN_RUN_MODE_SOLVE_VERIFY) || (MAIN_RUN_MODE == MAIN_RUN_MODE_LEVEL1_TEST))
+#if ((MAIN_RUN_MODE == MAIN_RUN_MODE_GAME) || (MAIN_RUN_MODE == MAIN_RUN_MODE_SOKO_SELFTEST) || (MAIN_RUN_MODE == MAIN_RUN_MODE_SOLVE_VERIFY) || (MAIN_RUN_MODE == MAIN_RUN_MODE_LEVEL1_TEST) || (MAIN_RUN_MODE == MAIN_RUN_MODE_LEVEL2_TEST))
     uart_init(MAIN_OPENART1_UART, 115200, MAIN_OPENART1_UART_TX, MAIN_OPENART1_UART_RX);
     uart_rx_interrupt(MAIN_OPENART1_UART, 1);
 #endif
 
     // OpenART2: 分类识别模块, 通过 UART1 上报 BOX_CLASS/HEARTBEAT 帧.
-#if ((MAIN_RUN_MODE == MAIN_RUN_MODE_GAME) || (MAIN_RUN_MODE == MAIN_RUN_MODE_OPENART2_TEST))
+#if ((MAIN_RUN_MODE == MAIN_RUN_MODE_GAME) || (MAIN_RUN_MODE == MAIN_RUN_MODE_OPENART2_TEST) || (MAIN_RUN_MODE == MAIN_RUN_MODE_LEVEL2_TEST))
     uart_init(MAIN_OPENART2_UART, 115200, MAIN_OPENART2_UART_TX, MAIN_OPENART2_UART_RX);
     uart_rx_interrupt(MAIN_OPENART2_UART, 1);
 #endif
 
-#if ((MAIN_RUN_MODE == MAIN_RUN_MODE_GAME) || (MAIN_RUN_MODE == MAIN_RUN_MODE_SOKO_SELFTEST) || (MAIN_RUN_MODE == MAIN_RUN_MODE_SOLVE_VERIFY) || (MAIN_RUN_MODE == MAIN_RUN_MODE_LEVEL1_TEST) || (MAIN_RUN_MODE == MAIN_RUN_MODE_OPENART2_TEST))
+#if ((MAIN_RUN_MODE == MAIN_RUN_MODE_GAME) || (MAIN_RUN_MODE == MAIN_RUN_MODE_SOKO_SELFTEST) || (MAIN_RUN_MODE == MAIN_RUN_MODE_SOLVE_VERIFY) || (MAIN_RUN_MODE == MAIN_RUN_MODE_LEVEL1_TEST) || (MAIN_RUN_MODE == MAIN_RUN_MODE_OPENART2_TEST) || (MAIN_RUN_MODE == MAIN_RUN_MODE_LEVEL2_TEST))
     app_link_init();                /* P0-1: 协议解析层初始化, 必须在 uart_rx_interrupt 之后 */
 #endif
 
@@ -1664,7 +2029,7 @@ static void main_apply_debug_wheel_pid(void)
     // ------------------------------------------------------------------
     chassis_ctrl_init();
     chassis_menu_init();
-#if (MAIN_RUN_MODE == MAIN_RUN_MODE_LEVEL1_TEST) || (MAIN_RUN_MODE == MAIN_RUN_MODE_HARDCODED_MAP)
+#if (MAIN_RUN_MODE == MAIN_RUN_MODE_LEVEL1_TEST) || (MAIN_RUN_MODE == MAIN_RUN_MODE_HARDCODED_MAP) || (MAIN_RUN_MODE == MAIN_RUN_MODE_LEVEL2_TEST)
     /* 模式7/8固定发车: 上电先把里程计放在 (1,5.5), 暖机后沿 Y 轴平移到 (1,5). */
     chassis_ctrl_set_pose(MAIN_POS_GRID_TO_M_X(MAIN_POS_HCM_HOME_X_GRID),
                           MAIN_POS_GRID_TO_M_Y(MAIN_POS_HCM_HOME_Y_GRID),
@@ -1715,6 +2080,9 @@ static void main_apply_debug_wheel_pid(void)
      *   等待 OpenART1 发来地图 → 冻结该地图 → 解算 → 固定发车 → 跑航点 → 回固定发车点.
      *   上电后车停在发车区不动, 直到收到地图且解算成功后才自动发车. */
     printf("L1_BOOT wait MAP from OpenART (UART4)...\n");
+    chassis_ctrl_hold_yaw(0.0f);
+#elif (MAIN_RUN_MODE == MAIN_RUN_MODE_LEVEL2_TEST)
+    printf("L2_BOOT wait MAP UART4 + BOX_CLASS UART1...\n");
     chassis_ctrl_hold_yaw(0.0f);
 #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_HARDCODED_MAP)
     /* 硬编码地图模式:
@@ -1970,6 +2338,9 @@ static void main_apply_debug_wheel_pid(void)
     #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_LEVEL1_TEST)
         main_run_level1_test_5ms();
         main_run_level1_test_log_50ms();
+    #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_LEVEL2_TEST)
+        main_run_level2_test_5ms();
+        main_run_level2_test_log_50ms();
     #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_HARDCODED_MAP)
         main_run_hardcoded_map_5ms();
         main_run_hardcoded_map_log_50ms();
