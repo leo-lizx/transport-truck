@@ -25,7 +25,7 @@ sensor.skip_frames(time = 2000)        # 让感光元件稳定
 sensor.set_auto_gain(False)            # 关闭自动增益，防止暗处噪点放大
 sensor.set_auto_whitebal(False)        # 关闭白平衡，防止色温漂移导致“认错颜色”
 sensor.set_auto_exposure(False, exposure_us=750) # 手动锁定曝光时间(8ms)
-                                       # 注意：如果场地极亮可调小至6000，极暗调大至12000
+                                       # 注意：采用较暗的视角，以提升准确率
                                        # 这能大幅抑制 PVC 场地的反光亮斑
 
 sensor.set_framerate(60)               # 目标帧率（解除软件限速）
