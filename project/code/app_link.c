@@ -2,6 +2,10 @@
  * 文件名称   : app_link.c
  * 模块功能   : 视觉端 (OpenART) 与主控端 (RT1064) 串口帧协议解析层 — 实现文件
  * 任务编号   : P0-1
+ *
+ * @owner     rt1064-main
+ * @periph    LPUART4 (UART4)        OpenART1 地图帧接收 C16/C17, 115200bps CRC8
+ * @periph    LPUART1 (UART1)        OpenART2 分类数据接收 B12/B13, 115200bps CRC8
  *--------------------------------------------------------------------------------------------------------------------
  * 设计要点:
  *   1. 状态机式逐字节解析, 任意非法字节均 fallback 到等 SOF1, 不会卡死
@@ -71,6 +75,7 @@ volatile uint32   g_link_map_byte_last_ms   = 0U;
 volatile uint32   g_link_class_byte_last_ms = 0U;
 volatile uint8    g_link_car_x         = 0U;
 volatile uint8    g_link_car_y         = 0U;
+volatile uint32   g_link_map_frame_id  = 0U;
 app_link_stats_t  g_link_stats         = {0};
 app_link_stats_t  g_link_map_stats     = {0};
 app_link_stats_t  g_link_class_stats   = {0};
@@ -437,6 +442,7 @@ static uint8 commit_map_frame(const uint8 *payload)
     }
     __DMB();
     s_map_seq++;
+    g_link_map_frame_id++;
 
     return 1U;
 }
@@ -514,6 +520,7 @@ void app_link_inject_static_map(const uint8 map[APP_LINK_MAP_ROWS][APP_LINK_MAP_
     }
     __DMB();
     s_map_seq++;
+    g_link_map_frame_id++;
 }
 
 /*===================================================================================================================
@@ -544,12 +551,11 @@ static void dispatch_frame(app_link_port_e port, const app_link_parser_t *parser
             {
                 cx = parser->rx_payload[APP_LINK_MAP_PAYLOAD_LEN];
                 cy = parser->rx_payload[APP_LINK_MAP_PAYLOAD_LEN + 1U];
-                if ((cx >= (uint8)APP_LINK_MAP_COLS) || (cy >= (uint8)APP_LINK_MAP_ROWS))
+                /* Car coordinates are optional for level-1 odometry runs. */
+                if ((cx < (uint8)APP_LINK_MAP_COLS) && (cy < (uint8)APP_LINK_MAP_ROWS))
                 {
-                    stats_inc_len_err(port);
-                    break;
+                    car_ready = 1U;
                 }
-                car_ready = 1U;
             }
             /* 先落地地图，成功后再提交车辆坐标，避免地图被拒而车位已更新的撕裂 */
             if (commit_map_frame((const uint8 *)parser->rx_payload) == 0U)
@@ -655,6 +661,7 @@ void app_link_init(void)
     g_link_class_byte_last_ms = 0U;
     g_link_car_x        = 0U;
     g_link_car_y        = 0U;
+    g_link_map_frame_id = 0U;
     s_ms_now            = 0U;
 
     /* 车辆坐标快照清零 */

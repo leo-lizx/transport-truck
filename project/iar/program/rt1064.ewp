@@ -1156,6 +1156,12 @@
             <name>$PROJ_DIR$\..\..\code\app_recognize.h</name>
         </file>
         <file>
+            <name>$PROJ_DIR$\..\..\code\app_recognize_clear.c</name>
+        </file>
+        <file>
+            <name>$PROJ_DIR$\..\..\code\app_recognize_clear.h</name>
+        </file>
+        <file>
             <name>$PROJ_DIR$\..\..\code\app_vision_fusion.c</name>
         </file>
         <file>

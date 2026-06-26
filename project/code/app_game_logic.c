@@ -4,6 +4,9 @@
 #include "app_recognize.h"
 
 /*
+ *  @owner  rt1064-main
+ *  @periph none                  状态机编排器，通过 app_link/recognize/solver/ctrl 间接驱动
+ *
  * P0-3 说明:
  *   g_game_map 现已降级为 "主循环侧的稳定地图快照", 唯一写者是
  *   Game_Logic_Task_Run() 入口处的 app_link_get_map_snapshot();
@@ -62,26 +65,25 @@ static LaunchZone_e        s_default_launch_zone = LAUNCH_ZONE_LEFT;
 
 /* ----- 【B1+B12】地图快照冻结标志 ----------------------------------
  * s_map_freeze: 1 = 主循环入口不再 app_link_get_map_snapshot 覆盖 g_game_map
- * 触发场景:
- *   1) 炸弹爆炸后 (主控直接 Sokoban_Apply_Bomb_Explosion 修改地图,
- *      视觉端不一定能在 1 帧内同步, 防止陈旧帧覆盖)
- *   2) RECOGNIZE_MAP 识别 tour 期间 (s_items[] 已按当时地图缓存,
- *      期间地图变更会导致访问错误格)
- * 清除场景:
- *   1) STAGE_WAIT_START 入口 (新一关或复位, 兜底)
- *   2) STAGE_DONE 入口 (比赛结束)
- *   3) RECOGNIZE_MAP 结束 (DONE_OK / DONE_NO_NEED / FAIL 都清除)
- *   4) DEADLOCK_RESET 完成 (重新开始, 视觉权威)
- * 注意: 设置后视觉端发的所有更新会被忽略, 直到清除.
+ *               (设置后视觉端发的所有更新会被忽略, 直到清除)。
+ * O8.2: 所有置位/清零统一经 map_snapshot_freeze()/map_snapshot_release() 两函数,
+ *       完整的冻结/解冻生命周期点见这两个函数处的集中注释。
  * --------------------------------------------------------------- */
 static uint8               s_map_freeze         = 0U;
 
 /* ----- 【B3b】航点执行 watchdog ------------------------------------
- * 单航点最长允许执行时长 = 5s @ 5ms/tick = 1000 tick.
+ * 单航点最长允许执行时长下限 = 5s @ 5ms/tick = 1000 tick.
  * 超时后先重发一次 MOVE_TO; 第二次仍超时切 STAGE_DEADLOCK_RESET.
+ *
+ * O8.3: 固定 5s 对"绕大圈的长航段"易误触发。改为按本段曼哈顿格距线性放宽:
+ *   limit = max(WAYPOINT_TIMEOUT_TICKS, 段格距 × WAYPOINT_TICKS_PER_CELL)
+ * 刻意保留 5s 作为下限(不缩短既有短航段的超时, 避免引入新的误超时),
+ * 只对长航段在其之上加时。每次派发航点时按当前 g_player_pos→目标格重算。
  * --------------------------------------------------------------- */
 #define WAYPOINT_TIMEOUT_TICKS         (1000U)
+#define WAYPOINT_TICKS_PER_CELL        (300U)    /* 每格放宽 1.5s @5ms */
 static uint16              s_wp_timeout_ticks   = 0U;
+static uint16              s_wp_timeout_limit   = WAYPOINT_TIMEOUT_TICKS;
 static uint8               s_wp_retry_count     = 0U;
 
 /* ----- 【B8】WAIT_START phase 0 自动复位超时 -----------------------
@@ -99,9 +101,17 @@ static uint16              s_wait_phase0_ticks  = 0U;
  * --------------------------------------------------------------- */
 #define LAUNCH_EXIT_MARGIN_M         (0.02f)
 #define LAUNCH_DRIVE_TIMEOUT_TICKS   (800U)
+#define LAUNCH_MAP_STABLE_REQUIRED_FRAMES  (5U)
+#define LAUNCH_MAP_STABLE_TIMEOUT_TICKS    (300U)
 static uint8               s_launch_drive_issued = 0U;
 static uint16              s_launch_drive_ticks  = 0U;
 static uint8               s_launch_retry_count  = 0U;
+static uint8               s_launch_map_candidate_valid = 0U;
+static uint8               s_launch_map_stable_count = 0U;
+static uint16              s_launch_map_stable_ticks = 0U;
+static uint32              s_launch_map_last_frame_id = 0U;
+static uint8               s_launch_map_candidate[MAP_ROWS][MAP_COLS];
+static uint8               s_launch_map_observed[MAP_ROWS][MAP_COLS];
 
 static SokoFullSolution_t    g_soko_solution;
 static SokoWaypointPath_t    g_soko_waypoints;
@@ -123,6 +133,117 @@ static ExecMode_e            g_exec_mode = EXEC_NONE;
  *  § 1. 执行上下文 / stage 跳转 / 地图查询工具 (全部需主循环单线程调用)
  * ========================================================================== */
 
+static void reset_launch_map_stability(void)
+{
+    s_launch_map_candidate_valid = 0U;
+    s_launch_map_stable_count = 0U;
+    s_launch_map_stable_ticks = 0U;
+    s_launch_map_last_frame_id = g_link_map_frame_id;
+}
+
+static uint8 maps_equal(const uint8 a[MAP_ROWS][MAP_COLS],
+                        const uint8 b[MAP_ROWS][MAP_COLS])
+{
+    uint8 r;
+    uint8 c;
+
+    for (r = 0U; r < (uint8)MAP_ROWS; ++r) {
+        for (c = 0U; c < (uint8)MAP_COLS; ++c) {
+            if (a[r][c] != b[r][c]) {
+                return 0U;
+            }
+        }
+    }
+    return 1U;
+}
+
+static void copy_map(uint8 dst[MAP_ROWS][MAP_COLS],
+                     const uint8 src[MAP_ROWS][MAP_COLS])
+{
+    uint8 r;
+    uint8 c;
+
+    for (r = 0U; r < (uint8)MAP_ROWS; ++r) {
+        for (c = 0U; c < (uint8)MAP_COLS; ++c) {
+            dst[r][c] = src[r][c];
+        }
+    }
+}
+
+static uint8 launch_map_is_usable(const uint8 map[MAP_ROWS][MAP_COLS])
+{
+    uint8 r;
+    uint8 c;
+    uint8 has_wall = 0U;
+    uint8 has_box = 0U;
+    uint8 has_target = 0U;
+
+    for (r = 0U; r < (uint8)MAP_ROWS; ++r) {
+        for (c = 0U; c < (uint8)MAP_COLS; ++c) {
+            if (map[r][c] == MAP_WALL) {
+                has_wall = 1U;
+            } else if (map[r][c] == MAP_BOX) {
+                has_box = 1U;
+            } else if (map[r][c] == MAP_TARGET) {
+                has_target = 1U;
+            }
+        }
+    }
+
+    return (uint8)((has_wall != 0U) && (has_box != 0U) && (has_target != 0U));
+}
+
+static uint8 launch_map_stability_tick(void)
+{
+    uint32 frame_id = g_link_map_frame_id;
+
+    if (frame_id == 0U) {
+        return 0U;
+    }
+
+    if (s_launch_map_stable_ticks < LAUNCH_MAP_STABLE_TIMEOUT_TICKS) {
+        s_launch_map_stable_ticks++;
+    } else {
+        reset_launch_map_stability();
+        return 0U;
+    }
+
+    if (frame_id == s_launch_map_last_frame_id) {
+        return 0U;
+    }
+    s_launch_map_last_frame_id = frame_id;
+
+    app_link_get_map_snapshot(s_launch_map_observed);
+    if (launch_map_is_usable(s_launch_map_observed) == 0U) {
+        reset_launch_map_stability();
+        return 0U;
+    }
+
+    if (s_launch_map_candidate_valid == 0U) {
+        copy_map(s_launch_map_candidate, s_launch_map_observed);
+        s_launch_map_candidate_valid = 1U;
+        s_launch_map_stable_count = 1U;
+        s_launch_map_stable_ticks = 0U;
+        return 0U;
+    }
+
+    if (maps_equal(s_launch_map_candidate, s_launch_map_observed) != 0U) {
+        if (s_launch_map_stable_count < 255U) {
+            s_launch_map_stable_count++;
+        }
+    } else {
+        copy_map(s_launch_map_candidate, s_launch_map_observed);
+        s_launch_map_stable_count = 1U;
+        s_launch_map_stable_ticks = 0U;
+    }
+
+    if (s_launch_map_stable_count >= LAUNCH_MAP_STABLE_REQUIRED_FRAMES) {
+        copy_map(g_game_map, s_launch_map_candidate);
+        return 1U;
+    }
+    return 0U;
+}
+
 static void reset_exec_context(void)
 {
     g_soko_solution.is_solved = 0;
@@ -137,16 +258,46 @@ static void reset_exec_context(void)
     g_exec_mode = EXEC_NONE;
     is_navigating = 0;
     s_wp_timeout_ticks = 0U;        /* B3b: 航点 watchdog 计数清零 */
+    s_wp_timeout_limit = WAYPOINT_TIMEOUT_TICKS;
     s_wp_retry_count   = 0U;
     s_wait_phase0_ticks = 0U;       /* Issue A: WAIT_START phase 0 计时跨入口清零 */
     s_launch_drive_issued = 0U;     /* 自动发车横移: 跨入口清零 */
     s_launch_drive_ticks  = 0U;
     s_launch_retry_count  = 0U;
+    reset_launch_map_stability();
 }
 
 static void goto_stage(GameStage_e next)
 {
     current_stage = next;
+}
+
+/* O8.2: 地图快照冻结开关的集中入口。
+ * 所有对 s_map_freeze 的置位/清零都经由这两个函数, 便于:
+ *   - 用函数名一次检索出全部生命周期点 (降低新增 stage 时漏配的风险);
+ *   - 把"为何冻结/解冻"的语义集中在此处记录。
+ * 注意: freeze 取值依赖运行时条件 (识别是否改图 App_Recognize_Map_Changed、
+ * 炸弹爆破后对 PLAN 那一拍的单拍保护), 不能化简为"纯 stage→freeze 静态表"
+ * (那样会改变上述条件与时序语义), 故此处只做集中封装, 不改变任何时序。
+ *
+ * 冻结 (hold, freeze=1) 点: 发车后/链路恢复进 RECOGNIZE 前、识别完成且地图被清障改动、
+ *                            炸弹爆破后保护 PLAN_PATH 当拍快照;
+ * 解冻 (release, freeze=0) 点: WAIT_START 入口、识别失败、PLAN 完成本拍、
+ *                              DEADLOCK_RESET 完成、DONE。 */
+static void map_snapshot_freeze(void)
+{
+    s_map_freeze = 1U;
+}
+
+static void map_snapshot_release(void)
+{
+    s_map_freeze = 0U;
+}
+
+/** 进入新识别轮次前废弃旧的箱子到目标映射。 */
+static void clear_box_target_mapping(void)
+{
+    memset(g_box_to_target, 0, sizeof(g_box_to_target));
 }
 
 static uint8 get_map_box_count(void)
@@ -273,21 +424,46 @@ static uint8 chassis_nav_arrived_for_waypoint(void)
 #endif
 }
 
+/* O8.3: 按"当前格 → 目标航点格"的曼哈顿距离给出本段 watchdog 超时上限.
+ * 维持 5s 下限(不缩短既有短航段超时), 仅对长航段线性放宽。 */
+static uint16 waypoint_timeout_limit(Point_t target)
+{
+    int16 dx = (int16)target.x - (int16)g_player_pos.x;
+    int16 dy = (int16)target.y - (int16)g_player_pos.y;
+    uint32 limit;
+
+    if (dx < 0) dx = (int16)-dx;
+    if (dy < 0) dy = (int16)-dy;
+    limit = (uint32)((uint16)(dx + dy)) * (uint32)WAYPOINT_TICKS_PER_CELL;
+
+    if (limit < (uint32)WAYPOINT_TIMEOUT_TICKS) {
+        return WAYPOINT_TIMEOUT_TICKS;
+    }
+    return (limit > 0xFFFFUL) ? 0xFFFFU : (uint16)limit;
+}
+
+/* 派发一个航点: 下发目标 + 置导航中 + 复位 watchdog 计数并按段长重算超时上限。 */
+static void dispatch_waypoint(const SokoWaypointPath_t *wp, uint16 idx)
+{
+    HAL_CHASSIS_MOVE_TO(wp->points[idx].x, wp->points[idx].y);
+    is_navigating = 1;
+    s_wp_timeout_ticks = 0U;
+    s_wp_timeout_limit = waypoint_timeout_limit(wp->points[idx]);
+}
+
 static uint8 exec_waypoints_common(const SokoWaypointPath_t *wp, uint16 *wp_idx)
 {
     if (!is_navigating) {
         if (*wp_idx < wp->count) {
-            HAL_CHASSIS_MOVE_TO(wp->points[*wp_idx].x, wp->points[*wp_idx].y);
-            is_navigating = 1;
-            s_wp_timeout_ticks = 0U;        /* B3b: 派发新航点, watchdog 重置 */
+            dispatch_waypoint(wp, *wp_idx);   /* B3b: 派发新航点, watchdog 重置+按段长定上限 */
         }
         return 0;
     }
 
-    /* B3b: 航点 watchdog — 超时 5s 先重发, 再超时切 DEADLOCK_RESET */
+    /* B3b: 航点 watchdog — 超时(随段长放宽)先重发, 再超时切 DEADLOCK_RESET */
     s_wp_timeout_ticks++;
     if (!chassis_nav_arrived_for_waypoint()) {
-        if (s_wp_timeout_ticks > WAYPOINT_TIMEOUT_TICKS) {
+        if (s_wp_timeout_ticks > s_wp_timeout_limit) {
             if (s_wp_retry_count == 0U) {
                 /* 第 1 次超时: 刹停后重发同一航点 (可能是 Snap 表决卡住) */
                 ++s_wp_retry_count;
@@ -313,8 +489,7 @@ static uint8 exec_waypoints_common(const SokoWaypointPath_t *wp, uint16 *wp_idx)
     (*wp_idx)++;
 
     if (*wp_idx < wp->count) {
-        HAL_CHASSIS_MOVE_TO(wp->points[*wp_idx].x, wp->points[*wp_idx].y);
-        is_navigating = 1;
+        dispatch_waypoint(wp, *wp_idx);
         return 0;
     }
 
@@ -347,20 +522,20 @@ static uint8 exec_push_box_solution(void)
 
 static uint8 find_first_unreachable_target(Point_t *blocked_target)
 {
-    /* P0-4: NavPath_t (Point_t[200]+uint16 ~402B) \u7531\u6808\u8fc1\u81f3\u6587\u4ef6\u7ea7 BSS\u3002
-     *       \u672c\u51fd\u6570\u4ec5\u5728 STAGE_DEADLOCK_RESET (\u4e3b\u5faa\u73af\u7ebf\u7a0b) \u8c03\u7528, \u65e0\u9012\u5f52\u65e0 ISR\u3002 */
-    static NavPath_t nav_tmp;
+    static uint8 reach[MAP_ROWS][MAP_COLS];
 
     if (!blocked_target) return 0;
 
     blocked_target->x = -1;
     blocked_target->y = -1;
 
+    if (!Algo_Nav_BFS_Flood(g_game_map, g_player_pos, reach, 0)) return 0;
+
     for (int8 r = (int8)CHASSIS_GRID_INNER_MIN_Y; r <= (int8)CHASSIS_GRID_INNER_MAX_Y; r++) {
         for (int8 c = (int8)CHASSIS_GRID_INNER_MIN_X; c <= (int8)CHASSIS_GRID_INNER_MAX_X; c++) {
             if (g_game_map[r][c] == MAP_TARGET) {
                 Point_t tp = {c, r};
-                if (!Algo_Nav_BFS(g_game_map, g_player_pos, tp, &nav_tmp)) {
+                if (!Algo_Nav_Is_Reachable(reach, tp)) {
                     *blocked_target = tp;
                     return 1;
                 }
@@ -477,7 +652,7 @@ static void stage_wait_start_handler(void)
      *
      * B1+B12: 进入 WAIT_START 总是解冻地图 (兜底), 防上一关地图冻结状态残留.
      */
-    s_map_freeze = 0U;
+    map_snapshot_release();
 
     if (s_wait_start_phase == 0U) {
         s_wait_phase0_ticks++;          /* B8: phase 0 超时计时 */
@@ -497,6 +672,7 @@ static void stage_wait_start_handler(void)
             s_wait_phase0_ticks = 0U;
             s_launch_drive_issued = 0U;
             s_launch_drive_ticks  = 0U;
+            reset_launch_map_stability();
             s_wait_start_phase  = 1U;
             return;
         }
@@ -506,6 +682,7 @@ static void stage_wait_start_handler(void)
         s_wait_phase0_ticks = 0U;
         s_launch_drive_issued = 0U;
         s_launch_drive_ticks  = 0U;
+        reset_launch_map_stability();
         s_wait_start_phase  = 1U;
         return;
     }
@@ -515,11 +692,14 @@ static void stage_wait_start_handler(void)
     /* 已完全离开发车区 → 发车成功, 进入识别 */
     if (chassis_zone_is_fully_outside_launch(s_default_launch_zone)) {
         chassis_ctrl_stop();
+        if (launch_map_stability_tick() == 0U) {
+            return;
+        }
         s_launch_drive_issued = 0U;
         s_launch_drive_ticks  = 0U;
         s_wait_start_phase = 0U;     /* 重置子相位, 供后续 LEVEL_JUDGE 复用 */
-        s_map_freeze = 1U;           /* B12: 进 RECOGNIZE 前锁定地图, 防 s_items[] 错位 */
-        memset(g_box_to_target, 0, sizeof(g_box_to_target));   /* Issue C: 清陈旧映射 */
+        map_snapshot_freeze();       /* B12: 进 RECOGNIZE 前锁定地图, 防 s_items[] 错位 */
+        clear_box_target_mapping();
         reset_exec_context();
         App_Recognize_Reset();       /* 进入 RECOGNIZE 前清识别 tour 状态 */
         goto_stage(STAGE_RECOGNIZE_MAP);
@@ -572,29 +752,73 @@ static void stage_recognize_handler(void)
             return;
         case APP_RECOG_DONE_OK:
         case APP_RECOG_DONE_NO_NEED:
-            s_map_freeze = 0U;             /* B12: 识别结束, 解冻地图 */
+            /* 清障推箱后先保留主控动态地图, 直到 PLAN_PATH 本拍完成解算。
+             * 否则视觉端的一帧旧地图可能在解算前把移动结果覆盖掉。 */
+            if (App_Recognize_Map_Changed()) {
+                map_snapshot_freeze();
+            } else {
+                map_snapshot_release();
+            }
             reset_exec_context();
             goto_stage(STAGE_PLAN_PATH);
             return;
         case APP_RECOG_FAIL:
         default:
-            s_map_freeze = 0U;             /* B12: 识别失败也解冻 */
+            map_snapshot_release();        /* B12: 识别失败也解冻 */
             reset_exec_context();
             goto_stage(STAGE_DEADLOCK_RESET);
             return;
     }
 }
 
-static void stage_plan_handler(void)
+/* O8.1: 破局炸弹决策链 (由 stage_plan_handler 内联链抽出, 逐分支等价)。
+ * 保持原有优先级与"死局短路"语义:
+ *   1) 角落/冻结死局: 仅尝试"死箱最近目标"这一种破局, 失败即放弃 (返回 0 → 调用方进死局复位),
+ *      刻意不再尝试策略 2/3 —— 与历史控制流一致;
+ *   2) 非死局: 先试"玩家走不到的目标", 再试"有炸弹时的通用破局";
+ *   任一成功 → 返回 1 (炸弹段已就绪)；全部失败 → 返回 0。
+ * 说明: 未采用方案 O8.1 的函数指针表 —— 其统一"逐项回退"语义会抹掉上面的死局短路,
+ *       改变行为; 这里以单函数提取达到"消嵌套/集中决策"的同等可读性目标且零行为变更。 */
+static uint8 try_build_breakout_bomb(void)
 {
-    Point_t dead_box;
+    Point_t dead_box = { -1, -1 };
     Point_t blocked_target;
 
+    if (Sokoban_Is_Deadlock(g_game_map, &dead_box)) {
+        blocked_target = choose_nearest_target(dead_box);
+        return (uint8)((blocked_target.x >= 0) && build_bomb_plan(blocked_target));
+    }
+
+    blocked_target.x = -1;
+    blocked_target.y = -1;
+    if (find_first_unreachable_target(&blocked_target) &&
+        build_bomb_plan(blocked_target)) {
+        return 1;
+    }
+
+    /* 通用炸弹兜底 (多炸弹关键补强):
+     * 推箱规划失败, 但既无死局、目标对玩家也都"可走到" —— 典型成因是
+     * 炸弹/内墙堵在 *箱子* 的推进通道上 (find_first_unreachable_target 只看
+     * 玩家→目标可达, 看不到箱子被堵)。此时以"最大化破局收益"为目标再尝试炸墙开路;
+     * Sokoban_Plan_Bomb 内部会确保选中的墙确有炸弹可推, 找不到则失败。 */
+    if (map_has_bomb()) {
+        Point_t no_target = { -1, -1 };
+        if (build_bomb_plan(no_target)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void stage_plan_handler(void)
+{
     if (g_soko_exec_init) {
         return;
     }
 
     g_soko_exec_init = 1;
+    /* 当前 handler 内同步完成规划; 从下一拍开始可恢复视觉地图刷新。 */
+    map_snapshot_release();
 
     if (get_map_box_count() == 0) {
         goto_stage(STAGE_LEVEL_JUDGE);
@@ -606,39 +830,9 @@ static void stage_plan_handler(void)
         return;
     }
 
-    dead_box.x = -1;
-    dead_box.y = -1;
-    blocked_target.x = -1;
-    blocked_target.y = -1;
-
-    if (Sokoban_Is_Deadlock(g_game_map, &dead_box)) {
-        blocked_target = choose_nearest_target(dead_box);
-        if (blocked_target.x >= 0 && build_bomb_plan(blocked_target)) {
-            goto_stage(STAGE_EXECUTE_ACTION);
-            return;
-        }
-        goto_stage(STAGE_DEADLOCK_RESET);
-        return;
-    }
-
-    if (find_first_unreachable_target(&blocked_target) &&
-        build_bomb_plan(blocked_target)) {
+    if (try_build_breakout_bomb()) {
         goto_stage(STAGE_EXECUTE_ACTION);
         return;
-    }
-
-    /* 通用炸弹兜底 (多炸弹关键补强):
-     * 推箱规划失败, 但既无角落死局、目标对玩家也都"可走到" —— 典型成因是
-     * 炸弹/内墙堵在 *箱子* 的推进通道上 (find_first_unreachable_target 只看
-     * 玩家→目标可达, 看不到箱子被堵)。此时以"最大化破局收益"为目标 (无特定
-     * blocked_target) 再尝试炸墙开路; Sokoban_Plan_Bomb 内部会确保选中的墙
-     * 确有炸弹可推, 找不到则照常进入死局复位。 */
-    if (map_has_bomb()) {
-        Point_t no_target = { -1, -1 };
-        if (build_bomb_plan(no_target)) {
-            goto_stage(STAGE_EXECUTE_ACTION);
-            return;
-        }
     }
 
     goto_stage(STAGE_DEADLOCK_RESET);
@@ -661,7 +855,7 @@ static void stage_execute_handler(void)
             g_game_map[g_bomb_wall_pos.y][g_bomb_wall_pos.x] = MAP_EMPTY;
             /* B1: 主控本地权威, 锁定地图; 直到本关结束(WAIT_START / DONE / DEADLOCK_RESET) 才解冻.
              * 视觉端不一定在 1 帧内同步爆炸结果, 防 g_game_map 被陈旧帧覆盖. */
-            s_map_freeze = 1U;
+            map_snapshot_freeze();
             reset_exec_context();
             goto_stage(STAGE_PLAN_PATH);
             return;
@@ -721,7 +915,7 @@ static void stage_deadlock_reset_handler(void)
 
     reset_exec_context();
     s_wait_start_phase = 0U;     /* 重置 WAIT_START 子相位, 下一关重新走 "复位→等离开" */
-    s_map_freeze = 0U;           /* B12: DEADLOCK 复位 → 解冻地图, 视觉端权威 */
+    map_snapshot_release();      /* B12: DEADLOCK 复位 → 解冻地图, 视觉端权威 */
     App_Recognize_Reset();       /* 死局重置后重新跑识别 tour */
     goto_stage(STAGE_WAIT_START);
 }
@@ -729,7 +923,7 @@ static void stage_deadlock_reset_handler(void)
 static void stage_done_handler(void)
 {
     /* 比赛流程完成，维持静止即可。 */
-    s_map_freeze = 0U;           /* B12: 比赛结束 → 解冻地图 */
+    map_snapshot_release();      /* B12: 比赛结束 → 解冻地图 */
 }
 
 /* ==================================================================
@@ -848,8 +1042,8 @@ static void recover_from_link_pause(void)
     {
         chassis_ctrl_stop();
         is_navigating  = 0U;
-        s_map_freeze   = 1U;
-        memset(g_box_to_target, 0, sizeof(g_box_to_target));
+        map_snapshot_freeze();
+        clear_box_target_mapping();
         current_stage  = STAGE_RECOGNIZE_MAP;
         App_Recognize_Reset();
         (void)s_stage_resume;

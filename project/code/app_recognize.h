@@ -96,7 +96,7 @@ void App_Recognize_Reset(void);
 /**
  * @brief 5ms 周期 tick — 推进识别子状态机
  *
- * @param map           当前地图快照 (主控侧 g_game_map)
+ * @param map           当前地图快照 (主控侧 g_game_map); 清障推箱成功后会原地更新
  * @param player_pos    当前车体网格坐标
  * @param has_bomb      地图是否含炸弹 (= map_has_bomb 结果)
  * @param level         当前关卡 (1=Stage1 跳过识别, ≥2 = 必走识别)
@@ -104,7 +104,7 @@ void App_Recognize_Reset(void);
  *
  * @return AppRecognizeStatus_e
  */
-AppRecognizeStatus_e App_Recognize_Tick(const uint8 map[MAP_ROWS][MAP_COLS],
+AppRecognizeStatus_e App_Recognize_Tick(uint8 map[MAP_ROWS][MAP_COLS],
                                         Point_t player_pos,
                                         uint8 has_bomb,
                                         uint8 level,
@@ -114,6 +114,12 @@ AppRecognizeStatus_e App_Recognize_Tick(const uint8 map[MAP_ROWS][MAP_COLS],
  * @brief 取调试信息 (供菜单/IPS显示)
  */
 void App_Recognize_Get_Debug(AppRecognizeDebug_t *out);
+
+/**
+ * @brief 本轮识别是否为打通观察路线而移动过箱子。
+ *        返回 1 时, 上层应至少保持本地图到后续推箱计划生成完毕。
+ */
+uint8 App_Recognize_Map_Changed(void);
 
 #ifdef __cplusplus
 }

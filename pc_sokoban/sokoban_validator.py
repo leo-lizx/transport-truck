@@ -43,6 +43,9 @@ BOMB   = 4
 
 MAX_BOXES = 8
 
+# 单次推箱最大步数（镜像 C 端 algo_sokoban_solver.h::SOKOBAN_MAX_ACTIONS）
+SOKOBAN_MAX_ACTIONS = 500
+
 # 方向偏移：UP=0, DOWN=1, LEFT=2, RIGHT=3
 DR = (-1,  1,  0,  0)   # row 偏移
 DC = ( 0,  0, -1,  1)   # col 偏移
@@ -157,6 +160,44 @@ def nav_bfs(the_map: list, start: tuple, end: tuple) -> Optional[list]:
                 queue.append(npos)
 
     return None
+
+
+def nav_bfs_distance_flood(the_map: list, start: tuple) -> Dict[tuple, int]:
+    """从 start 一次 BFS 扩散，返回各可达坐标的最短步数。"""
+    if not is_inner(*start) or not is_free(the_map, *start):
+        return {}
+
+    distance = {start: 0}
+    queue = deque([start])
+    while queue:
+        r, c = queue.popleft()
+        for d in range(4):
+            nr, nc = r + DR[d], c + DC[d]
+            pos = (nr, nc)
+            if is_free(the_map, nr, nc) and pos not in distance:
+                distance[pos] = distance[(r, c)] + 1
+                queue.append(pos)
+    return distance
+
+
+def nav_bfs_flood(the_map: list, start: tuple) -> set:
+    """从 start 一次 BFS 扩散，返回全部可达坐标。镜像 Algo_Nav_BFS_Flood。"""
+    return set(nav_bfs_distance_flood(the_map, start))
+
+
+def is_reachable(reachable: set, target: tuple) -> bool:
+    """基于 nav_bfs_flood 的结果执行 O(1) 可达性查询。"""
+    return target in reachable
+
+
+def _box_nav_distance(distance: Dict[tuple, int], box: tuple) -> int:
+    """玩家到箱子四邻接可站立格的最短距离；完全不可接近时返回大值。"""
+    return min(
+        (distance[(box[0] + DR[d], box[1] + DC[d])]
+         for d in range(4)
+         if (box[0] + DR[d], box[1] + DC[d]) in distance),
+        default=10 ** 9,
+    )
 
 
 # ============================================================
@@ -545,12 +586,18 @@ def sokoban_bfs_single(sub_map: list, player: tuple, box: tuple,
     start = (player[0], player[1], box[0], box[1])
     # parent: state -> (prev_state, action)
     parent: Dict[tuple, Optional[tuple]] = {start: None}
+    # O1.3: 镜像 C 端 SB_MAX_BFS_LAYERS —— 步数(=BFS 深度)超过 SOKOBAN_MAX_ACTIONS
+    # 的解在 C 端会被回溯阶段判为不可用, 这里同样不再向更深层扩展, 保持两端一致。
+    depth: Dict[tuple, int] = {start: 0}
     queue = deque([start])
 
     found_state = None
 
     while queue and found_state is None:
         pr, pc, br, bc = state = queue.popleft()
+        cur_depth = depth[state]
+        if cur_depth >= SOKOBAN_MAX_ACTIONS:
+            continue   # 再扩展将超过最大可用步数, 等价于无可用解
         for d in range(4):
             npr = pr + DR[d]
             npc = pc + DC[d]
@@ -572,6 +619,7 @@ def sokoban_bfs_single(sub_map: list, player: tuple, box: tuple,
                 continue
 
             parent[new_state] = (state, d)
+            depth[new_state] = cur_depth + 1
 
             if nbr == target[0] and nbc == target[1]:
                 found_state = new_state
@@ -669,13 +717,18 @@ def _solve_stage1_greedy(the_map: list, player_pos: tuple) -> Optional[dict]:
     cur_player = player_pos
 
     for _ in range(n):
-        # 选最近未完成箱子
+        # 一次扩散后按实际绕障距离选最近可接近的箱子
+        nav_map = [row[:] for row in the_map]
+        for i, box in enumerate(boxes):
+            if solved[i]:
+                nav_map[box[0]][box[1]] = EMPTY
+        distance = nav_bfs_distance_flood(nav_map, cur_player)
         best_b = min(
             (i for i in range(n) if not solved[i]),
-            key=lambda i: abs(boxes[i][0] - cur_player[0]) + abs(boxes[i][1] - cur_player[1]),
+            key=lambda i: _box_nav_distance(distance, boxes[i]),
             default=None
         )
-        if best_b is None:
+        if best_b is None or _box_nav_distance(distance, boxes[best_b]) >= 10 ** 9:
             return None
 
         # 选最近未使用目标
@@ -909,9 +962,37 @@ def is_blocker(the_map: list, r: int, c: int) -> bool:
     return the_map[r][c] in (WALL, BOX, BOMB)
 
 
+def _box_has_pushable_direction(the_map: list, br: int, bc: int) -> bool:
+    """O3.2 镜像 C 端 box_has_pushable_direction():
+    存在方向 d 使 去向格 box+Δd 与 玩家站位 box-Δd 同时可通行 → 还能推动。"""
+    for d in range(4):
+        dest_r, dest_c = br + DR[d], bc + DC[d]
+        stand_r, stand_c = br - DR[d], bc - DC[d]
+        if is_free(the_map, dest_r, dest_c) and is_free(the_map, stand_r, stand_c):
+            return True
+    return False
+
+
+def _box_frozen_on_border_line(the_map: list, br: int, bc: int) -> bool:
+    """O3.1 镜像 C 端 box_frozen_on_border_line():
+    贴内场外边界的箱子永远脱不开所贴行/列, 该行/列无目标即死局。"""
+    if br == INNER_R_MIN or br == INNER_R_MAX:
+        for c in range(INNER_C_MIN, INNER_C_MAX + 1):
+            if the_map[br][c] == TARGET:
+                return False
+        return True
+    if bc == INNER_C_MIN or bc == INNER_C_MAX:
+        for r in range(INNER_R_MIN, INNER_R_MAX + 1):
+            if the_map[r][bc] == TARGET:
+                return False
+        return True
+    return False
+
+
 def check_deadlock(the_map: list) -> Tuple[bool, Optional[tuple]]:
     """
-    检测角落死局。对应 C 代码 Sokoban_Is_Deadlock()。
+    死局检测。对应 C 代码 Sokoban_Is_Deadlock()。
+    第一遍角落死局(行为与历史完全一致), 仅当无角落死局时第二遍补 O3.2/O3.1。
     返回 (is_dead, dead_box_pos)。
     """
     for r in range(INNER_R_MIN, INNER_R_MAX + 1):
@@ -923,6 +1004,14 @@ def check_deadlock(the_map: list) -> Tuple[bool, Optional[tuple]]:
             left  = is_blocker(the_map, r, c - 1)
             right = is_blocker(the_map, r, c + 1)
             if (up and left) or (up and right) or (down and left) or (down and right):
+                return True, (r, c)
+
+    for r in range(INNER_R_MIN, INNER_R_MAX + 1):
+        for c in range(INNER_C_MIN, INNER_C_MAX + 1):
+            if the_map[r][c] != BOX:
+                continue
+            if (not _box_has_pushable_direction(the_map, r, c)) or \
+               _box_frozen_on_border_line(the_map, r, c):
                 return True, (r, c)
     return False, None
 
@@ -1026,7 +1115,13 @@ def plan_bomb(the_map: list, player_pos: tuple,
                             tmp[rr][cc] = EMPTY
                             cleared += 1
 
+            reachable_cells = nav_bfs_flood(tmp, player_pos)
+            if not reachable_cells:
+                continue
+
             if blocked_target is not None:
+                if not is_reachable(reachable_cells, blocked_target):
+                    continue
                 path = nav_bfs(tmp, player_pos, blocked_target)
                 if path is None:
                     continue
@@ -1037,7 +1132,8 @@ def plan_bomb(the_map: list, player_pos: tuple,
             reachable = sum(
                 1 for tr in range(INNER_R_MIN, INNER_R_MAX + 1)
                 for tc in range(INNER_C_MIN, INNER_C_MAX + 1)
-                if tmp[tr][tc] == TARGET and nav_bfs(tmp, player_pos, (tr, tc)) is not None
+                if tmp[tr][tc] == TARGET and
+                is_reachable(reachable_cells, (tr, tc))
             )
 
             score = reachable * 200 + cleared * 20 - (blocked_len * blocked_len) // 50
@@ -1092,10 +1188,11 @@ def solve_stage3(the_map: list, player_pos: tuple,
     if not bombs:
         return None
 
-    # 找不可达目标
+    # 一次扩散后查找首个不可达目标
     blocked_target = None
+    reachable_cells = nav_bfs_flood(the_map, player_pos)
     for t in extract_elements(the_map, TARGET):
-        if nav_bfs(the_map, player_pos, t) is None:
+        if not is_reachable(reachable_cells, t):
             blocked_target = t
             break
 

@@ -69,6 +69,7 @@ typedef struct {
 #define SOKOBAN_MAX_BOXES       8       // 地图中最大箱子数量
 #define SOKOBAN_MAX_ACTIONS     500     // 单次推箱最大步数
 #define SOKOBAN_MAX_WAYPOINTS   200     // 路点数组上限
+#define ALGO_NAV_DISTANCE_UNREACHABLE (0xFFU)
 
 /* ======================================================================
  *  数据类型
@@ -130,6 +131,27 @@ uint8 Algo_Nav_BFS(const uint8 map[MAP_ROWS][MAP_COLS],
                    Point_t start,
                    Point_t end,
                    NavPath_t *result_path);
+
+/**
+ * @brief 从起点执行一次完整 BFS 扩散，生成全图可达标记
+ * @param map 地图矩阵
+ * @param start 起点坐标
+ * @param reach [out] 可达标记，1=可达，0=不可达；不需要时可传 NULL
+ * @param distance_steps [out] 起点到各格的最短步数，不可达为
+ *                       ALGO_NAV_DISTANCE_UNREACHABLE；
+ *                       不需要时可传 NULL
+ * @return 1=扩散成功, 0=起点越界或不可通行
+ *
+ * 与 Algo_Nav_BFS 共享静态队列，不可重入，不得在 ISR 或嵌套调用中使用。
+ */
+uint8 Algo_Nav_BFS_Flood(const uint8 map[MAP_ROWS][MAP_COLS],
+                         Point_t start,
+                         uint8 reach[MAP_ROWS][MAP_COLS],
+                         uint8 distance_steps[MAP_ROWS][MAP_COLS]);
+
+/** 基于 Algo_Nav_BFS_Flood 结果查询单点是否可达 */
+uint8 Algo_Nav_Is_Reachable(const uint8 reach[MAP_ROWS][MAP_COLS],
+                            Point_t target);
 
 /**
  * @brief  第一阶段求解 — 任意箱→任意目标（基础模式）
@@ -276,6 +298,8 @@ uint8 Sokoban_Plan_Bomb(const uint8 map[MAP_ROWS][MAP_COLS],
  *  顶层迭代求解（推箱 + 多炸弹一气呵成）
  * ====================================================================== */
 
+#ifdef SOKOBAN_PC_VALIDATION
+
 /** 解算段类型 */
 typedef enum {
     SOKO_PHASE_PUSH = 0,    /* 推箱段: movable=箱子起点(可为空) */
@@ -323,5 +347,7 @@ uint8 Sokoban_Solve_Full(const uint8 map[MAP_ROWS][MAP_COLS],
                          const uint8 *box_to_target_idx,
                          uint8 box_count,
                          SokoPlan_t *out_plan);
+
+#endif /* SOKOBAN_PC_VALIDATION */
 
 #endif /* _ALGO_SOKOBAN_SOLVER_H_ */
