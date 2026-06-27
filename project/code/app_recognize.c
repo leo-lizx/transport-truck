@@ -1,6 +1,9 @@
 /*********************************************************************************************************************
  * 文件名称   : app_recognize.c
  * 模块功能   : 推箱子识别 tour 子状态机 (STAGE_RECOGNIZE_MAP 的真正实现)
+ *
+ * @owner     rt1064-main
+ * @periph    none                纯算法 (地图特征提取 + 箱子-目标匹配)
  *--------------------------------------------------------------------------------------------------------------------
  * 算法概述:
  *   1. 从地图提取所有 BOX 和 TARGET 坐标 (Stage1 跳过本流程)
@@ -18,6 +21,7 @@
  *********************************************************************************************************************/
 
 #include "app_recognize.h"
+#include "app_recognize_clear.h"
 #include "app_link.h"
 #include "chassis_ctrl.h"
 #include "chassis_config.h"
@@ -91,6 +95,12 @@ static uint8             s_cur_idx      = 0U;     /* s_items 中当前处理项 
 static uint8  s_nav_started     = 0U;
 static uint8  s_face_started    = 0U;
 static uint16 s_subphase_ticks  = 0U;     /* B3a: NAV/FACE 子阶段计时, enter_sub_* 时清零 */
+static AppRecogClearPlan_t s_nav_plan;
+static SokoWaypointPath_t  s_nav_waypoints;
+static Point_t s_nav_plan_start;
+static uint16  s_nav_wp_idx     = 0U;
+static uint8   s_nav_map_applied = 0U;
+static uint8   s_map_changed     = 0U;
 
 /* 多数票统计 */
 static uint16 s_sample_ticks    = 0U;
@@ -102,66 +112,6 @@ static uint32 s_last_seen_frame_id = 0U;     /* 已采样过的最大 frame_id, 
 /*===================================================================================================================
  * 内部工具
  *=================================================================================================================*/
-
-static inline uint8 recog_is_inner(int8 r, int8 c)
-{
-    if (c < (int8)CHASSIS_GRID_INNER_MIN_X || c > (int8)CHASSIS_GRID_INNER_MAX_X) return 0;
-    if (r < (int8)CHASSIS_GRID_INNER_MIN_Y || r > (int8)CHASSIS_GRID_INNER_MAX_Y) return 0;
-    return 1;
-}
-
-static inline uint8 recog_is_passable(const uint8 map[MAP_ROWS][MAP_COLS], int8 r, int8 c)
-{
-    if (!recog_is_inner(r, c)) return 0;
-    return (map[r][c] == MAP_EMPTY || map[r][c] == MAP_TARGET) ? 1 : 0;
-}
-
-/**
- * 在地图上 BFS 找到与给定坐标 (target_pos) 4-邻接的最近可立足格.
- * 复用 Algo_Nav_BFS 的能力: 对 4 个邻居分别尝试, 取路径最短者.
- *
- * @return 1 成功, 0 不可达 (4 邻居全是墙/箱)
- */
-static uint8 find_observe_point(const uint8 map[MAP_ROWS][MAP_COLS],
-                                Point_t player_pos,
-                                Point_t target_pos,
-                                Point_t *out_obs)
-{
-    static const int8 dr[4] = { -1,  1,  0,  0 };
-    static const int8 dc[4] = {  0,  0, -1,  1 };
-
-    /* P0-4: NavPath_t (~402B) 太大不能放栈, 用 static 单实例;
-     * find_observe_point 仅在主循环 RECOGNIZE 阶段顺序调用, 与 Algo_Nav_BFS
-     * 内部的 bfs_queue/parent_map/bfs_visited 是同一条非可重入约束. */
-    static NavPath_t s_obs_path;
-
-    int16 best_len = 32767;
-    Point_t best_obs = {(int8)-1, (int8)-1};
-    uint8 found = 0U;
-
-    for (uint8 d = 0U; d < 4U; ++d)
-    {
-        int8 ny = (int8)(target_pos.y + dr[d]);
-        int8 nx = (int8)(target_pos.x + dc[d]);
-        if (!recog_is_passable(map, ny, nx)) { continue; }
-
-        Point_t cand = { nx, ny };
-        if (!Algo_Nav_BFS(map, player_pos, cand, &s_obs_path)) { continue; }
-
-        if ((int16)s_obs_path.step_count < best_len)
-        {
-            best_len = (int16)s_obs_path.step_count;
-            best_obs = cand;
-            found = 1U;
-        }
-    }
-
-    if (found && out_obs != NULL)
-    {
-        *out_obs = best_obs;
-    }
-    return found;
-}
 
 /**
  * 计算"车头朝物体"的目标 yaw (度). 约定见文件头.
@@ -381,68 +331,184 @@ static uint8 pick_next_item(Point_t cur)
  * 输出: box_to_target_out[i] = "第 i 个箱子 (按 extract 顺序中的相对索引)" 应推到 "第 ? 个目标"
  *      约定与 algo_sokoban_solver 内部 extract_elements 顺序一致
  *=================================================================================================================*/
-static uint8 build_box_to_target_mapping(uint8 box_to_target_out[SOKOBAN_MAX_BOXES])
+static uint8 item_class_at(uint8 kind, int8 x, int8 y, uint8 *class_id)
 {
-    /* 先收集 boxes / targets 的 class_id (按 extract 顺序记录的相对索引) */
+    uint8 i;
+    for (i = 0U; i < s_item_count; ++i)
+    {
+        if (s_items[i].kind == kind &&
+            s_items[i].pos.x == x && s_items[i].pos.y == y &&
+            s_items[i].ok)
+        {
+            *class_id = s_items[i].class_id;
+            return 1U;
+        }
+    }
+    return 0U;
+}
+
+static uint8 build_box_to_target_mapping(const uint8 map[MAP_ROWS][MAP_COLS],
+                                         uint8 box_to_target_out[SOKOBAN_MAX_BOXES])
+{
     uint8 box_class[SOKOBAN_MAX_BOXES];
     uint8 tgt_class[SOKOBAN_MAX_BOXES];
     uint8 box_idx_in_extract = 0U;
     uint8 tgt_idx_in_extract = 0U;
+    int8 r, c;
 
     memset(box_class, 0, sizeof(box_class));
     memset(tgt_class, 0, sizeof(tgt_class));
 
-    /* extract_items 已按行/列扫描顺序存入 s_items, 与 algo_sokoban_solver
-     * 的 extract_elements(MAP_BOX) / extract_elements(MAP_TARGET) 同顺序;
-     * 因此分别按 kind 累加自身相对下标. */
-    for (uint8 i = 0U; i < s_item_count; ++i)
+    /*
+     * 清障后箱子的坐标和扫描顺序可能改变。必须按“当前地图”的行列顺序
+     * 重新生成类别数组, 才与 Sokoban_Solve_Stage2 的 extract_elements 对齐。
+     */
+    for (r = (int8)CHASSIS_GRID_INNER_MIN_Y;
+         r <= (int8)CHASSIS_GRID_INNER_MAX_Y; ++r)
     {
-        if (s_items[i].kind == APP_LINK_OBJ_KIND_BOX)
+        for (c = (int8)CHASSIS_GRID_INNER_MIN_X;
+             c <= (int8)CHASSIS_GRID_INNER_MAX_X; ++c)
         {
-            if (box_idx_in_extract < (uint8)SOKOBAN_MAX_BOXES)
+            if (map[r][c] == MAP_BOX)
             {
-                box_class[box_idx_in_extract] = s_items[i].class_id;
+                if (box_idx_in_extract >= (uint8)SOKOBAN_MAX_BOXES ||
+                    !item_class_at(APP_LINK_OBJ_KIND_BOX, c, r,
+                                   &box_class[box_idx_in_extract]))
+                {
+                    return 0U;
+                }
                 ++box_idx_in_extract;
             }
-        }
-        else
-        {
-            if (tgt_idx_in_extract < (uint8)SOKOBAN_MAX_BOXES)
+            else if (map[r][c] == MAP_TARGET)
             {
-                tgt_class[tgt_idx_in_extract] = s_items[i].class_id;
+                if (tgt_idx_in_extract >= (uint8)SOKOBAN_MAX_BOXES ||
+                    !item_class_at(APP_LINK_OBJ_KIND_TARGET, c, r,
+                                   &tgt_class[tgt_idx_in_extract]))
+                {
+                    return 0U;
+                }
                 ++tgt_idx_in_extract;
             }
         }
     }
 
-    if (box_idx_in_extract != tgt_idx_in_extract) { return 0U; }
+    if (box_idx_in_extract != s_box_count)         { return 0U; }
+    if (box_idx_in_extract != tgt_idx_in_extract)  { return 0U; }
     if (box_idx_in_extract == 0U)                  { return 0U; }
 
     /* 为每个 box 找同 class_id 的 target (要求一一匹配, 不可重复占用) */
-    uint8 t_used[SOKOBAN_MAX_BOXES] = {0};
-    for (uint8 bi = 0U; bi < box_idx_in_extract; ++bi)
     {
-        uint8 cls = box_class[bi];
-        uint8 matched = 0U;
-        if (cls == 0U) { return 0U; }      /* 任何 box 未识别 → 配对失败 */
-
-        for (uint8 ti = 0U; ti < tgt_idx_in_extract; ++ti)
+        uint8 t_used[SOKOBAN_MAX_BOXES] = {0};
+        uint8 bi;
+        for (bi = 0U; bi < box_idx_in_extract; ++bi)
         {
-            if (t_used[ti])           { continue; }
-            if (tgt_class[ti] != cls) { continue; }
-            box_to_target_out[bi] = ti;
-            t_used[ti] = 1U;
-            matched = 1U;
-            break;
+            uint8 cls = box_class[bi];
+            uint8 matched = 0U;
+            uint8 ti;
+            if (cls == 0U) { return 0U; }
+
+            for (ti = 0U; ti < tgt_idx_in_extract; ++ti)
+            {
+                if (t_used[ti])           { continue; }
+                if (tgt_class[ti] != cls) { continue; }
+                box_to_target_out[bi] = ti;
+                t_used[ti] = 1U;
+                matched = 1U;
+                break;
+            }
+            if (!matched) { return 0U; }
         }
-        if (!matched) { return 0U; }
+
+        for (; bi < (uint8)SOKOBAN_MAX_BOXES; ++bi)
+        {
+            box_to_target_out[bi] = 0U;
+        }
+    }
+    return 1U;
+}
+
+static uint8 prepare_nav_plan(const uint8 map[MAP_ROWS][MAP_COLS],
+                              Point_t player_pos)
+{
+    uint16 waypoint_need = 0U;
+    uint16 i;
+
+    if (!App_Recog_Clear_Plan(map, player_pos, s_items[s_cur_idx].pos,
+                              &s_nav_plan))
+    {
+        return 0U;
     }
 
-    /* 剩余位补 0, 不影响, 因为 Sokoban_Solve_Stage2 只用前 box_count 项 */
-    for (uint8 bi = box_idx_in_extract; bi < (uint8)SOKOBAN_MAX_BOXES; ++bi)
+    for (i = 0U; i < s_nav_plan.actions.count; ++i)
     {
-        box_to_target_out[bi] = 0U;
+        if (i + 1U == s_nav_plan.actions.count ||
+            s_nav_plan.actions.actions[i] != s_nav_plan.actions.actions[i + 1U])
+        {
+            ++waypoint_need;
+        }
     }
+    if (waypoint_need > (uint16)SOKOBAN_MAX_WAYPOINTS)
+    {
+        return 0U;
+    }
+
+    s_items[s_cur_idx].observe = s_nav_plan.observe;
+    s_nav_plan_start = player_pos;
+    Sokoban_Actions_To_Waypoints(s_nav_plan.actions.actions,
+                                 s_nav_plan.actions.count,
+                                 player_pos,
+                                 &s_nav_waypoints);
+    s_nav_wp_idx = 0U;
+    s_nav_map_applied = 0U;
+    return 1U;
+}
+
+static uint8 apply_nav_plan_to_map(uint8 map[MAP_ROWS][MAP_COLS])
+{
+    static const int8 dr[4] = {-1, 1, 0, 0};
+    static const int8 dc[4] = {0, 0, -1, 1};
+    Point_t player = s_nav_plan_start;
+    uint16 i;
+
+    for (i = 0U; i < s_nav_plan.actions.count; ++i)
+    {
+        uint8 d = (uint8)s_nav_plan.actions.actions[i];
+        Point_t next;
+        if (d > (uint8)SOKO_ACT_RIGHT) return 0U;
+        next.x = (int8)(player.x + dc[d]);
+        next.y = (int8)(player.y + dr[d]);
+
+        if (map[next.y][next.x] == MAP_BOX)
+        {
+            Point_t box_to;
+            uint8 item;
+            box_to.x = (int8)(next.x + dc[d]);
+            box_to.y = (int8)(next.y + dr[d]);
+            if (map[box_to.y][box_to.x] != MAP_EMPTY) return 0U;
+
+            for (item = 0U; item < s_item_count; ++item)
+            {
+                if (s_items[item].kind == APP_LINK_OBJ_KIND_BOX &&
+                    s_items[item].pos.x == next.x &&
+                    s_items[item].pos.y == next.y)
+                {
+                    s_items[item].pos = box_to;
+                    break;
+                }
+            }
+            if (item >= s_item_count) return 0U;
+            map[next.y][next.x] = MAP_EMPTY;
+            map[box_to.y][box_to.x] = MAP_BOX;
+        }
+        else if (map[next.y][next.x] != MAP_EMPTY &&
+                 map[next.y][next.x] != MAP_TARGET)
+        {
+            return 0U;
+        }
+        player = next;
+    }
+
+    s_map_changed = 1U;
     return 1U;
 }
 
@@ -455,6 +521,8 @@ static void enter_sub_nav(void)
     s_sub_state    = RECOG_SUB_NAV;
     s_nav_started  = 0U;
     s_face_started = 0U;
+    s_nav_wp_idx   = 0U;
+    s_nav_map_applied = 0U;
     s_subphase_ticks = 0U;        /* B3a: 进入新子阶段, watchdog 清零 */
 }
 
@@ -489,12 +557,17 @@ void App_Recognize_Reset(void)
     s_cur_idx      = 0U;
     s_nav_started  = 0U;
     s_face_started = 0U;
+    s_nav_wp_idx   = 0U;
+    s_nav_map_applied = 0U;
+    s_map_changed  = 0U;
     s_subphase_ticks = 0U;        /* B3a */
     sample_state_reset();
     memset(s_items, 0, sizeof(s_items));
+    memset(&s_nav_plan, 0, sizeof(s_nav_plan));
+    memset(&s_nav_waypoints, 0, sizeof(s_nav_waypoints));
 }
 
-AppRecognizeStatus_e App_Recognize_Tick(const uint8 map[MAP_ROWS][MAP_COLS],
+AppRecognizeStatus_e App_Recognize_Tick(uint8 map[MAP_ROWS][MAP_COLS],
                                         Point_t player_pos,
                                         uint8 has_bomb,
                                         uint8 level,
@@ -529,14 +602,10 @@ AppRecognizeStatus_e App_Recognize_Tick(const uint8 map[MAP_ROWS][MAP_COLS],
                 s_sub_state = RECOG_SUB_DONE;
                 return APP_RECOG_RUNNING;
             }
-            /* 找当前物体的观察点 */
-            if (!find_observe_point(map, player_pos, s_items[s_cur_idx].pos,
-                                    &s_items[s_cur_idx].observe))
+            if (!prepare_nav_plan(map, player_pos))
             {
-                /* 不可达 → 跳过该物体, 标 visited+fail */
                 s_items[s_cur_idx].visited = 1U;
                 s_items[s_cur_idx].ok      = 0U;
-                /* 仍循环 NEXT 决定整体失败 */
                 enter_sub_next();
                 return APP_RECOG_RUNNING;
             }
@@ -546,25 +615,46 @@ AppRecognizeStatus_e App_Recognize_Tick(const uint8 map[MAP_ROWS][MAP_COLS],
 
         case RECOG_SUB_NAV:
         {
-            Point_t obs = s_items[s_cur_idx].observe;
-            s_subphase_ticks++;            /* B3a: NAV 超时计时 */
-            if (!s_nav_started)
+            /* 按规划得到的转弯航点逐段执行, 确保真实轨迹与 BFS 绕障路径一致。 */
+            if (s_nav_wp_idx < s_nav_waypoints.count)
             {
-                HAL_CHASSIS_MOVE_TO((uint8)obs.x, (uint8)obs.y);
-                s_nav_started = 1U;
+                s_subphase_ticks++;
+                if (!s_nav_started)
+                {
+                    Point_t wp = s_nav_waypoints.points[s_nav_wp_idx];
+                    HAL_CHASSIS_MOVE_TO((uint8)wp.x, (uint8)wp.y);
+                    s_nav_started = 1U;
+                    s_subphase_ticks = 0U;
+                    return APP_RECOG_RUNNING;
+                }
+                if (s_subphase_ticks > RECOG_NAV_TIMEOUT_TICKS)
+                {
+                    s_items[s_cur_idx].visited = 1U;
+                    s_items[s_cur_idx].ok      = 0U;
+                    enter_sub_next();
+                    return APP_RECOG_RUNNING;
+                }
+                if (!chassis_ctrl_is_arrived())
+                {
+                    return APP_RECOG_RUNNING;
+                }
+                s_nav_started = 0U;
+                s_subphase_ticks = 0U;
+                s_nav_wp_idx++;
                 return APP_RECOG_RUNNING;
             }
-            /* B3a: 5s 仍跑不到 → 跳过此物体 (地图保证可解) */
-            if (s_subphase_ticks > RECOG_NAV_TIMEOUT_TICKS)
+
+            /* 推箱动作全部成功后, 一次性把相同动作应用到主控地图和稳定箱子 ID。 */
+            if (s_nav_plan.push_count > 0U && !s_nav_map_applied)
             {
-                s_items[s_cur_idx].visited = 1U;
-                s_items[s_cur_idx].ok      = 0U;
-                enter_sub_next();
-                return APP_RECOG_RUNNING;
-            }
-            if (!chassis_ctrl_is_arrived())
-            {
-                return APP_RECOG_RUNNING;
+                if (!apply_nav_plan_to_map(map))
+                {
+                    s_items[s_cur_idx].visited = 1U;
+                    s_items[s_cur_idx].ok = 0U;
+                    enter_sub_next();
+                    return APP_RECOG_RUNNING;
+                }
+                s_nav_map_applied = 1U;
             }
             enter_sub_face();
             return APP_RECOG_RUNNING;
@@ -621,7 +711,7 @@ AppRecognizeStatus_e App_Recognize_Tick(const uint8 map[MAP_ROWS][MAP_COLS],
             /* 已全部识别完 → 配对 */
             if (all_resolved())
             {
-                if (build_box_to_target_mapping(box_to_target_out))
+                if (build_box_to_target_mapping(map, box_to_target_out))
                 {
                     s_sub_state = RECOG_SUB_DONE;
                     return APP_RECOG_DONE_OK;
@@ -634,8 +724,7 @@ AppRecognizeStatus_e App_Recognize_Tick(const uint8 map[MAP_ROWS][MAP_COLS],
             if (next != 0xFFU)
             {
                 s_cur_idx = next;
-                if (!find_observe_point(map, player_pos, s_items[s_cur_idx].pos,
-                                        &s_items[s_cur_idx].observe))
+                if (!prepare_nav_plan(map, player_pos))
                 {
                     s_items[s_cur_idx].visited = 1U;
                     s_items[s_cur_idx].ok      = 0U;
@@ -646,7 +735,7 @@ AppRecognizeStatus_e App_Recognize_Tick(const uint8 map[MAP_ROWS][MAP_COLS],
                 return APP_RECOG_RUNNING;
             }
             /* 所有物体都尝试过仍未全识别 → 配对失败 */
-            if (build_box_to_target_mapping(box_to_target_out))
+            if (build_box_to_target_mapping(map, box_to_target_out))
             {
                 s_sub_state = RECOG_SUB_DONE;
                 return APP_RECOG_DONE_OK;
@@ -701,4 +790,9 @@ void App_Recognize_Get_Debug(AppRecognizeDebug_t *out)
     out->inferred_count  = 0U;
     out->resolved_box    = rb;
     out->resolved_target = rt;
+}
+
+uint8 App_Recognize_Map_Changed(void)
+{
+    return s_map_changed;
 }

@@ -119,7 +119,7 @@ static uint32 wait_for_tick(void)
 #define MAIN_RUN_MODE_LEVEL2_TEST     (10)  /* 第二关测试: 收图→固定发车→分类识别→Stage2推箱→回库 */
 
 /* ═══════════ 改下面这行切换运行模式 (0~10) ═══════════ */
-#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_LEVEL2_TEST)  /* mode 10: level 2 standalone test */
+#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_SOKO_SELFTEST)  /* mode 2: single wheel speed tuning */
 /* ═══════════ 改上面这行切换运行模式 (0~10) ═══════════ */
 
 /* OpenART1 地图链路硬件口: 若实测 UART4 走 D0/D1, 只改下面两行宏. */
@@ -350,8 +350,18 @@ static void main_l1_wait_map_5ms(void)
 /*
  * 主循环 5ms tick 总入口
  */
+static void main_l1_keep_locked_map_fresh(void)
+{
+    if ((s_l1_solve_ok != 0U) && (s_l1_phase >= L1_PHASE_WARMUP))
+    {
+        g_link_last_map_ms = app_link_get_ms();
+    }
+}
+
 static void main_run_level1_test_5ms(void)
 {
+    main_l1_keep_locked_map_fresh();
+
     switch (s_l1_phase)
     {
     case L1_PHASE_WAIT_MAP:
@@ -1723,17 +1733,9 @@ static void main_mode5_render_100ms(void)
 /*  ⬇⬇⬇ 姿态闭环调试阶段这里全部被 #if 屏蔽, 不会被编译, 不要删 ⬇⬇⬇          */
 /* ========================================================================== */
 #if (MAIN_RUN_MODE == MAIN_RUN_MODE_SINGLE_WHEEL)
-/*---------------------------------------------------------------------------
- * 单轮 PID 调试参数 (仅 SINGLE_WHEEL 模式生效)
- *   WHEEL_INDEX : 0=LF 1=RF 2=LB 3=RB
- *   TARGET_MPS  : 阶跃目标线速度 (m/s), 上限受 debug_target_speed_clamp() 约束
- *   FORCE_PID   : 1=用下面 KP/KI/KD 覆盖 menu 参数 (仅覆盖被调试那一轮)
- *                 0=沿用 menu/Flash 中的 PID
- *-------------------------------------------------------------------------*/
-#define MAIN_PID_DEBUG_WHEEL_INDEX    (CHASSIS_WHEEL_LF)  /* 左前轮, 最容易观察 */
-#define MAIN_PID_DEBUG_TARGET_MPS     (3.3f)   /* 极小速度验证: 约 18 rpm, 肉眼可见缓转 */
-
-#define MAIN_PID_DEBUG_FORCE_PID      (1)
+#define MAIN_PID_DEBUG_WHEEL_INDEX    (CHASSIS_WHEEL_LF)  /* 0=LF, 1=RF, 2=LB, 3=RB */
+#define MAIN_PID_DEBUG_TARGET_MPS     (0.10f)             /* target wheel speed, m/s */
+#define MAIN_PID_DEBUG_FORCE_PID      (1)                 /* 1=use KP/KI/KD below */
 #define MAIN_PID_DEBUG_KP             (70.0f)
 #define MAIN_PID_DEBUG_KI             (20.0f)
 #define MAIN_PID_DEBUG_KD             (0.0f)
@@ -2050,6 +2052,12 @@ static void main_apply_debug_wheel_pid(void)
   #endif
     chassis_ctrl_start_single_wheel_pid_debug((uint8)MAIN_PID_DEBUG_WHEEL_INDEX,
                                               MAIN_PID_DEBUG_TARGET_MPS);
+    printf("SW_BOOT wheel=%d target=%.3f kp=%.1f ki=%.1f kd=%.1f\n",
+           (int)MAIN_PID_DEBUG_WHEEL_INDEX,
+           MAIN_PID_DEBUG_TARGET_MPS,
+           MAIN_PID_DEBUG_KP,
+           MAIN_PID_DEBUG_KI,
+           MAIN_PID_DEBUG_KD);
 #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_YAW_HOLD)
     /* ✅ 姿态闭环调试走这里: 只设一次目标角, 后续 PIT_CH1 20ms 中断中持续闭环. */
     chassis_ctrl_hold_yaw(MAIN_POS_NAV_HOLD_YAW_DEG);

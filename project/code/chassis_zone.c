@@ -1,6 +1,9 @@
 /*===========================================================================
  *  chassis_zone.c — 底盘几何区域判定 / 越界 / 静止检测 / 软限位 guard
  *
+ *  @owner  rt1064-main
+ *  @periph none                  纯几何运算，数据来自 chassis_ctrl + app_link 快照
+ *
  *  调用节拍: 主循环 (chassis_zone_tick 5ms) + PIT_IRQn (软限位 guard)
  *  线程安全: file-static 仅主循环单线程访问; 通过 seq-lock 取位姿/地图快照
  *  依赖模块: chassis_ctrl.h (位姿 / cmd 类型), app_link.h (地图快照),

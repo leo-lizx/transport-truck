@@ -12,6 +12,10 @@
 /*===========================================================================
  * [chassis_menu.c] IPS map monitor
  *
+ * @owner  rt1064-main
+ * @periph SPI3                    IPS200 调试菜单屏 SCK=B0 MOSI=B1 RST=B2 DC=C19 CS=B3 BL=C18
+ * @periph GPIO_C15,C14,C13,C12   按键 K1-K4 (key_scanner 轮询)
+ *
  * The old two-level tuning menu has been collapsed into one race-facing
  * screen:
  *   - 16 x 12 map grid.

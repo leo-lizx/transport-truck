@@ -103,6 +103,7 @@ extern volatile uint32 g_link_map_byte_last_ms;   /* OpenART1 最近收到任意
 extern volatile uint32 g_link_class_byte_last_ms; /* OpenART2 最近收到任意字节的时刻                               */
 extern volatile uint8  g_link_car_x;           /* 最近一次 OpenART1 识别到的车辆 X 坐标 (0~15)                  */
 extern volatile uint8  g_link_car_y;           /* 最近一次 OpenART1 识别到的车辆 Y 坐标 (0~11)                  */
+extern volatile uint32 g_link_map_frame_id;    /* Increments after each valid MAP payload is committed.              */
 extern app_link_stats_t g_link_stats;          /* 统计计数 (P0-1 不要求原子读, 接受偶发撕裂)                    */
 extern app_link_stats_t g_link_map_stats;      /* OpenART1/UART4 MAP 解析统计                                  */
 extern app_link_stats_t g_link_class_stats;    /* OpenART2/UART1 BOX_CLASS 解析统计                            */

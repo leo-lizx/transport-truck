@@ -9,6 +9,9 @@
  *    · 四种互斥控制模式（枚举管理）
  *    · 里程计位姿追踪
  *==========================================================================*/
+ *
+ *  @owner  rt1064-main
+ *  @periph none                  聚合层，通过 chassis_motor/encoder/imu/pid 间接使用外设
 
 #include "chassis_ctrl.h"
 #include "chassis_imu.h"
@@ -72,17 +75,17 @@ typedef enum {
 /* ====================== 硬件实例 ====================== */
 
 static chassis_motor_t s_mot[CHASSIS_WHEEL_COUNT] = {
-    { CHASSIS_LF_PWM_CHANNEL, CHASSIS_LF_DIR_PIN, CHASSIS_LF_DIR_SIGN },  /* LF */
-    { CHASSIS_RF_PWM_CHANNEL, CHASSIS_RF_DIR_PIN, CHASSIS_RF_DIR_SIGN },  /* RF */
-    { CHASSIS_LB_PWM_CHANNEL, CHASSIS_LB_DIR_PIN, CHASSIS_LB_DIR_SIGN },  /* LB */
-    { CHASSIS_RB_PWM_CHANNEL, CHASSIS_RB_DIR_PIN, CHASSIS_RB_DIR_SIGN },  /* RB */
+    { MOTOR_LF_PWM_CHANNEL, MOTOR_LF_DIR_PIN, MOTOR_LF_OUTPUT_DIR },  /* LF */
+    { MOTOR_RF_PWM_CHANNEL, MOTOR_RF_DIR_PIN, MOTOR_RF_OUTPUT_DIR },  /* RF */
+    { MOTOR_LB_PWM_CHANNEL, MOTOR_LB_DIR_PIN, MOTOR_LB_OUTPUT_DIR },  /* LB */
+    { MOTOR_RB_PWM_CHANNEL, MOTOR_RB_DIR_PIN, MOTOR_RB_OUTPUT_DIR },  /* RB */
 };
 
 static chassis_encoder_t s_enc[CHASSIS_WHEEL_COUNT] = {
-    { CHASSIS_LF_ENC_INDEX, CHASSIS_LF_ENC_CH1, CHASSIS_LF_ENC_CH2, CHASSIS_LF_ENC_SIGN, 0.0f },
-    { CHASSIS_RF_ENC_INDEX, CHASSIS_RF_ENC_CH1, CHASSIS_RF_ENC_CH2, CHASSIS_RF_ENC_SIGN, 0.0f },
-    { CHASSIS_LB_ENC_INDEX, CHASSIS_LB_ENC_CH1, CHASSIS_LB_ENC_CH2, CHASSIS_LB_ENC_SIGN, 0.0f },
-    { CHASSIS_RB_ENC_INDEX, CHASSIS_RB_ENC_CH1, CHASSIS_RB_ENC_CH2, CHASSIS_RB_ENC_SIGN, 0.0f },
+    { ENCODER_LF_INDEX, ENCODER_LF_CH1, ENCODER_LF_CH2, ENCODER_LF_DIR, 0.0f },
+    { ENCODER_RF_INDEX, ENCODER_RF_CH1, ENCODER_RF_CH2, ENCODER_RF_DIR, 0.0f },
+    { ENCODER_LB_INDEX, ENCODER_LB_CH1, ENCODER_LB_CH2, ENCODER_LB_DIR, 0.0f },
+    { ENCODER_RB_INDEX, ENCODER_RB_CH1, ENCODER_RB_CH2, ENCODER_RB_DIR, 0.0f },
 };
 
 static chassis_pid_t s_pid[CHASSIS_WHEEL_COUNT];

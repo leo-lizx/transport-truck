@@ -5,6 +5,9 @@
 
 /*===========================================================================
  *  [algo_sokoban_solver.c] 推箱子求解 + 导航 BFS + 炸弹策略
+ *
+ *  @owner  rt1064-main
+ *  @periph none                  纯算法 (BFS 导航 + 推箱子求解器 + 死局检测)
  *---------------------------------------------------------------------------
  *  分区索引:
  *    § 1. 内部常量 / 静态数组 / 位图压缩 BFS 状态          [L  10±]
@@ -29,6 +32,12 @@ static const int8 s_dc[4] = {  0,  0, -1,  1 };
 #define SB_STATE_COUNT  ((uint32)SB_RC * (uint32)SB_RC)     /* 36864 */
 #define SB_BITMAP_BYTES ((SB_STATE_COUNT + 7u) / 8u)
 #define SB_NIBBLE_BYTES ((SB_STATE_COUNT + 1u) / 2u)
+
+/* O1.3 单箱 BFS 层数(=解步数)上限。
+ * 取 SOKOBAN_MAX_ACTIONS: 任何步数 > 该值的解都会在下方回溯阶段
+ * (steps >= SOKOBAN_MAX_ACTIONS → return 0) 被判为不可用, 故在 BFS 阶段
+ * 提前以同一阈值收手与"找到后再丢弃"完全等价, 只是省去多余层的扫描, 不改变可用解。 */
+#define SB_MAX_BFS_LAYERS  (SOKOBAN_MAX_ACTIONS)
 
 /*===========================================================================
  *  静态数组（位图压缩版）
@@ -235,6 +244,80 @@ uint8 Algo_Nav_BFS(const uint8 map[MAP_ROWS][MAP_COLS],
     return 0;
 }
 
+uint8 Algo_Nav_BFS_Flood(const uint8 map[MAP_ROWS][MAP_COLS],
+                         Point_t start,
+                         uint8 reach[MAP_ROWS][MAP_COLS],
+                         uint8 distance_steps[MAP_ROWS][MAP_COLS])
+{
+    int16 head = 0;
+    int16 tail = 0;
+
+    if (!reach && !distance_steps) return 0;
+
+    memset(bfs_visited, 0, sizeof(bfs_visited));
+    if (reach) {
+        memset(reach, 0, (size_t)(MAP_ROWS * MAP_COLS));
+    }
+    if (distance_steps) {
+        memset(distance_steps, ALGO_NAV_DISTANCE_UNREACHABLE,
+               (size_t)(MAP_ROWS * MAP_COLS));
+    }
+    if (!map_is_inner_cell(start.y, start.x) ||
+        !algo_is_nav_passable(map, start.y, start.x)) {
+        return 0;
+    }
+
+    bfs_queue[tail++] = start;
+    bfs_visited[start.y][start.x] = 1U;
+    if (reach) reach[start.y][start.x] = 1U;
+    if (distance_steps) distance_steps[start.y][start.x] = 0U;
+
+    while (head < tail) {
+        Point_t current = bfs_queue[head++];
+
+        for (int i = 0; i < 4; i++) {
+            int8 ny = current.y + s_dr[i];
+            int8 nx = current.x + s_dc[i];
+
+            if (algo_is_nav_passable(map, ny, nx) && !bfs_visited[ny][nx]) {
+                bfs_visited[ny][nx] = 1U;
+                if (reach) reach[ny][nx] = 1U;
+                if (distance_steps) {
+                    distance_steps[ny][nx] =
+                        (uint8)(distance_steps[current.y][current.x] + 1U);
+                }
+                bfs_queue[tail].x = nx;
+                bfs_queue[tail].y = ny;
+                tail++;
+            }
+        }
+    }
+    return 1;
+}
+
+uint8 Algo_Nav_Is_Reachable(const uint8 reach[MAP_ROWS][MAP_COLS],
+                            Point_t target)
+{
+    if (!reach || !map_is_inner_cell(target.y, target.x)) return 0;
+    return reach[target.y][target.x] ? 1U : 0U;
+}
+
+/** 玩家到箱子四邻接可站立格的最短距离；箱子本身不可通行，不能直接查其坐标。 */
+static uint8 nav_distance_to_box(const uint8 distance_steps[MAP_ROWS][MAP_COLS],
+                                 Point_t box)
+{
+    uint8 best = ALGO_NAV_DISTANCE_UNREACHABLE;
+
+    for (int d = 0; d < 4; d++) {
+        int8 y = (int8)(box.y + s_dr[d]);
+        int8 x = (int8)(box.x + s_dc[d]);
+        if (map_is_inner_cell(y, x) && distance_steps[y][x] < best) {
+            best = distance_steps[y][x];
+        }
+    }
+    return best;
+}
+
 /*===========================================================================
  *  内联辅助函数
  *===========================================================================*/
@@ -338,15 +421,29 @@ static uint8 sokoban_bfs_single(const uint8 sub_map[MAP_ROWS][MAP_COLS],
     sb_bm_set(sb_visited_bm, start_idx);
     sb_bm_set(sb_frontier_cur_bm, start_idx);
 
+    uint16 layers = 0;
     while (1) {
         uint8 has_next = 0;
 
+        /* O1.3: 层数(=解步数)达到上限仍未命中, 与"找到超长解后被回溯丢弃"等价, 直接判无解。 */
+        if (++layers > (uint16)SB_MAX_BFS_LAYERS) return 0;
+
         memset(sb_frontier_nxt_bm, 0, sizeof(sb_frontier_nxt_bm));
 
-        for (uint16 cur_idx = 0; cur_idx < (uint16)SB_STATE_COUNT; cur_idx++) {
-            int8 pr, pc, br, bc;
-            if (!sb_bm_test(sb_frontier_cur_bm, cur_idx)) continue;
+        /* O1.1b: 前沿位图通常很稀疏(典型层宽 50~200 状态), 旧实现逐位扫描全部
+         * 36864 个状态索引。改为逐字节遍历位图: 空字节(占绝大多数)一次比较即跳过,
+         * 只对置位字节展开其 8 个比特。避免解码海量未置位状态, 显著降低单层耗时。
+         * (未使用 __builtin_ctz: 该 GCC 内建在 IAR/ICCARM 下不保证可用, 改用可移植写法。) */
+        for (uint16 byi = 0; byi < (uint16)SB_BITMAP_BYTES; byi++) {
+            uint8 bits = sb_frontier_cur_bm[byi];
+            if (bits == 0u) continue;
 
+          for (uint8 b = 0u; b < 8u; b++) {
+            int8 pr, pc, br, bc;
+            uint16 cur_idx;
+            if ((bits & (uint8)(1u << b)) == 0u) continue;
+
+            cur_idx = (uint16)(byi * 8u + b);
             sb_decode(cur_idx, &pr, &pc, &br, &bc);
 
             for (int d = 0; d < 4; d++) {
@@ -386,7 +483,9 @@ static uint8 sokoban_bfs_single(const uint8 sub_map[MAP_ROWS][MAP_COLS],
             }
 
             if (found) break;
-        }
+          }                        /* end for b  (字节内 8 个比特) */
+          if (found) break;
+        }                          /* end for byi (位图字节) */
 
         if (found) break;
         if (!has_next) return 0;   /* 无新前沿, 无解 */
@@ -507,7 +606,57 @@ static uint8 is_blocker_cell(const uint8 map[MAP_ROWS][MAP_COLS], int8 r, int8 c
     return (map[r][c] == MAP_WALL || map[r][c] == MAP_BOX || map[r][c] == MAP_BOMB) ? 1 : 0;
 }
 
-/** 角落死局：箱子位于两个垂直阻挡夹角内（且该格不是目标） */
+/** O3.2: 箱子在当前静态地图上是否还存在"可被立即推动"的方向。
+ *  方向 d 可推的充要条件:
+ *    - 箱子去向格 box+Δd 可通行(空地/目标);
+ *    - 玩家站位格 box-Δd 可通行(玩家需站在反侧才能向 d 推)。
+ *  四个方向都不满足 → 该箱当前一步也动不了 → 死局。
+ *  注意: 与既有角落判定一致, 把其他箱子/炸弹也视为阻挡(sb_is_free 仅放行空地/目标),
+ *  因此与角落判定属同一保守口径——可能因"其他箱子之后会移走"而偏保守, 但只在
+ *  推箱规划已失败后用于挑选破局方向, 退化路径安全。 */
+static uint8 box_has_pushable_direction(const uint8 map[MAP_ROWS][MAP_COLS],
+                                        int8 br, int8 bc)
+{
+    for (int d = 0; d < 4; d++) {
+        int8 dest_r  = br + s_dr[d];
+        int8 dest_c  = bc + s_dc[d];
+        int8 stand_r = br - s_dr[d];
+        int8 stand_c = bc - s_dc[d];
+        if (sb_is_free(map, dest_r, dest_c) && sb_is_free(map, stand_r, stand_c)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/** O3.1: 边线冻结死局。贴内场外边界的箱子永远无法离开所贴的那条行/列:
+ *    - 贴上/下边界: 朝边界外推不可行(去向格在界外), 反向推又需玩家站界外, 故纵向永久不可动,
+ *      只能在该行内左右滑 → 该行若无任何目标, 箱子永远到不了目标, 死局;
+ *    - 贴左/右边界: 同理横向永久不可动, 该列无目标即死局。
+ *  这是 O3.2 之外、可移动箱子也可能成立的独立死局(箱子能滑动但永远脱不开此线)。 */
+static uint8 box_frozen_on_border_line(const uint8 map[MAP_ROWS][MAP_COLS],
+                                       int8 br, int8 bc)
+{
+    if (br == (int8)CHASSIS_GRID_INNER_MIN_Y || br == (int8)CHASSIS_GRID_INNER_MAX_Y) {
+        for (int8 c = (int8)CHASSIS_GRID_INNER_MIN_X; c <= (int8)CHASSIS_GRID_INNER_MAX_X; c++) {
+            if (map[br][c] == MAP_TARGET) return 0;
+        }
+        return 1;
+    }
+    if (bc == (int8)CHASSIS_GRID_INNER_MIN_X || bc == (int8)CHASSIS_GRID_INNER_MAX_X) {
+        for (int8 r = (int8)CHASSIS_GRID_INNER_MIN_Y; r <= (int8)CHASSIS_GRID_INNER_MAX_Y; r++) {
+            if (map[r][bc] == MAP_TARGET) return 0;
+        }
+        return 1;
+    }
+    return 0;
+}
+
+/** 死局检测:
+ *   第一遍 — 角落死局(箱子卡在两垂直阻挡夹角), 保持历史判定与返回的箱子完全不变;
+ *   第二遍 — 仅当无角落死局时, 再补 O3.2(无可推方向) / O3.1(边线冻结)两类。
+ *  分两遍是为了保证"原本能判出角落死局"的场景结果与返回箱子逐字节不变,
+ *  新增类型只在原本判为"无死局"时才可能额外命中。 */
 uint8 Sokoban_Is_Deadlock(const uint8 map[MAP_ROWS][MAP_COLS],
                           Point_t *dead_box_pos)
 {
@@ -528,6 +677,21 @@ uint8 Sokoban_Is_Deadlock(const uint8 map[MAP_ROWS][MAP_COLS],
                     }
                     return 1;
                 }
+            }
+        }
+    }
+
+    for (int8 r = (int8)CHASSIS_GRID_INNER_MIN_Y; r <= (int8)CHASSIS_GRID_INNER_MAX_Y; r++) {
+        for (int8 c = (int8)CHASSIS_GRID_INNER_MIN_X; c <= (int8)CHASSIS_GRID_INNER_MAX_X; c++) {
+            if (map[r][c] != MAP_BOX) continue;
+
+            if (!box_has_pushable_direction(map, r, c) ||
+                box_frozen_on_border_line(map, r, c)) {
+                if (dead_box_pos) {
+                    dead_box_pos->x = c;
+                    dead_box_pos->y = r;
+                }
+                return 1;
             }
         }
     }
@@ -592,6 +756,7 @@ static uint8 sokoban_solve_stage1_greedy(const uint8 map[MAP_ROWS][MAP_COLS],
     Point_t targets[SOKOBAN_MAX_BOXES];
     uint8   solved[SOKOBAN_MAX_BOXES]  = {0};
     uint8   t_used[SOKOBAN_MAX_BOXES]  = {0};
+    static uint8 nav_distance[MAP_ROWS][MAP_COLS];
 
     result->is_solved   = 0;
     result->total_boxes = 0;
@@ -607,25 +772,32 @@ static uint8 sokoban_solve_stage1_greedy(const uint8 map[MAP_ROWS][MAP_COLS],
     /* 逐个解算 — 贪心: 先推离当前玩家最近的箱子 */
     for (uint8 done = 0; done < box_n; done++) {
 
-        /* 1. 选最近未完成箱子 */
+        /* 1. 从当前玩家一次扩散，按实际绕障步数选最近可接近的箱子。 */
         int8  best_b = -1;
-        int16 best_d = 32767;
+        uint8 best_d = ALGO_NAV_DISTANCE_UNREACHABLE;
+        memcpy(sb_sub_map, map, sizeof(sb_sub_map));
+        for (uint8 i = 0; i < box_n; i++) {
+            if (solved[i]) sb_sub_map[boxes[i].y][boxes[i].x] = MAP_EMPTY;
+        }
+        if (!Algo_Nav_BFS_Flood(sb_sub_map, cur_player, 0, nav_distance)) return 0;
         for (uint8 i = 0; i < box_n; i++) {
             if (solved[i]) continue;
-            int16 d = (int16)(abs(boxes[i].x - cur_player.x)
-                            + abs(boxes[i].y - cur_player.y));
+            uint16 d = nav_distance_to_box(nav_distance, boxes[i]);
             if (d < best_d) { best_d = d; best_b = (int8)i; }
         }
         if (best_b < 0) return 0;
 
         /* 2. 为该箱子分配最近未使用目标 */
         int8  best_t = -1;
-        best_d = 32767;
+        int16 best_target_d = 32767;
         for (uint8 i = 0; i < target_n; i++) {
             if (t_used[i]) continue;
             int16 d = (int16)(abs(targets[i].x - boxes[best_b].x)
                             + abs(targets[i].y - boxes[best_b].y));
-            if (d < best_d) { best_d = d; best_t = (int8)i; }
+            if (d < best_target_d) {
+                best_target_d = d;
+                best_t = (int8)i;
+            }
         }
         if (best_t < 0) return 0;
 
@@ -1213,6 +1385,7 @@ uint8 Sokoban_Plan_Bomb(const uint8 map[MAP_ROWS][MAP_COLS],
                         SokoActionSeq_t *out_seq)
 {
     static uint8     tmp_map[MAP_ROWS][MAP_COLS];
+    static uint8     reach[MAP_ROWS][MAP_COLS];
     static NavPath_t tmp_path;
     static SokoActionSeq_t try_seq;
 
@@ -1255,15 +1428,15 @@ uint8 Sokoban_Plan_Bomb(const uint8 map[MAP_ROWS][MAP_COLS],
                 }
             }
 
-            /* 统计爆炸后可达目标数量.
-             * 注意: 其余炸弹仍留在 tmp_map 上作为障碍 (Algo_Nav_BFS 视其不可通行),
-             * 这与"一次只引爆一颗"的物理一致。 */
+            /* 一次扩散后查询全部目标。
+             * 其余炸弹仍留在 tmp_map 上作为障碍，与“一次只引爆一颗”的物理一致。 */
+            if (!Algo_Nav_BFS_Flood(tmp_map, player_pos, reach, 0)) continue;
             for (int8 tr = (int8)CHASSIS_GRID_INNER_MIN_Y; tr <= (int8)CHASSIS_GRID_INNER_MAX_Y; tr++) {
                 for (int8 tc = (int8)CHASSIS_GRID_INNER_MIN_X; tc <= (int8)CHASSIS_GRID_INNER_MAX_X; tc++) {
                     if (tmp_map[tr][tc] != MAP_TARGET) continue;
                     {
                         Point_t tp = {tc, tr};
-                        if (Algo_Nav_BFS(tmp_map, player_pos, tp, &tmp_path)) {
+                        if (Algo_Nav_Is_Reachable(reach, tp)) {
                             reachable_targets++;
                         }
                     }
@@ -1272,9 +1445,11 @@ uint8 Sokoban_Plan_Bomb(const uint8 map[MAP_ROWS][MAP_COLS],
 
             /* 破局门控: 给定 blocked_target 时, 该墙必须能恢复其可达性 */
             if (blocked_target.x >= 0 && blocked_target.y >= 0) {
-                if (!Algo_Nav_BFS(tmp_map, player_pos, blocked_target, &tmp_path)) {
+                if (!Algo_Nav_Is_Reachable(reach, blocked_target)) {
                     continue;
                 }
+                /* 评分仍需真实最短路长度，仅为该单一目标保留一次点到点 BFS。 */
+                if (!Algo_Nav_BFS(tmp_map, player_pos, blocked_target, &tmp_path)) continue;
                 blocked_len = tmp_path.step_count;
             }
 
@@ -1328,6 +1503,8 @@ uint8 Sokoban_Plan_Bomb(const uint8 map[MAP_ROWS][MAP_COLS],
 /*===========================================================================
  *  顶层迭代求解 (推箱 + 多炸弹)
  *===========================================================================*/
+
+#ifdef SOKOBAN_PC_VALIDATION
 
 /** 在地图上找离 ref 曼哈顿最近的目标 */
 static uint8 sf_nearest_target(const uint8 map[MAP_ROWS][MAP_COLS],
@@ -1473,3 +1650,5 @@ uint8 Sokoban_Solve_Full(const uint8 map[MAP_ROWS][MAP_COLS],
 
     return 0;   /* 轮次预算耗尽 */
 }
+
+#endif /* SOKOBAN_PC_VALIDATION */

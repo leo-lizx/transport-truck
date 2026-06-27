@@ -96,5 +96,19 @@ print("\n=== 测试9: V2 完整求解 ===")
 sol9 = sv.solve_level(2, m8, p8)
 assert sol9 is not None and sol9['scout']['all_visited']
 print(f"  总步数: {sol9['total_steps']}  侦查访问: {sol9['scout']['visited_count']}")
+
+# 测试10: Stage1 选箱使用实际 BFS 距离而非曼哈顿距离
+print("\n=== 测试10: Stage1 BFS 选箱距离 ===")
+m10 = sv._make_empty_map()
+for row in range(1, 9):
+    m10[row][4] = sv.WALL
+m10[2][5] = sv.BOX
+m10[7][2] = sv.BOX
+m10[9][2] = sv.TARGET
+m10[9][5] = sv.TARGET
+greedy10 = sv._solve_stage1_greedy(m10, (2, 2))
+assert greedy10 is not None
+assert greedy10['sub_solutions'][0]['box_idx'] == 1
+print("墙体绕障场景下按实际 BFS 距离选择箱子")
 print("\n=============================")
 print("所有测试通过！")
