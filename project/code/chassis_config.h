@@ -139,7 +139,7 @@
  *   dist = sqrt(dx² + dy²) <= EPSILON 立即置 s_arrived=1.
  * 不再叠加速度稳定帧 / dwell 等待 / yaw 条件, 避免车已在误差范围内但上层迟迟不切点.
  */
-#define CHASSIS_TARGET_REACHED_EPSILON_M  (0.018f)
+#define CHASSIS_TARGET_REACHED_EPSILON_M  (0.025f)
 
 /**
  * 到位后的 Schmitt 滞后释放阈值（米）.
@@ -373,7 +373,7 @@
  *   1.20 m/s 时单轮峰值电流超 TB6612 过流阈值 → 驱动器关断 → 轮停.
  *   麦轮斜走单轮最坏 = 1.20×√2≈1.70 m/s, 冲击更大.
  *   0.70 m/s: d_stop=0.70²/(2×2.10)=0.117m, BRAKE_DIST=0.25m ✓ 有裕量. */
-#define CHASSIS_MAX_LINEAR_SPEED_MPS    (1.10f)
+#define CHASSIS_MAX_LINEAR_SPEED_MPS    (2.10f)
 
 /* CHASSIS_MAX_YAW_SPEED_DPS 已移到文件顶部“用户常调参数区”。 */
 
@@ -423,7 +423,7 @@
 /** 位置环沿程方向积分增益 (m/s per m·s).
  * 消除静摩擦/坡面等引起的稳态位置残差.
  * 建议从 0 开始调, 每次 +0.05; 过大时车到位后缓慢漂移/越界. 设 0 即关闭. */
-#define CHASSIS_POS_KI                  (0.2f)
+#define CHASSIS_POS_KI                  (0.17f)
 
 /* ----------------------------------------------------------------------
  *  位置环自动推导 / 内部固定常量 (用户一般无需修改)
@@ -487,7 +487,7 @@
  * brake_cap 末段最小有效速度 (m/s).
  * 保证 sqrt 减速曲线末段输出仍足以克服静摩擦, 车始终能推进到 EPSILON 内.
  * 只与轮端静摩擦特性相关, 与 0.05 的轮端 ff 起步阈值同量级. */
-#define CHASSIS_POS_BRAKE_FLOOR_MPS      (0.320f)
+#define CHASSIS_POS_BRAKE_FLOOR_MPS      (0.450f)
 
 /* ----------------------------------------------------------------------
  *  航向环实现: sqrt_ctrl + P-only 速率阻尼
@@ -804,10 +804,10 @@
 
 /** X 方向里程计缩放系数 */
 //#define CHASSIS_ODOM_SCALE_X            (0.468539f)
-#define CHASSIS_ODOM_SCALE_X            (0.3970f)
+#define CHASSIS_ODOM_SCALE_X            (0.3930f)
 
 /** Y 方向里程计缩放系数 */
-#define CHASSIS_ODOM_SCALE_Y            (0.420f)
+#define CHASSIS_ODOM_SCALE_Y            (0.4130f)
 
 //#define CHASSIS_ODOM_SCALE_Y            (0.43617f)
 
@@ -995,7 +995,7 @@
 #define CHASSIS_RF_ENC_INDEX        QTIMER2_ENCODER1               /**< 编码器定时器通道（实车标定：ENCODER3） */
 #define CHASSIS_RF_ENC_CH1          QTIMER2_ENCODER1_CH1_C3        /**< 编码器 A 相: C3 引脚 */
 #define CHASSIS_RF_ENC_CH2          QTIMER2_ENCODER1_CH2_C4        /**< 编码器 B 相: C4 引脚 */
-#define CHASSIS_RF_DIR_SIGN         (1.0f)                        /**< 方向修正: 1.0=正向, -1.0=反向 */
+#define CHASSIS_RF_DIR_SIGN         (-1.0f)                        /**< 方向修正: 1.0=正向, -1.0=反向 */
 
 /* ---------- 左后轮 (LB) ---------- *
  * 实车标定: MOTOR2(C6/C7) + ENCODER_1(QTIMER1_ENCODER1, C0/C1)
@@ -1016,7 +1016,7 @@
 #define CHASSIS_RB_ENC_INDEX        QTIMER1_ENCODER2                 /**< 编码器定时器通道（实车标定：ENCODER2） */
 #define CHASSIS_RB_ENC_CH1          QTIMER1_ENCODER2_CH1_C2          /**< 编码器 A 相: C2  引脚 */
 #define CHASSIS_RB_ENC_CH2          QTIMER1_ENCODER2_CH2_C24         /**< 编码器 B 相: C24 引脚 */
-#define CHASSIS_RB_DIR_SIGN         (1.0f)                          /**< 方向修正: 1.0=正向, -1.0=反向 */
+#define CHASSIS_RB_DIR_SIGN         (-1.0f)                          /**< 方向修正: 1.0=正向, -1.0=反向 */
 
 /* ======================================================================
  *  轮子编号枚举 — 统一四轮索引，用于数组下标
