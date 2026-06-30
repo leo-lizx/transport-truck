@@ -159,8 +159,8 @@ void chassis_zone_apply_soft_limit_guard(struct chassis_body_speed_cmd_s *cmd)
     sy = sinf(yaw_rad);
 
     /* 车体系速度 -> 全局速度 */
-    vxg = cy * cmd->vx_body_mps - sy * cmd->vy_body_mps;
-    vyg = sy * cmd->vx_body_mps + cy * cmd->vy_body_mps;
+    vxg = cy * cmd->vx_body_mps + sy * cmd->vy_body_mps;
+    vyg = -sy * cmd->vx_body_mps + cy * cmd->vy_body_mps;
 
     nx = pose_snap.x_m + vxg * SOFT_LIMIT_LOOKAHEAD_S;
     ny = pose_snap.y_m + vyg * SOFT_LIMIT_LOOKAHEAD_S;
@@ -173,18 +173,18 @@ void chassis_zone_apply_soft_limit_guard(struct chassis_body_speed_cmd_s *cmd)
     cmd->vy_body_mps *= SOFT_LIMIT_BRAKE_SCALE;
 
     /* 使用法向偏移评估左右绕行可行性 */
-    left_x  = nx - sy * SOFT_LIMIT_SIDE_OFFSET_M;
-    left_y  = ny + cy * SOFT_LIMIT_SIDE_OFFSET_M;
-    right_x = nx + sy * SOFT_LIMIT_SIDE_OFFSET_M;
-    right_y = ny - cy * SOFT_LIMIT_SIDE_OFFSET_M;
+    left_x  = nx - cy * SOFT_LIMIT_SIDE_OFFSET_M;
+    left_y  = ny + sy * SOFT_LIMIT_SIDE_OFFSET_M;
+    right_x = nx + cy * SOFT_LIMIT_SIDE_OFFSET_M;
+    right_y = ny - sy * SOFT_LIMIT_SIDE_OFFSET_M;
 
     left_hit  = zone_soft_limit_is_wall_point(map_snap, left_x, left_y);
     right_hit = zone_soft_limit_is_wall_point(map_snap, right_x, right_y);
 
     if (left_hit && !right_hit) {
-        cmd->wz_dps -= SOFT_LIMIT_AVOID_WZ_DPS;
-    } else if (!left_hit && right_hit) {
         cmd->wz_dps += SOFT_LIMIT_AVOID_WZ_DPS;
+    } else if (!left_hit && right_hit) {
+        cmd->wz_dps -= SOFT_LIMIT_AVOID_WZ_DPS;
     } else {
         /* 两侧同样拥挤/开阔: 保留原命令转向方向, 给一个固定偏置 */
         if (cmd->wz_dps >= 0.0f) {

@@ -110,7 +110,7 @@
 
 /** 航向 sqrt_controller 线性段 P 增益 (°/s per °): 近目标时的响应
  *  sqrt_controller 保证远处时间最优、近处线性平滑, 不会超调 */
-#define CHASSIS_YAW_KP                      (1.10f)
+#define CHASSIS_YAW_KP                      (5.10f)
 
 /** sqrt_controller 最大减速度 (°/s²): 决定刹车距离 */
 #define CHASSIS_YAW_ACCEL_MAX_DPS2          (720.0f)
@@ -138,7 +138,7 @@
 /* ---- 到位锁 ---- */
 
 /** 进入在位锁: |err| < 此值 */
-#define CHASSIS_YAW_INPOS_ENTER_DEG         (0.50f)
+#define CHASSIS_YAW_INPOS_ENTER_DEG         (0.250f)
 
 /** 退出在位锁: |err| > 此值 */
 #define CHASSIS_YAW_INPOS_EXIT_DEG          (3.00f)
@@ -187,7 +187,7 @@
 /** 到达目标点判定阈值 (米) — 纯位置判断，不叠加速度/ dwell/yaw */
 /** P0-修复 2026-06-30: 0.012→0.025。0.012 小于 BRAKE_FLOOR 一拍位移(1.3cm),
  *   物理上无法停住 → 反复过冲震荡。0.025=1/8 格，推箱子精度足够。 */
-#define CHASSIS_TARGET_REACHED_EPSILON_M    (0.017f)
+#define CHASSIS_TARGET_REACHED_EPSILON_M    (0.013f)
 
 /** 到位后 Schmitt 滞后释放阈值 (米) — 10cm 覆盖惯性滑移 */
 /** P0-修复 2026-06-30: 0.15→0.30。原值过小，小幅过冲即触发回弹震荡。
@@ -225,7 +225,7 @@
  *   hold_max_speed = v_max * HOLD_SPEED_RATIO
  *   brake_dist = v_max²/(2·accel) + EPSILON + BRAKE_MARGIN
  */
-#define CHASSIS_POS_KD_RATIO                (0.33f)
+#define CHASSIS_POS_KD_RATIO                (0.30f)
 #define CHASSIS_POS_HOLD_KD_RATIO           (3.0f)
 #define CHASSIS_POS_BRAKE_MARGIN_M          (-0.009f)
 #define CHASSIS_POS_I_LIMIT_RATIO           (0.20f)
@@ -245,7 +245,7 @@
  *  P0-修复 2026-06-30: 0.65→0.15。0.65 刹车距离 7cm > EPSILON 2.5cm → 必定过冲。
  *  0.15 刹车距离 ~4mm < EPSILON，且 MPC 自行规划减速，不需要刹车底速硬兜。
  *  如需应对长距离 sqrt_controller 路径的静摩擦卡死，可保留 0.20~0.25。 */
-#define CHASSIS_POS_BRAKE_FLOOR_MPS         (0.85f)
+#define CHASSIS_POS_BRAKE_FLOOR_MPS         (0.15f)
 
 /* ============================================================
  * §D IMU / 卡尔曼滤波 / 编码器融合
@@ -353,7 +353,7 @@
 /** 车体平移最大合成线速度 (m/s)
  *  P0-修复 2026-05-19 (轮子停转): 1.20→0.70 (TB6612 过流关断)
  *  0.70: d_stop=0.117m, BRAKE_DIST=0.25m 有裕量 */
-#define CHASSIS_MAX_LINEAR_SPEED_MPS        (2.0f)
+#define CHASSIS_MAX_LINEAR_SPEED_MPS        (1.80f)
 
 /** 正常控制路径的单轮速度兑底上限 (m/s) — 等比例缩放保方向 */
 #define CHASSIS_WHEEL_SPEED_CAP_MPS         (2.70f)
@@ -410,7 +410,7 @@
  * P0-修复 2026-06-07: TARGET_EPS=0+FB_STATIC=2.10→breakaway 永远激活，
  * 位置环收拢时指令小幅正负交替→breakaway 跟跳 2000PWM→把车甩出极限环 */
 #define CHASSIS_WHEEL_BREAKAWAY_LF_TARGET_EPS_MPS          (0.0f)
-#define CHASSIS_WHEEL_BREAKAWAY_LF_PWM_FLOOR               (800.0f)
+#define CHASSIS_WHEEL_BREAKAWAY_LF_PWM_FLOOR               (900.0f)
 #define CHASSIS_WHEEL_BREAKAWAY_LF_FB_STATIC_EPS_MPS       (0.90f)
 
 /* RF (Wheel 1) */
@@ -425,7 +425,7 @@
 
 /* RB (Wheel 3) */
 #define CHASSIS_WHEEL_BREAKAWAY_RB_TARGET_EPS_MPS          (0.0f)
-#define CHASSIS_WHEEL_BREAKAWAY_RB_PWM_FLOOR               (800.0f)
+#define CHASSIS_WHEEL_BREAKAWAY_RB_PWM_FLOOR               (900.0f)
 #define CHASSIS_WHEEL_BREAKAWAY_RB_FB_STATIC_EPS_MPS       (0.90f)
 
 /* 正/负向不对称前馈 (XP=正X移动 / XN=负X移动)
@@ -632,13 +632,13 @@
 #define CHASSIS_MPC_H_PACKED                    ((CHASSIS_MPC_H_DIM) * ((CHASSIS_MPC_H_DIM) + 1) / 2)
 
 /** 位置精度权重 (m⁻²): 大→冲得快/停得猛, 小→柔和但可能不到位 */
-#define CHASSIS_MPC_Q_POS                       (8.0f)
+#define CHASSIS_MPC_Q_POS                       (10.0f)
 
 /** 速度幅值代价 (s²/m²): 大→巡航速度降低, 小→更接近 v_max */
 #define CHASSIS_MPC_R_VEL                       (0.15f)
 
 /** 速度平滑代价 (s²/m²): 大→加减速柔和, 小→响应快但可能 jerk */
-#define CHASSIS_MPC_R_SMOOTH                    (0.50f)
+#define CHASSIS_MPC_R_SMOOTH                    (0.650f)
 
 /** 终端位置额外权重因子: Q_term = Q_POS * 此值 */
 #define CHASSIS_MPC_QF_FACTOR                   (3.0f)
@@ -659,7 +659,7 @@
 #define CHASSIS_MPC_FALLBACK_ERR_M              (0.50f)
 
 /** 距离低于此值不用 MPC (m): 近端驻车保持更可靠 */
-#define CHASSIS_MPC_MIN_DIST_M                  (0.02f)
+#define CHASSIS_MPC_MIN_DIST_M                  (0.005f)
 
 /* ---- Yaw MPC ---- */
 
