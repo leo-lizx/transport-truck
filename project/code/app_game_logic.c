@@ -462,10 +462,19 @@ static uint16 waypoint_timeout_limit(Point_t target)
     return (limit > 0xFFFFUL) ? 0xFFFFU : (uint16)limit;
 }
 
-/* 派发一个航点: 下发目标 + 置导航中 + 复位 watchdog 计数并按段长重算超时上限。 */
+static void move_to_grid_keep_current_yaw(Point_t target)
+{
+    chassis_pose_t pose = chassis_ctrl_get_pose();
+
+    chassis_ctrl_move_to_m(chassis_grid_x_to_m((uint8)target.x),
+                           chassis_grid_y_to_m((uint8)target.y),
+                           pose.yaw_deg);
+}
+
+/* 派发一个航点: 按地图坐标移动, 保持当前车头角, 并复位 watchdog。 */
 static void dispatch_waypoint(const SokoWaypointPath_t *wp, uint16 idx)
 {
-    HAL_CHASSIS_MOVE_TO(wp->points[idx].x, wp->points[idx].y);
+    move_to_grid_keep_current_yaw(wp->points[idx]);
     is_navigating = 1;
     s_wp_timeout_ticks = 0U;
     s_wp_timeout_limit = waypoint_timeout_limit(wp->points[idx]);

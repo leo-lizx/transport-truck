@@ -18,7 +18,7 @@
  *   - App_Recognize_Tick 返回值见 AppRecognizeStatus_e, 业务侧据此切 stage
  *
  * 与硬件层契约:
- *   - 移动:    HAL_CHASSIS_MOVE_TO  /  chassis_ctrl_is_arrived
+ *   - 移动:    chassis_ctrl_move_to_m(保持当前 yaw)  /  chassis_ctrl_is_arrived
  *   - 朝向:    chassis_ctrl_rotate_to_deg  /  chassis_ctrl_is_arrived
  *   - 视觉:    app_link_get_box_class_snapshot (seq-lock 拷贝)
  *
@@ -60,7 +60,7 @@ typedef enum
     RECOG_SUB_NAV,            /* 移动到当前物体观察点                     */
     RECOG_SUB_FACE,            /* 原地旋转车头朝向物体                     */
     RECOG_SUB_SAMPLE,          /* 多数票采样视觉分类结果                   */
-    RECOG_SUB_RETURN_YAW,      /* 采样完成后回到 yaw=0                     */
+    RECOG_SUB_RETURN_YAW,      /* 旧调试枚举: 采样后保持当前 yaw, 不再回正 */
     RECOG_SUB_NEXT,            /* 当前物体完成, 切下一个                   */
     RECOG_SUB_DONE,            /* 全部完成 (对外输出 DONE_OK 一帧后归 INIT)*/
     RECOG_SUB_FAIL             /* 不可达或视觉超时                         */

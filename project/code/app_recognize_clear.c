@@ -32,10 +32,10 @@ static const int8 s_dc[4] = {0, 0, -1, 1};/*************************************
  *   2. 贪心: 反复挑离当前位置最近 (BFS 步数最短) 的未访问物体
  *   3. 对每个物体:
  *        - 找观察点: 与物体 4-邻接的可立足空地, BFS 求最近
- *        - 移动到观察点 (HAL_CHASSIS_MOVE_TO + chassis_ctrl_is_arrived)
+ *        - 保持当前车头角移动到观察点 (chassis_ctrl_move_to_m + chassis_ctrl_is_arrived)
  *        - 旋转车头朝物体 (chassis_ctrl_rotate_to_deg + chassis_ctrl_is_arrived)
  *        - 等多数票稳定: 在 SAMPLE_WINDOW_MS 内统计 BOX_CLASS 帧, 占比 ≥ MAJORITY_THRESH 即确认
- *        - 旋转回 yaw=0, 再继续下一个物体
+ *        - 保持采样后的车头角, 直接继续下一个物体
  *   4. 所有 box → class_id, target → class_id 收齐后, 按相同 class_id 配对生成 g_box_to_target[]
  *
  * 资源:
@@ -83,9 +83,6 @@ static const int8 s_dc[4] = {0, 0, -1, 1};/*************************************
 
 /** B3a: 单点 FACE (旋转到位) 最长时长 — 3s */
 #define RECOG_FACE_TIMEOUT_TICKS       (600U)
-
-/** 看完图案后恢复到的导航基准航向 */
-#define RECOG_RETURN_YAW_DEG           (0.0f)
 
 /** 单次 SAMPLE 阶段最大 tick 数 */
 #define RECOG_SAMPLE_MAX_TICKS         (RECOG_SAMPLE_WINDOW_MS / RECOG_TICK_MS)
@@ -167,6 +164,15 @@ static float recog_calc_face_yaw_deg(Point_t observe, Point_t target)
     }
     yaw_rad = atan2f(dx, dy);
     return yaw_rad * (180.0f / PI_F);
+}
+
+static void recog_move_to_grid_keep_current_yaw(Point_t target)
+{
+    chassis_pose_t pose = chassis_ctrl_get_pose();
+
+    chassis_ctrl_move_to_m(chassis_grid_x_to_m((uint8)target.x),
+                           chassis_grid_y_to_m((uint8)target.y),
+                           pose.yaw_deg);
 }
 
 /*===================================================================================================================
@@ -661,13 +667,6 @@ static void enter_sub_sample(void)
     sample_state_reset();
 }
 
-static void enter_sub_return_yaw(void)
-{
-    s_sub_state = RECOG_SUB_RETURN_YAW;
-    s_face_started = 0U;
-    s_subphase_ticks = 0U;
-}
-
 static void enter_sub_next(void)
 {
     s_sub_state = RECOG_SUB_NEXT;
@@ -751,7 +750,7 @@ AppRecognizeStatus_e App_Recognize_Tick(uint8 map[MAP_ROWS][MAP_COLS],
                 if (!s_nav_started)
                 {
                     Point_t wp = s_nav_waypoints.points[s_nav_wp_idx];
-                    HAL_CHASSIS_MOVE_TO((uint8)wp.x, (uint8)wp.y);
+                    recog_move_to_grid_keep_current_yaw(wp);
                     s_nav_started = 1U;
                     s_subphase_ticks = 0U;
                     return APP_RECOG_RUNNING;
@@ -822,7 +821,7 @@ AppRecognizeStatus_e App_Recognize_Tick(uint8 map[MAP_ROWS][MAP_COLS],
                 s_items[s_cur_idx].class_id = (uint8)r;
                 s_items[s_cur_idx].visited  = 1U;
                 s_items[s_cur_idx].ok       = 1U;
-                enter_sub_return_yaw();
+                enter_sub_next();
             }
             else if (r == -1 || r == -2)
             {
@@ -830,29 +829,14 @@ AppRecognizeStatus_e App_Recognize_Tick(uint8 map[MAP_ROWS][MAP_COLS],
                  * 最终在 NEXT/DONE 阶段统一判断映射是否完整 */
                 s_items[s_cur_idx].visited = 1U;
                 s_items[s_cur_idx].ok      = 0U;
-                enter_sub_return_yaw();
+                enter_sub_next();
             }
             return APP_RECOG_RUNNING;
         }
 
         case RECOG_SUB_RETURN_YAW:
         {
-            s_subphase_ticks++;
-            if (!s_face_started)
-            {
-                chassis_ctrl_rotate_to_deg(RECOG_RETURN_YAW_DEG);
-                s_face_started = 1U;
-                return APP_RECOG_RUNNING;
-            }
-            if (s_subphase_ticks > RECOG_FACE_TIMEOUT_TICKS)
-            {
-                enter_sub_next();
-                return APP_RECOG_RUNNING;
-            }
-            if (!chassis_ctrl_is_arrived())
-            {
-                return APP_RECOG_RUNNING;
-            }
+            /* 兼容旧调试枚举: 新策略采样后不回正, 保持当前 yaw 继续导航。 */
             enter_sub_next();
             return APP_RECOG_RUNNING;
         }
