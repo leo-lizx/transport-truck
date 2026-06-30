@@ -109,15 +109,15 @@
 /* ---- 用户常调参数 (优先调下面几个) ---- */
 
 /** 航向响应快慢: 越大越快，过大可能轻微摆动 */
-#define CHASSIS_YAW_KP                      (4.20f)
+#define CHASSIS_YAW_KP                      (3.50f)
 
 /** 角速度 P-only 阻尼: 越大越稳，过大可能发闷
  *  P0-调 2026-06-07: 0.05 几乎没阻尼 → yaw 来回摆/车一直抖；
  *  提到 0.25 加 5 倍阻尼，抑制 yaw 震荡 */
-#define CHASSIS_YAW_RATE_KP                 (0.35f)
+#define CHASSIS_YAW_RATE_KP                 (0.30f)
 
 /** 最大旋转速度 (°/s): 限制原地转向和导航修正的最高角速度 */
-#define CHASSIS_MAX_YAW_SPEED_DPS           (170.0f)
+#define CHASSIS_MAX_YAW_SPEED_DPS           (180.0f)
 
 /** 角速度加减速限制 (°/s²): 同时用于 yaw sqrt 曲线和下游 ramp */
 #define CHASSIS_CMD_ACCEL_LIMIT_DPS2        (720.0f)
@@ -161,7 +161,7 @@
 /* ---- 导航：到位/保持/制动 ---- */
 
 /** 到达目标点判定阈值 (米) — 纯位置判断，不叠加速度/ dwell/yaw */
-#define CHASSIS_TARGET_REACHED_EPSILON_M    (0.018f)
+#define CHASSIS_TARGET_REACHED_EPSILON_M    (0.012f)
 
 /** 到位后 Schmitt 滞后释放阈值 (米) — 10cm 覆盖惯性滑移 */
 #define CHASSIS_POS_HOLD_EXIT_M             (0.15f)
@@ -169,7 +169,7 @@
 /** 到位后 yaw 容忍带 (°) — |yaw_err| < 该值即硬归零，不咬最后残差
  *  P0-修复 2026-05-12 (走斜线): 1.5°→0.5°  (vyg 投影从 31→10 mm/s)
  *  P0-修复 2026-06-07: 0.5°→0.10°，0.10°每米仅漂 1.7mm */
-#define CHASSIS_YAW_GOAL_TOLERANCE_DEG      (0.10f)
+#define CHASSIS_YAW_GOAL_TOLERANCE_DEG      (0.60f)
 
 /* ---- 导航增益 ---- */
 
@@ -177,10 +177,10 @@
  *  P0-调参 2026-05-08: 2.50→3.50，加快远场逼近
  *  P0-修复 2026-05-11 (拐点停留+走斜线): 10.50→4.50
  *  (KP=10.5 时 linear_dist=accel/KP²≈0.027m → 冲过头) */
-#define CHASSIS_POS_KP                      (8.5f)
+#define CHASSIS_POS_KP                      (7.5f)
 
 /** 位置环沿程积分增益 — 消除静摩擦稳态残差。从 0 起调，+0.05/次 */
-#define CHASSIS_POS_KI                      (0.2f)
+#define CHASSIS_POS_KI                      (0.17f)
 
 /** 线速度最大加速度 (m/s²)
  *  P0-调参 2026-05-08: 3.00→5.00，加快爬坡/刹车
@@ -197,8 +197,8 @@
  *   brake_dist = v_max²/(2·accel) + EPSILON + BRAKE_MARGIN
  */
 #define CHASSIS_POS_KD_RATIO                (0.30f)
-#define CHASSIS_POS_HOLD_KD_RATIO           (2.0f)
-#define CHASSIS_POS_BRAKE_MARGIN_M          (-0.006f)
+#define CHASSIS_POS_HOLD_KD_RATIO           (3.0f)
+#define CHASSIS_POS_BRAKE_MARGIN_M          (-0.009f)
 #define CHASSIS_POS_I_LIMIT_RATIO           (0.20f)
 #define CHASSIS_POS_I_BAND_RATIO            (0.8f)
 #define CHASSIS_POS_AXIS_SWITCH_RATIO       (0.6f)
@@ -213,7 +213,7 @@
 #define CHASSIS_POS_D_LPF_ALPHA             (0.10f)
 
 /** brake_cap 末段最小有效速度 (m/s) — 克服静摩擦，确保推进到 EPSILON 内 */
-#define CHASSIS_POS_BRAKE_FLOOR_MPS         (0.320f)
+#define CHASSIS_POS_BRAKE_FLOOR_MPS         (0.650f)
 
 /* ============================================================
  * §D IMU / 卡尔曼滤波 / 编码器融合
@@ -228,7 +228,7 @@
 /* ---- Yaw 角速度处理 ---- */
 
 /** Yaw 角速度死区 (°/s) — 抑制静止抖动 */
-#define CHASSIS_IMU_GYRO_DEADZONE_DPS       (0.8f)
+#define CHASSIS_IMU_GYRO_DEADZONE_DPS       (0.3f)
 
 /** Yaw 角速度一阶低通系数 (0,1] — 越小越平滑 */
 #define CHASSIS_IMU_GYRO_LPF_ALPHA          (0.25f)
@@ -243,7 +243,7 @@
 
 /** 静止判别阈值: 窗口方差上限 (°/s)²
  *  P0-回调 2026-05-02: 0.020→0.050，平台微震动也能识别静止 */
-#define CHASSIS_IMU_STILL_VAR_TH_DPS2       (0.020f)
+#define CHASSIS_IMU_STILL_VAR_TH_DPS2       (0.0001f)
 
 /** 静止确认时 bias 快速更新系数 — 时间常数 ~10 拍 = 50ms */
 #define CHASSIS_IMU_BIAS_FAST_ALPHA         (0.10f)
@@ -258,10 +258,10 @@
 
 /** 过程噪声: bias (°²/s²/s) — 反映 bias 随机游走速度
  *  P0-回调 2026-05-02: 8e-6→5e-5，车跑 5min 温升 0.05°/s/min，K 增益翻几倍 */
-#define CHASSIS_IMU_KF_Q_BIAS_DPS2_PER_S    (0.00005f)
+#define CHASSIS_IMU_KF_Q_BIAS_DPS2_PER_S    (0.0005f)
 
 /** 观测噪声: ZUPT 时陀螺噪声方差 (°²/s²) */
-#define CHASSIS_IMU_KF_R_ZUPT_DPS2          (0.0050f)
+#define CHASSIS_IMU_KF_R_ZUPT_DPS2          (0.00010f)
 
 /** 状态协方差初值 */
 #define CHASSIS_IMU_KF_P0_ANGLE_DEG2        (1.0f)
@@ -273,14 +273,14 @@
 #define CHASSIS_ODOM_YAW_FUSION_ENABLE      (1)
 
 /** 编码器 yaw 观测噪声方差 (°²) — 大=几乎不信(仅长期纠偏)，小=信任高(打滑污染) */
-#define CHASSIS_ODOM_YAW_R_DEG2             (40.0f)
+#define CHASSIS_ODOM_YAW_R_DEG2             (150.0f)
 
 /** odom yaw 与 IMU yaw 偏差超过此值视为打滑/重定位，跳过观测 */
-#define CHASSIS_ODOM_YAW_OUTLIER_DEG        (3.0f)
+#define CHASSIS_ODOM_YAW_OUTLIER_DEG        (1.20f)
 
 /** Innovation Gating: |wz_odom - wz_imu| 超过此值拒绝 (°/s)
  *  P0-修复 2026-05-02 (抬车空转污染 KF): IMU=0, odom>>0 → 自然拒绝 */
-#define CHASSIS_ODOM_YAW_INNOV_GATE_DPS     (20.0f)
+#define CHASSIS_ODOM_YAW_INNOV_GATE_DPS     (5.0f)
 
 /* ============================================================
  * §E 几何 + 限幅 + 滤波 + 静摩擦前馈 + 里程计
@@ -315,7 +315,7 @@
 /** 车体平移最大合成线速度 (m/s)
  *  P0-修复 2026-05-19 (轮子停转): 1.20→0.70 (TB6612 过流关断)
  *  0.70: d_stop=0.117m, BRAKE_DIST=0.25m 有裕量 */
-#define CHASSIS_MAX_LINEAR_SPEED_MPS        (1.10f)
+#define CHASSIS_MAX_LINEAR_SPEED_MPS        (1.50f)
 
 /** 正常控制路径的单轮速度兑底上限 (m/s) — 等比例缩放保方向 */
 #define CHASSIS_WHEEL_SPEED_CAP_MPS         (2.70f)
@@ -350,7 +350,7 @@
  *   则 SCALE = 0.20 / d_real
  */
 #define CHASSIS_ODOM_SCALE_X                (0.3970f)
-#define CHASSIS_ODOM_SCALE_Y                (0.420f)
+#define CHASSIS_ODOM_SCALE_Y                (0.4130f)
 
 /* ---- 静摩擦前馈 (Breakaway FF) — 每轮独立可配 ----
  *   实现 (apply_speed): 每轮独立查 g_chassis_tune_params
@@ -435,9 +435,9 @@
 /* (1) 执行器输出 MOTOR_*_OUTPUT_DIR: driver 乘命令，使 +命令 → 物理前进
  *     ★ 占位 +1 已按实车标定填写，换接线/换电机线序后必须重新辨识 */
 #define MOTOR_LF_OUTPUT_DIR                 (+1.0f)
-#define MOTOR_RF_OUTPUT_DIR                 (+1.0f)
+#define MOTOR_RF_OUTPUT_DIR                 (-1.0f)
 #define MOTOR_LB_OUTPUT_DIR                 (+1.0f)
-#define MOTOR_RB_OUTPUT_DIR                 (+1.0f)
+#define MOTOR_RB_OUTPUT_DIR                 (-1.0f)
 
 /* (2) 编码器 ENCODER_*_DIR: 乘原始计数，使 前进 → +速度反馈
  *     ★ 实车已标定值，换编码器线序/减速箱后必须重新辨识 */
