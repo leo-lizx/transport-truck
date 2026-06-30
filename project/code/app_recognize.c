@@ -7,7 +7,7 @@
  *--------------------------------------------------------------------------------------------------------------------
  * 算法概述:
  *   1. 从地图提取所有 BOX 和 TARGET 坐标 (Stage1 跳过本流程)
- *   2. 贪心: 反复挑离当前位置最近 (BFS 步数最短) 的未访问物体
+ *   2. 6 个以内物体用精确 tour 选首项；更多物体退化为 BFS 最近观察点
  *   3. 对每个物体:
  *        - 找观察点: 与物体 4-邻接的可立足空地, BFS 求最近
  *        - 移动到观察点 (HAL_CHASSIS_MOVE_TO + chassis_ctrl_is_arrived)
@@ -29,9 +29,6 @@
 #include <math.h>
 #include <string.h>
 
-#include <stdlib.h>     /* abs() */
-
-#if 0  /* disabled 2026-07-01: replaced by app_recognize_clear.c */
 #ifndef PI_F
 #define PI_F (3.14159265358979323846f)
 #endif
@@ -75,6 +72,13 @@
 /** class_id 的有效编号上限 (1..N), 对齐 openart2 的 10 类箱子/目标 */
 #define RECOG_CLASS_ID_MAX             (10U)
 
+/** 小规模识别 tour 精确搜索上限: 3 箱 + 3 目标。更大地图用 BFS 贪心控制耗时。 */
+#define RECOG_EXACT_TOUR_ITEM_LIMIT    (6U)
+
+#define RECOG_TOUR_MASK_COUNT          (1U << RECOG_EXACT_TOUR_ITEM_LIMIT)
+#define RECOG_TOUR_MAX_CANDIDATES      (RECOG_EXACT_TOUR_ITEM_LIMIT * 4U)
+#define RECOG_ROUTE_COST_INF           (0xFFFFU)
+
 /*===================================================================================================================
  * 内部数据结构
  *=================================================================================================================*/
@@ -113,6 +117,14 @@ static uint16 s_sample_total    = 0U;
 static uint16 s_sample_consec_none = 0U;     /* B16: 连续 None 计数, 任一有效帧清零 */
 static uint16 s_class_hist[RECOG_CLASS_ID_MAX + 1U] = {0};
 static uint32 s_last_seen_frame_id = 0U;     /* 已采样过的最大 frame_id, 防重复计票 */
+
+/* 识别 tour 选点 scratch: 小规模 DP 约 5.5KB BSS, 低于单次新增 10KB 约束。 */
+static uint8  s_pick_distance[MAP_ROWS][MAP_COLS];
+static uint8  s_tour_start_cost[RECOG_TOUR_MAX_CANDIDATES];
+static uint8  s_tour_edge_cost[RECOG_TOUR_MAX_CANDIDATES][RECOG_TOUR_MAX_CANDIDATES];
+static uint16 s_tour_dp[RECOG_TOUR_MASK_COUNT][RECOG_TOUR_MAX_CANDIDATES];
+static uint8  s_tour_first[RECOG_TOUR_MASK_COUNT][RECOG_TOUR_MAX_CANDIDATES];
+static AppRecogClearPlan_t s_pick_clear_plan;
 
 /*===================================================================================================================
  * 内部工具
@@ -306,29 +318,232 @@ static void extract_items(const uint8 map[MAP_ROWS][MAP_COLS])
     }
 }
 
-/**
- * 选下一个未访问的物体 — 贪心: 离当前位置曼哈顿距离最近.
- * (BFS 路径长度更准, 但开销大 (每次 O(n*MR*MC)); 内场 14×10 的曼哈顿近似已足够.)
- *
- * @return 选中下标, 没有未访问项时返回 0xFF
- */
-static uint8 pick_next_item(Point_t cur)
+static uint8 recog_is_observe_standable(const uint8 map[MAP_ROWS][MAP_COLS],
+                                        int8 y,
+                                        int8 x)
 {
-    uint8 best = 0xFFU;
-    int16 best_d = 32767;
+    if (x < (int8)CHASSIS_GRID_INNER_MIN_X ||
+        x > (int8)CHASSIS_GRID_INNER_MAX_X ||
+        y < (int8)CHASSIS_GRID_INNER_MIN_Y ||
+        y > (int8)CHASSIS_GRID_INNER_MAX_Y)
+    {
+        return 0U;
+    }
+    return (uint8)(map[y][x] == MAP_EMPTY || map[y][x] == MAP_TARGET);
+}
+
+static uint16 observe_distance_from_flood(const uint8 map[MAP_ROWS][MAP_COLS],
+                                          const uint8 distance_steps[MAP_ROWS][MAP_COLS],
+                                          Point_t object)
+{
+    static const int8 dr[4] = {-1, 1, 0, 0};
+    static const int8 dc[4] = {0, 0, -1, 1};
+    uint16 best = RECOG_ROUTE_COST_INF;
+
+    for (uint8 d = 0U; d < 4U; ++d)
+    {
+        int8 y = (int8)(object.y + dr[d]);
+        int8 x = (int8)(object.x + dc[d]);
+        if (!recog_is_observe_standable(map, y, x)) { continue; }
+        if (distance_steps[y][x] < (uint8)ALGO_NAV_DISTANCE_UNREACHABLE &&
+            (uint16)distance_steps[y][x] < best)
+        {
+            best = (uint16)distance_steps[y][x];
+        }
+    }
+    return best;
+}
+
+/**
+ * 小规模精确 tour:
+ *   - 节点是每个未访问物体的所有可站观察格;
+ *   - DP 状态为 (已访问物体集合, 当前观察格), 求覆盖全部物体的最短总步数;
+ *   - 只输出当前应访问的首个物体, 真实导航仍由 prepare_nav_plan() 重新规划。
+ */
+static uint8 pick_exact_direct_tour(const uint8 map[MAP_ROWS][MAP_COLS],
+                                    Point_t cur,
+                                    uint8 *out_idx)
+{
+    static const int8 dr[4] = {-1, 1, 0, 0};
+    static const int8 dc[4] = {0, 0, -1, 1};
+    uint8 item_idx[RECOG_EXACT_TOUR_ITEM_LIMIT];
+    uint8 cand_item[RECOG_TOUR_MAX_CANDIDATES];
+    Point_t cand_pos[RECOG_TOUR_MAX_CANDIDATES];
+    uint8 item_count = 0U;
+    uint8 cand_count = 0U;
+    uint8 full_mask;
+    uint16 best_total = RECOG_ROUTE_COST_INF;
+    uint8 best_first = 0xFFU;
 
     for (uint8 i = 0U; i < s_item_count; ++i)
     {
         if (s_items[i].visited) { continue; }
-        int16 d = (int16)(abs((int)s_items[i].pos.x - (int)cur.x)
-                        + abs((int)s_items[i].pos.y - (int)cur.y));
-        if (d < best_d)
+        if (item_count >= (uint8)RECOG_EXACT_TOUR_ITEM_LIMIT) { return 0U; }
+        item_idx[item_count++] = i;
+    }
+    if (item_count == 0U) { return 0U; }
+
+    for (uint8 local = 0U; local < item_count; ++local)
+    {
+        Point_t object = s_items[item_idx[local]].pos;
+        uint8 has_candidate = 0U;
+        for (uint8 d = 0U; d < 4U; ++d)
         {
-            best_d = d;
-            best   = i;
+            int8 y = (int8)(object.y + dr[d]);
+            int8 x = (int8)(object.x + dc[d]);
+            if (!recog_is_observe_standable(map, y, x)) { continue; }
+            if (cand_count >= (uint8)RECOG_TOUR_MAX_CANDIDATES) { return 0U; }
+            cand_pos[cand_count].x = x;
+            cand_pos[cand_count].y = y;
+            cand_item[cand_count] = local;
+            cand_count++;
+            has_candidate = 1U;
+        }
+        if (!has_candidate) { return 0U; }
+    }
+    if (cand_count == 0U) { return 0U; }
+
+    memset(s_tour_dp, 0xFF, sizeof(s_tour_dp));
+    memset(s_tour_first, 0xFF, sizeof(s_tour_first));
+    memset(s_tour_start_cost, ALGO_NAV_DISTANCE_UNREACHABLE, sizeof(s_tour_start_cost));
+    memset(s_tour_edge_cost, ALGO_NAV_DISTANCE_UNREACHABLE, sizeof(s_tour_edge_cost));
+
+    if (!Algo_Nav_BFS_Flood(map, cur, NULL, s_pick_distance)) { return 0U; }
+    for (uint8 c = 0U; c < cand_count; ++c)
+    {
+        s_tour_start_cost[c] = s_pick_distance[cand_pos[c].y][cand_pos[c].x];
+    }
+
+    for (uint8 from = 0U; from < cand_count; ++from)
+    {
+        if (!Algo_Nav_BFS_Flood(map, cand_pos[from], NULL, s_pick_distance)) { continue; }
+        for (uint8 to = 0U; to < cand_count; ++to)
+        {
+            s_tour_edge_cost[from][to] = s_pick_distance[cand_pos[to].y][cand_pos[to].x];
+        }
+    }
+
+    for (uint8 c = 0U; c < cand_count; ++c)
+    {
+        uint8 item_bit = (uint8)(1U << cand_item[c]);
+        if (s_tour_start_cost[c] >= (uint8)ALGO_NAV_DISTANCE_UNREACHABLE) { continue; }
+        s_tour_dp[item_bit][c] = (uint16)s_tour_start_cost[c];
+        s_tour_first[item_bit][c] = cand_item[c];
+    }
+
+    full_mask = (uint8)((1U << item_count) - 1U);
+    for (uint8 mask = 1U; mask <= full_mask; ++mask)
+    {
+        for (uint8 from = 0U; from < cand_count; ++from)
+        {
+            uint16 base_cost = s_tour_dp[mask][from];
+            if (base_cost >= RECOG_ROUTE_COST_INF) { continue; }
+
+            for (uint8 to = 0U; to < cand_count; ++to)
+            {
+                uint8 to_bit = (uint8)(1U << cand_item[to]);
+                uint8 next_mask;
+                uint16 next_cost;
+
+                if ((mask & to_bit) != 0U) { continue; }
+                if (s_tour_edge_cost[from][to] >= (uint8)ALGO_NAV_DISTANCE_UNREACHABLE) { continue; }
+
+                next_mask = (uint8)(mask | to_bit);
+                next_cost = (uint16)(base_cost + (uint16)s_tour_edge_cost[from][to]);
+                if (next_cost < s_tour_dp[next_mask][to])
+                {
+                    s_tour_dp[next_mask][to] = next_cost;
+                    s_tour_first[next_mask][to] = s_tour_first[mask][from];
+                }
+            }
+        }
+    }
+
+    for (uint8 c = 0U; c < cand_count; ++c)
+    {
+        if (s_tour_dp[full_mask][c] < best_total)
+        {
+            best_total = s_tour_dp[full_mask][c];
+            best_first = s_tour_first[full_mask][c];
+        }
+    }
+
+    if (best_first == 0xFFU) { return 0U; }
+    *out_idx = item_idx[best_first];
+    return 1U;
+}
+
+static uint8 pick_nearest_direct_item(const uint8 map[MAP_ROWS][MAP_COLS],
+                                      Point_t cur)
+{
+    uint8 best = 0xFFU;
+    uint16 best_cost = RECOG_ROUTE_COST_INF;
+
+    if (!Algo_Nav_BFS_Flood(map, cur, NULL, s_pick_distance)) { return 0xFFU; }
+    for (uint8 i = 0U; i < s_item_count; ++i)
+    {
+        uint16 cost;
+        if (s_items[i].visited) { continue; }
+        cost = observe_distance_from_flood(map, s_pick_distance, s_items[i].pos);
+        if (cost < best_cost)
+        {
+            best_cost = cost;
+            best = i;
         }
     }
     return best;
+}
+
+static uint8 pick_clearable_item(const uint8 map[MAP_ROWS][MAP_COLS],
+                                 Point_t cur)
+{
+    uint8 best = 0xFFU;
+    uint8 best_pushes = 0xFFU;
+    uint16 best_actions = RECOG_ROUTE_COST_INF;
+
+    for (uint8 i = 0U; i < s_item_count; ++i)
+    {
+        if (s_items[i].visited) { continue; }
+        if (!App_Recog_Clear_Plan(map, cur, s_items[i].pos, &s_pick_clear_plan)) { continue; }
+        if (s_pick_clear_plan.push_count < best_pushes ||
+            (s_pick_clear_plan.push_count == best_pushes &&
+             s_pick_clear_plan.actions.count < best_actions))
+        {
+            best_pushes = s_pick_clear_plan.push_count;
+            best_actions = s_pick_clear_plan.actions.count;
+            best = i;
+        }
+    }
+    return best;
+}
+
+/**
+ * 选下一个未访问的物体。
+ * 6 个以内物体先用精确 tour 找全局最短首项；更大规模使用一次 BFS flood 的最近观察点。
+ * 仅当没有直接可达观察点时才按清障规划成本兜底，避免过早移动其它箱子。
+ */
+static uint8 pick_next_item(const uint8 map[MAP_ROWS][MAP_COLS],
+                            Point_t cur)
+{
+    uint8 remaining = 0U;
+    uint8 best = 0xFFU;
+
+    for (uint8 i = 0U; i < s_item_count; ++i)
+    {
+        if (!s_items[i].visited) { remaining++; }
+    }
+    if (remaining == 0U) { return 0xFFU; }
+
+    if (remaining <= (uint8)RECOG_EXACT_TOUR_ITEM_LIMIT &&
+        pick_exact_direct_tour(map, cur, &best))
+    {
+        return best;
+    }
+
+    best = pick_nearest_direct_item(map, cur);
+    if (best != 0xFFU) { return best; }
+
+    return pick_clearable_item(map, cur);
 }
 
 /*===================================================================================================================
@@ -703,7 +918,7 @@ AppRecognizeStatus_e App_Recognize_Tick(uint8 map[MAP_ROWS][MAP_COLS],
                 s_sub_state = RECOG_SUB_FAIL;
                 return APP_RECOG_FAIL;
             }
-            s_cur_idx = pick_next_item(player_pos);
+            s_cur_idx = pick_next_item(map, player_pos);
             if (s_cur_idx == 0xFFU)
             {
                 /* 不应发生 (s_item_count > 0) */
@@ -850,7 +1065,7 @@ AppRecognizeStatus_e App_Recognize_Tick(uint8 map[MAP_ROWS][MAP_COLS],
                 return APP_RECOG_FAIL;
             }
 
-            uint8 next = pick_next_item(player_pos);
+            uint8 next = pick_next_item(map, player_pos);
             if (next != 0xFFU)
             {
                 s_cur_idx = next;
@@ -926,4 +1141,3 @@ uint8 App_Recognize_Map_Changed(void)
 {
     return s_map_changed;
 }
-#endif /* app_recognize.c disabled */

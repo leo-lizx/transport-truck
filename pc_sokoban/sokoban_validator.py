@@ -418,6 +418,8 @@ def plan_scout_phase(the_map: list, player_start: tuple,
 # 赛题约定: 箱子 class_id ∈ {1..N}, 目标 class_id ∈ {1..N}, 集合相同;
 #           箱-目一一对应 (相同 class_id 互推).
 # ============================================================
+EXACT_SCOUT_ITEM_LIMIT = 6
+
 
 def plan_scout_phase_v2(the_map: list, player_start: tuple,
                          box_classes: Optional[list] = None,
@@ -475,26 +477,119 @@ def plan_scout_phase_v2(the_map: list, player_start: tuple,
     def all_resolved() -> bool:
         return all(it['ok'] for it in items)
 
+    def observe_options(target: tuple) -> list:
+        opts = []
+        for d in range(4):
+            obs = (target[0] + DR[d], target[1] + DC[d])
+            if is_free(the_map, *obs):
+                opts.append(obs)
+        return opts
+
+    def shortest_observe_path(start: tuple, target: tuple) -> Tuple[Optional[int], Optional[tuple], Optional[list]]:
+        best_cost = None
+        best_obs = None
+        best_path = None
+        for obs in observe_options(target):
+            path = nav_bfs(the_map, start, obs)
+            if path is None:
+                continue
+            cost = len(path) - 1
+            if best_cost is None or cost < best_cost:
+                best_cost = cost
+                best_obs = obs
+                best_path = path
+        return best_cost, best_obs, best_path
+
+    def choose_exact_tour_first(start: tuple, cand: list) -> Optional[dict]:
+        if not cand or len(cand) > EXACT_SCOUT_ITEM_LIMIT:
+            return None
+
+        obs_nodes = []
+        for local_idx, it in enumerate(cand):
+            opts = observe_options(it['pos'])
+            if not opts:
+                return None
+            for obs in opts:
+                obs_nodes.append((local_idx, obs))
+        if not obs_nodes:
+            return None
+
+        start_cost = []
+        for _, obs in obs_nodes:
+            path = nav_bfs(the_map, start, obs)
+            start_cost.append(None if path is None else len(path) - 1)
+
+        edge_cost = [[None] * len(obs_nodes) for _ in obs_nodes]
+        for i, (_, from_obs) in enumerate(obs_nodes):
+            for j, (_, to_obs) in enumerate(obs_nodes):
+                path = nav_bfs(the_map, from_obs, to_obs)
+                edge_cost[i][j] = None if path is None else len(path) - 1
+
+        full_mask = (1 << len(cand)) - 1
+        dp = {}
+        for node_idx, (local_idx, _) in enumerate(obs_nodes):
+            if start_cost[node_idx] is None:
+                continue
+            mask = 1 << local_idx
+            key = (mask, node_idx)
+            old = dp.get(key)
+            value = (start_cost[node_idx], local_idx)
+            if old is None or value[0] < old[0]:
+                dp[key] = value
+
+        for mask in range(1, full_mask + 1):
+            states = [(node_idx, val) for (state_mask, node_idx), val in dp.items()
+                      if state_mask == mask]
+            for node_idx, (base_cost, first_idx) in states:
+                for next_node, (next_local, _) in enumerate(obs_nodes):
+                    if mask & (1 << next_local):
+                        continue
+                    step = edge_cost[node_idx][next_node]
+                    if step is None:
+                        continue
+                    next_mask = mask | (1 << next_local)
+                    key = (next_mask, next_node)
+                    value = (base_cost + step, first_idx)
+                    old = dp.get(key)
+                    if old is None or value[0] < old[0]:
+                        dp[key] = value
+
+        best = None
+        for (mask, _), value in dp.items():
+            if mask != full_mask:
+                continue
+            if best is None or value[0] < best[0]:
+                best = value
+        if best is None:
+            return None
+        return cand[best[1]]
+
+    def choose_next_item(start: tuple, cand: list) -> Tuple[Optional[dict], Optional[tuple]]:
+        exact = choose_exact_tour_first(start, cand)
+        if exact is not None:
+            _, obs, _ = shortest_observe_path(start, exact['pos'])
+            if obs is not None:
+                return exact, obs
+
+        best_it = None
+        best_obs = None
+        best_cost = None
+        for it in cand:
+            cost, obs, _ = shortest_observe_path(start, it['pos'])
+            if cost is None:
+                continue
+            if best_cost is None or cost < best_cost:
+                best_cost = cost
+                best_it = it
+                best_obs = obs
+        return best_it, best_obs
+
     while not all_resolved():
         cand = [it for it in items if not it['visited'] and not it['ok']]
         if not cand:
             break
 
-        best_it = None
-        best_obs = None
-        best_cost = 10 ** 9
-        for it in cand:
-            obs = find_observe_point_for_box(the_map, cur, it['pos'])
-            if obs is None:
-                continue
-            path = nav_bfs(the_map, cur, obs)
-            if path is None:
-                continue
-            cost = len(path)
-            if cost < best_cost:
-                best_cost = cost
-                best_it = it
-                best_obs = obs
+        best_it, best_obs = choose_next_item(cur, cand)
 
         if best_it is None or best_obs is None:
             break

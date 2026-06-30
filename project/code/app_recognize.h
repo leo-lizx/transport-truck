@@ -5,7 +5,7 @@
  * 用途:
  *   游戏主状态机 STAGE_RECOGNIZE_MAP 的真正内容由本模块承担:
  *     1) 提取地图中所有 BOX 与 TARGET 坐标
- *     2) 贪心 BFS 计算访问顺序 (与 PC 验证器 plan_scout_phase 对齐)
+ *     2) 小规模精确 tour / BFS 最近观察点计算访问顺序 (与 PC 验证器 plan_scout_phase_v2 对齐)
  *     3) 对每个待识别物体:
  *          - 移动到侧面观察点 (BFS 选最近的可立足格)
  *          - 原地旋转车头朝向物体

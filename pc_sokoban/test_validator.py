@@ -91,6 +91,15 @@ for v in scout8['visits']:
 print(f"  box_classes={scout8['box_classes']} target_classes={scout8['target_classes']}")
 print(f"  box→target 映射: {scout8['box_to_target_idx']}")
 
+# 测试8a: 小规模侦查应使用全局 tour，而不是当前最近点贪心
+print("\n=== 测试8a: V2 侦查全局顺序 ===")
+m8a, p8a = sv.generate_map(stage=2, box_count=2, seed=4)
+scout8a = sv.plan_scout_phase_v2(m8a, p8a)
+order8a = [(v['kind'], v['item_idx']) for v in scout8a['visits']]
+assert order8a == [('target', 1), ('target', 0), ('box', 0), ('box', 1)], order8a
+assert len(scout8a['scout_actions']) == 12, len(scout8a['scout_actions'])
+print(f"  顺序: {order8a}  侦查步数: {len(scout8a['scout_actions'])}")
+
 # 测试8b: 同图案多箱/多目标时按组内最短距离匹配
 print("\n=== 测试8b: 重复图案最短匹配 ===")
 m8b = sv._make_empty_map()
