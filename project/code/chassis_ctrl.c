@@ -47,7 +47,7 @@
  *   新链路: 保持轴 → vx/vy(m/s) → 直接 PWM = GAIN × 麦轮分配系数 × 速度
  *   O 型麦轮: vy 四轮同号, vx 对角同号 (LF=-, RF=+, LB=+, RB=-).
  *   GAIN=1500 时, 保持 0.06m/s→90PWM/轮, 足以对抗 odom 漂移和耦合扰动. */
-#define CHASSIS_HOLD_PWM_GAIN             (300.0f)
+#define CHASSIS_HOLD_PWM_GAIN             (100.0f)
 /* P0-修复 2026-04-29 姿态环“一段一段”真凶:
  * 原阈值 0.015 m/s, 但 yaw 转 1° 需 wheel target ≈ 0.023 m/s, 仅高出 53%,
  * wz 一抖 target 跌破 → stop_wheel_with_pid_reset 把 PWM 拍 0 → 下一拍
@@ -1129,11 +1129,8 @@ void chassis_ctrl_task_20ms(void)
                 float yerr_hold = chassis_normalize_angle_deg(s_tgt_yaw_deg - s_pose.yaw_deg);
                 cmd.vx_body_mps = 0.0f;
                 cmd.vy_body_mps = 0.0f;
-                if (fabsf(yerr_hold) <= CHASSIS_YAW_GOAL_TOLERANCE_DEG) {
-                    cmd.wz_dps = 0.0f;
-                } else {
-                    cmd.wz_dps = yaw_pi(yerr_hold, 1U, 1U);  /* 静止保持: 速率PI+在位锁 */
-                }
+                /* inpos 锁内自然归零, 外层不硬切 → yaw PWM 前馈连续 */
+                cmd.wz_dps = yaw_pi(yerr_hold, 1U, 1U);
             }
             break;
         }
@@ -1440,15 +1437,8 @@ void chassis_ctrl_task_20ms(void)
         /* 全局 → 车体坐标变换 */
         cmd.vx_body_mps =  cy * vxg + sy * vyg;
         cmd.vy_body_mps = -sy * vxg + cy * vyg;
-        if (fabsf(yerr) <= CHASSIS_YAW_GOAL_TOLERANCE_DEG)
-        {
-            cmd.wz_dps = 0.0f;
-        }
-        else
-        {
-            /* 平动期间禁用 in-pos 锁, 保留速率阻尼抑制旋转超调 */
-            cmd.wz_dps = yaw_pi(yerr, 0U, 0U);
-        }
+        /* 平移时开内环 PI: I_leak 自然滤噪, 消除稳态 1° 静差 */
+        cmd.wz_dps = yaw_pi(yerr, 1U, 0U);
         break;
     }
 
