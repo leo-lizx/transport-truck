@@ -395,7 +395,8 @@ static inline void sb_nibble_set(uint8 *arr, uint16 idx, uint8 val)
  *===========================================================================*/
 static uint8 sokoban_bfs_single(const uint8 sub_map[MAP_ROWS][MAP_COLS],
                                 Point_t player, Point_t box, Point_t target,
-                                SokoActionSeq_t *sol)
+                                SokoActionSeq_t *sol,
+                                uint8 block_other_targets)
 {
     uint16 start_idx, goal_idx = 0;
     uint8 found = 0;
@@ -457,6 +458,11 @@ static uint8 sokoban_bfs_single(const uint8 sub_map[MAP_ROWS][MAP_COLS],
                     nbr = br + s_dr[d];
                     nbc = bc + s_dc[d];
                     if (!sb_is_free(sub_map, nbr, nbc)) continue;
+                    if (block_other_targets &&
+                        sub_map[nbr][nbc] == MAP_TARGET &&
+                        !(nbr == target.y && nbc == target.x)) {
+                        continue;
+                    }
                     is_push = 1U;
                 } else {
                     /* ---------- 普通行走 ---------- */
@@ -715,6 +721,7 @@ static void build_sub_map(const uint8 base_map[MAP_ROWS][MAP_COLS],
                           const Point_t targets[],
                           uint8 box_count, uint8 target_count,
                           const uint8 solved_flags[],
+                          const uint8 target_used_flags[],
                           uint8 cur_box_idx, uint8 cur_target_idx,
                           uint8 out_map[MAP_ROWS][MAP_COLS])
 {
@@ -734,10 +741,12 @@ static void build_sub_map(const uint8 base_map[MAP_ROWS][MAP_COLS],
         }
     }
 
-    /* 处理目标: 仅保留当前任务的目标，其余变空地 */
+    /* Unused targets stay as MAP_TARGET; box BFS blocks entering them. */
     for (uint8 i = 0; i < target_count; i++) {
         if (i == cur_target_idx) continue;   /* 当前目标保留 */
-        if (out_map[targets[i].y][targets[i].x] == MAP_TARGET) {
+        if (target_used_flags != 0 &&
+            target_used_flags[i] &&
+            out_map[targets[i].y][targets[i].x] == MAP_TARGET) {
             out_map[targets[i].y][targets[i].x] = MAP_EMPTY;
         }
     }
@@ -803,12 +812,12 @@ static uint8 sokoban_solve_stage1_greedy(const uint8 map[MAP_ROWS][MAP_COLS],
 
         /* 3. 构建子地图 */
         build_sub_map(map, boxes, targets, box_n, target_n,
-                      solved, (uint8)best_b, (uint8)best_t, sb_sub_map);
+                      solved, t_used, (uint8)best_b, (uint8)best_t, sb_sub_map);
 
         /* 4. BFS 解算 */
         SokoActionSeq_t *sol = &result->sub_solutions[done];
         if (!sokoban_bfs_single(sb_sub_map, cur_player,
-                                boxes[best_b], targets[best_t], sol)) {
+                                boxes[best_b], targets[best_t], sol, 1U)) {
             return 0;
         }
 
@@ -836,6 +845,7 @@ static uint8 sokoban_solve_stage2_greedy(const uint8 map[MAP_ROWS][MAP_COLS],
     Point_t boxes[SOKOBAN_MAX_BOXES];
     Point_t targets[SOKOBAN_MAX_BOXES];
     uint8   solved[SOKOBAN_MAX_BOXES] = {0};
+    uint8   t_used[SOKOBAN_MAX_BOXES] = {0};
 
     result->is_solved   = 0;
     result->total_boxes = 0;
@@ -864,17 +874,18 @@ static uint8 sokoban_solve_stage2_greedy(const uint8 map[MAP_ROWS][MAP_COLS],
         if (ti >= target_n) return 0;
 
         build_sub_map(map, boxes, targets, box_n, target_n,
-                      solved, (uint8)best_b, ti, sb_sub_map);
+                      solved, t_used, (uint8)best_b, ti, sb_sub_map);
 
         SokoActionSeq_t *sol = &result->sub_solutions[done];
         if (!sokoban_bfs_single(sb_sub_map, cur_player,
-                                boxes[best_b], targets[ti], sol)) {
+                                boxes[best_b], targets[ti], sol, 1U)) {
             return 0;
         }
 
         cur_player = simulate_actions(sol, cur_player, boxes[best_b]);
         result->player_end_pos[done] = cur_player;
         solved[best_b] = 1;
+        t_used[ti] = 1;
     }
 
     result->is_solved = 1;
@@ -999,6 +1010,7 @@ static void soko_opt_save_best(uint8 depth, uint16 cost)
 }
 
 static uint8 soko_opt_solve_pair(uint8 solved_mask,
+                                 uint8 used_target_mask,
                                  uint8 box_idx,
                                  uint8 target_idx,
                                  Point_t cur_player,
@@ -1006,14 +1018,17 @@ static uint8 soko_opt_solve_pair(uint8 solved_mask,
                                  Point_t *end_player)
 {
     uint8 solved_flags[SOKOBAN_MAX_BOXES];
+    uint8 target_used_flags[SOKOBAN_MAX_BOXES];
 
     soko_flags_from_mask(solved_mask, solved_flags, s_soko_opt.box_n);
+    soko_flags_from_mask(used_target_mask, target_used_flags, s_soko_opt.target_n);
     build_sub_map(s_soko_opt.map,
                   s_soko_opt.boxes,
                   s_soko_opt.targets,
                   s_soko_opt.box_n,
                   s_soko_opt.target_n,
                   solved_flags,
+                  target_used_flags,
                   box_idx,
                   target_idx,
                   sb_sub_map);
@@ -1022,7 +1037,8 @@ static uint8 soko_opt_solve_pair(uint8 solved_mask,
                             cur_player,
                             s_soko_opt.boxes[box_idx],
                             s_soko_opt.targets[target_idx],
-                            seq)) {
+                            seq,
+                            1U)) {
         return 0U;
     }
 
@@ -1086,6 +1102,7 @@ static void soko_opt_dfs(uint8 depth,
             ++s_soko_opt.node_count;
         }
         if (!soko_opt_solve_pair(solved_mask,
+                                 used_target_mask,
                                  bi,
                                  ti,
                                  cur_player,
@@ -1362,7 +1379,7 @@ uint8 Sokoban_Solve_Push_Bomb(const uint8 map[MAP_ROWS][MAP_COLS],
     sb_sub_map[bomb_pos.y][bomb_pos.x] = MAP_EMPTY;
     sb_sub_map[wall_pos.y][wall_pos.x] = MAP_TARGET;
 
-    return sokoban_bfs_single(sb_sub_map, player_pos, bomb_pos, wall_pos, sol);
+    return sokoban_bfs_single(sb_sub_map, player_pos, bomb_pos, wall_pos, sol, 0U);
 }
 
 /*===========================================================================
