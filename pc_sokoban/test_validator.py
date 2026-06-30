@@ -91,6 +91,22 @@ for v in scout8['visits']:
 print(f"  box_classes={scout8['box_classes']} target_classes={scout8['target_classes']}")
 print(f"  box→target 映射: {scout8['box_to_target_idx']}")
 
+# 测试8b: 同图案多箱/多目标时按组内最短距离匹配
+print("\n=== 测试8b: 重复图案最短匹配 ===")
+m8b = sv._make_empty_map()
+m8b[2][2] = sv.BOX
+m8b[8][10] = sv.BOX
+m8b[2][10] = sv.TARGET
+m8b[8][2] = sv.TARGET
+scout8b = sv.plan_scout_phase_v2(
+    m8b, (5, 6),
+    box_classes=[1, 1],
+    target_classes=[1, 1],
+)
+assert scout8b['all_visited']
+assert scout8b['box_to_target_idx'] == [1, 0], scout8b['box_to_target_idx']
+print(f"  重复 class=1 映射: {scout8b['box_to_target_idx']} (期望 [1, 0])")
+
 # 测试9: V2 + Stage2 完整求解 (走真实路径)
 print("\n=== 测试9: V2 完整求解 ===")
 sol9 = sv.solve_level(2, m8, p8)

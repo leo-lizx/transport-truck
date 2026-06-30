@@ -106,6 +106,8 @@ static uint16              s_wait_phase0_ticks  = 0U;
 static uint8               s_launch_drive_issued = 0U;
 static uint16              s_launch_drive_ticks  = 0U;
 static uint8               s_launch_retry_count  = 0U;
+static uint8               s_launch_map_ready    = 0U;
+static uint8               s_level_class_probe   = 0U;
 static uint8               s_launch_map_candidate_valid = 0U;
 static uint8               s_launch_map_stable_count = 0U;
 static uint16              s_launch_map_stable_ticks = 0U;
@@ -264,12 +266,30 @@ static void reset_exec_context(void)
     s_launch_drive_issued = 0U;     /* 自动发车横移: 跨入口清零 */
     s_launch_drive_ticks  = 0U;
     s_launch_retry_count  = 0U;
+    s_launch_map_ready    = 0U;
+    s_level_class_probe   = 0U;
     reset_launch_map_stability();
 }
 
 static void goto_stage(GameStage_e next)
 {
     current_stage = next;
+}
+
+static uint8 launch_start_grid_x(void)
+{
+    return (s_default_launch_zone == LAUNCH_ZONE_RIGHT)
+         ? (uint8)CHASSIS_GRID_INNER_MAX_X
+         : (uint8)CHASSIS_START_GRID_X;
+}
+
+static void calibrate_launch_heading(void)
+{
+    chassis_pose_t pose = chassis_ctrl_get_pose();
+
+    chassis_ctrl_set_pose(pose.x_m,
+                          pose.y_m,
+                          APP_GAME_LAUNCH_FACE_YAW_DEG);
 }
 
 /* O8.2: 地图快照冻结开关的集中入口。
@@ -611,9 +631,22 @@ static uint8 build_push_box_plan(void)
 
 static uint8 should_enter_next_level(void)
 {
-    /* TODO: 结合裁判系统/传感器触发下一关。
-     * 当前默认仅跑单关，返回 0。 */
-    return 0;
+    /* 无法预知一次发车连续给几张地图；当前关完成后统一回发车区等待下一张可用地图。
+     * 若比赛软件没有继续出图，WAIT_START 会保持驻停等待。 */
+    return 1U;
+}
+
+static void select_level_from_loaded_map(void)
+{
+    if (map_has_bomb() != 0U) {
+        g_current_level = 3U;
+        s_level_class_probe = 0U;
+    } else {
+        /* MAP 帧只区分普通箱/目标/炸弹，不携带"箱子是否有图案"。
+         * 无炸弹地图先按分类关跑一次识别；若完全识别不到类别，再降级为 Stage1。 */
+        g_current_level = 2U;
+        s_level_class_probe = 1U;
+    }
 }
 
 /* ==========================================================================
@@ -643,24 +676,25 @@ static void stage_wait_start_handler(void)
 {
     /* 【P0-8 + 自动发车】WAIT_START 两段式:
      *   phase 0: 主控主动 MOVE_TO 起点 (车被人放偏时复位到发车区中心)
-     *   phase 1: 朝场内单轴横移, 自动驶出发车区 → 进入 RECOGNIZE_MAP
+     *   phase 1: 等待稳定可用地图 → 朝场内单轴横移 → 进入 RECOGNIZE_MAP
      *
      * 摆位约定 (规则提炼 + 用户确认):
      *   左发车区: 车左侧贴发车区左侧黄线 (x=0 墙线), 发车向右 (+X)
      *   右发车区: 车右侧贴发车区右侧黄线 (x=W 墙线), 发车向左 (-X)
      * 由 s_default_launch_zone 决定方向, 逻辑左右对称.
      *
-     * B1+B12: 进入 WAIT_START 总是解冻地图 (兜底), 防上一关地图冻结状态残留.
+     * B1+B12: WAIT_START 在尚未锁定本关地图前解冻地图, 防上一关地图冻结状态残留.
+     *         一旦 s_launch_map_ready=1, 需保持冻结直到进入 RECOGNIZE.
      */
-    map_snapshot_release();
+    if (s_launch_map_ready == 0U) {
+        map_snapshot_release();
+    }
 
     if (s_wait_start_phase == 0U) {
         s_wait_phase0_ticks++;          /* B8: phase 0 超时计时 */
         if (!is_navigating) {
             /* 起点按发车区对称: 左区→首列(贴左墙), 右区→末列(贴右墙) */
-            uint8 start_gx = (s_default_launch_zone == LAUNCH_ZONE_RIGHT)
-                           ? (uint8)CHASSIS_GRID_INNER_MAX_X
-                           : (uint8)CHASSIS_START_GRID_X;
+            uint8 start_gx = launch_start_grid_x();
             HAL_CHASSIS_MOVE_TO(start_gx, CHASSIS_START_GRID_Y);
             is_navigating = 1;
             return;
@@ -672,6 +706,7 @@ static void stage_wait_start_handler(void)
             s_wait_phase0_ticks = 0U;
             s_launch_drive_issued = 0U;
             s_launch_drive_ticks  = 0U;
+            s_launch_map_ready    = 0U;
             reset_launch_map_stability();
             s_wait_start_phase  = 1U;
             return;
@@ -682,25 +717,38 @@ static void stage_wait_start_handler(void)
         s_wait_phase0_ticks = 0U;
         s_launch_drive_issued = 0U;
         s_launch_drive_ticks  = 0U;
+        s_launch_map_ready    = 0U;
         reset_launch_map_stability();
+        calibrate_launch_heading();
         s_wait_start_phase  = 1U;
         return;
     }
 
-    /* phase 1: 自动横移驶出发车区 (主动发车) */
-
-    /* 已完全离开发车区 → 发车成功, 进入识别 */
-    if (chassis_zone_is_fully_outside_launch(s_default_launch_zone)) {
+    /* phase 1: 先等下一关地图稳定，再自动横移驶出发车区 (主动发车) */
+    if (s_launch_map_ready == 0U) {
         chassis_ctrl_stop();
         if (launch_map_stability_tick() == 0U) {
             return;
         }
+
+        reset_exec_context();
+        calibrate_launch_heading();
+        s_launch_map_ready = 1U;
+        map_snapshot_freeze();       /* 发车后沿用已确认地图, 防移动中旧帧/抖动覆盖 */
+        select_level_from_loaded_map();
+        clear_box_target_mapping();
+        App_Recognize_Reset();
+        return;
+    }
+
+    /* 已完全离开发车区 → 发车成功, 进入识别 */
+    if (chassis_zone_is_fully_outside_launch(s_default_launch_zone)) {
+        chassis_ctrl_stop();
         s_launch_drive_issued = 0U;
         s_launch_drive_ticks  = 0U;
+        s_launch_map_ready    = 0U;
         s_wait_start_phase = 0U;     /* 重置子相位, 供后续 LEVEL_JUDGE 复用 */
         map_snapshot_freeze();       /* B12: 进 RECOGNIZE 前锁定地图, 防 s_items[] 错位 */
-        clear_box_target_mapping();
-        reset_exec_context();
         App_Recognize_Reset();       /* 进入 RECOGNIZE 前清识别 tour 状态 */
         goto_stage(STAGE_RECOGNIZE_MAP);
         return;
@@ -752,6 +800,7 @@ static void stage_recognize_handler(void)
             return;
         case APP_RECOG_DONE_OK:
         case APP_RECOG_DONE_NO_NEED:
+            s_level_class_probe = 0U;
             /* 清障推箱后先保留主控动态地图, 直到 PLAN_PATH 本拍完成解算。
              * 否则视觉端的一帧旧地图可能在解算前把移动结果覆盖掉。 */
             if (App_Recognize_Map_Changed()) {
@@ -763,6 +812,21 @@ static void stage_recognize_handler(void)
             goto_stage(STAGE_PLAN_PATH);
             return;
         case APP_RECOG_FAIL:
+            if ((s_level_class_probe != 0U) && (map_has_bomb() == 0U)) {
+                AppRecognizeDebug_t dbg;
+                App_Recognize_Get_Debug(&dbg);
+                if (dbg.resolved_box == 0U) {
+                    s_level_class_probe = 0U;
+                    g_current_level = 1U;
+                    App_Recognize_Reset();
+                    reset_exec_context();
+                    map_snapshot_release();
+                    goto_stage(STAGE_PLAN_PATH);
+                    return;
+                }
+            }
+            s_level_class_probe = 0U;
+            /* fall through */
         default:
             map_snapshot_release();        /* B12: 识别失败也解冻 */
             reset_exec_context();
@@ -879,7 +943,6 @@ static void stage_level_judge_handler(void)
     }
 
     if (should_enter_next_level()) {
-        g_current_level++;
         reset_exec_context();
         goto_stage(STAGE_WAIT_START);
         return;

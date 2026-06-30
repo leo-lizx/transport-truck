@@ -119,7 +119,7 @@ static uint32 wait_for_tick(void)
 #define MAIN_RUN_MODE_LEVEL2_TEST     (10)  /* 第二关测试: 收图→固定发车→分类识别→Stage2推箱→回库 */
 
 /* ═══════════ 改下面这行切换运行模式 (0~10) ═══════════ */
-#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_POINT_NAV)  /* mode 2: single wheel speed tuning */
+#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_GAME)  /* mode 0: autonomous multi-level game flow */
 /* ═══════════ 改上面这行切换运行模式 (0~10) ═══════════ */
 
 /* OpenART1 地图链路硬件口: 若实测 UART4 走 D0/D1, 只改下面两行宏. */
@@ -2036,6 +2036,11 @@ static void main_apply_debug_wheel_pid(void)
     chassis_ctrl_set_pose(MAIN_POS_GRID_TO_M_X(MAIN_POS_HCM_HOME_X_GRID),
                           MAIN_POS_GRID_TO_M_Y(MAIN_POS_HCM_HOME_Y_GRID),
                           0.0f);
+#elif (MAIN_RUN_MODE == MAIN_RUN_MODE_GAME)
+    /* 正式比赛: 发车区人工摆车时车头朝地图 -Y, 以 180° 写入全局 yaw 基准. */
+    chassis_ctrl_set_pose(MAIN_POS_GRID_TO_M_X(MAIN_POS_NAV_START_X_GRID),
+                          MAIN_POS_GRID_TO_M_Y(MAIN_POS_NAV_START_Y_GRID),
+                          APP_GAME_LAUNCH_FACE_YAW_DEG);
 #else
     /* 解算/导航起点: 整数格约定 (1, 5.5) → 自动换算成米送入里程计原点. */
     chassis_ctrl_set_pose(MAIN_POS_GRID_TO_M_X(MAIN_POS_NAV_START_X_GRID),
@@ -2099,6 +2104,9 @@ static void main_apply_debug_wheel_pid(void)
     printf("HCM_BOOT solving hardcoded map...\n");
     chassis_ctrl_hold_yaw(0.0f);
     main_hcm_solve();   /* 同步解算, 结果写入 s_hcm_solve_ok */
+#elif (MAIN_RUN_MODE == MAIN_RUN_MODE_GAME)
+    /* 游戏模式: 设置发车区 -Y 航向基准, 等待状态机调度. */
+    chassis_ctrl_hold_yaw(APP_GAME_LAUNCH_FACE_YAW_DEG);
 #else
     /* 游戏模式: 设置初始航向基准, 等待状态机调度. */
     chassis_ctrl_hold_yaw(0.0f);
