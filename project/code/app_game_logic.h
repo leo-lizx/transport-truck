@@ -59,6 +59,9 @@
 #define HAL_VISION_GET_BOX_CLASS_ID()  (0)
 // ==========================================
 
+/* Formal game launch heading calibration: car nose faces map -Y in the launch zone. */
+#define APP_GAME_LAUNCH_FACE_YAW_DEG   (180.0f)
+
 // 游戏主流程状态机枚举
 typedef enum {
     STAGE_WAIT_START = 0,           // 发车区等待

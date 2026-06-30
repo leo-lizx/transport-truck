@@ -347,17 +347,81 @@ static uint8 item_class_at(uint8 kind, int8 x, int8 y, uint8 *class_id)
     return 0U;
 }
 
+static uint16 point_manhattan_cost(Point_t a, Point_t b)
+{
+    int16 dx = (int16)a.x - (int16)b.x;
+    int16 dy = (int16)a.y - (int16)b.y;
+
+    if (dx < 0) { dx = (int16)-dx; }
+    if (dy < 0) { dy = (int16)-dy; }
+    return (uint16)(dx + dy);
+}
+
+static void search_min_cost_match(const Point_t box_pos[SOKOBAN_MAX_BOXES],
+                                  const Point_t tgt_pos[SOKOBAN_MAX_BOXES],
+                                  const uint8 group_boxes[SOKOBAN_MAX_BOXES],
+                                  const uint8 group_targets[SOKOBAN_MAX_BOXES],
+                                  uint8 group_count,
+                                  uint8 depth,
+                                  uint8 used_mask,
+                                  uint16 cur_cost,
+                                  uint16 *best_cost,
+                                  uint8 cur_assign[SOKOBAN_MAX_BOXES],
+                                  uint8 best_assign[SOKOBAN_MAX_BOXES])
+{
+    uint8 i;
+
+    if (depth >= group_count) {
+        if (cur_cost < *best_cost) {
+            *best_cost = cur_cost;
+            for (i = 0U; i < group_count; ++i) {
+                best_assign[i] = cur_assign[i];
+            }
+        }
+        return;
+    }
+
+    if (cur_cost >= *best_cost) {
+        return;
+    }
+
+    for (i = 0U; i < group_count; ++i) {
+        uint8 bit = (uint8)(1U << i);
+        uint16 step_cost;
+        if ((used_mask & bit) != 0U) { continue; }
+
+        step_cost = point_manhattan_cost(box_pos[group_boxes[depth]],
+                                         tgt_pos[group_targets[i]]);
+        if ((uint16)(cur_cost + step_cost) < cur_cost) { continue; }
+
+        cur_assign[depth] = group_targets[i];
+        search_min_cost_match(box_pos, tgt_pos,
+                              group_boxes, group_targets,
+                              group_count,
+                              (uint8)(depth + 1U),
+                              (uint8)(used_mask | bit),
+                              (uint16)(cur_cost + step_cost),
+                              best_cost,
+                              cur_assign,
+                              best_assign);
+    }
+}
+
 static uint8 build_box_to_target_mapping(const uint8 map[MAP_ROWS][MAP_COLS],
                                          uint8 box_to_target_out[SOKOBAN_MAX_BOXES])
 {
     uint8 box_class[SOKOBAN_MAX_BOXES];
     uint8 tgt_class[SOKOBAN_MAX_BOXES];
+    Point_t box_pos[SOKOBAN_MAX_BOXES];
+    Point_t tgt_pos[SOKOBAN_MAX_BOXES];
     uint8 box_idx_in_extract = 0U;
     uint8 tgt_idx_in_extract = 0U;
     int8 r, c;
 
     memset(box_class, 0, sizeof(box_class));
     memset(tgt_class, 0, sizeof(tgt_class));
+    memset(box_pos, 0, sizeof(box_pos));
+    memset(tgt_pos, 0, sizeof(tgt_pos));
 
     /*
      * 清障后箱子的坐标和扫描顺序可能改变。必须按“当前地图”的行列顺序
@@ -377,6 +441,8 @@ static uint8 build_box_to_target_mapping(const uint8 map[MAP_ROWS][MAP_COLS],
                 {
                     return 0U;
                 }
+                box_pos[box_idx_in_extract].x = c;
+                box_pos[box_idx_in_extract].y = r;
                 ++box_idx_in_extract;
             }
             else if (map[r][c] == MAP_TARGET)
@@ -387,6 +453,8 @@ static uint8 build_box_to_target_mapping(const uint8 map[MAP_ROWS][MAP_COLS],
                 {
                     return 0U;
                 }
+                tgt_pos[tgt_idx_in_extract].x = c;
+                tgt_pos[tgt_idx_in_extract].y = r;
                 ++tgt_idx_in_extract;
             }
         }
@@ -396,27 +464,55 @@ static uint8 build_box_to_target_mapping(const uint8 map[MAP_ROWS][MAP_COLS],
     if (box_idx_in_extract != tgt_idx_in_extract)  { return 0U; }
     if (box_idx_in_extract == 0U)                  { return 0U; }
 
-    /* 为每个 box 找同 class_id 的 target (要求一一匹配, 不可重复占用) */
+    /* 同 class_id 内按箱→目标曼哈顿总代价最小做一一匹配。 */
     {
-        uint8 t_used[SOKOBAN_MAX_BOXES] = {0};
+        uint8 box_done[SOKOBAN_MAX_BOXES] = {0};
         uint8 bi;
         for (bi = 0U; bi < box_idx_in_extract; ++bi)
         {
             uint8 cls = box_class[bi];
-            uint8 matched = 0U;
+            uint8 group_boxes[SOKOBAN_MAX_BOXES];
+            uint8 group_targets[SOKOBAN_MAX_BOXES];
+            uint8 cur_assign[SOKOBAN_MAX_BOXES];
+            uint8 best_assign[SOKOBAN_MAX_BOXES];
+            uint8 group_box_count = 0U;
+            uint8 group_target_count = 0U;
+            uint16 best_cost = 0xFFFFU;
+            uint8 i;
             uint8 ti;
+
+            if (box_done[bi] != 0U) { continue; }
             if (cls == 0U) { return 0U; }
 
-            for (ti = 0U; ti < tgt_idx_in_extract; ++ti)
-            {
-                if (t_used[ti])           { continue; }
-                if (tgt_class[ti] != cls) { continue; }
-                box_to_target_out[bi] = ti;
-                t_used[ti] = 1U;
-                matched = 1U;
-                break;
+            for (i = 0U; i < box_idx_in_extract; ++i) {
+                if (box_class[i] == cls) {
+                    group_boxes[group_box_count++] = i;
+                }
             }
-            if (!matched) { return 0U; }
+            for (ti = 0U; ti < tgt_idx_in_extract; ++ti) {
+                if (tgt_class[ti] == cls) {
+                    group_targets[group_target_count++] = ti;
+                }
+            }
+
+            if (group_box_count != group_target_count) { return 0U; }
+            if (group_box_count == 0U) { return 0U; }
+
+            memset(cur_assign, 0, sizeof(cur_assign));
+            memset(best_assign, 0, sizeof(best_assign));
+            search_min_cost_match(box_pos, tgt_pos,
+                                  group_boxes, group_targets,
+                                  group_box_count,
+                                  0U, 0U, 0U,
+                                  &best_cost,
+                                  cur_assign,
+                                  best_assign);
+            if (best_cost == 0xFFFFU) { return 0U; }
+
+            for (i = 0U; i < group_box_count; ++i) {
+                box_to_target_out[group_boxes[i]] = best_assign[i];
+                box_done[group_boxes[i]] = 1U;
+            }
         }
 
         for (; bi < (uint8)SOKOBAN_MAX_BOXES; ++bi)

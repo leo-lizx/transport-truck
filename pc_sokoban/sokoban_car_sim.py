@@ -161,7 +161,20 @@ def _normalize_map_text(text: str) -> str:
     return '\n'.join(line.rstrip() for line in text.strip().splitlines())
 
 
-def _info_from_map_text(text: str, level: int) -> dict:
+def _normalize_classes(values: Optional[list], count: int) -> list:
+    out = []
+    for i in range(count):
+        try:
+            cls = int(values[i]) if values is not None and i < len(values) else (i + 1)
+        except (TypeError, ValueError):
+            cls = i + 1
+        out.append(max(1, cls))
+    return out
+
+
+def _info_from_map_text(text: str, level: int,
+                        box_classes: Optional[list] = None,
+                        target_classes: Optional[list] = None) -> dict:
     the_map, player_pos, err = parse_map_text(_normalize_map_text(text))
     if err:
         raise ValueError(err)
@@ -180,8 +193,8 @@ def _info_from_map_text(text: str, level: int) -> dict:
         'start': start,
         'exit': exit_c,
         'zone': zone,
-        'box_classes': list(range(1, box_count + 1)),
-        'target_classes': list(range(1, target_count + 1)),
+        'box_classes': _normalize_classes(box_classes, box_count),
+        'target_classes': _normalize_classes(target_classes, target_count),
         'level': level,
     }
 
@@ -204,19 +217,32 @@ def _load_custom_maps() -> list:
         text = str(item.get('text', '')).strip()
         level = int(item.get('level', 3) or 3)
         if name and text:
-            out.append({'name': name, 'text': text, 'level': max(1, min(3, level))})
+            level = max(1, min(3, level))
+            try:
+                info = _info_from_map_text(text, level,
+                                           item.get('box_classes'),
+                                           item.get('target_classes'))
+            except ValueError:
+                continue
+            out.append({'name': name, 'text': text, 'level': level,
+                        'box_classes': info['box_classes'],
+                        'target_classes': info['target_classes']})
     return out
 
 
-def _save_custom_map(name: str, text: str, level: int):
+def _save_custom_map(name: str, text: str, level: int,
+                     box_classes: Optional[list] = None,
+                     target_classes: Optional[list] = None):
     clean_name = name.strip()
     if not clean_name:
         raise ValueError('请输入地图名称')
     clean_text = _normalize_map_text(text)
-    _info_from_map_text(clean_text, level)
+    info = _info_from_map_text(clean_text, level, box_classes, target_classes)
 
     items = _load_custom_maps()
-    rec = {'name': clean_name, 'text': clean_text, 'level': level}
+    rec = {'name': clean_name, 'text': clean_text, 'level': level,
+           'box_classes': info['box_classes'],
+           'target_classes': info['target_classes']}
     for i, item in enumerate(items):
         if item['name'] == clean_name:
             items[i] = rec
@@ -506,11 +532,10 @@ class CarSim:
         self.box_class = [bc[i] if i < len(bc) else (i + 1) for i in range(n_box)]
         tgts_ex = extract_elements(src, TARGET)
         tcs = self.target_classes if self.target_classes else list(range(1, len(tgts_ex) + 1))
-        # class_id -> 该号目标格坐标 (第2/3关用于"必须推到对应号目标"的判定)
-        self.tpos_by_class: Dict[int, tuple] = {}
+        self.target_class = [tcs[j] if j < len(tcs) else (j + 1) for j in range(len(tgts_ex))]
+        self.target_class_by_pos: Dict[tuple, int] = {}
         for j, p in enumerate(tgts_ex):
-            cls = tcs[j] if j < len(tcs) else (j + 1)
-            self.tpos_by_class[cls] = p
+            self.target_class_by_pos[p] = self.target_class[j]
 
         self.player = self.start
         self.last_dir = RIGHT if self.zone == ZONE_LEFT else LEFT
@@ -541,8 +566,7 @@ class CarSim:
         if self.level >= 2:
             for i, pos in enumerate(self.boxes):
                 cls = self.box_class[i] if i < len(self.box_class) else None
-                want = self.tpos_by_class.get(cls)
-                if want is None or pos != want:
+                if self.target_class_by_pos.get(pos) != cls:
                     return False
         return True
 
@@ -565,6 +589,8 @@ class CarSim:
             'win':       self._win(),
             'mapping':   list(self.mapping) if self.mapping else None,
             'recog':     self.recog_summary,
+            'box_classes': list(self.box_class),
+            'target_classes': list(self.target_class),
         })
 
     def _step(self, d: int, stage: str, info: str,
@@ -959,6 +985,13 @@ def launch_gui():
         base = fr['base']
         boxset = set(fr['boxes'])
         bombset = set(fr['bombs'])
+        target_positions = [(r, c) for r in range(MAP_ROWS) for c in range(MAP_COLS)
+                            if base[r][c] == TARGET]
+        target_classes = fr.get('target_classes') or []
+        target_class_by_pos = {
+            p: target_classes[i] if i < len(target_classes) else (i + 1)
+            for i, p in enumerate(target_positions)
+        }
         for r in range(MAP_ROWS):
             for c in range(MAP_COLS):
                 v = base[r][c]
@@ -978,12 +1011,19 @@ def launch_gui():
                     canvas.create_oval(x0 + CELL * 0.3, y0 + CELL * 0.3,
                                        x1 - CELL * 0.3, y1 - CELL * 0.3,
                                        outline='#ffffff', width=1)
+                    canvas.create_text((x0 + x1) / 2, (y0 + y1) / 2,
+                                       text=str(target_class_by_pos.get((r, c), '')),
+                                       fill='#ffffff', font=F_SMALL)
         # 箱子
-        for (r, c) in fr['boxes']:
+        box_classes = fr.get('box_classes') or []
+        for i, (r, c) in enumerate(fr['boxes']):
             x0, y0, x1, y1 = cell_rect(r, c)
             on_t = base[r][c] == TARGET
             canvas.create_rectangle(x0 + 1, y0 + 1, x1 - 1, y1 - 1, fill=COL_BOX,
                                     outline=COL_TARGET if on_t else '', width=2 if on_t else 0)
+            canvas.create_text((x0 + x1) / 2, (y0 + y1) / 2,
+                               text=str(box_classes[i] if i < len(box_classes) else (i + 1)),
+                               fill='#111827', font=F_SMALL)
         # 炸弹
         for (r, c) in fr['bombs']:
             x0, y0, x1, y1 = cell_rect(r, c)
@@ -1100,9 +1140,11 @@ def launch_gui():
                    f'箱子 {len(extract_elements(info["map"], BOX))}'] + lines)
         show_frame()
 
-    def _load_text_map(text: str, level: int):
+    def _load_text_map(text: str, level: int,
+                       box_classes: Optional[list] = None,
+                       target_classes: Optional[list] = None):
         try:
-            info = _info_from_map_text(text, level)
+            info = _info_from_map_text(text, level, box_classes, target_classes)
         except ValueError as err:
             messagebox.showerror('地图解析失败', str(err))
             return
@@ -1115,7 +1157,8 @@ def launch_gui():
         if not rec:
             messagebox.showwarning('未选择地图', '请先选择一张内置或保存的地图')
             return
-        _load_text_map(rec['text'], int(rec.get('level', level_var.get())))
+        _load_text_map(rec['text'], int(rec.get('level', level_var.get())),
+                       rec.get('box_classes'), rec.get('target_classes'))
 
     def do_play():
         if not state['frames']:
@@ -1146,18 +1189,24 @@ def launch_gui():
 
     def do_custom():
         initial = None
+        initial_box_classes = None
+        initial_target_classes = None
         if state.get('info'):
             initial = export_map_text(state['info']['map'], state['info']['start'])
+            initial_box_classes = state['info'].get('box_classes')
+            initial_target_classes = state['info'].get('target_classes')
         _open_custom_editor(root, _load_custom, level_var.get(),
                             on_save=_save_from_editor,
-                            initial_text=initial)
+                            initial_text=initial,
+                            initial_box_classes=initial_box_classes,
+                            initial_target_classes=initial_target_classes)
 
-    def _load_custom(text, level):
-        _load_text_map(text, level)
+    def _load_custom(text, level, box_classes=None, target_classes=None):
+        _load_text_map(text, level, box_classes, target_classes)
 
-    def _save_from_editor(name, text, level):
+    def _save_from_editor(name, text, level, box_classes=None, target_classes=None):
         try:
-            _save_custom_map(name, text, level)
+            _save_custom_map(name, text, level, box_classes, target_classes)
         except (ValueError, OSError) as err:
             messagebox.showerror('保存失败', str(err))
             return False
@@ -1193,9 +1242,11 @@ def launch_gui():
 
 
 def _open_custom_editor(root, on_load, default_level=1,
-                        on_save=None, initial_text: Optional[str] = None):
+                        on_save=None, initial_text: Optional[str] = None,
+                        initial_box_classes: Optional[list] = None,
+                        initial_target_classes: Optional[list] = None):
     import tkinter as tk
-    from tkinter import messagebox
+    from tkinter import messagebox, simpledialog
 
     top = tk.Toplevel(root)
     top.title('自定义地图 (12 行 × 16 列)')
@@ -1222,9 +1273,24 @@ def _open_custom_editor(root, on_load, default_level=1,
     tk.Entry(namefrm, textvariable=name_var, width=18, bg='#0c0e13',
              fg='#e8edff', insertbackground='#fff').pack(side='left', padx=(6, 0))
 
-    txt = tk.Text(top, width=20, height=12, font=('Consolas', 14),
+    body = tk.Frame(top, bg='#15171e')
+    body.pack(padx=10, pady=8)
+
+    txt = tk.Text(body, width=20, height=12, font=('Consolas', 14),
                   bg='#0c0e13', fg='#e8edff', insertbackground='#fff')
-    txt.pack(padx=10, pady=8)
+    txt.pack(side='left')
+
+    preview = tk.Frame(body, bg='#15171e')
+    preview.pack(side='left', padx=(12, 0), anchor='n')
+    tk.Label(preview, text='点击箱子/目标设置编号', bg='#15171e', fg='#c0caf5',
+             font=('Segoe UI', 9)).pack(anchor='w')
+    cell = 24
+    preview_canvas = tk.Canvas(preview, width=MAP_COLS * cell, height=MAP_ROWS * cell,
+                               bg='#0c0e13', highlightthickness=0)
+    preview_canvas.pack(pady=(4, 4))
+    status_var = tk.StringVar(value='预览就绪')
+    tk.Label(preview, textvariable=status_var, bg='#15171e', fg='#9fb0d0',
+             font=('Segoe UI', 9)).pack(anchor='w')
 
     # 模板
     sample = (
@@ -1243,16 +1309,167 @@ def _open_custom_editor(root, on_load, default_level=1,
     )
     txt.insert('1.0', initial_text if initial_text else sample)
 
+    initial_map, _, initial_err = parse_map_text(_normalize_map_text(txt.get('1.0', 'end')))
+    box_class_by_pos: Dict[tuple, int] = {}
+    target_class_by_pos: Dict[tuple, int] = {}
+    if not initial_err:
+        for i, pos in enumerate(extract_elements(initial_map, BOX)):
+            cls = initial_box_classes[i] if initial_box_classes and i < len(initial_box_classes) else (i + 1)
+            box_class_by_pos[pos] = int(cls)
+        for i, pos in enumerate(extract_elements(initial_map, TARGET)):
+            cls = initial_target_classes[i] if initial_target_classes and i < len(initial_target_classes) else (i + 1)
+            target_class_by_pos[pos] = int(cls)
+
+    def parse_current(show_error=False):
+        clean_text = _normalize_map_text(txt.get('1.0', 'end'))
+        the_map, player_pos, err = parse_map_text(clean_text)
+        if err:
+            status_var.set(f'地图错误: {err}')
+            if show_error:
+                messagebox.showerror('地图解析失败', err, parent=top)
+            return None
+        return the_map, player_pos, clean_text
+
+    def sync_class_maps(show_error=False):
+        parsed = parse_current(show_error)
+        if parsed is None:
+            return None
+        the_map, _, _ = parsed
+        boxes = extract_elements(the_map, BOX)
+        targets = extract_elements(the_map, TARGET)
+        old_boxes = dict(box_class_by_pos)
+        old_targets = dict(target_class_by_pos)
+        box_class_by_pos.clear()
+        target_class_by_pos.clear()
+        for i, pos in enumerate(boxes):
+            box_class_by_pos[pos] = old_boxes.get(pos, i + 1)
+        for i, pos in enumerate(targets):
+            target_class_by_pos[pos] = old_targets.get(pos, i + 1)
+        status_var.set(f'箱子 {len(boxes)} 个, 目标 {len(targets)} 个')
+        return the_map, boxes, targets
+
+    def draw_preview():
+        preview_canvas.delete('all')
+        synced = sync_class_maps(False)
+        if synced is None:
+            return
+        the_map, _, _ = synced
+        clean_text = _normalize_map_text(txt.get('1.0', 'end'))
+        _, player_pos, _ = parse_map_text(clean_text)
+        colors = {
+            EMPTY: '#111827',
+            WALL: '#30384d',
+            TARGET: '#5f6f52',
+            BOX: '#d8a348',
+            BOMB: '#c55b5b',
+        }
+        for r in range(MAP_ROWS):
+            for c in range(MAP_COLS):
+                v = the_map[r][c]
+                x0, y0 = c * cell, r * cell
+                x1, y1 = x0 + cell, y0 + cell
+                preview_canvas.create_rectangle(x0 + 1, y0 + 1, x1 - 1, y1 - 1,
+                                                fill=colors.get(v, '#111827'),
+                                                outline='#263044')
+                if v == TARGET:
+                    preview_canvas.create_oval(x0 + 5, y0 + 5, x1 - 5, y1 - 5,
+                                               outline='#ffffff', width=1)
+                    preview_canvas.create_text((x0 + x1) / 2, (y0 + y1) / 2,
+                                               text=str(target_class_by_pos.get((r, c), '')),
+                                               fill='#ffffff', font=('Consolas', 9, 'bold'))
+                elif v == BOX:
+                    preview_canvas.create_text((x0 + x1) / 2, (y0 + y1) / 2,
+                                               text=str(box_class_by_pos.get((r, c), '')),
+                                               fill='#111827', font=('Consolas', 9, 'bold'))
+                elif v == BOMB:
+                    preview_canvas.create_text((x0 + x1) / 2, (y0 + y1) / 2,
+                                               text='*', fill='#ffffff',
+                                               font=('Consolas', 10, 'bold'))
+        if player_pos:
+            r, c = player_pos
+            x0, y0 = c * cell, r * cell
+            preview_canvas.create_rectangle(x0 + 4, y0 + 4, x0 + cell - 4, y0 + cell - 4,
+                                            fill='#7aa2f7', outline='')
+            preview_canvas.create_text(x0 + cell / 2, y0 + cell / 2, text='@',
+                                       fill='#111827', font=('Consolas', 9, 'bold'))
+
+    def class_lists_for_current(show_error=False):
+        synced = sync_class_maps(show_error)
+        if synced is None:
+            return None
+        _, boxes, targets = synced
+        box_classes = [box_class_by_pos[pos] for pos in boxes]
+        target_classes = [target_class_by_pos[pos] for pos in targets]
+        return box_classes, target_classes
+
+    def set_cell_class(event):
+        synced = sync_class_maps(True)
+        if synced is None:
+            return
+        row = int(event.y // cell)
+        col = int(event.x // cell)
+        if not (0 <= row < MAP_ROWS and 0 <= col < MAP_COLS):
+            return
+        pos = (row, col)
+        if pos in box_class_by_pos:
+            current = box_class_by_pos[pos]
+            label = '箱子'
+            target_dict = box_class_by_pos
+        elif pos in target_class_by_pos:
+            current = target_class_by_pos[pos]
+            label = '目标点'
+            target_dict = target_class_by_pos
+        else:
+            status_var.set('请点击箱子($)或目标点(.)')
+            return
+        value = simpledialog.askinteger('设置编号',
+                                        f'{label} ({row},{col}) 的编号:',
+                                        initialvalue=current, minvalue=1, maxvalue=99,
+                                        parent=top)
+        if value is not None:
+            target_dict[pos] = value
+            draw_preview()
+
+    def reset_classes():
+        synced = sync_class_maps(True)
+        if synced is None:
+            return
+        _, boxes, targets = synced
+        for i, pos in enumerate(boxes):
+            box_class_by_pos[pos] = i + 1
+        for i, pos in enumerate(targets):
+            target_class_by_pos[pos] = i + 1
+        draw_preview()
+
+    preview_canvas.bind('<Button-1>', set_cell_class)
+    txt.bind('<KeyRelease>', lambda _event: draw_preview())
+
     def submit():
-        on_load(txt.get('1.0', 'end'), lv.get())
+        classes = class_lists_for_current(True)
+        if classes is None:
+            return
+        box_classes, target_classes = classes
+        on_load(txt.get('1.0', 'end'), lv.get(), box_classes, target_classes)
         top.destroy()
 
     def save_current():
         if on_save is None:
             return
-        ok = on_save(name_var.get(), txt.get('1.0', 'end'), lv.get())
+        classes = class_lists_for_current(True)
+        if classes is None:
+            return
+        box_classes, target_classes = classes
+        ok = on_save(name_var.get(), txt.get('1.0', 'end'), lv.get(),
+                     box_classes, target_classes)
         if ok:
             messagebox.showinfo('保存成功', f'已保存: {name_var.get().strip()}')
+
+    preview_btns = tk.Frame(preview, bg='#15171e')
+    preview_btns.pack(anchor='w', pady=(6, 0))
+    tk.Button(preview_btns, text='刷新预览', command=draw_preview, bg='#2c324a', fg='#e8edff',
+              relief='flat', padx=8, pady=3).pack(side='left', padx=(0, 4))
+    tk.Button(preview_btns, text='重置编号', command=reset_classes, bg='#2c324a', fg='#e8edff',
+              relief='flat', padx=8, pady=3).pack(side='left')
 
     btnfrm = tk.Frame(top, bg='#15171e')
     btnfrm.pack(pady=(0, 10))
@@ -1260,6 +1477,7 @@ def _open_custom_editor(root, on_load, default_level=1,
               relief='flat', padx=12, pady=4).pack(side='left', padx=4)
     tk.Button(btnfrm, text='保存地图', command=save_current, bg='#2c324a', fg='#e8edff',
               relief='flat', padx=12, pady=4).pack(side='left', padx=4)
+    draw_preview()
 
 
 def main():

@@ -534,22 +534,58 @@ def plan_scout_phase_v2(the_map: list, player_start: tuple,
 
     box_to_target_idx: list = [0] * n_box
     if all_resolved() and n_box == n_tgt:
-        used = [False] * n_tgt
+        box_done = [False] * n_box
         ok = True
+
         for bi in range(n_box):
+            if box_done[bi]:
+                continue
             cls = out_box_classes[bi]
-            matched = False
-            for ti in range(n_tgt):
-                if used[ti]:
-                    continue
-                if out_target_classes[ti] == cls:
-                    box_to_target_idx[bi] = ti
-                    used[ti] = True
-                    matched = True
-                    break
-            if not matched:
+            if cls == 0:
                 ok = False
                 break
+
+            group_boxes = [i for i, c in enumerate(out_box_classes) if c == cls]
+            group_targets = [i for i, c in enumerate(out_target_classes) if c == cls]
+            if len(group_boxes) != len(group_targets) or not group_boxes:
+                ok = False
+                break
+
+            best_cost = None
+            best_assign = None
+            used = [False] * len(group_targets)
+            cur_assign = [0] * len(group_boxes)
+
+            def dfs(depth: int, cur_cost: int) -> None:
+                nonlocal best_cost, best_assign
+                if best_cost is not None and cur_cost >= best_cost:
+                    return
+                if depth >= len(group_boxes):
+                    best_cost = cur_cost
+                    best_assign = list(cur_assign)
+                    return
+
+                box_pos = boxes[group_boxes[depth]]
+                for local_ti, target_idx in enumerate(group_targets):
+                    if used[local_ti]:
+                        continue
+                    target_pos = targets[target_idx]
+                    step_cost = abs(box_pos[0] - target_pos[0]) + abs(box_pos[1] - target_pos[1])
+                    used[local_ti] = True
+                    cur_assign[depth] = target_idx
+                    dfs(depth + 1, cur_cost + step_cost)
+                    used[local_ti] = False
+
+            dfs(0, 0)
+            if best_assign is None:
+                ok = False
+                break
+
+            for local_bi, target_idx in enumerate(best_assign):
+                box_idx = group_boxes[local_bi]
+                box_to_target_idx[box_idx] = target_idx
+                box_done[box_idx] = True
+
         if not ok:
             box_to_target_idx = []
 
