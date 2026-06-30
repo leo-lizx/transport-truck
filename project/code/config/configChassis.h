@@ -109,15 +109,27 @@
 /* ---- 用户常调参数 (优先调下面几个) ---- */
 
 /** 航向响应快慢: 越大越快，过大可能轻微摆动 */
-#define CHASSIS_YAW_KP                      (4.50f)
+#define CHASSIS_YAW_KP                      (5.0f)
 
-/** 角速度 P-only 阻尼: 越大越稳，过大可能发闷
- *  P0-调 2026-06-07: 0.05 几乎没阻尼 → yaw 来回摆/车一直抖；
- *  提到 0.25 加 5 倍阻尼，抑制 yaw 震荡 */
-#define CHASSIS_YAW_RATE_KP                 (0.35f)
+/** 角速度 D 阻尼 (真 D): 只抵抗旋转速度，不放大前馈。
+ *  0=无阻尼(快但过冲), 0.5~1.0=适度, >1.5=强阻尼(肉但稳)
+ *  自适应: 大误差时乘 |err|/10°, 近 0° 时才满额 */
+#define CHASSIS_YAW_RATE_KD                 (1.20f)
+
+/** yaw 积分增益 — 消除静摩擦稳态残差。从 0 起调，+0.3/次 */
+#define CHASSIS_YAW_KI                      (1.50f)
+
+/** yaw 积分上限 (°/s) — 最多贡献这么多角速度 */
+#define CHASSIS_YAW_I_LIMIT_DPS             (40.0f)
+
+/** yaw 积分生效误差带 (°) — 仅在此误差内累积，防大角度卷绕 */
+#define CHASSIS_YAW_I_BAND_DEG              (15.0f)
+
+/** 自适应 D 满额误差 (°) — |err| 超此值 D 满额，低于此值线性衰减 */
+#define CHASSIS_YAW_D_FULL_ERR_DEG          (10.0f)
 
 /** 最大旋转速度 (°/s): 限制原地转向和导航修正的最高角速度 */
-#define CHASSIS_MAX_YAW_SPEED_DPS           (180.0f)
+#define CHASSIS_MAX_YAW_SPEED_DPS           (360.0f)
 
 /** 角速度加减速限制 (°/s²): 同时用于 yaw sqrt 曲线和下游 ramp */
 #define CHASSIS_CMD_ACCEL_LIMIT_DPS2        (720.0f)
@@ -235,10 +247,10 @@
 /* ---- Yaw 角速度处理 ---- */
 
 /** Yaw 角速度死区 (°/s) — 抑制静止抖动 */
-#define CHASSIS_IMU_GYRO_DEADZONE_DPS       (0.3f)
+#define CHASSIS_IMU_GYRO_DEADZONE_DPS       (0.1f)
 
 /** Yaw 角速度一阶低通系数 (0,1] — 越小越平滑 */
-#define CHASSIS_IMU_GYRO_LPF_ALPHA          (0.25f)
+#define CHASSIS_IMU_GYRO_LPF_ALPHA          (0.1f)
 
 /** 静止时在线零偏慢修正系数 (EMA) */
 #define CHASSIS_IMU_BIAS_ADAPT_ALPHA        (0.002f)

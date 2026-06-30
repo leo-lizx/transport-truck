@@ -119,7 +119,7 @@ static uint32 wait_for_tick(void)
 #define MAIN_RUN_MODE_LEVEL2_TEST     (10)  /* 第二关测试: 收图→固定发车→分类识别→Stage2推箱→回库 */
 
 /* ═══════════ 改下面这行切换运行模式 (0~10) ═══════════ */
-#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_POINT_NAV)  /* mode 0: autonomous multi-level game flow */
+#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_YAW_HOLD)  /* mode 0: autonomous multi-level game flow */
 /* ═══════════ 改上面这行切换运行模式 (0~10) ═══════════ */
 
 /* OpenART1 地图链路硬件口: 若实测 UART4 走 D0/D1, 只改下面两行宏. */
