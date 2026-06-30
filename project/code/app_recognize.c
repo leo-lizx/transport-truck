@@ -116,8 +116,9 @@ static uint32 s_last_seen_frame_id = 0U;     /* 已采样过的最大 frame_id, 
 /**
  * 计算"车头朝物体"的目标 yaw (度). 约定见文件头.
  *  - 车体 +Y 为前进方向, +X 为右
- *  - yaw 是车体相对全局坐标系 +X 的角度 (CCW 正)
- *  - 朝物体 = 车体 +Y 指向物体 → 解得 yaw = atan2(-Δx, Δy)
+ *  - yaw 以地图 +Y 为 0°, 按地图坐标约定逆时针为正:
+ *    90°=+X, 180°=-Y, 270°=-X
+ *  - 朝物体 = 车体 +Y 指向物体 → 解得 yaw = atan2(Δx, Δy)
  */
 static float recog_calc_face_yaw_deg(Point_t observe, Point_t target)
 {
@@ -139,7 +140,7 @@ static float recog_calc_face_yaw_deg(Point_t observe, Point_t target)
     {
         return 0.0f;
     }
-    yaw_rad = atan2f(-dx, dy);
+    yaw_rad = atan2f(dx, dy);
     return yaw_rad * (180.0f / PI_F);
 }
 
