@@ -2067,9 +2067,7 @@ static void main_apply_debug_wheel_pid(void)
     /* ✅ 姿态闭环调试走这里: 只设一次目标角, 后续 PIT_CH1 20ms 中断中持续闭环. */
     chassis_ctrl_hold_yaw(MAIN_POS_NAV_HOLD_YAW_DEG);
 #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_POINT_NAV)
-    /* 四角遍历: 首目标由主循环在暖机完成后下发 (MAIN_POINT_NAV_WARMUP_TICKS).
-     * 此处只保持 YAW_HOLD, 让 IMU KF / 编码器 LPF 先稳定,
-     * 避免位置积分在系统未就绪时提前累积导致起步超调. */
+    /* 车头朝上=yaw0°, 暖机期间保持当前航向不动. */
     chassis_ctrl_hold_yaw(0.0f);
 #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_SOKO_SELFTEST)
     /* 推箱求解自测: 摄像头 OpenART 通过 UART4 发来地图帧 → app_link 解析 →
@@ -2162,9 +2160,9 @@ static void main_apply_debug_wheel_pid(void)
             static const s_nav_wp_t s_wps[] = {
                 /*    x格    y格    yaw°   说明 */
                 {   1.0f, 10.0f,  0.0f },  /* ① (1,1)→(1,10) 北↑ */
-                {  14.0f, 10.0f,   0.0f },  /* ② (1,10)→(14,10) 东→ */
-                {  14.0f,  1.0f, 0.0f },  /* ③ (14,10)→(14,1) 南↓ */
-                {   1.0f,  1.0f, 0.0f },  /* ④ (14,1)→(1,1) 西← */
+                {  14.0f, 10.0f,  0.0f },  /* ② (1,10)→(14,10) 东→ */
+                {  14.0f,  1.0f,  0.0f },  /* ③ (14,10)→(14,1) 南↓ */
+                {   1.0f,  1.0f,  0.0f },  /* ④ (14,1)→(1,1) 西← */
                 //  { S_NAV_MOVE_M,  7.0f, 10.0f  },
                 // { S_NAV_MOVE_M,  1.0f, 10.0f },  /* ③ 右下角 (14,10) */
                 // { S_NAV_MOVE_M,  9.0f, 10.0f },  /* ④ 左下角 (1,10)  */
@@ -2244,7 +2242,8 @@ static void main_apply_debug_wheel_pid(void)
             static uint8  s_nav_started  = 0U;   /* 0=暖机中, 1=遍历进行中 */
 
 
-/* P0-改进 2026-06-30: 直接取结构体的 x(格)/y(格)/yaw(°) */
+/* P0-修复 2026-06-30: 坐标系 +X=左,+Y=上,CCW=yaw正.
+ *   车头朝上=yaw90°, 旋转矩阵已对齐, user_yaw 直接可用. */
 #define S_NAV_DISPATCH(wp)                                                   \
     chassis_ctrl_move_to_m(MAIN_POS_GRID_TO_M_X((wp)->x),                   \
                            MAIN_POS_GRID_TO_M_Y((wp)->y),                   \

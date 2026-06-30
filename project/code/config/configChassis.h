@@ -109,12 +109,12 @@
 /* ---- 用户常调参数 (优先调下面几个) ---- */
 
 /** 航向响应快慢: 越大越快，过大可能轻微摆动 */
-#define CHASSIS_YAW_KP                      (4.70f)
+#define CHASSIS_YAW_KP                      (4.50f)
 
 /** 角速度 P-only 阻尼: 越大越稳，过大可能发闷
  *  P0-调 2026-06-07: 0.05 几乎没阻尼 → yaw 来回摆/车一直抖；
  *  提到 0.25 加 5 倍阻尼，抑制 yaw 震荡 */
-#define CHASSIS_YAW_RATE_KP                 (0.50f)
+#define CHASSIS_YAW_RATE_KP                 (0.35f)
 
 /** 最大旋转速度 (°/s): 限制原地转向和导航修正的最高角速度 */
 #define CHASSIS_MAX_YAW_SPEED_DPS           (180.0f)
@@ -123,7 +123,7 @@
 #define CHASSIS_CMD_ACCEL_LIMIT_DPS2        (720.0f)
 
 /** 进入在位锁的角度阈值 (°): 越小锁得越准，越大越不抖 */
-#define CHASSIS_YAW_INPOS_ENTER_DEG         (0.30f)
+#define CHASSIS_YAW_INPOS_ENTER_DEG         (0.50f)
 
 /* ---- 网格 & 场地参数 ----
  *   比赛地图 16×12，最外圈不可进入；可通行 14×10，对应 3.2m×2.4m
@@ -163,7 +163,7 @@
 /** 到达目标点判定阈值 (米) — 纯位置判断，不叠加速度/ dwell/yaw */
 /** P0-修复 2026-06-30: 0.012→0.025。0.012 小于 BRAKE_FLOOR 一拍位移(1.3cm),
  *   物理上无法停住 → 反复过冲震荡。0.025=1/8 格，推箱子精度足够。 */
-#define CHASSIS_TARGET_REACHED_EPSILON_M    (0.015f)
+#define CHASSIS_TARGET_REACHED_EPSILON_M    (0.017f)
 
 /** 到位后 Schmitt 滞后释放阈值 (米) — 10cm 覆盖惯性滑移 */
 /** P0-修复 2026-06-30: 0.15→0.30。原值过小，小幅过冲即触发回弹震荡。
@@ -181,10 +181,10 @@
  *  P0-调参 2026-05-08: 2.50→3.50，加快远场逼近
  *  P0-修复 2026-05-11 (拐点停留+走斜线): 10.50→4.50
  *  (KP=10.5 时 linear_dist=accel/KP²≈0.027m → 冲过头) */
-#define CHASSIS_POS_KP                      (7.5f)
+#define CHASSIS_POS_KP                      (6.5f)
 
 /** 位置环沿程积分增益 — 消除静摩擦稳态残差。从 0 起调，+0.05/次 */
-#define CHASSIS_POS_KI                      (0.24f)
+#define CHASSIS_POS_KI                      (0.30f)
 
 /** 线速度最大加速度 (m/s²)
  *  P0-调参 2026-05-08: 3.00→5.00，加快爬坡/刹车
@@ -200,7 +200,7 @@
  *   hold_max_speed = v_max * HOLD_SPEED_RATIO
  *   brake_dist = v_max²/(2·accel) + EPSILON + BRAKE_MARGIN
  */
-#define CHASSIS_POS_KD_RATIO                (0.30f)
+#define CHASSIS_POS_KD_RATIO                (0.33f)
 #define CHASSIS_POS_HOLD_KD_RATIO           (3.0f)
 #define CHASSIS_POS_BRAKE_MARGIN_M          (-0.009f)
 #define CHASSIS_POS_I_LIMIT_RATIO           (0.20f)
@@ -220,7 +220,7 @@
  *  P0-修复 2026-06-30: 0.65→0.15。0.65 刹车距离 7cm > EPSILON 2.5cm → 必定过冲。
  *  0.15 刹车距离 ~4mm < EPSILON，且 MPC 自行规划减速，不需要刹车底速硬兜。
  *  如需应对长距离 sqrt_controller 路径的静摩擦卡死，可保留 0.20~0.25。 */
-#define CHASSIS_POS_BRAKE_FLOOR_MPS         (0.65f)
+#define CHASSIS_POS_BRAKE_FLOOR_MPS         (0.85f)
 
 /* ============================================================
  * §D IMU / 卡尔曼滤波 / 编码器融合
@@ -322,7 +322,7 @@
 /** 车体平移最大合成线速度 (m/s)
  *  P0-修复 2026-05-19 (轮子停转): 1.20→0.70 (TB6612 过流关断)
  *  0.70: d_stop=0.117m, BRAKE_DIST=0.25m 有裕量 */
-#define CHASSIS_MAX_LINEAR_SPEED_MPS        (1.80f)
+#define CHASSIS_MAX_LINEAR_SPEED_MPS        (2.0f)
 
 /** 正常控制路径的单轮速度兑底上限 (m/s) — 等比例缩放保方向 */
 #define CHASSIS_WHEEL_SPEED_CAP_MPS         (2.70f)
@@ -378,22 +378,22 @@
 /* LF (Wheel 0)
  * P0-修复 2026-06-07: TARGET_EPS=0+FB_STATIC=2.10→breakaway 永远激活，
  * 位置环收拢时指令小幅正负交替→breakaway 跟跳 2000PWM→把车甩出极限环 */
-#define CHASSIS_WHEEL_BREAKAWAY_LF_TARGET_EPS_MPS          (0.03f)
+#define CHASSIS_WHEEL_BREAKAWAY_LF_TARGET_EPS_MPS          (0.0f)
 #define CHASSIS_WHEEL_BREAKAWAY_LF_PWM_FLOOR               (800.0f)
 #define CHASSIS_WHEEL_BREAKAWAY_LF_FB_STATIC_EPS_MPS       (0.90f)
 
 /* RF (Wheel 1) */
-#define CHASSIS_WHEEL_BREAKAWAY_RF_TARGET_EPS_MPS          (0.03f)
+#define CHASSIS_WHEEL_BREAKAWAY_RF_TARGET_EPS_MPS          (0.0f)
 #define CHASSIS_WHEEL_BREAKAWAY_RF_PWM_FLOOR               (800.0f)
 #define CHASSIS_WHEEL_BREAKAWAY_RF_FB_STATIC_EPS_MPS       (0.90f)
 
 /* LB (Wheel 2) */
-#define CHASSIS_WHEEL_BREAKAWAY_LB_TARGET_EPS_MPS          (0.03f)
+#define CHASSIS_WHEEL_BREAKAWAY_LB_TARGET_EPS_MPS          (0.0f)
 #define CHASSIS_WHEEL_BREAKAWAY_LB_PWM_FLOOR               (800.0f)
 #define CHASSIS_WHEEL_BREAKAWAY_LB_FB_STATIC_EPS_MPS       (0.90f)
 
 /* RB (Wheel 3) */
-#define CHASSIS_WHEEL_BREAKAWAY_RB_TARGET_EPS_MPS          (0.03f)
+#define CHASSIS_WHEEL_BREAKAWAY_RB_TARGET_EPS_MPS          (0.0f)
 #define CHASSIS_WHEEL_BREAKAWAY_RB_PWM_FLOOR               (800.0f)
 #define CHASSIS_WHEEL_BREAKAWAY_RB_FB_STATIC_EPS_MPS       (0.90f)
 
