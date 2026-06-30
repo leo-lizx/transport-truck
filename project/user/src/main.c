@@ -120,6 +120,7 @@ static uint32 wait_for_tick(void)
 
 /* ═══════════ 改下面这行切换运行模式 (0~10) ═══════════ */
 #define MAIN_RUN_MODE                 (MAIN_RUN_MODE_POINT_NAV)  /* mode 0: autonomous multi-level game flow */
+#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_POINT_NAV)  /* mode 0: autonomous multi-level game flow */
 /* ═══════════ 改上面这行切换运行模式 (0~10) ═══════════ */
 
 /* OpenART1 地图链路硬件口: 若实测 UART4 走 D0/D1, 只改下面两行宏. */
