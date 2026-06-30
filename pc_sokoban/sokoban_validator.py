@@ -607,7 +607,8 @@ def plan_scout_phase_v2(the_map: list, player_start: tuple,
 # ============================================================
 
 def sokoban_bfs_single(sub_map: list, player: tuple, box: tuple,
-                       target: tuple) -> Optional[list]:
+                       target: tuple,
+                       block_other_targets: bool = True) -> Optional[list]:
     """
     单箱推箱 BFS 求解。
     状态 = (player_r, player_c, box_r, box_c)。
@@ -644,6 +645,9 @@ def sokoban_bfs_single(sub_map: list, player: tuple, box: tuple,
                 nbr = br + DR[d]
                 nbc = bc + DC[d]
                 if not is_free(sub_map, nbr, nbc):
+                    continue
+                if (block_other_targets and sub_map[nbr][nbc] == TARGET
+                        and (nbr, nbc) != target):
                     continue
             else:
                 # 行走：目标格可通行且不是箱子所在格
@@ -703,13 +707,15 @@ def simulate_actions(actions: list, player: tuple, box: tuple) -> tuple:
 # ============================================================
 
 def build_sub_map(base_map: list, boxes: list, targets: list,
-                  solved: list, cur_box_idx: int, cur_target_idx: int) -> list:
+                  solved: list, target_used: list,
+                  cur_box_idx: int, cur_target_idx: int) -> list:
     """
     构建单箱子问题的子地图：
       - 当前箱子：从地图移除（BFS 状态跟踪）
       - 已完成箱子：空地
       - 其余未完成箱子：墙壁
-      - 非当前目标点：改为空地
+      - 未使用目标点：保留，禁止箱子提前进入消除
+      - 已使用目标点：改为空地
     对应 C 代码 build_sub_map()。
     """
     sub = [row[:] for row in base_map]
@@ -724,7 +730,7 @@ def build_sub_map(base_map: list, boxes: list, targets: list,
     for i, (tr, tc) in enumerate(targets):
         if i == cur_target_idx:
             continue
-        if sub[tr][tc] == TARGET:
+        if target_used[i] and sub[tr][tc] == TARGET:
             sub[tr][tc] = EMPTY
 
     return sub
@@ -776,7 +782,7 @@ def _solve_stage1_greedy(the_map: list, player_pos: tuple) -> Optional[dict]:
         if best_t is None:
             return None
 
-        sub = build_sub_map(the_map, boxes, targets, solved, best_b, best_t)
+        sub = build_sub_map(the_map, boxes, targets, solved, t_used, best_b, best_t)
         sol = sokoban_bfs_single(sub, cur_player, boxes[best_b], targets[best_t])
         if sol is None:
             return None
@@ -817,6 +823,7 @@ def _solve_stage2_greedy(the_map: list, player_pos: tuple,
         return None
 
     solved = [False] * n
+    t_used = [False] * n
     sub_solutions = []
     cur_player = player_pos
 
@@ -833,7 +840,7 @@ def _solve_stage2_greedy(the_map: list, player_pos: tuple,
         if ti >= len(targets):
             return None
 
-        sub = build_sub_map(the_map, boxes, targets, solved, best_b, ti)
+        sub = build_sub_map(the_map, boxes, targets, solved, t_used, best_b, ti)
         sol = sokoban_bfs_single(sub, cur_player, boxes[best_b], targets[ti])
         if sol is None:
             return None
@@ -846,6 +853,7 @@ def _solve_stage2_greedy(the_map: list, player_pos: tuple,
             'player_end': cur_player,
         })
         solved[best_b] = True
+        t_used[ti] = True
 
     return {
         'sub_solutions': sub_solutions,
@@ -942,8 +950,10 @@ def _solve_stage_opt(the_map: list, player_pos: tuple,
         candidates.sort(key=lambda x: x[2])
 
         solved = [False] * n
+        target_used = [False] * n
         for i in range(n):
             solved[i] = bool(solved_mask & (1 << i))
+            target_used[i] = bool(used_target_mask & (1 << i))
 
         for bi, ti, _ in candidates:
             if node_limit:
@@ -951,7 +961,7 @@ def _solve_stage_opt(the_map: list, player_pos: tuple,
                     hit_limit = True
                     return
                 node_count += 1
-            sub = build_sub_map(the_map, boxes, targets, solved, bi, ti)
+            sub = build_sub_map(the_map, boxes, targets, solved, target_used, bi, ti)
             sol = sokoban_bfs_single(sub, cur_player, boxes[bi], targets[ti])
             if sol is None:
                 continue
@@ -1187,7 +1197,8 @@ def plan_bomb(the_map: list, player_pos: tuple,
                 sub = [row[:] for row in the_map]
                 sub[bombs[bi][0]][bombs[bi][1]] = EMPTY
                 sub[wall[0]][wall[1]] = TARGET
-                acts = sokoban_bfs_single(sub, player_pos, bombs[bi], wall)
+                acts = sokoban_bfs_single(sub, player_pos, bombs[bi], wall,
+                                          block_other_targets=False)
                 if acts is not None:
                     chosen = bombs[bi]
                     chosen_actions = acts

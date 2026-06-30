@@ -126,5 +126,30 @@ greedy10 = sv._solve_stage1_greedy(m10, (2, 2))
 assert greedy10 is not None
 assert greedy10['sub_solutions'][0]['box_idx'] == 1
 print("墙体绕障场景下按实际 BFS 距离选择箱子")
+# Test 11: a box may enter only the current target, not pass through another
+# unused target on the way to a farther target.
+print("\n=== Test 11: block pass-through targets ===")
+m11 = sv._make_empty_map()
+for c in range(2, 9):
+    m11[4][c] = sv.WALL
+    m11[6][c] = sv.WALL
+m11[5][3] = sv.BOX
+m11[5][5] = sv.TARGET
+m11[5][8] = sv.TARGET
+boxes11 = sv.extract_elements(m11, sv.BOX)
+targets11 = sv.extract_elements(m11, sv.TARGET)
+sub11_far = sv.build_sub_map(
+    m11, boxes11, targets11,
+    [False], [False, False],
+    0, 1,
+)
+assert sv.sokoban_bfs_single(sub11_far, (5, 2), boxes11[0], targets11[1]) is None
+sub11_near = sv.build_sub_map(
+    m11, boxes11, targets11,
+    [False], [False, False],
+    0, 0,
+)
+assert sv.sokoban_bfs_single(sub11_near, (5, 2), boxes11[0], targets11[0]) is not None
+print("Pass-through target candidate is rejected; current target remains valid.")
 print("\n=============================")
 print("所有测试通过！")
