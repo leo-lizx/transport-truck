@@ -322,6 +322,8 @@ void chassis_imu_update_5ms(void)
      */
     gyro_z_raw_dps = imu_yaw_gyro_raw_dps();
 
+    gyro_z_raw_dps *= CHASSIS_IMU_GYRO_SCALE;  /* 陀螺灵敏度标定, 默认 1.0 */
+
     /* 步骤 2: 滑窗静止检测 -> 通用零偏在线辨识 (P0-改进 2026-04-29) */
     is_still = still_detect_step(gyro_z_raw_dps, &still_mean_dps, &still_var_dps2);
     s_imu_is_still = is_still;

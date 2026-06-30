@@ -1704,7 +1704,7 @@ static void main_mode5_render_100ms(void)
 #define MAIN_POS_NAV_TARGET_Y_GRID    (10)     /* 整数 0..10, 10 = 下边界 */
 /* <<<<<<<<<<<< 改这两行换目标格 >>>>>>>>>>>> */
 
-#define MAIN_POS_NAV_HOLD_YAW_DEG     (90.0f)   /* 全程锁住 0° 航向 */
+#define MAIN_POS_NAV_HOLD_YAW_DEG     (180.0f)   /* 全程锁住 0° 航向 */
 
 /*
  * 上电暖机等待时长 (5ms tick 数). 200 × 5ms = 1s.
