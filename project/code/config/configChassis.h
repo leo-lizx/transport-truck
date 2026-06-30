@@ -109,12 +109,12 @@
 /* ---- 用户常调参数 (优先调下面几个) ---- */
 
 /** 航向响应快慢: 越大越快，过大可能轻微摆动 */
-#define CHASSIS_YAW_KP                      (4.50f)
+#define CHASSIS_YAW_KP                      (4.70f)
 
 /** 角速度 P-only 阻尼: 越大越稳，过大可能发闷
  *  P0-调 2026-06-07: 0.05 几乎没阻尼 → yaw 来回摆/车一直抖；
  *  提到 0.25 加 5 倍阻尼，抑制 yaw 震荡 */
-#define CHASSIS_YAW_RATE_KP                 (0.30f)
+#define CHASSIS_YAW_RATE_KP                 (0.50f)
 
 /** 最大旋转速度 (°/s): 限制原地转向和导航修正的最高角速度 */
 #define CHASSIS_MAX_YAW_SPEED_DPS           (180.0f)

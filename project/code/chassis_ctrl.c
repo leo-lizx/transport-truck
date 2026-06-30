@@ -1026,8 +1026,8 @@ void chassis_ctrl_task_20ms(void)
     cy = cosf(yaw_rad);
     sy = sinf(yaw_rad);
     {
-        float new_x = s_pose.x_m + (cy * s_fb_vx - sy * s_fb_vy) * CHASSIS_TASK_DT_20MS_S;
-        float new_y = s_pose.y_m + (sy * s_fb_vx + cy * s_fb_vy) * CHASSIS_TASK_DT_20MS_S;
+        float new_x = s_pose.x_m + (sy * s_fb_vy + cy * s_fb_vx) * CHASSIS_TASK_DT_20MS_S;
+        float new_y = s_pose.y_m + (cy * s_fb_vy + sy * s_fb_vx) * CHASSIS_TASK_DT_20MS_S;
         pose_write_begin();
         s_pose.x_m = new_x;
         s_pose.y_m = new_y;
@@ -1138,8 +1138,8 @@ void chassis_ctrl_task_20ms(void)
          *              保持轴 kd_hold = pos_kp × HOLD_KD_RATIO (轻阻尼).
          * D 项始终用全局速度 (vxg_meas, vyg_meas) 直接做 PD, 与 axis 独立. */
         {
-            float vxg_meas      = cy * s_fb_vx - sy * s_fb_vy;  /* 全局速度 X */
-            float vyg_meas      = sy * s_fb_vx + cy * s_fb_vy;  /* 全局速度 Y */
+            float vxg_meas      = sy * s_fb_vy + cy * s_fb_vx;  /* 全局速度 X */
+            float vyg_meas      = cy * s_fb_vy + sy * s_fb_vx;  /* 全局速度 Y */
 
             /* D 项低通 (Tesla/Waymo: derivative-on-measurement + IIR LPF) */
             s_v_along_lpf = (1.0f - CHASSIS_POS_D_LPF_ALPHA) * s_v_along_lpf
@@ -1384,21 +1384,22 @@ void chassis_ctrl_task_20ms(void)
          * 以免 X->Y 切轴时边旋转边走, 旋转耦合被保持环放大成横向偏移. */
         yerr = chassis_normalize_angle_deg(s_tgt_yaw_deg - s_pose.yaw_deg);
 
-        /* 起步 yaw 门控: 临时关闭排查"突然停下"问题.
-         * 验证后恢复: 改回 !s_nav_yaw_aligned && (fabsf(yerr) > INPOS_DEG) */
-        if (0) {
+        /* 起步 yaw 门控: 先原地转到目标航向, 对齐后再平移.
+         * P0-改进 2026-06-30: 恢复门控。边转边走时旋转耦合会被保持环放大
+         * 成横向偏移 → 走不直。先对齐再平移消除这种耦合。 */
+        if (!s_nav_yaw_aligned && (fabsf(yerr) > CHASSIS_YAW_INPOS_ENTER_DEG)) {
             s_ramp.vx_body_mps = 0.0f;
             s_ramp.vy_body_mps = 0.0f;
             cmd.vx_body_mps = 0.0f;
             cmd.vy_body_mps = 0.0f;
-            cmd.wz_dps      = yaw_pi(yerr, 0U);
+            cmd.wz_dps      = yaw_pi(yerr, 1U);  /* 原地旋转, 允许 in-pos 锁 */
             break;
         }
         s_nav_yaw_aligned = 1U;
 
-        /* 全局 → 车体坐标变换 */
+        /* 全局→车体: vy=前进轴, vx=侧向轴 */
+        cmd.vy_body_mps =  sy * vxg + cy * vyg;
         cmd.vx_body_mps =  cy * vxg + sy * vyg;
-        cmd.vy_body_mps = -sy * vxg + cy * vyg;
         if (fabsf(yerr) <= CHASSIS_YAW_GOAL_TOLERANCE_DEG)
         {
             cmd.wz_dps = 0.0f;
@@ -1667,9 +1668,9 @@ void chassis_ctrl_get_odom_velocity_global_mps(float *out_vx_g, float *out_vy_g)
     sy      = sinf(yaw_rad);
     vx_b    = s_fb_vx;
     vy_b    = s_fb_vy;
-    /* 与里程计积分同一旋转: new_x += (cy*vx - sy*vy)*dt */
-    vxg     = cy * vx_b - sy * vy_b;
-    vyg     = sy * vx_b + cy * vy_b;
+    /* 与里程计积分同一旋转 */
+    vxg     = sy * vy_b + cy * vx_b;
+    vyg     = cy * vy_b + sy * vx_b;
 
     if (out_vx_g != NULL) { *out_vx_g = vxg; }
     if (out_vy_g != NULL) { *out_vy_g = vyg; }

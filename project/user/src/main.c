@@ -119,7 +119,7 @@ static uint32 wait_for_tick(void)
 #define MAIN_RUN_MODE_LEVEL2_TEST     (10)  /* 第二关测试: 收图→固定发车→分类识别→Stage2推箱→回库 */
 
 /* ═══════════ 改下面这行切换运行模式 (0~10) ═══════════ */
-#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_GAME)  /* mode 0: autonomous multi-level game flow */
+#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_POINT_NAV)  /* mode 0: autonomous multi-level game flow */
 /* ═══════════ 改上面这行切换运行模式 (0~10) ═══════════ */
 
 /* OpenART1 地图链路硬件口: 若实测 UART4 走 D0/D1, 只改下面两行宏. */
@@ -2152,47 +2152,19 @@ static void main_apply_debug_wheel_pid(void)
          *     == 1: 已到达当前目标
          *   到达后立即更新索引并派发下一个航点, 自动将标志位清零; 全程结束驻停. */
         {
-            /* 航点动作类型 */
-            #define S_NAV_MOVE_GRID  (0U)   /* chassis_ctrl_move_to_grid(x格, y格) */
-            #define S_NAV_MOVE_M     (2U)   /* chassis_ctrl_move_to_m (用于半格精度) */
+            /* 航点描述: { x(格), y(格), yaw(°) }
+             *   x/y = 网格坐标, 运行时自动换算为米
+             *   yaw = 目标航向°: 0=东(+X), 90=北(+Y), ±180=西(-X), -90=南(-Y)
+             *   可设任意值, 自动 snap 到最近 90° 整数倍 */
+            typedef struct { float x; float y; float yaw; } s_nav_wp_t;
 
-            /* 航点描述: { 动作, a, b }
-             *   S_NAV_MOVE_GRID: a=x(格), b=y(格)
-             *   S_NAV_MOVE_M:    a=x(格,运行时换算为米), b=y(格,运行时换算为米)
-             *
-             * 注意: 不再使用 S_NAV_ROTATE 原地旋转指令.
-             * 根因: 麦轮原地旋转时滚子滑动 → 里程计 X/Y 积分偏差 → 旋转后
-             *       move_to_grid 的 yaw_snap 锁住非 0° 航向 → 后续平移变成侧向
-             *       strafing (精度低) → "走斜线". 去掉旋转后车辆全程锁 0° 航向,
-             *       与之前可靠运行的四角遍历逻辑保持一致. */
-            typedef struct { uint8 act; float a; float b; } s_nav_wp_t;
-            /* ────────────────────────────────────────────────────────────
-             * 当前路线总行程约 25.4m，麦轮里程计漂移 2~5% → 位置误差 50cm~1.3m.
-             * 【优化建议】去掉⑥⑦⑧三个重复角落，改为5步直接回起点，
-             * 可将行程缩短到 ~15m，漂移减半。若赛规要求重复访问则保留。
-             * ──────────────────────────────────────────────────────────── */
+            /* ═══════════ 航点序列 — 改这里 ═══════════ */
             static const s_nav_wp_t s_wps[] = {
-                // { S_NAV_MOVE_M,  1.0f,  5.50f  },  /* ⑥ 左上角 (1,1) 再次经过 */
-                // { S_NAV_MOVE_M,  14.0f, 5.50f },  /* ⑦ 右下角 (14,10) 再次经过 */
-                // { S_NAV_MOVE_M,  1.0f,  5.50f  },  /* ⑧ 左上角 (1,1)  作为回程中转 */
-                // { S_NAV_MOVE_M,   14.0f,  5.50f  },  /* ⑨ 回起点 (1,5.5) */
-                // { S_NAV_MOVE_M,  1.0f,  5.50f  },  /* ① 左上角 (1,1)   */
-                // { S_NAV_MOVE_M,  1.0f, 10.0f  },  /* ② 右上角 (14,1)  */
-                // { S_NAV_MOVE_M,  1.0f, 1.0f },  /* ③ 右下角 (14,10) */
-                // { S_NAV_MOVE_M,  1.0f, 10.0f }, 
-                // { S_NAV_MOVE_M, 1.0f,  1.0f  },  /* ⑥ 左上角 (1,1) 再次经过 */
-                { S_NAV_MOVE_M,  1.0f, 10.0f },  /* ⑦ 右下角 (14,10) 再次经过 */
-                { S_NAV_MOVE_M,  14.0f,  10.0f  },  /* ⑧ 左上角 (1,1)  作为回程中转 */
-                { S_NAV_MOVE_M,  14.0f,  1.0f  },  /* ⑨ 回起点 (1,5.5) */
-                { S_NAV_MOVE_M,  1.0f,  1.0f  },  /* ① 左上角 (1,1)   */
-                { S_NAV_MOVE_M,  1.0f, 10.0f },  /* ⑦ 右下角 (14,10) 再次经过 */
-                { S_NAV_MOVE_M,  14.0f,  10.0f  },  /* ⑧ 左上角 (1,1)  作为回程中转 */
-                { S_NAV_MOVE_M,  14.0f,  1.0f  },  /* ⑨ 回起点 (1,5.5) */
-                { S_NAV_MOVE_M,  1.0f,  1.0f  },
-                 { S_NAV_MOVE_M,  1.0f, 10.0f },  /* ⑦ 右下角 (14,10) 再次经过 */
-                { S_NAV_MOVE_M,  14.0f,  10.0f  },  /* ⑧ 左上角 (1,1)  作为回程中转 */
-                { S_NAV_MOVE_M,  14.0f,  1.0f  },  /* ⑨ 回起点 (1,5.5) */
-                { S_NAV_MOVE_M,  1.0f,  1.0f  },
+                /*    x格    y格    yaw°   说明 */
+                {   1.0f, 10.0f,  0.0f },  /* ① (1,1)→(1,10) 北↑ */
+                {  14.0f, 10.0f,   0.0f },  /* ② (1,10)→(14,10) 东→ */
+                {  14.0f,  1.0f, 0.0f },  /* ③ (14,10)→(14,1) 南↓ */
+                {   1.0f,  1.0f, 0.0f },  /* ④ (14,1)→(1,1) 西← */
                 //  { S_NAV_MOVE_M,  7.0f, 10.0f  },
                 // { S_NAV_MOVE_M,  1.0f, 10.0f },  /* ③ 右下角 (14,10) */
                 // { S_NAV_MOVE_M,  9.0f, 10.0f },  /* ④ 左下角 (1,10)  */
@@ -2271,16 +2243,12 @@ static void main_apply_debug_wheel_pid(void)
             static uint16 s_warmup_ticks = 0U;   /* 暖机计数 (5ms tick) */
             static uint8  s_nav_started  = 0U;   /* 0=暖机中, 1=遍历进行中 */
 
-/* 航点派发辅助宏: wp 为 const s_nav_wp_t * */
+
+/* P0-改进 2026-06-30: 直接取结构体的 x(格)/y(格)/yaw(°) */
 #define S_NAV_DISPATCH(wp)                                                   \
-    do {                                                                     \
-        if (S_NAV_MOVE_GRID == (wp)->act) {                                  \
-            chassis_ctrl_move_to_grid((uint8)(wp)->a, (uint8)(wp)->b);       \
-        } else {                                                             \
-            chassis_ctrl_move_to_m(MAIN_POS_GRID_TO_M_X((wp)->a),           \
-                                   MAIN_POS_GRID_TO_M_Y((wp)->b), 0.0f);    \
-        }                                                                    \
-    } while (0)
+    chassis_ctrl_move_to_m(MAIN_POS_GRID_TO_M_X((wp)->x),                   \
+                           MAIN_POS_GRID_TO_M_Y((wp)->y),                   \
+                           (wp)->yaw)
 
             if (!s_nav_started) {
                 /* 暖机: 等待 IMU KF + 编码器 LPF + 静止窗口全部就绪 */
