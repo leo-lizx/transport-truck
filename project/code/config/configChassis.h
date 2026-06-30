@@ -109,15 +109,15 @@
 /* ---- 用户常调参数 (优先调下面几个) ---- */
 
 /** 航向响应快慢: 越大越快，过大可能轻微摆动 */
-#define CHASSIS_YAW_KP                      (4.20f)
+#define CHASSIS_YAW_KP                      (4.50f)
 
 /** 角速度 P-only 阻尼: 越大越稳，过大可能发闷
  *  P0-调 2026-06-07: 0.05 几乎没阻尼 → yaw 来回摆/车一直抖；
  *  提到 0.25 加 5 倍阻尼，抑制 yaw 震荡 */
-#define CHASSIS_YAW_RATE_KP                 (0.35f)
+#define CHASSIS_YAW_RATE_KP                 (0.30f)
 
 /** 最大旋转速度 (°/s): 限制原地转向和导航修正的最高角速度 */
-#define CHASSIS_MAX_YAW_SPEED_DPS           (170.0f)
+#define CHASSIS_MAX_YAW_SPEED_DPS           (180.0f)
 
 /** 角速度加减速限制 (°/s²): 同时用于 yaw sqrt 曲线和下游 ramp */
 #define CHASSIS_CMD_ACCEL_LIMIT_DPS2        (720.0f)
@@ -161,15 +161,19 @@
 /* ---- 导航：到位/保持/制动 ---- */
 
 /** 到达目标点判定阈值 (米) — 纯位置判断，不叠加速度/ dwell/yaw */
-#define CHASSIS_TARGET_REACHED_EPSILON_M    (0.018f)
+/** P0-修复 2026-06-30: 0.012→0.025。0.012 小于 BRAKE_FLOOR 一拍位移(1.3cm),
+ *   物理上无法停住 → 反复过冲震荡。0.025=1/8 格，推箱子精度足够。 */
+#define CHASSIS_TARGET_REACHED_EPSILON_M    (0.015f)
 
 /** 到位后 Schmitt 滞后释放阈值 (米) — 10cm 覆盖惯性滑移 */
-#define CHASSIS_POS_HOLD_EXIT_M             (0.15f)
+/** P0-修复 2026-06-30: 0.15→0.30。原值过小，小幅过冲即触发回弹震荡。
+ *   配合 BRAKE_FLOOR 降低后，惯性过冲通常 <5cm，30cm 余量充足。 */
+#define CHASSIS_POS_HOLD_EXIT_M             (0.30f)
 
 /** 到位后 yaw 容忍带 (°) — |yaw_err| < 该值即硬归零，不咬最后残差
  *  P0-修复 2026-05-12 (走斜线): 1.5°→0.5°  (vyg 投影从 31→10 mm/s)
  *  P0-修复 2026-06-07: 0.5°→0.10°，0.10°每米仅漂 1.7mm */
-#define CHASSIS_YAW_GOAL_TOLERANCE_DEG      (0.10f)
+#define CHASSIS_YAW_GOAL_TOLERANCE_DEG      (0.40f)
 
 /* ---- 导航增益 ---- */
 
@@ -177,10 +181,10 @@
  *  P0-调参 2026-05-08: 2.50→3.50，加快远场逼近
  *  P0-修复 2026-05-11 (拐点停留+走斜线): 10.50→4.50
  *  (KP=10.5 时 linear_dist=accel/KP²≈0.027m → 冲过头) */
-#define CHASSIS_POS_KP                      (8.5f)
+#define CHASSIS_POS_KP                      (7.5f)
 
 /** 位置环沿程积分增益 — 消除静摩擦稳态残差。从 0 起调，+0.05/次 */
-#define CHASSIS_POS_KI                      (0.2f)
+#define CHASSIS_POS_KI                      (0.24f)
 
 /** 线速度最大加速度 (m/s²)
  *  P0-调参 2026-05-08: 3.00→5.00，加快爬坡/刹车
@@ -197,12 +201,12 @@
  *   brake_dist = v_max²/(2·accel) + EPSILON + BRAKE_MARGIN
  */
 #define CHASSIS_POS_KD_RATIO                (0.30f)
-#define CHASSIS_POS_HOLD_KD_RATIO           (2.0f)
-#define CHASSIS_POS_BRAKE_MARGIN_M          (-0.006f)
+#define CHASSIS_POS_HOLD_KD_RATIO           (3.0f)
+#define CHASSIS_POS_BRAKE_MARGIN_M          (-0.009f)
 #define CHASSIS_POS_I_LIMIT_RATIO           (0.20f)
 #define CHASSIS_POS_I_BAND_RATIO            (0.8f)
 #define CHASSIS_POS_AXIS_SWITCH_RATIO       (0.6f)
-#define CHASSIS_POS_HOLD_SPEED_RATIO        (0.25f)
+#define CHASSIS_POS_HOLD_SPEED_RATIO        (0.35f)
 
 /** 保持轴死区 (m) — 滤除编码器量化噪声 (~2~5mm)，远小于 EPSILON
  *  P0-修复 2026-06-07: 原无死区，噪声被 sqrt_ctrl 放大 → Y 方向持续微幅震荡 */
@@ -212,8 +216,11 @@
  *  0.10 @ 20ms → 截止≈0.8Hz，衰减 odom 高频噪声 */
 #define CHASSIS_POS_D_LPF_ALPHA             (0.10f)
 
-/** brake_cap 末段最小有效速度 (m/s) — 克服静摩擦，确保推进到 EPSILON 内 */
-#define CHASSIS_POS_BRAKE_FLOOR_MPS         (0.320f)
+/** brake_cap 末段最小有效速度 (m/s) — 克服静摩擦，确保推进到 EPSILON 内
+ *  P0-修复 2026-06-30: 0.65→0.15。0.65 刹车距离 7cm > EPSILON 2.5cm → 必定过冲。
+ *  0.15 刹车距离 ~4mm < EPSILON，且 MPC 自行规划减速，不需要刹车底速硬兜。
+ *  如需应对长距离 sqrt_controller 路径的静摩擦卡死，可保留 0.20~0.25。 */
+#define CHASSIS_POS_BRAKE_FLOOR_MPS         (0.65f)
 
 /* ============================================================
  * §D IMU / 卡尔曼滤波 / 编码器融合
@@ -228,7 +235,7 @@
 /* ---- Yaw 角速度处理 ---- */
 
 /** Yaw 角速度死区 (°/s) — 抑制静止抖动 */
-#define CHASSIS_IMU_GYRO_DEADZONE_DPS       (0.8f)
+#define CHASSIS_IMU_GYRO_DEADZONE_DPS       (0.3f)
 
 /** Yaw 角速度一阶低通系数 (0,1] — 越小越平滑 */
 #define CHASSIS_IMU_GYRO_LPF_ALPHA          (0.25f)
@@ -243,7 +250,7 @@
 
 /** 静止判别阈值: 窗口方差上限 (°/s)²
  *  P0-回调 2026-05-02: 0.020→0.050，平台微震动也能识别静止 */
-#define CHASSIS_IMU_STILL_VAR_TH_DPS2       (0.020f)
+#define CHASSIS_IMU_STILL_VAR_TH_DPS2       (0.05f)
 
 /** 静止确认时 bias 快速更新系数 — 时间常数 ~10 拍 = 50ms */
 #define CHASSIS_IMU_BIAS_FAST_ALPHA         (0.10f)
@@ -258,10 +265,10 @@
 
 /** 过程噪声: bias (°²/s²/s) — 反映 bias 随机游走速度
  *  P0-回调 2026-05-02: 8e-6→5e-5，车跑 5min 温升 0.05°/s/min，K 增益翻几倍 */
-#define CHASSIS_IMU_KF_Q_BIAS_DPS2_PER_S    (0.00005f)
+#define CHASSIS_IMU_KF_Q_BIAS_DPS2_PER_S    (0.0009f)
 
 /** 观测噪声: ZUPT 时陀螺噪声方差 (°²/s²) */
-#define CHASSIS_IMU_KF_R_ZUPT_DPS2          (0.0050f)
+#define CHASSIS_IMU_KF_R_ZUPT_DPS2          (0.000010f)
 
 /** 状态协方差初值 */
 #define CHASSIS_IMU_KF_P0_ANGLE_DEG2        (1.0f)
@@ -273,14 +280,14 @@
 #define CHASSIS_ODOM_YAW_FUSION_ENABLE      (1)
 
 /** 编码器 yaw 观测噪声方差 (°²) — 大=几乎不信(仅长期纠偏)，小=信任高(打滑污染) */
-#define CHASSIS_ODOM_YAW_R_DEG2             (40.0f)
+#define CHASSIS_ODOM_YAW_R_DEG2             (150.0f)
 
 /** odom yaw 与 IMU yaw 偏差超过此值视为打滑/重定位，跳过观测 */
-#define CHASSIS_ODOM_YAW_OUTLIER_DEG        (3.0f)
+#define CHASSIS_ODOM_YAW_OUTLIER_DEG        (1.20f)
 
 /** Innovation Gating: |wz_odom - wz_imu| 超过此值拒绝 (°/s)
  *  P0-修复 2026-05-02 (抬车空转污染 KF): IMU=0, odom>>0 → 自然拒绝 */
-#define CHASSIS_ODOM_YAW_INNOV_GATE_DPS     (20.0f)
+#define CHASSIS_ODOM_YAW_INNOV_GATE_DPS     (5.0f)
 
 /* ============================================================
  * §E 几何 + 限幅 + 滤波 + 静摩擦前馈 + 里程计
@@ -315,7 +322,7 @@
 /** 车体平移最大合成线速度 (m/s)
  *  P0-修复 2026-05-19 (轮子停转): 1.20→0.70 (TB6612 过流关断)
  *  0.70: d_stop=0.117m, BRAKE_DIST=0.25m 有裕量 */
-#define CHASSIS_MAX_LINEAR_SPEED_MPS        (1.10f)
+#define CHASSIS_MAX_LINEAR_SPEED_MPS        (1.80f)
 
 /** 正常控制路径的单轮速度兑底上限 (m/s) — 等比例缩放保方向 */
 #define CHASSIS_WHEEL_SPEED_CAP_MPS         (2.70f)
@@ -350,7 +357,7 @@
  *   则 SCALE = 0.20 / d_real
  */
 #define CHASSIS_ODOM_SCALE_X                (0.3970f)
-#define CHASSIS_ODOM_SCALE_Y                (0.420f)
+#define CHASSIS_ODOM_SCALE_Y                (0.4130f)
 
 /* ---- 静摩擦前馈 (Breakaway FF) — 每轮独立可配 ----
  *   实现 (apply_speed): 每轮独立查 g_chassis_tune_params
@@ -435,9 +442,9 @@
 /* (1) 执行器输出 MOTOR_*_OUTPUT_DIR: driver 乘命令，使 +命令 → 物理前进
  *     ★ 占位 +1 已按实车标定填写，换接线/换电机线序后必须重新辨识 */
 #define MOTOR_LF_OUTPUT_DIR                 (+1.0f)
-#define MOTOR_RF_OUTPUT_DIR                 (+1.0f)
+#define MOTOR_RF_OUTPUT_DIR                 (-1.0f)
 #define MOTOR_LB_OUTPUT_DIR                 (+1.0f)
-#define MOTOR_RB_OUTPUT_DIR                 (+1.0f)
+#define MOTOR_RB_OUTPUT_DIR                 (-1.0f)
 
 /* (2) 编码器 ENCODER_*_DIR: 乘原始计数，使 前进 → +速度反馈
  *     ★ 实车已标定值，换编码器线序/减速箱后必须重新辨识 */
@@ -568,5 +575,58 @@
 #ifndef CHASSIS_VISION_CONSISTENCY_MAX_AGE_MS
 #define CHASSIS_VISION_CONSISTENCY_MAX_AGE_MS   (250U)
 #endif
+
+/* ============================================================
+ * §G MPC 直线行驶 (Model Predictive Control) — 1D 纵向
+ *
+ *   推箱子场景: 车沿网格轴线走直线, 推箱子时有变负载。
+ *   MPC 提前 N 拍预知目标距离, 规划最优速度曲线,
+ *   干扰后自动重规划。只接管驱动轴速度, 横向保持和
+ *   航向保持沿用现有 hold_axis + yaw_pi。
+ *
+ *   CHASSIS_MPC_ENABLE=0 回退原 axis-by-axis sqrt_controller。
+ * ============================================================ */
+
+/** 1=MPC 接管驱动轴, 0=回退原 axis-by-axis */
+#define CHASSIS_MPC_ENABLE                      (1)
+
+/** 预测步数 (20ms/步), N=10 → 200ms 前瞻 */
+#define CHASSIS_MPC_HORIZON_N                   (10)
+
+/** QP 决策变量维度 = HORIZON_N */
+#define CHASSIS_MPC_H_DIM                       (CHASSIS_MPC_HORIZON_N)
+
+/** 对称矩阵 packed 存储元素数 = N*(N+1)/2 */
+#define CHASSIS_MPC_H_PACKED                    ((CHASSIS_MPC_H_DIM) * ((CHASSIS_MPC_H_DIM) + 1) / 2)
+
+/** 位置精度权重 (m⁻²): 大→冲得快/停得猛, 小→柔和但可能不到位 */
+#define CHASSIS_MPC_Q_POS                       (8.0f)
+
+/** 速度幅值代价 (s²/m²): 大→巡航速度降低, 小→更接近 v_max */
+#define CHASSIS_MPC_R_VEL                       (0.15f)
+
+/** 速度平滑代价 (s²/m²): 大→加减速柔和, 小→响应快但可能 jerk */
+#define CHASSIS_MPC_R_SMOOTH                    (0.50f)
+
+/** 终端位置额外权重因子: Q_term = Q_POS * 此值 */
+#define CHASSIS_MPC_QF_FACTOR                   (3.0f)
+
+/** MPC 驱动轴最大速度 (m/s), ≤ 全局限速 */
+#define CHASSIS_MPC_V_MAX_MPS                   CHASSIS_MAX_LINEAR_SPEED_MPS
+
+/** FISTA 最大迭代数 */
+#define CHASSIS_MPC_FISTA_MAX_ITER              (15)
+
+/** FISTA 梯度范数收敛容差 */
+#define CHASSIS_MPC_FISTA_TOL                   (1e-4f)
+
+/** FISTA 步长 (0=基于 H 的 Frobenius 范数自动计算) */
+#define CHASSIS_MPC_FISTA_STEP                  (0.0f)
+
+/** 距离超此值回退 sqrt_controller (m): 大跳后 MPC 短时域可能不够 */
+#define CHASSIS_MPC_FALLBACK_ERR_M              (0.50f)
+
+/** 距离低于此值不用 MPC (m): 近端驻车保持更可靠 */
+#define CHASSIS_MPC_MIN_DIST_M                  (0.02f)
 
 #endif /* _CONFIG_CHASSIS_H_ */

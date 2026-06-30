@@ -1201,6 +1201,12 @@
             <name>$PROJ_DIR$\..\..\code\chassis_mecanum.h</name>
         </file>
         <file>
+            <name>$PROJ_DIR$\..\..\code\chassis_mpc.c</name>
+        </file>
+        <file>
+            <name>$PROJ_DIR$\..\..\code\chassis_mpc.h</name>
+        </file>
+        <file>
             <name>$PROJ_DIR$\..\..\code\chassis_menu.c</name>
         </file>
         <file>

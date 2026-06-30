@@ -9,16 +9,17 @@
  *    · 四种互斥控制模式（枚举管理）
  *    · 里程计位姿追踪
  *==========================================================================*/
- *
+/*
  *  @owner  rt1064-main
  *  @periph none                  聚合层，通过 chassis_motor/encoder/imu/pid 间接使用外设
-
+ */
 #include "chassis_ctrl.h"
 #include "chassis_imu.h"
 #include "chassis_encoder.h"
 #include "chassis_motor.h"
 #include "chassis_pid.h"
 #include "chassis_mecanum.h"
+#include "chassis_mpc.h"     /* P0-MPC: 直线行驶 MPC 驱动轴纵向速度规划                   */
 #include "app_link.h"        /* P0-3: 软限位改用 app_link_get_map_snapshot() 拿一致地图副本   */
 #include "zf_common_headfile.h"  /* P0-3: __DMB() / __disable_irq() 内存屏障与临界区          */
 #include <math.h>
@@ -50,7 +51,7 @@
  *   新链路: 保持轴 → vx/vy(m/s) → 直接 PWM = GAIN × 麦轮分配系数 × 速度
  *   O 型麦轮: vy 四轮同号, vx 对角同号 (LF=-, RF=+, LB=+, RB=-).
  *   GAIN=1500 时, 保持 0.06m/s→90PWM/轮, 足以对抗 odom 漂移和耦合扰动. */
-#define CHASSIS_HOLD_PWM_GAIN             (700.0f)
+#define CHASSIS_HOLD_PWM_GAIN             (600.0f)
 /* P0-修复 2026-04-29 姿态环“一段一段”真凶:
  * 原阈值 0.015 m/s, 但 yaw 转 1° 需 wheel target ≈ 0.023 m/s, 仅高出 53%,
  * wz 一抖 target 跌破 → stop_wheel_with_pid_reset 把 PWM 拍 0 → 下一拍
@@ -721,6 +722,43 @@ static float position_axis_velocity_cmd(float axis_error,
 }
 
 /**
+ * 驱动轴速度指令 — MPC 包装器
+ *
+ * 优先尝试 MPC (直线行驶纵向前瞻规划);
+ * MPC 未启用 / 距离超阈值 / 求解异常 → 回退 sqrt_controller。
+ *
+ * MPC 内部自行管理前瞻, 不需要外部积分累积 (ACCUMULATE_POS_I 在 MPC 路径下跳过).
+ */
+static float driving_axis_velocity_cmd(float axis_error,
+                                       float axis_velocity_lpf,
+                                       float position_gain,
+                                       float damping_gain,
+                                       float accel_limit,
+                                       float integral_term,
+                                       uint8 *out_mpc_active)
+{
+#if CHASSIS_MPC_ENABLE
+    float mpc_v;
+    if (chassis_mpc_step(axis_error, &mpc_v)) {
+        *out_mpc_active = 1U;
+        (void)axis_velocity_lpf;
+        (void)position_gain;
+        (void)damping_gain;
+        (void)accel_limit;
+        (void)integral_term;
+        return mpc_v;
+    }
+#endif
+    *out_mpc_active = 0U;
+    return position_axis_velocity_cmd(axis_error,
+                                      axis_velocity_lpf,
+                                      position_gain,
+                                      damping_gain,
+                                      accel_limit,
+                                      integral_term);
+}
+
+/**
  * 航向闭环: sqrt_ctrl + P-only 速率阻尼
  * @param err              航向误差(°)，已归一化
  * @param allow_inpos_lock  1=允许 Schmitt-trigger 在位锁 (YAW_HOLD 静止保持);
@@ -820,6 +858,9 @@ static void enter_mode(ctrl_mode_t m)
             chassis_pid_reset(&s_pid[pid_i]);
         }
     }
+#if CHASSIS_MPC_ENABLE
+    chassis_mpc_reset();  /* P0-MPC: 切换目标时清热启动, 旧解不污染新方向 */
+#endif
     s_mode              = m;
 }
 
@@ -871,6 +912,10 @@ void chassis_ctrl_init(void)
 #endif
 
     chassis_pid_debug_reset();
+
+#if CHASSIS_MPC_ENABLE
+    chassis_mpc_init();     /* P0-MPC: 构建 H 矩阵, 预计算 FISTA 步长 */
+#endif
 
     force_stop();
 }
@@ -1148,9 +1193,22 @@ void chassis_ctrl_task_20ms(void)
 
                 if (run_x_phase) {
                     float y_hold_err;
+                    uint8 mpc_active;
                     y_hold_err = s_axis_hold_y_m - s_pose.y_m;
                     s_axis_y_locked    = 0U;
-                    ACCUMULATE_POS_I(dx);
+                    /* P0-MPC: 驱动轴先走 MPC, 失败则自动回退 sqrt_controller.
+                     * MPC 内部管理前瞻, 不需要外部积分 → mpc_active 时跳过 ACCUMULATE_POS_I.
+                     * sqrt_controller 回退时仍需积分消除静摩擦残差, 放在 vxg 赋值后累积. */
+                    vxg = driving_axis_velocity_cmd(dx,
+                                                    s_v_along_lpf,
+                                                    kp_eff,
+                                                    kd_eff,
+                                                    g_chassis_tune_params.cmd_accel_limit_mps2,
+                                                    s_pos_i,
+                                                    &mpc_active);
+                    if (!mpc_active) {
+                        ACCUMULATE_POS_I(dx);
+                    }
                     /* 保持轴独立积分: 消除坡面/耦合等稳态偏移.
                      * 死区内不累积, 并清零已有积分, 防止积分在死区边界突然释放. */
                     if (fabsf(y_hold_err) > CHASSIS_POS_HOLD_DEAD_ZONE_M) {
@@ -1164,12 +1222,6 @@ void chassis_ctrl_task_20ms(void)
                     } else {
                         s_pos_i_hold = 0.0f;
                     }
-                    vxg = position_axis_velocity_cmd(dx,
-                                                     s_v_along_lpf,
-                                                     kp_eff,
-                                                     kd_eff,
-                                                     g_chassis_tune_params.cmd_accel_limit_mps2,
-                                                     s_pos_i);
                     vyg = axis_hold_velocity_cmd(y_hold_err,
                                                  s_v_cross_lpf,
                                                  kp_eff,
@@ -1205,7 +1257,20 @@ void chassis_ctrl_task_20ms(void)
                     }
                     x_hold_err         = s_axis_hold_x_m - s_pose.x_m;
                     s_axis_y_locked    = 1U;
-                    ACCUMULATE_POS_I(dy);
+                    /* P0-MPC: Y 驱动轴 MPC 优先, 回退时累积积分 */
+                    {
+                        uint8 mpc_active_y;
+                        vyg = driving_axis_velocity_cmd(dy,
+                                                        s_v_cross_lpf,
+                                                        kp_eff,
+                                                        kd_eff,
+                                                        g_chassis_tune_params.cmd_accel_limit_mps2,
+                                                        s_pos_i,
+                                                        &mpc_active_y);
+                        if (!mpc_active_y) {
+                            ACCUMULATE_POS_I(dy);
+                        }
+                    }
                     /* 保持轴独立积分: 消除坡面/耦合等稳态偏移.
                      * 死区内不累积, 并清零已有积分, 防止积分在死区边界突然释放. */
                     if (fabsf(x_hold_err) > CHASSIS_POS_HOLD_DEAD_ZONE_M) {
@@ -1225,12 +1290,6 @@ void chassis_ctrl_task_20ms(void)
                                                  kd_hold,
                                                  g_chassis_tune_params.cmd_accel_limit_mps2,
                                                  s_pos_i_hold);
-                    vyg = position_axis_velocity_cmd(dy,
-                                                     s_v_cross_lpf,
-                                                     kp_eff,
-                                                     kd_eff,
-                                                     g_chassis_tune_params.cmd_accel_limit_mps2,
-                                                     s_pos_i);
                 } else {
                     /* 两轴都在容忍带内: 2D 平滑收敛.
                      * P0-修复 2026-06-07: 原 integral=0, 车在 dist 略 >8cm 时

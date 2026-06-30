@@ -402,10 +402,13 @@ void chassis_imu_update_5ms(void)
 
         kalman_predict(gyro_signed_dps, IMU_DT_S);
 
-        /* 静止时做 ZUPT 观测: 真实角速度=0, 故 z=gyro 是对 bias 的观测 */
+        /* 静止时做 ZUPT 观测: 真实角速度=0, 故 z=gyro 是对 bias 的观测.
+         * P0-修复 2026-06-30: 用滑窗均值 still_mean_dps 替代瞬时 gyro_signed_dps.
+         *   瞬时噪声 σ≈0.1°/s, 64 拍均值噪声 σ/8≈0.0125°/s → 信噪比提升 8 倍,
+         *   KF 不再被单拍噪声带着跳. still_mean_dps 为原始轴值, 须乘 IMU_YAW_SIGN. */
         if (is_still)
         {
-            kalman_update_zupt(gyro_signed_dps);
+            kalman_update_zupt(still_mean_dps * IMU_YAW_SIGN);
         }
 
         /* 角度归一化到 [-180,180], 同步写回 car_angle 与外部用的 bias 镜像 */
