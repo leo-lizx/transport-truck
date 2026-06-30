@@ -138,7 +138,7 @@
 /* ---- 到位锁 ---- */
 
 /** 进入在位锁: |err| < 此值 */
-#define CHASSIS_YAW_INPOS_ENTER_DEG         (0.250f)
+#define CHASSIS_YAW_INPOS_ENTER_DEG         (0.450f)
 
 /** 退出在位锁: |err| > 此值 */
 #define CHASSIS_YAW_INPOS_EXIT_DEG          (3.00f)
@@ -187,7 +187,7 @@
 /** 到达目标点判定阈值 (米) — 纯位置判断，不叠加速度/ dwell/yaw */
 /** P0-修复 2026-06-30: 0.012→0.025。0.012 小于 BRAKE_FLOOR 一拍位移(1.3cm),
  *   物理上无法停住 → 反复过冲震荡。0.025=1/8 格，推箱子精度足够。 */
-#define CHASSIS_TARGET_REACHED_EPSILON_M    (0.013f)
+#define CHASSIS_TARGET_REACHED_EPSILON_M    (0.012f)
 
 /** 到位后 Schmitt 滞后释放阈值 (米) — 10cm 覆盖惯性滑移 */
 /** P0-修复 2026-06-30: 0.15→0.30。原值过小，小幅过冲即触发回弹震荡。
@@ -263,10 +263,10 @@
  *  实物转 360° 显示 200° → scale = 200/360 = 0.556
  *  实物转 360° 显示 400° → scale = 400/360 = 1.111
  *  公式: 新值 = 当前值 × (显示角度 / 实际角度) */
-#define CHASSIS_IMU_GYRO_SCALE              (1.015f)
+#define CHASSIS_IMU_GYRO_SCALE              (1.0f)
 
 /** Yaw 角速度死区 (°/s) — 抑制静止抖动 */
-#define CHASSIS_IMU_GYRO_DEADZONE_DPS       (0.1f)
+#define CHASSIS_IMU_GYRO_DEADZONE_DPS       (0.03f)
 
 /** Yaw 角速度一阶低通系数 (0,1] — 越小越平滑 */
 #define CHASSIS_IMU_GYRO_LPF_ALPHA          (0.1f)
@@ -311,7 +311,7 @@
 #define CHASSIS_ODOM_YAW_FUSION_ENABLE      (1)
 
 /** 编码器 yaw 观测噪声方差 (°²) — 大=几乎不信(仅长期纠偏)，小=信任高(打滑污染) */
-#define CHASSIS_ODOM_YAW_R_DEG2             (150.0f)
+#define CHASSIS_ODOM_YAW_R_DEG2             (250.0f)
 
 /** odom yaw 与 IMU yaw 偏差超过此值视为打滑/重定位，跳过观测 */
 #define CHASSIS_ODOM_YAW_OUTLIER_DEG        (1.20f)
