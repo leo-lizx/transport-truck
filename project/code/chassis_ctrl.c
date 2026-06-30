@@ -51,7 +51,7 @@
  *   新链路: 保持轴 → vx/vy(m/s) → 直接 PWM = GAIN × 麦轮分配系数 × 速度
  *   O 型麦轮: vy 四轮同号, vx 对角同号 (LF=-, RF=+, LB=+, RB=-).
  *   GAIN=1500 时, 保持 0.06m/s→90PWM/轮, 足以对抗 odom 漂移和耦合扰动. */
-#define CHASSIS_HOLD_PWM_GAIN             (500.0f)
+#define CHASSIS_HOLD_PWM_GAIN             (300.0f)
 /* P0-修复 2026-04-29 姿态环“一段一段”真凶:
  * 原阈值 0.015 m/s, 但 yaw 转 1° 需 wheel target ≈ 0.023 m/s, 仅高出 53%,
  * wz 一抖 target 跌破 → stop_wheel_with_pid_reset 把 PWM 拍 0 → 下一拍
@@ -220,9 +220,8 @@ volatile uint32 g_chassis_arrival_count = 0U;  /* 到达计数, 不被清零, �
 static volatile float s_tgt_x_m       = 0.0f;
 static volatile float s_tgt_y_m       = 0.0f;
 static volatile float s_tgt_yaw_deg   = 0.0f;
-/* 1 = 点位导航主动锁定航向, 禁止任务层用 atan2 覆盖.
- * 曼哈顿轴模式下 move_to_grid()/move_to_m() 都保持起步航向,
- * 平移方向由全局速度 -> 车体速度变换保证, 不要求车头回到 0°. */
+/* 1 = chassis_ctrl_move_to_m() 主动锁定航向, 禁止任务层用 atan2 覆盖.
+ * 曼哈顿轴模式下 move_to_grid() 也会保持起步航向, 不边走轴边转头. */
 static volatile uint8 s_nav_lock_yaw  = 0U;
 
 /* D 项低通状态 (一阶 IIR, 消除 odom 高频噪声对 KD 的放大) */
@@ -1027,8 +1026,8 @@ void chassis_ctrl_task_20ms(void)
     cy = cosf(yaw_rad);
     sy = sinf(yaw_rad);
     {
-        float new_x = s_pose.x_m + (cy * s_fb_vx + sy * s_fb_vy) * CHASSIS_TASK_DT_20MS_S;
-        float new_y = s_pose.y_m + (-sy * s_fb_vx + cy * s_fb_vy) * CHASSIS_TASK_DT_20MS_S;
+        float new_x = s_pose.x_m + (sy * s_fb_vy + cy * s_fb_vx) * CHASSIS_TASK_DT_20MS_S;
+        float new_y = s_pose.y_m + (cy * s_fb_vy + sy * s_fb_vx) * CHASSIS_TASK_DT_20MS_S;
         pose_write_begin();
         s_pose.x_m = new_x;
         s_pose.y_m = new_y;
@@ -1139,8 +1138,8 @@ void chassis_ctrl_task_20ms(void)
          *              保持轴 kd_hold = pos_kp × HOLD_KD_RATIO (轻阻尼).
          * D 项始终用全局速度 (vxg_meas, vyg_meas) 直接做 PD, 与 axis 独立. */
         {
-            float vxg_meas      = cy * s_fb_vx + sy * s_fb_vy;   /* 全局速度 X */
-            float vyg_meas      = -sy * s_fb_vx + cy * s_fb_vy;  /* 全局速度 Y */
+            float vxg_meas      = sy * s_fb_vy + cy * s_fb_vx;  /* 全局速度 X */
+            float vyg_meas      = cy * s_fb_vy + sy * s_fb_vx;  /* 全局速度 Y */
 
             /* D 项低通 (Tesla/Waymo: derivative-on-measurement + IIR LPF) */
             s_v_along_lpf = (1.0f - CHASSIS_POS_D_LPF_ALPHA) * s_v_along_lpf
@@ -1381,26 +1380,26 @@ void chassis_ctrl_task_20ms(void)
          *   sqrt_ctrl 自动平滑收敛, 无需特殊处理.
          */
         /* 曼哈顿轴模式按全局 X/Y 分段平移, yaw 在 move_to_grid/move_to_m 起步时
-         * 锁定为调用时的保持航向, 行进中不再用 atan2 跟踪方位角.
-         * 全局速度在下方按当前 yaw 转换到车体系, 因此车头朝 0/90/180/270°
-         * 或识别后停在任意角度时, 地图方向仍与底盘运动方向解耦. */
+         * 锁到最近的 0/90/180/270° (见 move_to_grid), 行进中不再用 atan2 跟踪方位角,
+         * 以免 X->Y 切轴时边旋转边走, 旋转耦合被保持环放大成横向偏移. */
         yerr = chassis_normalize_angle_deg(s_tgt_yaw_deg - s_pose.yaw_deg);
 
-        /* 起步 yaw 门控: 临时关闭排查"突然停下"问题.
-         * 验证后恢复: 改回 !s_nav_yaw_aligned && (fabsf(yerr) > INPOS_DEG) */
-        if (0) {
+        /* 起步 yaw 门控: 先原地转到目标航向, 对齐后再平移.
+         * P0-改进 2026-06-30: 恢复门控。边转边走时旋转耦合会被保持环放大
+         * 成横向偏移 → 走不直。先对齐再平移消除这种耦合。 */
+        if (!s_nav_yaw_aligned && (fabsf(yerr) > CHASSIS_YAW_INPOS_ENTER_DEG)) {
             s_ramp.vx_body_mps = 0.0f;
             s_ramp.vy_body_mps = 0.0f;
             cmd.vx_body_mps = 0.0f;
             cmd.vy_body_mps = 0.0f;
-            cmd.wz_dps      = yaw_pi(yerr, 0U);
+            cmd.wz_dps      = yaw_pi(yerr, 1U);  /* 原地旋转, 允许 in-pos 锁 */
             break;
         }
         s_nav_yaw_aligned = 1U;
 
-        /* 全局 → 车体坐标变换 */
-        cmd.vx_body_mps = cy * vxg - sy * vyg;
-        cmd.vy_body_mps = sy * vxg + cy * vyg;
+        /* 全局→车体: vy=前进轴, vx=侧向轴 */
+        cmd.vy_body_mps =  sy * vxg + cy * vyg;
+        cmd.vx_body_mps =  cy * vxg + sy * vyg;
         if (fabsf(yerr) <= CHASSIS_YAW_GOAL_TOLERANCE_DEG)
         {
             cmd.wz_dps = 0.0f;
@@ -1470,13 +1469,17 @@ void chassis_ctrl_move_to_grid(uint8 target_x_grid, uint8 target_y_grid)
      * 不提前追目标坐标, 避免 X 驱动阶段叠加 vy 修正 → 走斜线. */
     s_axis_hold_x_m = pose_snap.x_m;
     s_axis_hold_y_m = pose_snap.y_m;
-    /* 地图导航目标始终在全局坐标系, 麦轮正解始终吃车体系速度.
-     * 这里保持下发航点时的真实 yaw, 不再 snap 到 0/90/180/270°.
-     * 后续控制周期会用当前 yaw 将 vxg/vyg 转成 vx_body/vy_body,
-     * 因而看箱子图案旋转后也能沿全局格线正常平移. */
-    s_tgt_yaw_deg = chassis_normalize_angle_deg(pose_snap.yaw_deg);
+    /* P0-修复 2026-05-12 (走斜线根因):
+     * 曼哈顿轴模式下底盘只走 X/Y 网格方向, yaw 应锁到最近的 0/90/180/270°,
+     * 让全局速度=车体速度, 不再有任何斜投影. 起点偏 ±45° 内会自动 snap, 偏更多则
+     * 取最近 90° 倍数. 配合 yaw_pi P-only 阻尼, 起步时 IMU 会快速把 yaw 拉到位
+     * (snap_err ≤45°, 以 max_yaw=150°/s 算 ≤0.3s 完成对齐). */
+    {
+        float yaw_now  = chassis_normalize_angle_deg(pose_snap.yaw_deg);
+        float yaw_snap = roundf(yaw_now / 90.0f) * 90.0f;
+        s_tgt_yaw_deg  = chassis_normalize_angle_deg(yaw_snap);
+    }
     enter_mode(MODE_POINT_NAV);
-    s_nav_lock_yaw = 1U;
     s_arrived = 0U;
     __enable_irq();
 }
@@ -1665,9 +1668,9 @@ void chassis_ctrl_get_odom_velocity_global_mps(float *out_vx_g, float *out_vy_g)
     sy      = sinf(yaw_rad);
     vx_b    = s_fb_vx;
     vy_b    = s_fb_vy;
-    /* 与里程计积分同一旋转: new_x += (cy*vx + sy*vy)*dt */
-    vxg     = cy * vx_b + sy * vy_b;
-    vyg     = -sy * vx_b + cy * vy_b;
+    /* 与里程计积分同一旋转 */
+    vxg     = sy * vy_b + cy * vx_b;
+    vyg     = cy * vy_b + sy * vx_b;
 
     if (out_vx_g != NULL) { *out_vx_g = vxg; }
     if (out_vy_g != NULL) { *out_vy_g = vyg; }
