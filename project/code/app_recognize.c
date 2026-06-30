@@ -13,6 +13,7 @@
  *        - 移动到观察点 (HAL_CHASSIS_MOVE_TO + chassis_ctrl_is_arrived)
  *        - 旋转车头朝物体 (chassis_ctrl_rotate_to_deg + chassis_ctrl_is_arrived)
  *        - 等多数票稳定: 在 SAMPLE_WINDOW_MS 内统计 BOX_CLASS 帧, 占比 ≥ MAJORITY_THRESH 即确认
+ *        - 旋转回 yaw=0, 再继续下一个物体
  *   4. 所有 box → class_id, target → class_id 收齐后, 按相同 class_id 配对生成 g_box_to_target[]
  *
  * 资源:
@@ -60,6 +61,9 @@
 
 /** B3a: 单点 FACE (旋转到位) 最长时长 — 3s */
 #define RECOG_FACE_TIMEOUT_TICKS       (600U)
+
+/** 看完图案后恢复到的导航基准航向 */
+#define RECOG_RETURN_YAW_DEG           (0.0f)
 
 /** 单次 SAMPLE 阶段最大 tick 数 */
 #define RECOG_SAMPLE_MAX_TICKS         (RECOG_SAMPLE_WINDOW_MS / RECOG_TICK_MS)
@@ -116,9 +120,8 @@ static uint32 s_last_seen_frame_id = 0U;     /* 已采样过的最大 frame_id, 
 /**
  * 计算"车头朝物体"的目标 yaw (度). 约定见文件头.
  *  - 车体 +Y 为前进方向, +X 为右
- *  - yaw 以地图 +Y 为 0°, 按地图坐标约定逆时针为正:
- *    90°=+X, 180°=-Y, 270°=-X
- *  - 朝物体 = 车体 +Y 指向物体 → 解得 yaw = atan2(Δx, Δy)
+ *  - yaw 是车体相对全局坐标系 +X 的角度 (CCW 正)
+ *  - 朝物体 = 车体 +Y 指向物体 → 解得 yaw = atan2(-Δx, Δy)
  */
 static float recog_calc_face_yaw_deg(Point_t observe, Point_t target)
 {
@@ -140,7 +143,7 @@ static float recog_calc_face_yaw_deg(Point_t observe, Point_t target)
     {
         return 0.0f;
     }
-    yaw_rad = atan2f(dx, dy);
+    yaw_rad = atan2f(-dx, dy);
     return yaw_rad * (180.0f / PI_F);
 }
 
@@ -636,6 +639,13 @@ static void enter_sub_sample(void)
     sample_state_reset();
 }
 
+static void enter_sub_return_yaw(void)
+{
+    s_sub_state = RECOG_SUB_RETURN_YAW;
+    s_face_started = 0U;
+    s_subphase_ticks = 0U;
+}
+
 static void enter_sub_next(void)
 {
     s_sub_state = RECOG_SUB_NEXT;
@@ -790,7 +800,7 @@ AppRecognizeStatus_e App_Recognize_Tick(uint8 map[MAP_ROWS][MAP_COLS],
                 s_items[s_cur_idx].class_id = (uint8)r;
                 s_items[s_cur_idx].visited  = 1U;
                 s_items[s_cur_idx].ok       = 1U;
-                enter_sub_next();
+                enter_sub_return_yaw();
             }
             else if (r == -1 || r == -2)
             {
@@ -798,8 +808,30 @@ AppRecognizeStatus_e App_Recognize_Tick(uint8 map[MAP_ROWS][MAP_COLS],
                  * 最终在 NEXT/DONE 阶段统一判断映射是否完整 */
                 s_items[s_cur_idx].visited = 1U;
                 s_items[s_cur_idx].ok      = 0U;
-                enter_sub_next();
+                enter_sub_return_yaw();
             }
+            return APP_RECOG_RUNNING;
+        }
+
+        case RECOG_SUB_RETURN_YAW:
+        {
+            s_subphase_ticks++;
+            if (!s_face_started)
+            {
+                chassis_ctrl_rotate_to_deg(RECOG_RETURN_YAW_DEG);
+                s_face_started = 1U;
+                return APP_RECOG_RUNNING;
+            }
+            if (s_subphase_ticks > RECOG_FACE_TIMEOUT_TICKS)
+            {
+                enter_sub_next();
+                return APP_RECOG_RUNNING;
+            }
+            if (!chassis_ctrl_is_arrived())
+            {
+                return APP_RECOG_RUNNING;
+            }
+            enter_sub_next();
             return APP_RECOG_RUNNING;
         }
 

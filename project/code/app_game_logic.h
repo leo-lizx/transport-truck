@@ -19,7 +19,7 @@
 // ==========================================
 // 底盘硬件调用层（直接对接 chassis_ctrl.*）
 // 说明：
-// 1. HAL_CHASSIS_MOVE_TO: 下发全局网格坐标目标点，保持当前航向平移。
+// 1. HAL_CHASSIS_MOVE_TO: 下发网格坐标目标点。
 // 2. HAL_CHASSIS_IS_ARRIVED: 查询是否已到达目标点。
 // 3. 分类识别已改由 app_recognize 读取 OpenART2 BOX_CLASS 快照。
 // ==========================================
@@ -27,9 +27,8 @@
 /*
  * 宏名称: HAL_CHASSIS_MOVE_TO(x, y)
  * 功能说明:
- * 1) 向底盘控制链路下发“全局网格坐标目标点”。
+ * 1) 向底盘控制链路下发“网格坐标目标点”。
  * 2) 该宏不会阻塞等待底盘到达，仅负责触发目标更新。
- * 3) 底盘保持下发时的航向，通过坐标变换把全局速度转为车体系速度。
  * 参数说明:
  * 1) x: 目标网格 X 坐标（建议范围 1~14，最外圈边界不可进）。
  * 2) y: 目标网格 Y 坐标（建议范围 1~10，最外圈边界不可进）。
@@ -60,8 +59,8 @@
 #define HAL_VISION_GET_BOX_CLASS_ID()  (0)
 // ==========================================
 
-/* Formal game launch heading calibration: yaw=0 means car nose faces map +Y. */
-#define APP_GAME_LAUNCH_FACE_YAW_DEG   (0.0f)
+/* Formal game launch heading calibration: car nose faces map -Y in the launch zone. */
+#define APP_GAME_LAUNCH_FACE_YAW_DEG   (180.0f)
 
 // 游戏主流程状态机枚举
 typedef enum {

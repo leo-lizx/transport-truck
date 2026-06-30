@@ -22,7 +22,7 @@
  *     ① 读取编码器 → 计算四轮实际速度
  *     ② 麦轮逆运动学 → 估算车体速度
  *     ③ 里程计积分 → 更新全局位姿 (x, y)
- *     ④ 导航 P 控制器 → 计算全局目标速度, 再按 yaw 转为车体速度
+ *     ④ 导航 P 控制器 → 计算目标车体速度
  *     ⑤ 缓加速滤波 → 麦轮正运动学 → PID → 电机输出
  *
  * [模块依赖]:
@@ -125,8 +125,7 @@ void chassis_ctrl_task_5ms(void);
 void chassis_ctrl_task_20ms(void);
 
 /**
- * @brief  下发全局网格坐标目标，底盘自动移动到该位置，并保持下发时的航向
- *         平移方向通过全局速度到车体速度的坐标变换实现，不要求车头为 0°。
+ * @brief  下发网格坐标目标，底盘自动移动到该位置
  *         竞赛地图采用 12×16，总外框边界不可进入。
  *         可通行索引范围: x=[CHASSIS_GRID_INNER_MIN_X, CHASSIS_GRID_INNER_MAX_X]
  *                       y=[CHASSIS_GRID_INNER_MIN_Y, CHASSIS_GRID_INNER_MAX_Y]
