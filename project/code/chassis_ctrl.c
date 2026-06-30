@@ -231,6 +231,8 @@ static float s_v_cross_lpf = 0.0f;
 static float s_pos_i       = 0.0f;
 /* 保持轴独立积分 (P0-修复 2026-06-06): 驱动轴积分不帮保持轴纠偏, 保持轴需独立 I 消除稳态误差 */
 static float s_pos_i_hold  = 0.0f;
+/* yaw 环积分累积量 (°·s): 消除静摩擦稳态残差，仅在误差带内累积 */
+static float s_yaw_i       = 0.0f;
 /* Schmitt 触发器: 1 = X 轴已到位, 当前锁定 Y 轴优先; 0 = X 未完成 */
 static uint8_t s_axis_y_locked = 0U;
 /* POINT_NAV 起步 yaw 对齐标志: 进入模式时清零, 首次 |yerr|≤INPOS 后置1.
@@ -419,6 +421,7 @@ static void force_stop(void)
     s_last_cmd = (chassis_body_speed_cmd_t){0};
     s_pos_i    = 0.0f;
     s_pos_i_hold = 0.0f;
+    s_yaw_i    = 0.0f;
     s_v_along_lpf = 0.0f;
     s_v_cross_lpf = 0.0f;
 
@@ -807,7 +810,12 @@ static float yaw_pi(float err, uint8 allow_inpos_lock)
     }
 
     /* ==================================================================
-     * sqrt_ctrl + P-only 速率阻尼
+     * sqrt_ctrl + 自适应 D + 误差带积分
+     *
+     * 自适应 D: |err| 大 → D 衰减 → 允许猛转加速
+     *           |err| 小 → D 满额 → 精准收拢
+     * 积分: 仅在 |err| < I_BAND 且 |rate| < 60°/s 时累积,
+     *       消除静摩擦稳态残差，防大角度卷绕。
      * ================================================================== */
     {
         /* 1) 外环: 位置误差 -> 期望角速度 (sqrt 时间最优曲线) */
@@ -819,11 +827,33 @@ static float yaw_pi(float err, uint8 allow_inpos_lock)
                                     -g_chassis_tune_params.max_yaw_speed_dps,
                                      g_chassis_tune_params.max_yaw_speed_dps);
 
-        /* 2) P-only 阻尼: 无积分累积, POINT_NAV 与 YAW_HOLD 共用一套逻辑 */
+        /* 2) yaw 积分: 仅在误差带内 + 转速不高时累积 (防卷绕)
+         *    误差与积分异号 → 已过冲，清零 */
+        if (CHASSIS_YAW_KI > 1e-6f
+            && fabsf(err) < CHASSIS_YAW_I_BAND_DEG
+            && fabsf(yaw_rate_dps) < 60.0f)
         {
-            float rate_err = wz_target - yaw_rate_dps;
-            float rate_damping = CHASSIS_YAW_RATE_KP * rate_err;
-            wz = wz_target + rate_damping;
+            s_yaw_i += CHASSIS_YAW_KI * err * CHASSIS_TASK_DT_20MS_S;
+            if (s_yaw_i >  CHASSIS_YAW_I_LIMIT_DPS) s_yaw_i =  CHASSIS_YAW_I_LIMIT_DPS;
+            if (s_yaw_i < -CHASSIS_YAW_I_LIMIT_DPS) s_yaw_i = -CHASSIS_YAW_I_LIMIT_DPS;
+            if (err * s_yaw_i < 0.0f) s_yaw_i = 0.0f;
+        }
+
+        /* 3) 自适应 D 阻尼: |err| 越大阻尼越弱 → 转得快;
+         *    |err| → 0 时阻尼满额 → 收得稳 */
+        {
+            float d_scale;
+            if (CHASSIS_YAW_D_FULL_ERR_DEG < 1e-6f) {
+                d_scale = 1.0f;
+            } else {
+                d_scale = fabsf(err) / CHASSIS_YAW_D_FULL_ERR_DEG;
+                if (d_scale > 1.0f) d_scale = 1.0f;
+            }
+            {
+                float kd = CHASSIS_YAW_RATE_KD * d_scale;
+                float rate_damping = kd * yaw_rate_dps;
+                wz = wz_target + s_yaw_i - rate_damping;
+            }
         }
     }
 
@@ -845,6 +875,7 @@ static void enter_mode(ctrl_mode_t m)
     s_v_cross_lpf     = 0.0f;
     s_pos_i           = 0.0f;  /* 切换目标时清零位置积分, 防旧路径残留量误推新起点 */
     s_pos_i_hold      = 0.0f;  /* 保持轴积分同步清零 */
+    s_yaw_i           = 0.0f;  /* yaw 积分同步清零 */
     s_ramp = (chassis_body_speed_cmd_t){0};  /* P0-修复 2026-06-07:
                      * 原漏清 s_ramp: 方向反转时 ramp 保留旧方向速度残值,
                      * 新目标要求反向但 ramp_filter 每拍只能变 dv=0.012,
@@ -1108,6 +1139,7 @@ void chassis_ctrl_task_20ms(void)
             s_v_cross_lpf   = 0.0f;
             s_pos_i         = 0.0f;  /* 清积分, 防止卷绕导致初始速度过大 */
             s_pos_i_hold    = 0.0f;
+            s_yaw_i         = 0.0f;  /* yaw 积分同步清零 */
             s_ramp.vx_body_mps = 0.0f;  /* 清 ramp, 防旧残值污染新驱动方向 */
             s_ramp.vy_body_mps = 0.0f;
             s_axis_hold_x_m = s_pose.x_m;  /* 更新保持轴锚点到当前位置 */
