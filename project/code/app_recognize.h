@@ -10,6 +10,7 @@
  *          - 移动到侧面观察点 (BFS 选最近的可立足格)
  *          - 原地旋转车头朝向物体
  *          - 等待视觉端 BOX_CLASS 帧持续广播, 多数票稳定后采样
+ *          - 回正到 yaw=0, 再进入下一段导航
  *     4) 全部物体识别完成后, 把 (boxIdx -> targetIdx) 映射写入 g_box_to_target[]
  *        游戏主状态机据此进入 STAGE_PLAN_PATH (Sokoban_Solve_Stage2)
  *
@@ -60,6 +61,7 @@ typedef enum
     RECOG_SUB_NAV,            /* 移动到当前物体观察点                     */
     RECOG_SUB_FACE,            /* 原地旋转车头朝向物体                     */
     RECOG_SUB_SAMPLE,          /* 多数票采样视觉分类结果                   */
+    RECOG_SUB_RETURN_YAW,      /* 采样完成后回正到 yaw=0                  */
     RECOG_SUB_NEXT,            /* 当前物体完成, 切下一个                   */
     RECOG_SUB_DONE,            /* 全部完成 (对外输出 DONE_OK 一帧后归 INIT)*/
     RECOG_SUB_FAIL             /* 不可达或视觉超时                         */

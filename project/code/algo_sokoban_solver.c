@@ -1388,8 +1388,9 @@ uint8 Sokoban_Solve_Push_Bomb(const uint8 map[MAP_ROWS][MAP_COLS],
  *  与旧 Sokoban_Find_Bomb_Wall 的关键区别:
  *    - 墙体打分阶段就把"该墙能否被某颗炸弹推到"纳入硬约束 (可行性);
  *    - 在多颗炸弹中按到墙曼哈顿距离从近到远挑选, 选到第一颗可推的即可;
- *    - 打分时把"待推炸弹自身原格"视为已清空 (爆炸后它会离开原格),
- *      可达性评估不再被自己堵住, 修正旧实现的悲观估计。
+ *    - P0-2: 打分阶段将全部炸弹从 tmp_map 中清除 (被选中的炸弹推走后原格即空,
+ *      其余炸弹虽暂留但本阶段只做一次可达性快照, 清空所有炸弹比保留全部
+ *      更接近爆炸后真实状态)。注意这仅影响评分, 可行性检查仍使用原始地图。
  *
  *  为控制单片机上的一次性规划耗时, 仅当某面墙的得分"有望刷新当前最优"时,
  *  才执行 (较昂贵的) 单箱推炸弹可行性 BFS, 失败则不更新最优, 继续下一面墙。
@@ -1445,8 +1446,18 @@ uint8 Sokoban_Plan_Bomb(const uint8 map[MAP_ROWS][MAP_COLS],
                 }
             }
 
-            /* 一次扩散后查询全部目标。
-             * 其余炸弹仍留在 tmp_map 上作为障碍，与“一次只引爆一颗”的物理一致。 */
+            /* P0-2: 打分阶段将所有炸弹从 tmp_map 中清除。
+             * 被选中的炸弹推走后原格即空; 其余炸弹虽暂留但本阶段只做一次
+             * 可达性快照, 清空所有炸弹比保留全部更接近爆炸后真实状态。
+             * 注意: 这仅影响评分, 可行性检查 (Sokoban_Solve_Push_Bomb)
+             * 仍使用原始地图 (仅清空被选炸弹 + 目标墙)。 */
+            for (uint8 bi = 0; bi < bomb_n; bi++) {
+                if (tmp_map[bombs[bi].y][bombs[bi].x] == MAP_BOMB) {
+                    tmp_map[bombs[bi].y][bombs[bi].x] = MAP_EMPTY;
+                }
+            }
+
+            /* 一次扩散后查询全部目标 */
             if (!Algo_Nav_BFS_Flood(tmp_map, player_pos, reach, 0)) continue;
             for (int8 tr = (int8)CHASSIS_GRID_INNER_MIN_Y; tr <= (int8)CHASSIS_GRID_INNER_MAX_Y; tr++) {
                 for (int8 tc = (int8)CHASSIS_GRID_INNER_MIN_X; tc <= (int8)CHASSIS_GRID_INNER_MAX_X; tc++) {

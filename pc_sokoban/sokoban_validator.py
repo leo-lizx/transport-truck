@@ -1081,6 +1081,10 @@ def find_bomb_wall(the_map: list, player_pos: tuple,
                    blocked_target: Optional[tuple] = None) -> Optional[tuple]:
     """
     寻找最优炸弹目标墙体。对应 C 代码 Sokoban_Find_Bomb_Wall()。
+
+    P0-1: 评分公式已与 C 端 Sokoban_Find_Bomb_Wall / Sokoban_Plan_Bomb 统一:
+          reachable * 200 + cleared * 20 - blocked_len^2 / 50.
+          同时将逐目标 BFS 改为一次 Flood + O(1) 查询，与 Plan_Bomb 对齐。
     """
     best_score = float('-inf')
     best_wall  = None
@@ -1100,22 +1104,31 @@ def find_bomb_wall(the_map: list, player_pos: tuple,
                             tmp[rr][cc] = EMPTY
                             cleared += 1
 
+            # 一次 Flood 扩散后 O(1) 查询全部目标可达性
+            reachable_cells = nav_bfs_flood(tmp, player_pos)
+            if not reachable_cells:
+                continue
+
             # 若指定了被卡目标，要求此墙能解锁该目标
             if blocked_target is not None:
-                if nav_bfs(tmp, player_pos, blocked_target) is None:
+                if not is_reachable(reachable_cells, blocked_target):
                     continue
                 path = nav_bfs(tmp, player_pos, blocked_target)
-                blocked_len = len(path) if path else 999
+                if path is None:
+                    continue
+                blocked_len = len(path)
             else:
                 blocked_len = 0
 
             reachable = sum(
                 1 for tr in range(INNER_R_MIN, INNER_R_MAX + 1)
                 for tc in range(INNER_C_MIN, INNER_C_MAX + 1)
-                if tmp[tr][tc] == TARGET and nav_bfs(tmp, player_pos, (tr, tc)) is not None
+                if tmp[tr][tc] == TARGET and
+                is_reachable(reachable_cells, (tr, tc))
             )
 
-            score = reachable * 1000 + cleared * 20 - blocked_len
+            # P0-1: 与 C 端 Sokoban_Find_Bomb_Wall / Sokoban_Plan_Bomb 统一评分公式
+            score = reachable * 200 + cleared * 20 - (blocked_len * blocked_len) // 50
             if score > best_score:
                 best_score = score
                 best_wall  = (r, c)
@@ -1160,6 +1173,11 @@ def plan_bomb(the_map: list, player_pos: tuple,
                         if tmp[rr][cc] == WALL:
                             tmp[rr][cc] = EMPTY
                             cleared += 1
+
+            # P0-2: 打分阶段将所有炸弹从 tmp 中清除 (镜像 C 端)
+            for (br, bc) in bombs:
+                if tmp[br][bc] == BOMB:
+                    tmp[br][bc] = EMPTY
 
             reachable_cells = nav_bfs_flood(tmp, player_pos)
             if not reachable_cells:

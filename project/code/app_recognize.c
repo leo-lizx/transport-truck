@@ -13,6 +13,7 @@
  *        - 移动到观察点 (HAL_CHASSIS_MOVE_TO + chassis_ctrl_is_arrived)
  *        - 旋转车头朝物体 (chassis_ctrl_rotate_to_deg + chassis_ctrl_is_arrived)
  *        - 等多数票稳定: 在 SAMPLE_WINDOW_MS 内统计 BOX_CLASS 帧, 占比 ≥ MAJORITY_THRESH 即确认
+ *        - 回正 yaw=0 后再继续下一段导航
  *   4. 所有 box → class_id, target → class_id 收齐后, 按相同 class_id 配对生成 g_box_to_target[]
  *
  * 资源:
@@ -61,6 +62,12 @@
 /** B3a: 单点 FACE (旋转到位) 最长时长 — 3s */
 #define RECOG_FACE_TIMEOUT_TICKS       (600U)
 
+/** 识别采样后必须回到 0 度航向, 避免后续麦轮平移带着观察角起步。 */
+#define RECOG_RETURN_YAW_DEG           (0.0f)
+
+/** 回正航向最长时长 — 复用 FACE 的 3s 量级 */
+#define RECOG_RETURN_TIMEOUT_TICKS     RECOG_FACE_TIMEOUT_TICKS
+
 /** 单次 SAMPLE 阶段最大 tick 数 */
 #define RECOG_SAMPLE_MAX_TICKS         (RECOG_SAMPLE_WINDOW_MS / RECOG_TICK_MS)
 
@@ -94,6 +101,7 @@ static uint8             s_cur_idx      = 0U;     /* s_items 中当前处理项 
 /* 子阶段状态 */
 static uint8  s_nav_started     = 0U;
 static uint8  s_face_started    = 0U;
+static uint8  s_return_started  = 0U;
 static uint16 s_subphase_ticks  = 0U;     /* B3a: NAV/FACE 子阶段计时, enter_sub_* 时清零 */
 static AppRecogClearPlan_t s_nav_plan;
 static SokoWaypointPath_t  s_nav_waypoints;
@@ -635,6 +643,13 @@ static void enter_sub_sample(void)
     sample_state_reset();
 }
 
+static void enter_sub_return_yaw(void)
+{
+    s_sub_state       = RECOG_SUB_RETURN_YAW;
+    s_return_started = 0U;
+    s_subphase_ticks  = 0U;
+}
+
 static void enter_sub_next(void)
 {
     s_sub_state = RECOG_SUB_NEXT;
@@ -653,7 +668,8 @@ void App_Recognize_Reset(void)
     s_cur_idx      = 0U;
     s_nav_started  = 0U;
     s_face_started = 0U;
-    s_nav_wp_idx   = 0U;
+    s_return_started = 0U;
+    s_nav_wp_idx     = 0U;
     s_nav_map_applied = 0U;
     s_map_changed  = 0U;
     s_subphase_ticks = 0U;        /* B3a */
@@ -789,7 +805,7 @@ AppRecognizeStatus_e App_Recognize_Tick(uint8 map[MAP_ROWS][MAP_COLS],
                 s_items[s_cur_idx].class_id = (uint8)r;
                 s_items[s_cur_idx].visited  = 1U;
                 s_items[s_cur_idx].ok       = 1U;
-                enter_sub_next();
+                enter_sub_return_yaw();
             }
             else if (r == -1 || r == -2)
             {
@@ -797,8 +813,30 @@ AppRecognizeStatus_e App_Recognize_Tick(uint8 map[MAP_ROWS][MAP_COLS],
                  * 最终在 NEXT/DONE 阶段统一判断映射是否完整 */
                 s_items[s_cur_idx].visited = 1U;
                 s_items[s_cur_idx].ok      = 0U;
-                enter_sub_next();
+                enter_sub_return_yaw();
             }
+            return APP_RECOG_RUNNING;
+        }
+
+        case RECOG_SUB_RETURN_YAW:
+        {
+            s_subphase_ticks++;
+            if (!s_return_started)
+            {
+                chassis_ctrl_rotate_to_deg(RECOG_RETURN_YAW_DEG);
+                s_return_started = 1U;
+                return APP_RECOG_RUNNING;
+            }
+            if (s_subphase_ticks > RECOG_RETURN_TIMEOUT_TICKS)
+            {
+                s_sub_state = RECOG_SUB_FAIL;
+                return APP_RECOG_FAIL;
+            }
+            if (!chassis_ctrl_is_arrived())
+            {
+                return APP_RECOG_RUNNING;
+            }
+            enter_sub_next();
             return APP_RECOG_RUNNING;
         }
 

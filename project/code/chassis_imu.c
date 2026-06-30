@@ -322,6 +322,8 @@ void chassis_imu_update_5ms(void)
      */
     gyro_z_raw_dps = imu_yaw_gyro_raw_dps();
 
+    gyro_z_raw_dps *= CHASSIS_IMU_GYRO_SCALE;  /* 陀螺灵敏度标定, 默认 1.0 */
+
     /* 步骤 2: 滑窗静止检测 -> 通用零偏在线辨识 (P0-改进 2026-04-29) */
     is_still = still_detect_step(gyro_z_raw_dps, &still_mean_dps, &still_var_dps2);
     s_imu_is_still = is_still;
@@ -348,22 +350,12 @@ void chassis_imu_update_5ms(void)
 #endif
 
     /* 步骤 3.5: D 项专用通道 (P0-修复 2026-04-29 段段 + 静止自走 bug)
-     * 软死区 (soft-deadzone): r' = sign(r) * max(|r|-d, 0)
-     *   - 边界处 r'=0 且斜率连续 -> KD*r' 不会跳变 -> 不会段段
-     *   - 静止噪声 (|r|<0.8 dps) 后 r'=0 -> D=0 -> 不会被 KD=300 放大拉走车
-     * 原因: 上一版完全去死区, KD=300 * 噪声 0.5 dps = 150 dps 虚假 wz 指令。 */
+     * P0-修复 2026-06-30: 移除软死区。原 KD=300 时需要死区防噪声放大,
+     * 现 KD≈1.2, 0.5dps 噪声仅产生 0.6dps 阻尼, 死区反而造成
+     * "转速<0.3→D=0→加速→转速>0.3→D激活→减速" 的极限环 → 一卡一卡。
+     * 纯 LPF (α=0.25, 截止 8Hz) 已足够滤噪。 */
     {
-        float r_abs = fabsf(yaw_rate_dps);
-        float r_for_d;
-        if (r_abs <= IMU_GYRO_DEADZONE_DPS)
-        {
-            r_for_d = 0.0f;
-        }
-        else
-        {
-            r_for_d = (yaw_rate_dps >= 0.0f) ? (r_abs - IMU_GYRO_DEADZONE_DPS)
-                                             : -(r_abs - IMU_GYRO_DEADZONE_DPS);
-        }
+        float r_for_d = yaw_rate_dps;
         s_yaw_rate_for_d_dps += IMU_GYRO_LPF_ALPHA * (r_for_d - s_yaw_rate_for_d_dps);
     }
 

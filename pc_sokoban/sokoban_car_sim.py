@@ -172,6 +172,12 @@ def _normalize_classes(values: Optional[list], count: int) -> list:
     return out
 
 
+def _level_classes(level: int, values: Optional[list], count: int) -> list:
+    if level < 2:
+        return []
+    return _normalize_classes(values, count)
+
+
 def _info_from_map_text(text: str, level: int,
                         box_classes: Optional[list] = None,
                         target_classes: Optional[list] = None) -> dict:
@@ -193,8 +199,8 @@ def _info_from_map_text(text: str, level: int,
         'start': start,
         'exit': exit_c,
         'zone': zone,
-        'box_classes': _normalize_classes(box_classes, box_count),
-        'target_classes': _normalize_classes(target_classes, target_count),
+        'box_classes': _level_classes(level, box_classes, box_count),
+        'target_classes': _level_classes(level, target_classes, target_count),
         'level': level,
     }
 
@@ -356,10 +362,14 @@ def _gen_open_map(level: int, box_count: int, wall_density: float,
         for (r, c) in targets:
             m[r][c] = TARGET
 
-        # class 真值 (按 extract 顺序): 箱 = 1..N; 目标 = 随机排列.
+        # class 真值 (按 extract 顺序): 第 1 关不显示/使用编号; 第 2 关才随机配对.
         # 第 2 关强制"非恒等"排列, 保证"按数字配对"真正起作用 (不是随便推哪个都行).
-        bc = list(range(1, box_count + 1))
-        tc = _make_perm(box_count, rng, allow_identity=(level == 1))
+        if level == 1:
+            bc = []
+            tc = []
+        else:
+            bc = list(range(1, box_count + 1))
+            tc = _make_perm(box_count, rng, allow_identity=False)
 
         if check_deadlock(m)[0]:
             continue
@@ -477,8 +487,12 @@ def _fallback_map(level: int, box_count: int, zone: str) -> dict:
         m[3][10] = BOX
         m[8][6] = TARGET
         m[8][10] = TARGET
-        bc = [1, 2]
-        tc = [2, 1] if level == 2 else [1, 2]
+        if level == 1:
+            bc = []
+            tc = []
+        else:
+            bc = [1, 2]
+            tc = [2, 1]
     return {'map': m, 'start': start, 'exit': exit_c, 'zone': zone,
             'box_classes': bc, 'target_classes': tc, 'level': level}
 
@@ -793,6 +807,14 @@ def run_selftest() -> int:
     rc = 0
     for level in (1, 2, 3):
         info = gen_level_map(level, box_count=2, seed=20260608 + level)
+        if level == 1 and (info.get('box_classes') or info.get('target_classes')):
+            print("Level 1: class labels should be empty")
+            rc = 1
+            continue
+        if level >= 2 and (not info.get('box_classes') or not info.get('target_classes')):
+            print(f"Level {level}: class labels missing")
+            rc = 1
+            continue
         frames, log = build_timeline(info)
         last = frames[-1]
         ok = last['win']
@@ -968,6 +990,7 @@ def launch_gui():
 
     def render(fr):
         canvas.delete('all')
+        show_classes = fr.get('level', 1) >= 2
         # 标题
         canvas.create_text(OX, px(4), anchor='nw', text='SOKOBAN CAR MONITOR',
                            fill=COL_TITLE, font=F_TITLE)
@@ -1011,9 +1034,10 @@ def launch_gui():
                     canvas.create_oval(x0 + CELL * 0.3, y0 + CELL * 0.3,
                                        x1 - CELL * 0.3, y1 - CELL * 0.3,
                                        outline='#ffffff', width=1)
-                    canvas.create_text((x0 + x1) / 2, (y0 + y1) / 2,
-                                       text=str(target_class_by_pos.get((r, c), '')),
-                                       fill='#ffffff', font=F_SMALL)
+                    if show_classes:
+                        canvas.create_text((x0 + x1) / 2, (y0 + y1) / 2,
+                                           text=str(target_class_by_pos.get((r, c), '')),
+                                           fill='#ffffff', font=F_SMALL)
         # 箱子
         box_classes = fr.get('box_classes') or []
         for i, (r, c) in enumerate(fr['boxes']):
@@ -1021,9 +1045,10 @@ def launch_gui():
             on_t = base[r][c] == TARGET
             canvas.create_rectangle(x0 + 1, y0 + 1, x1 - 1, y1 - 1, fill=COL_BOX,
                                     outline=COL_TARGET if on_t else '', width=2 if on_t else 0)
-            canvas.create_text((x0 + x1) / 2, (y0 + y1) / 2,
-                               text=str(box_classes[i] if i < len(box_classes) else (i + 1)),
-                               fill='#111827', font=F_SMALL)
+            if show_classes:
+                canvas.create_text((x0 + x1) / 2, (y0 + y1) / 2,
+                                   text=str(box_classes[i] if i < len(box_classes) else (i + 1)),
+                                   fill='#111827', font=F_SMALL)
         # 炸弹
         for (r, c) in fr['bombs']:
             x0, y0, x1, y1 = cell_rect(r, c)
@@ -1354,6 +1379,7 @@ def _open_custom_editor(root, on_load, default_level=1,
         if synced is None:
             return
         the_map, _, _ = synced
+        show_classes = lv.get() >= 2
         clean_text = _normalize_map_text(txt.get('1.0', 'end'))
         _, player_pos, _ = parse_map_text(clean_text)
         colors = {
@@ -1374,10 +1400,11 @@ def _open_custom_editor(root, on_load, default_level=1,
                 if v == TARGET:
                     preview_canvas.create_oval(x0 + 5, y0 + 5, x1 - 5, y1 - 5,
                                                outline='#ffffff', width=1)
-                    preview_canvas.create_text((x0 + x1) / 2, (y0 + y1) / 2,
-                                               text=str(target_class_by_pos.get((r, c), '')),
-                                               fill='#ffffff', font=('Consolas', 9, 'bold'))
-                elif v == BOX:
+                    if show_classes:
+                        preview_canvas.create_text((x0 + x1) / 2, (y0 + y1) / 2,
+                                                   text=str(target_class_by_pos.get((r, c), '')),
+                                                   fill='#ffffff', font=('Consolas', 9, 'bold'))
+                elif v == BOX and show_classes:
                     preview_canvas.create_text((x0 + x1) / 2, (y0 + y1) / 2,
                                                text=str(box_class_by_pos.get((r, c), '')),
                                                fill='#111827', font=('Consolas', 9, 'bold'))
@@ -1443,12 +1470,15 @@ def _open_custom_editor(root, on_load, default_level=1,
 
     preview_canvas.bind('<Button-1>', set_cell_class)
     txt.bind('<KeyRelease>', lambda _event: draw_preview())
+    lv.trace_add('write', lambda *_args: draw_preview())
 
     def submit():
         classes = class_lists_for_current(True)
         if classes is None:
             return
         box_classes, target_classes = classes
+        if lv.get() < 2:
+            box_classes, target_classes = [], []
         on_load(txt.get('1.0', 'end'), lv.get(), box_classes, target_classes)
         top.destroy()
 
@@ -1459,6 +1489,8 @@ def _open_custom_editor(root, on_load, default_level=1,
         if classes is None:
             return
         box_classes, target_classes = classes
+        if lv.get() < 2:
+            box_classes, target_classes = [], []
         ok = on_save(name_var.get(), txt.get('1.0', 'end'), lv.get(),
                      box_classes, target_classes)
         if ok:
