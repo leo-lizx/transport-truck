@@ -31,6 +31,7 @@
 
 #include <stdlib.h>     /* abs() */
 
+#if 0  /* disabled 2026-07-01: replaced by app_recognize_clear.c */
 #ifndef PI_F
 #define PI_F (3.14159265358979323846f)
 #endif
@@ -925,3 +926,4 @@ uint8 App_Recognize_Map_Changed(void)
 {
     return s_map_changed;
 }
+#endif /* app_recognize.c disabled */

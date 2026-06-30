@@ -187,7 +187,7 @@
 /** 到达目标点判定阈值 (米) — 纯位置判断，不叠加速度/ dwell/yaw */
 /** P0-修复 2026-06-30: 0.012→0.025。0.012 小于 BRAKE_FLOOR 一拍位移(1.3cm),
  *   物理上无法停住 → 反复过冲震荡。0.025=1/8 格，推箱子精度足够。 */
-#define CHASSIS_TARGET_REACHED_EPSILON_M    (0.012f)
+#define CHASSIS_TARGET_REACHED_EPSILON_M    (0.014f)
 
 /** 到位后 Schmitt 滞后释放阈值 (米) — 10cm 覆盖惯性滑移 */
 /** P0-修复 2026-06-30: 0.15→0.30。原值过小，小幅过冲即触发回弹震荡。
@@ -206,7 +206,7 @@
  *  P0-调参 2026-05-08: 2.50→3.50，加快远场逼近
  *  P0-修复 2026-05-11 (拐点停留+走斜线): 10.50→4.50
  *  (KP=10.5 时 linear_dist=accel/KP²≈0.027m → 冲过头) */
-#define CHASSIS_POS_KP                      (6.5f)
+#define CHASSIS_POS_KP                      (4.5f)
 
 /** 位置环沿程积分增益 — 消除静摩擦稳态残差。从 0 起调，+0.05/次 */
 #define CHASSIS_POS_KI                      (0.30f)
@@ -245,7 +245,7 @@
  *  P0-修复 2026-06-30: 0.65→0.15。0.65 刹车距离 7cm > EPSILON 2.5cm → 必定过冲。
  *  0.15 刹车距离 ~4mm < EPSILON，且 MPC 自行规划减速，不需要刹车底速硬兜。
  *  如需应对长距离 sqrt_controller 路径的静摩擦卡死，可保留 0.20~0.25。 */
-#define CHASSIS_POS_BRAKE_FLOOR_MPS         (0.15f)
+#define CHASSIS_POS_BRAKE_FLOOR_MPS         (0.25f)
 
 /* ============================================================
  * §D IMU / 卡尔曼滤波 / 编码器融合
@@ -638,7 +638,7 @@
 #define CHASSIS_MPC_R_VEL                       (0.15f)
 
 /** 速度平滑代价 (s²/m²): 大→加减速柔和, 小→响应快但可能 jerk */
-#define CHASSIS_MPC_R_SMOOTH                    (0.650f)
+#define CHASSIS_MPC_R_SMOOTH                    (0.850f)
 
 /** 终端位置额外权重因子: Q_term = Q_POS * 此值 */
 #define CHASSIS_MPC_QF_FACTOR                   (3.0f)
