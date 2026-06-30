@@ -40,7 +40,7 @@
 /* Yaw 串级 P-PI 内环: 前馈 + PI 直接输出 PWM, 自动克服静摩擦.
  * 外环(yaw_pi): angle_err → wz_cmd (纯 P)
  * 内环(本段):   wz_cmd - wz_actual → PWM (PI), 取代旧 GAIN×wz 开环 */
-#define CHASSIS_YAW_PWM_GAIN              (0.0f)    /* 已废弃, 由内环 PI 替代 */
+#define CHASSIS_YAW_PWM_GAIN              (1500.0f)    /* 已废弃, 由内环 PI 替代 */
 
 /* 保持轴直接 PWM 前馈: 绕过轮速 PID, 把车体速度 (vx,vy) 直接换算成 PWM.
  *   问题同 yaw: 保持轴输出 0.06m/s → 轮速 PID 只给 40×0.06=2.4PWM → 无力纠偏.
@@ -231,6 +231,10 @@ static float s_pos_i_hold  = 0.0f;
 static float s_yaw_i       = 0.0f;
 /* 串级 P-PI 内环积分 (PWM 域): ∫(wz_cmd - wz_actual) → 自动克服静摩擦 */
 static float s_yaw_rate_i  = 0.0f;
+/* ADRC: z1=估计角速度(°/s), z2=估计总扰动(°/s²), u=上拍PWM输出 */
+static float s_yaw_adrc_z1 = 0.0f;
+static float s_yaw_adrc_z2 = 0.0f;
+static float s_yaw_adrc_u  = 0.0f;
 /* Schmitt 触发器: 1 = X 轴已到位, 当前锁定 Y 轴优先; 0 = X 未完成 */
 static uint8_t s_axis_y_locked = 0U;
 /* POINT_NAV 起步 yaw 对齐标志: 进入模式时清零, 首次 |yerr|≤INPOS 后置1.
@@ -421,6 +425,9 @@ static void force_stop(void)
     s_pos_i_hold = 0.0f;
     s_yaw_i      = 0.0f;
     s_yaw_rate_i = 0.0f;
+    s_yaw_adrc_z1 = 0.0f;
+    s_yaw_adrc_z2 = 0.0f;
+    s_yaw_adrc_u  = 0.0f;
     s_v_along_lpf = 0.0f;
     s_v_cross_lpf = 0.0f;
 
@@ -481,24 +488,6 @@ static void apply_speed(chassis_body_speed_cmd_t cmd,
             pwm_floor_selected = g_chassis_tune_params.wheel_breakaway_pwm_floor;
         }
 
-    /* ---- 串级 P-PI 内环: wz 前馈 + 角速度 PI ---- */
-    float yaw_pi_pwm;
-    float yaw_ff_pwm;
-    {
-        float yaw_rate_actual = chassis_imu_get_yaw_rate_dps();
-        float rate_err = f.wz_dps - yaw_rate_actual;
-        /* PI: 自动找到克服静摩擦的稳态 PWM */
-        s_yaw_rate_i += CHASSIS_YAW_INNER_KI * rate_err * CHASSIS_TASK_DT_20MS_S;
-        if (s_yaw_rate_i >  CHASSIS_YAW_INNER_I_LIMIT) s_yaw_rate_i =  CHASSIS_YAW_INNER_I_LIMIT;
-        if (s_yaw_rate_i < -CHASSIS_YAW_INNER_I_LIMIT) s_yaw_rate_i = -CHASSIS_YAW_INNER_I_LIMIT;
-        /* 只做饱和限幅, 不做过零清零: rate_err 反号时积分自然衰减,
-         * 硬清零造成扭矩跳崖 → 车骤停 → "中间位置停一下" */
-        yaw_pi_pwm = CHASSIS_YAW_INNER_KP * rate_err + s_yaw_rate_i;
-        /* 前馈: 给 PI 做 baseline, 减积分负担 */
-        yaw_ff_pwm = CHASSIS_YAW_FF_GAIN * CHASSIS_MECANUM_K_M
-                   * f.wz_dps * CHASSIS_DEG_TO_RAD_F;
-    }
-
     for (i = 0U; i < (uint8)CHASSIS_WHEEL_COUNT; ++i) {
             float pwm_forward_domain;
             float pwm_motor_domain;
@@ -507,11 +496,7 @@ static void apply_speed(chassis_body_speed_cmd_t cmd,
 
             pwm_forward_domain = chassis_pid_step(&s_pid[i], targets[i], wheel_fb_mps[i]);
 
-            /* 静摩擦前馈: 线性衰减 + 方向门控.
-             *   fb≈0                  → ff=100%, 方向=target 方向 (起步)
-             *   fb 与 target 同向     → ff=线性衰减 (助力)
-             *   fb 与 target 反向     → ff=0 (正在刹车/换向, PID 全权)
-             *   避免指令翻向时 breakaway 立刻反打 2000PWM 的冲击. */
+            /* 静摩擦前馈: 线性衰减 + 方向门控 */
             if (abs_target > g_chassis_tune_params.wheel_breakaway_target_eps_mps[i]) {
                 float fb_eps = g_chassis_tune_params.wheel_breakaway_fb_static_eps_mps[i];
                 uint8 same_dir = ((targets[i] >= 0.0f) == (wheel_fb_mps[i] >= 0.0f));
@@ -533,13 +518,6 @@ static void apply_speed(chassis_body_speed_cmd_t cmd,
                 }
             }
 
-            /* 串级 P-PI 内环: FF + PI → yaw PWM (O 型: LF=-, RF=+, LB=-, RB=+) */
-            {
-                static const float s_yaw_signs[CHASSIS_WHEEL_COUNT] =
-                    { -1.0f, +1.0f, -1.0f, +1.0f };
-                pwm_forward_domain += s_yaw_signs[i] * (yaw_ff_pwm + yaw_pi_pwm);
-            }
-
             /* 保持轴直接 PWM 前馈: 绕过轮速 PID, 给保持轴纠偏力度.
              * O 型麦轮: vy 四轮同号(+1), vx 对角异号(LF=-,RF=+,LB=+,RB=-) */
             {
@@ -548,6 +526,16 @@ static void apply_speed(chassis_body_speed_cmd_t cmd,
                 float hold_pwm = CHASSIS_HOLD_PWM_GAIN
                                * (f.vy_body_mps + s_vx_signs[i] * f.vx_body_mps);
                 pwm_forward_domain += hold_pwm;
+            }
+
+            /* Yaw 直接 PWM 前馈: O 型 LF=-,RF=+,LB=-,RB=+ */
+            {
+                static const float s_yaw_signs[CHASSIS_WHEEL_COUNT] =
+                    { -1.0f, +1.0f, -1.0f, +1.0f };
+                float yaw_pwm = s_yaw_signs[i] * CHASSIS_YAW_PWM_GAIN
+                              * CHASSIS_MECANUM_K_M
+                              * f.wz_dps * CHASSIS_DEG_TO_RAD_F;
+                pwm_forward_domain += yaw_pwm;
             }
 
             /* PID + 前馈叠加后再做总限幅, 避免硬件溢出 */
@@ -774,31 +762,34 @@ static float driving_axis_velocity_cmd(float axis_error,
 }
 
 /**
- * 航向闭环 (串级 P-PI 外环): 纯 P — angle_err → wz_cmd
+ * 航向闭环: sqrt_controller + 内环速率 PI (级联)
  *
- * 内环 PI 在 apply_speed() 中直接输出 PWM,
- * 自动克服静摩擦, 无需 breakaway/MPC/自适应 D。
+ * 外环: 位置误差 → wz_target (sqrt_controller 时间最优)
+ * 内环: rate_err → PI 修正 → 追加到 wz
+ *       平动时 enable_rate_loop=0 关闭内环反馈, 防 IMU 振动噪声入积分
  *
  * @param err              航向误差(°)，已归一化
+ * @param enable_rate_loop  1=开启内环速率 PI (静止保持)
  * @param allow_inpos_lock  1=允许 Schmitt-trigger 在位锁
  * @return                 角速度指令(°/s)
  */
-static float yaw_pi(float err, uint8 allow_inpos_lock)
+static float yaw_pi(float err, uint8 enable_rate_loop, uint8 allow_inpos_lock)
 {
     const float yaw_rate_dps = chassis_imu_get_yaw_rate_dps();
-    const float inpos_exit_deg = CHASSIS_YAW_INPOS_ENTER_DEG * 2.0f;
-    const float inpos_settle_dps = 25.0f;
+    float wz;
 
-    /* In-Position Schmitt 锁: |err|<0.5° 且 |rate|<25°/s → 硬归零 */
+#if (CHASSIS_YAW_USE_CASCADED_CTRL != 0)
+    /* ── In-Position Schmitt 锁 ── */
     if (allow_inpos_lock) {
         const float abs_err  = fabsf(err);
         const float abs_rate = fabsf(yaw_rate_dps);
         if (s_yaw_in_position) {
-            if (abs_err > inpos_exit_deg) { s_yaw_in_position = 0; }
+            if (abs_err > CHASSIS_YAW_INPOS_EXIT_DEG) { s_yaw_in_position = 0; }
         } else {
             if ((abs_err < CHASSIS_YAW_INPOS_ENTER_DEG) &&
-                (abs_rate < inpos_settle_dps)) {
+                (abs_rate < CHASSIS_YAW_INPOS_SETTLE_DPS)) {
                 s_yaw_in_position = 1;
+                s_yaw_i = 0.0f;  /* 锁定时清零积分 */
             }
         }
         if (s_yaw_in_position) { return 0.0f; }
@@ -806,14 +797,69 @@ static float yaw_pi(float err, uint8 allow_inpos_lock)
         s_yaw_in_position = 0;
     }
 
-    /* 外环纯 P: angle_err → wz_cmd, 夹到 ±max_yaw_speed */
+    /* ── 外环: MPC 优先, sqrt_controller 兜底 → wz_target ── */
     {
-        float wz = g_chassis_tune_params.yaw_kp * err;
-        wz = chassis_clamp_f(wz,
-                             -g_chassis_tune_params.max_yaw_speed_dps,
-                              g_chassis_tune_params.max_yaw_speed_dps);
-        return wz;
+        float wz_target;
+        float rate_err;
+        float kp_v, ki_v;
+        uint8 mpc_ok = 0U;
+
+#if CHASSIS_MPC_YAW_ENABLE
+        {
+            float mpc_wz;
+            if (chassis_mpc_yaw_step(err, &mpc_wz)) {
+                wz_target = mpc_wz;
+                mpc_ok = 1U;
+            }
+        }
+#endif
+        if (!mpc_ok) {
+            wz_target = sqrt_controller(err,
+                                        g_chassis_tune_params.yaw_kp,
+                                        CHASSIS_YAW_ACCEL_MAX_DPS2);
+        }
+
+        wz_target = chassis_clamp_f(wz_target,
+                                    -g_chassis_tune_params.max_yaw_speed_dps,
+                                     g_chassis_tune_params.max_yaw_speed_dps);
+
+        /* ── 内环 PI: 仅静止时开启, 平动时关 ── */
+        if (enable_rate_loop) {
+            rate_err = wz_target - yaw_rate_dps;
+        } else {
+            rate_err = 0.0f;
+        }
+
+        /* 反向卷绕保护 */
+        if ((err * s_yaw_i) < 0.0f) { s_yaw_i = 0.0f; }
+
+        /* I 累积 + 缓慢泄漏 */
+        s_yaw_i = s_yaw_i * (1.0f - CHASSIS_YAW_RATE_I_LEAK)
+                + rate_err * CHASSIS_TASK_DT_20MS_S;
+        s_yaw_i = chassis_clamp_f(s_yaw_i,
+                                  -CHASSIS_YAW_RATE_I_LIMIT,
+                                   CHASSIS_YAW_RATE_I_LIMIT);
+
+        kp_v = CHASSIS_YAW_RATE_KP * rate_err;
+        ki_v = CHASSIS_YAW_RATE_KI * s_yaw_i;
+
+        wz = wz_target + kp_v + ki_v;
     }
+
+    wz = chassis_clamp_f(wz,
+                         -g_chassis_tune_params.max_yaw_speed_dps,
+                          g_chassis_tune_params.max_yaw_speed_dps);
+    return wz;
+
+#else /* 旧单环回退 */
+    (void)enable_rate_loop;
+    /* ... fallback PID ... */
+    wz = g_chassis_tune_params.yaw_kp * err;
+    wz = chassis_clamp_f(wz,
+                         -g_chassis_tune_params.max_yaw_speed_dps,
+                          g_chassis_tune_params.max_yaw_speed_dps);
+    return wz;
+#endif
 }
 
 /** 模式切换辅助: 清状态 + 设模式 */
@@ -828,6 +874,9 @@ static void enter_mode(ctrl_mode_t m)
     s_pos_i_hold      = 0.0f;  /* 保持轴积分同步清零 */
     s_yaw_i           = 0.0f;  /* yaw 积分同步清零 */
     s_yaw_rate_i      = 0.0f;  /* 内环 PI 积分清零 */
+    s_yaw_adrc_z1     = 0.0f;  /* ADRC 状态清零 */
+    s_yaw_adrc_z2     = 0.0f;
+    s_yaw_adrc_u      = 0.0f;
     s_ramp = (chassis_body_speed_cmd_t){0};  /* P0-修复 2026-06-07:
                      * 原漏清 s_ramp: 方向反转时 ramp 保留旧方向速度残值,
                      * 新目标要求反向但 ramp_filter 每拍只能变 dv=0.012,
@@ -1083,7 +1132,7 @@ void chassis_ctrl_task_20ms(void)
                 if (fabsf(yerr_hold) <= CHASSIS_YAW_GOAL_TOLERANCE_DEG) {
                     cmd.wz_dps = 0.0f;
                 } else {
-                    cmd.wz_dps = yaw_pi(yerr_hold, 1U);
+                    cmd.wz_dps = yaw_pi(yerr_hold, 1U, 1U);  /* 静止保持: 速率PI+在位锁 */
                 }
             }
             break;
@@ -1383,7 +1432,7 @@ void chassis_ctrl_task_20ms(void)
             s_ramp.vy_body_mps = 0.0f;
             cmd.vx_body_mps = 0.0f;
             cmd.vy_body_mps = 0.0f;
-            cmd.wz_dps      = yaw_pi(yerr, 1U);  /* 原地旋转, 允许 in-pos 锁 */
+            cmd.wz_dps      = yaw_pi(yerr, 0U, 1U);  /* 原地旋转: 禁速率PI(噪声), 允在位锁 */
             break;
         }
         s_nav_yaw_aligned = 1U;
@@ -1397,8 +1446,8 @@ void chassis_ctrl_task_20ms(void)
         }
         else
         {
-            /* 平动期间禁用 in-pos 锁, 但保留 P-only 速率阻尼抑制旋转超调。 */
-            cmd.wz_dps = yaw_pi(yerr, 0U);
+            /* 平动期间禁用 in-pos 锁, 保留速率阻尼抑制旋转超调 */
+            cmd.wz_dps = yaw_pi(yerr, 0U, 0U);
         }
         break;
     }
@@ -1412,8 +1461,8 @@ void chassis_ctrl_task_20ms(void)
         float yerr = chassis_normalize_angle_deg(s_tgt_yaw_deg - s_pose.yaw_deg);
         cmd.vx_body_mps = 0.0f;
         cmd.vy_body_mps = 0.0f;
-        /* 静止保持: P-only 阻尼 + 允许 in-pos 锁消除极限环 */
-        cmd.wz_dps = yaw_pi(yerr, 1U);
+        /* 静止保持: 速率PI + 在位锁 */
+        cmd.wz_dps = yaw_pi(yerr, 1U, 1U);
 
         /* rotate_to_deg 到达判定: 误差进入容忍带且 in-pos 锁已触发 (车体稳定) */
         if (s_rotate_active && s_yaw_in_position) {

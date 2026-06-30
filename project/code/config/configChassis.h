@@ -108,29 +108,43 @@
 
 /* ---- 用户常调参数 (优先调下面几个) ---- */
 
-/** 航向外环 P 增益: angle_err(°) → wz_cmd(°/s). 纯 P, 极简.
- *  10°偏→ 60°/s, 45°偏→ 270°/s(夹到 MAX). 大→转得猛, 小→柔和 */
-#define CHASSIS_YAW_KP                      (4.0f)
+/** 航向 sqrt_controller 线性段 P 增益 (°/s per °): 近目标时的响应
+ *  sqrt_controller 保证远处时间最优、近处线性平滑, 不会超调 */
+#define CHASSIS_YAW_KP                      (1.10f)
 
-/** 最大旋转速度 (°/s): 限制原地转向和导航修正的最高角速度 */
+/** sqrt_controller 最大减速度 (°/s²): 决定刹车距离 */
+#define CHASSIS_YAW_ACCEL_MAX_DPS2          (720.0f)
+
+/** 最大旋转速度 (°/s) */
 #define CHASSIS_MAX_YAW_SPEED_DPS           (150.0f)
 
-/** 进入在位锁的角度阈值 (°): |err|<此值且|rate|<25°/s → 输出硬归零 */
+/* ---- 内环速率 PI (角速度跟踪) ---- */
+
+/** 1=级联 sqrt+PI, 0=回退单环 PID */
+#define CHASSIS_YAW_USE_CASCADED_CTRL       (1)
+
+/** 内环 P: rate_err(°/s) → wz 修正 (°/s) */
+#define CHASSIS_YAW_RATE_KP                 (1.45f)
+
+/** 内环 I 增益: ∫rate_err → wz 修正. 自动克服静摩擦 */
+#define CHASSIS_YAW_RATE_KI                 (2.0f)
+
+/** 内环 I 上限 (°/s): 积分最多贡献的角速度 */
+#define CHASSIS_YAW_RATE_I_LIMIT            (120.0f)
+
+/** 内环 I 泄漏系数: 每拍 I *= 1-LEAK, 防卷绕且自然衰减 */
+#define CHASSIS_YAW_RATE_I_LEAK             (0.003f)
+
+/* ---- 到位锁 ---- */
+
+/** 进入在位锁: |err| < 此值 */
 #define CHASSIS_YAW_INPOS_ENTER_DEG         (0.50f)
 
-/* ---- 串级 P-PI: 内环 (角速度→PWM) ---- */
+/** 退出在位锁: |err| > 此值 */
+#define CHASSIS_YAW_INPOS_EXIT_DEG          (3.00f)
 
-/** 内环 P 增益: rate_err(°/s) → PWM. 大→转得猛, 过大可能抖 */
-#define CHASSIS_YAW_INNER_KP                (20.0f)
-
-/** 内环 I 增益: ∫rate_err → PWM. 自动克服静摩擦, 不需 breakaway */
-#define CHASSIS_YAW_INNER_KI                (100.0f)
-
-/** 内环积分上限 (PWM): 防卷绕, 30%占空比 */
-#define CHASSIS_YAW_INNER_I_LIMIT           (3000.0f)
-
-/** 内环前馈增益: 给 PI 做 baseline, 减少积分负担 */
-#define CHASSIS_YAW_FF_GAIN                 (2000.0f)
+/** 即位锁需车体稳定: |rate| < 此值 */
+#define CHASSIS_YAW_INPOS_SETTLE_DPS        (25.0f)
 
 /** 角速度加减速限制 (°/s²): 同时用于 yaw sqrt 曲线和下游 ramp */
 #define CHASSIS_CMD_ACCEL_LIMIT_DPS2        (5000.0f)
@@ -184,7 +198,7 @@
  *  P0-修复 2026-06-30: 0.40→1.00。原值 0.40 与 inpos enter 0.50 过近,
  *  硬归零→漂出→重新激活→拉回的循环造成目标点抖动。
  *  1.00=inpos 退出阈值, 两个行为一致, 消除硬切换。 */
-#define CHASSIS_YAW_GOAL_TOLERANCE_DEG      (1.00f)
+#define CHASSIS_YAW_GOAL_TOLERANCE_DEG      (0.500f)
 
 /* ---- 导航增益 ---- */
 
@@ -249,7 +263,7 @@
  *  实物转 360° 显示 200° → scale = 200/360 = 0.556
  *  实物转 360° 显示 400° → scale = 400/360 = 1.111
  *  公式: 新值 = 当前值 × (显示角度 / 实际角度) */
-#define CHASSIS_IMU_GYRO_SCALE              (1.0f)
+#define CHASSIS_IMU_GYRO_SCALE              (1.015f)
 
 /** Yaw 角速度死区 (°/s) — 抑制静止抖动 */
 #define CHASSIS_IMU_GYRO_DEADZONE_DPS       (0.1f)
@@ -653,13 +667,13 @@
 #define CHASSIS_MPC_YAW_ENABLE                  (1)
 
 /** Yaw 角度精度权重 (°⁻²): 大→转得猛/停得准, 小→柔和 */
-#define CHASSIS_MPC_YAW_Q_POS                   (0.600f)
+#define CHASSIS_MPC_YAW_Q_POS                   (0.300f)
 
 /** Yaw 角速度代价 (s²/°²): 大→转速降低, 小→更接近 max_yaw_speed */
 #define CHASSIS_MPC_YAW_R_VEL                   (0.1f)
 
 /** Yaw 角速度平滑代价: 大→加速柔和, 小→响应快 */
-#define CHASSIS_MPC_YAW_R_SMOOTH                (0.15f)
+#define CHASSIS_MPC_YAW_R_SMOOTH                (0.25f)
 
 /** Yaw 终端角度额外权重: Q_term = Q_POS * 此值 */
 #define CHASSIS_MPC_YAW_QF_FACTOR               (5.0f)
