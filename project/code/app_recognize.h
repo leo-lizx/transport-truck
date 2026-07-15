@@ -8,6 +8,7 @@
  *     2) 小规模精确 tour / BFS 最近观察点计算访问顺序 (与 PC 验证器 plan_scout_phase_v2 对齐)
  *     3) 对每个待识别物体:
  *          - 移动到侧面观察点 (BFS 选最近的可立足格)
+ *          - 最终观察航点用视觉 Snap 校准到格中心
  *          - 原地旋转车头朝向物体
  *          - 等待视觉端 BOX_CLASS 帧持续广播, 多数票稳定后采样
  *     4) 全部物体识别完成后, 把 (boxIdx -> targetIdx) 映射写入 g_box_to_target[]
@@ -18,7 +19,7 @@
  *   - App_Recognize_Tick 返回值见 AppRecognizeStatus_e, 业务侧据此切 stage
  *
  * 与硬件层契约:
- *   - 移动:    chassis_ctrl_move_to_m(保持当前 yaw)  /  chassis_ctrl_is_arrived
+ *   - 移动:    chassis_ctrl_move_to_m(基准 yaw) / chassis_ctrl_is_arrived / 到站视觉 Snap
  *   - 朝向:    chassis_ctrl_rotate_to_deg  /  chassis_ctrl_is_arrived
  *   - 视觉:    app_link_get_box_class_snapshot (seq-lock 拷贝)
  *
@@ -28,7 +29,7 @@
  *     冷启动, 链路恢复后自动重新走识别流程 (RECOGNIZE_MAP 是恢复点)
  *
  * 资源占用:
- *   - 全部 static, BSS 约 1.2KB; 单循环线程, 不可重入, 不可在 ISR 调用
+ *   - 全部 static, BSS 约 6KB; 单循环线程, 不可重入, 不可在 ISR 调用
  *********************************************************************************************************************/
 #ifndef _APP_RECOGNIZE_H_
 #define _APP_RECOGNIZE_H_

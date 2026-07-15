@@ -135,6 +135,61 @@ greedy10 = sv._solve_stage1_greedy(m10, (2, 2))
 assert greedy10 is not None
 assert greedy10['sub_solutions'][0]['box_idx'] == 1
 print("墙体绕障场景下按实际 BFS 距离选择箱子")
+
+# 测试10b: Stage2 固定映射也应按实际 BFS 距离选箱，而不是退回曼哈顿距离。
+print("\n=== 测试10b: Stage2 BFS 选箱距离 ===")
+mapping10b = [1, 0]
+greedy10b = sv._solve_stage2_greedy(m10, (2, 2), mapping10b)
+assert greedy10b is not None
+assert greedy10b['sub_solutions'][0]['box_idx'] == 1
+assert greedy10b['sub_solutions'][0]['target_idx'] == 0
+print("固定映射场景下同样优先选择实际可近的箱子")
+
+# Tests 10c/10d: the nearest pair/box can be locally unsolvable while a later
+# candidate gives a complete solution. The feasible-greedy fallback must keep
+# searching instead of returning a false negative on the first failed BFS.
+print("\n=== Test 10c: Stage1 feasible-candidate fallback ===")
+m10c, p10c, err10c = sv.parse_map_text("""
+################
+#--------------#
+#--------------#
+#-----.--------#
+#---##-##------#
+#---@$$-.------#
+#---##-##------#
+#--------------#
+#--------------#
+#--------------#
+#--------------#
+################
+""")
+assert err10c == "", err10c
+greedy10c = sv._solve_stage1_greedy(m10c, p10c)
+assert greedy10c is not None
+assert [(s['box_idx'], s['target_idx']) for s in greedy10c['sub_solutions']] == [(1, 0), (0, 1)]
+print("Stage1 skips an infeasible nearest pairing and completes all boxes.")
+
+print("\n=== Test 10d: Stage2 feasible-box fallback ===")
+m10d, p10d, err10d = sv.parse_map_text("""
+################
+#--------------#
+#--------------#
+#-----.--------#
+#---##-##------#
+#---@$$-.------#
+#---##-##------#
+#--------------#
+#--------------#
+#--------------#
+#--------------#
+################
+""")
+assert err10d == "", err10d
+greedy10d = sv._solve_stage2_greedy(m10d, p10d, [1, 0])
+assert greedy10d is not None
+assert [s['box_idx'] for s in greedy10d['sub_solutions']] == [1, 0]
+print("Stage2 skips an infeasible nearest box and preserves the fixed mapping.")
+
 # Test 11: a box may enter only the current target, not pass through another
 # unused target on the way to a farther target.
 print("\n=== Test 11: block pass-through targets ===")

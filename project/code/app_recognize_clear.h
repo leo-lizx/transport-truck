@@ -1,8 +1,6 @@
 #ifndef _APP_RECOGNIZE_CLEAR_H_
 #define _APP_RECOGNIZE_CLEAR_H_
 
-#define APP_RECOGNIZE_USE_CLEAR  /* 通知 app_recognize.c 闭嘴, 防链接冲突 */
-
 #include "algo_sokoban_solver.h"
 
 #ifdef __cplusplus

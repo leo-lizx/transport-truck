@@ -854,33 +854,41 @@ def _solve_stage1_greedy(the_map: list, player_pos: tuple) -> Optional[dict]:
     cur_player = player_pos
 
     for _ in range(n):
-        # 一次扩散后按实际绕障距离选最近可接近的箱子
+        # 一次扩散后按实际绕障距离排列箱子；最近候选无解时继续试后续候选。
         nav_map = [row[:] for row in the_map]
         for i, box in enumerate(boxes):
             if solved[i]:
                 nav_map[box[0]][box[1]] = EMPTY
         distance = nav_bfs_distance_flood(nav_map, cur_player)
-        best_b = min(
+        box_candidates = sorted(
             (i for i in range(n) if not solved[i]),
-            key=lambda i: _box_nav_distance(distance, boxes[i]),
-            default=None
+            key=lambda i: (_box_nav_distance(distance, boxes[i]), i),
         )
-        if best_b is None or _box_nav_distance(distance, boxes[best_b]) >= 10 ** 9:
+        chosen = None
+        for best_b in box_candidates:
+            if _box_nav_distance(distance, boxes[best_b]) >= 10 ** 9:
+                break
+            target_candidates = sorted(
+                (i for i in range(n) if not t_used[i]),
+                key=lambda i: (
+                    abs(targets[i][0] - boxes[best_b][0])
+                    + abs(targets[i][1] - boxes[best_b][1]),
+                    i,
+                ),
+            )
+            for best_t in target_candidates:
+                sub = build_sub_map(the_map, boxes, targets, solved, t_used,
+                                    best_b, best_t)
+                sol = sokoban_bfs_single(sub, cur_player, boxes[best_b],
+                                         targets[best_t])
+                if sol is not None:
+                    chosen = (best_b, best_t, sol)
+                    break
+            if chosen is not None:
+                break
+        if chosen is None:
             return None
-
-        # 选最近未使用目标
-        best_t = min(
-            (i for i in range(n) if not t_used[i]),
-            key=lambda i: abs(targets[i][0] - boxes[best_b][0]) + abs(targets[i][1] - boxes[best_b][1]),
-            default=None
-        )
-        if best_t is None:
-            return None
-
-        sub = build_sub_map(the_map, boxes, targets, solved, t_used, best_b, best_t)
-        sol = sokoban_bfs_single(sub, cur_player, boxes[best_b], targets[best_t])
-        if sol is None:
-            return None
+        best_b, best_t, sol = chosen
 
         cur_player, _ = simulate_actions(sol, cur_player, boxes[best_b])
         sub_solutions.append({
@@ -923,22 +931,33 @@ def _solve_stage2_greedy(the_map: list, player_pos: tuple,
     cur_player = player_pos
 
     for _ in range(n):
-        best_b = min(
+        # 与 Stage1 一致改用 BFS 绕障距离选箱 (曼哈顿距离在有阻挡时会选中
+        # "直线近但绕路远/暂不可达"的箱子)。对应 C 代码 2026-07-08 修改。
+        nav_map = [row[:] for row in the_map]
+        for i, box in enumerate(boxes):
+            if solved[i]:
+                nav_map[box[0]][box[1]] = EMPTY
+        distance = nav_bfs_distance_flood(nav_map, cur_player)
+        box_candidates = sorted(
             (i for i in range(n) if not solved[i]),
-            key=lambda i: abs(boxes[i][0] - cur_player[0]) + abs(boxes[i][1] - cur_player[1]),
-            default=None
+            key=lambda i: (_box_nav_distance(distance, boxes[i]), i),
         )
-        if best_b is None:
+        chosen = None
+        for best_b in box_candidates:
+            if _box_nav_distance(distance, boxes[best_b]) >= 10 ** 9:
+                break
+            ti = box_to_target_idx[best_b]
+            if ti >= len(targets):
+                return None
+            sub = build_sub_map(the_map, boxes, targets, solved, t_used,
+                                best_b, ti)
+            sol = sokoban_bfs_single(sub, cur_player, boxes[best_b], targets[ti])
+            if sol is not None:
+                chosen = (best_b, ti, sol)
+                break
+        if chosen is None:
             return None
-
-        ti = box_to_target_idx[best_b]
-        if ti >= len(targets):
-            return None
-
-        sub = build_sub_map(the_map, boxes, targets, solved, t_used, best_b, ti)
-        sol = sokoban_bfs_single(sub, cur_player, boxes[best_b], targets[ti])
-        if sol is None:
-            return None
+        best_b, ti, sol = chosen
 
         cur_player, _ = simulate_actions(sol, cur_player, boxes[best_b])
         sub_solutions.append({

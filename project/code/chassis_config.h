@@ -134,4 +134,18 @@ static inline float chassis_normalize_angle_deg(float angle_deg)
     return angle_deg;
 }
 
+/**
+ * @brief  航向吸附到最近的 90° 倍数 (0 / ±90 / 180)
+ *         网格导航按轴对齐控制器设计: 保持任意斜角 (如识别转向后的 37°)
+ *         平移会让两轴速度耦合, 精度和限速表现都变差。派发航点前先 snap。
+ * @param  yaw_deg  当前航向 (度, 任意范围)
+ * @return          最近的基准航向 (度, [-90, 180] 内的 90° 倍数)
+ */
+static inline float chassis_snap_yaw_to_cardinal_deg(float yaw_deg)
+{
+    float norm = chassis_normalize_angle_deg(yaw_deg);
+    float snapped = 90.0f * (float)(int32)((norm + ((norm >= 0.0f) ? 45.0f : -45.0f)) / 90.0f);
+    return chassis_normalize_angle_deg(snapped);
+}
+
 #endif /* CHASSIS_CONFIG_H */

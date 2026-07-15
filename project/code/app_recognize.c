@@ -10,7 +10,7 @@
  *   2. 6 个以内物体用精确 tour 选首项；更多物体退化为 BFS 最近观察点
  *   3. 对每个物体:
  *        - 找观察点: 与物体 4-邻接的可立足空地, BFS 求最近
- *        - 保持当前车头角移动到观察点 (chassis_ctrl_move_to_m + chassis_ctrl_is_arrived)
+ *        - 以最近的 90° 基准航向移动到观察点，最终航点做视觉 Snap
  *        - 旋转车头朝物体 (chassis_ctrl_rotate_to_deg + chassis_ctrl_is_arrived)
  *        - 等多数票稳定: 在 SAMPLE_WINDOW_MS 内统计 BOX_CLASS 帧, 占比 ≥ MAJORITY_THRESH 即确认
  *        - 保持采样后的车头角, 直接继续下一个物体
@@ -24,6 +24,7 @@
 #include "app_recognize.h"
 #include "app_recognize_clear.h"
 #include "app_link.h"
+#include "app_vision_fusion.h"
 #include "chassis_ctrl.h"
 #include "chassis_config.h"
 #include <math.h>
@@ -32,9 +33,6 @@
 #ifndef PI_F
 #define PI_F (3.14159265358979323846f)
 #endif
-
-#ifndef APP_RECOGNIZE_USE_CLEAR
-/* 上方宏由 app_recognize_clear.h 定义, 有此宏时本文件静默, 防链接冲突 */
 
 /*===================================================================================================================
  * 调参 (集中, 后续可挪到 chassis_config.h)
@@ -57,8 +55,12 @@
 /** 5ms 周期 */
 #define RECOG_TICK_MS                  (5U)
 
-/** B3a: 单点 NAV (跑到观察点) 最长时长 — 5s @ 5ms tick */
+/** 单个分类帧最大年龄；超过该值不得计入当前观察点的多数票。 */
+#define RECOG_CLASS_FRAME_MAX_AGE_MS   (250U)
+
+/** B3a: 单点 NAV 最短时限 5s，长直线按每格 1.5s 线性放宽。 */
 #define RECOG_NAV_TIMEOUT_TICKS        (1000U)
+#define RECOG_NAV_TICKS_PER_CELL       (300U)
 
 /** B3a: 单点 FACE (旋转到位) 最长时长 — 3s */
 #define RECOG_FACE_TIMEOUT_TICKS       (600U)
@@ -104,12 +106,14 @@ static uint8             s_cur_idx      = 0U;     /* s_items 中当前处理项 
 static uint8  s_nav_started     = 0U;
 static uint8  s_face_started    = 0U;
 static uint16 s_subphase_ticks  = 0U;     /* B3a: NAV/FACE 子阶段计时, enter_sub_* 时清零 */
+static uint16 s_nav_timeout_limit = RECOG_NAV_TIMEOUT_TICKS;
 static AppRecogClearPlan_t s_nav_plan;
 static SokoWaypointPath_t  s_nav_waypoints;
-static Point_t s_nav_plan_start;
 static uint16  s_nav_wp_idx     = 0U;
-static uint8   s_nav_map_applied = 0U;
+static uint16  s_nav_actions_applied = 0U;
+static Point_t s_nav_apply_player;
 static uint8   s_map_changed     = 0U;
+static uint8   s_nav_replay_map[MAP_ROWS][MAP_COLS];
 
 /* 多数票统计 */
 static uint16 s_sample_ticks    = 0U;
@@ -164,9 +168,43 @@ static void recog_move_to_grid_keep_current_yaw(Point_t target)
 {
     chassis_pose_t pose = chassis_ctrl_get_pose();
 
+    /* snap 到最近 90° 倍数: 面向物体采样后 yaw 是任意角, 直接保持会让
+     * 轴对齐平移控制器两轴耦合 → 走斜线/限速失真, 故先吸附再派发 */
     chassis_ctrl_move_to_m(chassis_grid_x_to_m((uint8)target.x),
                            chassis_grid_y_to_m((uint8)target.y),
-                           pose.yaw_deg);
+                           chassis_snap_yaw_to_cardinal_deg(pose.yaw_deg));
+}
+
+/* 识别巡航仅在每个物体的最终观察航点做视觉 Snap。中间转弯点继续使用
+ * odom 到位即可，避免每段额外等待最多 800ms；最终点校准后再计算朝物体 yaw。 */
+static uint8 recog_nav_arrived_for_waypoint(uint8 require_snap)
+{
+    if (chassis_ctrl_is_arrived() == 0U)
+    {
+        app_vision_fusion_snap_cancel();
+        return 0U;
+    }
+
+#if CHASSIS_VISION_SNAP_ON_ARRIVE_ENABLE
+    if (require_snap != 0U)
+    {
+        float target_x_m = 0.0f;
+        float target_y_m = 0.0f;
+        app_vision_snap_state_e state;
+
+        chassis_ctrl_get_point_nav_target_m(&target_x_m, &target_y_m);
+        app_vision_fusion_snap_request(target_x_m, target_y_m);
+        state = app_vision_fusion_snap_state();
+        return (uint8)((state == APP_VISION_SNAP_DONE) ||
+                       (state == APP_VISION_SNAP_TIMEOUT) ||
+                       (state == APP_VISION_SNAP_REJECT));
+    }
+#else
+    (void)require_snap;
+#endif
+
+    app_vision_fusion_snap_cancel();
+    return 1U;
 }
 
 /*===================================================================================================================
@@ -175,10 +213,14 @@ static void recog_move_to_grid_keep_current_yaw(Point_t target)
 
 static void sample_state_reset(void)
 {
+    app_link_box_class_snapshot_t snap;
+
     s_sample_ticks       = 0U;
     s_sample_total       = 0U;
     s_sample_consec_none = 0U;
-    s_last_seen_frame_id = 0U;
+    /* 丢弃转向完成前已经落地的最后一帧，只统计进入 SAMPLE 后的新帧。 */
+    app_link_get_box_class_snapshot(&snap);
+    s_last_seen_frame_id = (snap.valid != 0U) ? snap.frame_id : 0U;
     memset(s_class_hist, 0, sizeof(s_class_hist));
 }
 
@@ -191,7 +233,9 @@ static void sample_state_reset(void)
 static int16 sample_majority_step(uint8 expect_kind)
 {
     app_link_box_class_snapshot_t snap;
+    uint32 now_ms;
     app_link_get_box_class_snapshot(&snap);
+    now_ms = app_link_get_ms();
 
     s_sample_ticks++;
 
@@ -199,6 +243,12 @@ static int16 sample_majority_step(uint8 expect_kind)
     if ((snap.valid != 0U) && (snap.frame_id != s_last_seen_frame_id))
     {
         s_last_seen_frame_id = snap.frame_id;
+
+        /* frame_id 只保证“没重复”，stamp_ms 再保证它确属当前实时观察窗口。 */
+        if ((uint32)(now_ms - snap.stamp_ms) > RECOG_CLASS_FRAME_MAX_AGE_MS)
+        {
+            return 0;
+        }
 
         /* B11: 物体类型不匹配 (主控想看 BOX, 视觉端却给 TARGET): 静默忽略,
          * 不计入 None 也不计入 total. 否则相邻 box/target 会把 None 拉满判失败. */
@@ -755,8 +805,8 @@ static uint8 build_box_to_target_mapping(const uint8 map[MAP_ROWS][MAP_COLS],
 static uint8 prepare_nav_plan(const uint8 map[MAP_ROWS][MAP_COLS],
                               Point_t player_pos)
 {
-    uint16 waypoint_need = 0U;
     uint16 i;
+    Point_t player;
 
     if (!App_Recog_Clear_Plan(map, player_pos, s_items[s_cur_idx].pos,
                               &s_nav_plan))
@@ -764,44 +814,78 @@ static uint8 prepare_nav_plan(const uint8 map[MAP_ROWS][MAP_COLS],
         return 0U;
     }
 
-    for (i = 0U; i < s_nav_plan.actions.count; ++i)
-    {
-        if (i + 1U == s_nav_plan.actions.count ||
-            s_nav_plan.actions.actions[i] != s_nav_plan.actions.actions[i + 1U])
-        {
-            ++waypoint_need;
-        }
-    }
-    if (waypoint_need > (uint16)SOKOBAN_MAX_WAYPOINTS)
-    {
-        return 0U;
-    }
-
     s_items[s_cur_idx].observe = s_nav_plan.observe;
-    s_nav_plan_start = player_pos;
-    Sokoban_Actions_To_Waypoints(s_nav_plan.actions.actions,
-                                 s_nav_plan.actions.count,
-                                 player_pos,
-                                 &s_nav_waypoints);
-    s_nav_wp_idx = 0U;
-    s_nav_map_applied = 0U;
-    return 1U;
-}
+    s_nav_waypoints.count = 0U;
+    memcpy(s_nav_replay_map, map, sizeof(s_nav_replay_map));
+    player = player_pos;
 
-static uint8 apply_nav_plan_to_map(uint8 map[MAP_ROWS][MAP_COLS])
-{
-    static const int8 dr[4] = {-1, 1, 0, 0};
-    static const int8 dc[4] = {0, 0, -1, 1};
-    Point_t player = s_nav_plan_start;
-    uint16 i;
-
+    /* 转弯、路径末尾以及每一次推箱后都形成航点。推箱单独成段后，只有底盘
+     * 确认到达该格才会更新逻辑地图，避免清障执行到一半时物理/逻辑箱位脱节。 */
     for (i = 0U; i < s_nav_plan.actions.count; ++i)
     {
         uint8 d = (uint8)s_nav_plan.actions.actions[i];
         Point_t next;
+        uint8 pushed = 0U;
+        static const int8 dr[4] = {-1, 1, 0, 0};
+        static const int8 dc[4] = {0, 0, -1, 1};
+
         if (d > (uint8)SOKO_ACT_RIGHT) return 0U;
         next.x = (int8)(player.x + dc[d]);
         next.y = (int8)(player.y + dr[d]);
+        if (next.x < 0 || next.x >= (int8)MAP_COLS ||
+            next.y < 0 || next.y >= (int8)MAP_ROWS) return 0U;
+
+        if (s_nav_replay_map[next.y][next.x] == MAP_BOX)
+        {
+            Point_t box_to;
+            box_to.x = (int8)(next.x + dc[d]);
+            box_to.y = (int8)(next.y + dr[d]);
+            if (box_to.x < 0 || box_to.x >= (int8)MAP_COLS ||
+                box_to.y < 0 || box_to.y >= (int8)MAP_ROWS ||
+                s_nav_replay_map[box_to.y][box_to.x] != MAP_EMPTY) return 0U;
+            s_nav_replay_map[next.y][next.x] = MAP_EMPTY;
+            s_nav_replay_map[box_to.y][box_to.x] = MAP_BOX;
+            pushed = 1U;
+        }
+        else if (s_nav_replay_map[next.y][next.x] != MAP_EMPTY &&
+                 s_nav_replay_map[next.y][next.x] != MAP_TARGET)
+        {
+            return 0U;
+        }
+        player = next;
+
+        if ((pushed != 0U) ||
+            (i + 1U == s_nav_plan.actions.count) ||
+            (s_nav_plan.actions.actions[i] != s_nav_plan.actions.actions[i + 1U]))
+        {
+            if (s_nav_waypoints.count >= (uint16)SOKOBAN_MAX_WAYPOINTS) return 0U;
+            s_nav_waypoints.points[s_nav_waypoints.count++] = player;
+        }
+    }
+
+    s_nav_wp_idx = 0U;
+    s_nav_actions_applied = 0U;
+    s_nav_apply_player = player_pos;
+    return 1U;
+}
+
+static uint8 apply_nav_plan_to_waypoint(uint8 map[MAP_ROWS][MAP_COLS],
+                                        Point_t waypoint)
+{
+    static const int8 dr[4] = {-1, 1, 0, 0};
+    static const int8 dc[4] = {0, 0, -1, 1};
+    Point_t player = s_nav_apply_player;
+
+    while (s_nav_actions_applied < s_nav_plan.actions.count &&
+           (player.x != waypoint.x || player.y != waypoint.y))
+    {
+        uint8 d = (uint8)s_nav_plan.actions.actions[s_nav_actions_applied];
+        Point_t next;
+        if (d > (uint8)SOKO_ACT_RIGHT) return 0U;
+        next.x = (int8)(player.x + dc[d]);
+        next.y = (int8)(player.y + dr[d]);
+        if (next.x < 0 || next.x >= (int8)MAP_COLS ||
+            next.y < 0 || next.y >= (int8)MAP_ROWS) return 0U;
 
         if (map[next.y][next.x] == MAP_BOX)
         {
@@ -809,7 +893,9 @@ static uint8 apply_nav_plan_to_map(uint8 map[MAP_ROWS][MAP_COLS])
             uint8 item;
             box_to.x = (int8)(next.x + dc[d]);
             box_to.y = (int8)(next.y + dr[d]);
-            if (map[box_to.y][box_to.x] != MAP_EMPTY) return 0U;
+            if (box_to.x < 0 || box_to.x >= (int8)MAP_COLS ||
+                box_to.y < 0 || box_to.y >= (int8)MAP_ROWS ||
+                map[box_to.y][box_to.x] != MAP_EMPTY) return 0U;
 
             for (item = 0U; item < s_item_count; ++item)
             {
@@ -824,6 +910,7 @@ static uint8 apply_nav_plan_to_map(uint8 map[MAP_ROWS][MAP_COLS])
             if (item >= s_item_count) return 0U;
             map[next.y][next.x] = MAP_EMPTY;
             map[box_to.y][box_to.x] = MAP_BOX;
+            s_map_changed = 1U;
         }
         else if (map[next.y][next.x] != MAP_EMPTY &&
                  map[next.y][next.x] != MAP_TARGET)
@@ -831,10 +918,25 @@ static uint8 apply_nav_plan_to_map(uint8 map[MAP_ROWS][MAP_COLS])
             return 0U;
         }
         player = next;
+        s_nav_actions_applied++;
     }
 
-    s_map_changed = 1U;
-    return 1U;
+    s_nav_apply_player = player;
+    return (uint8)(player.x == waypoint.x && player.y == waypoint.y);
+}
+
+static uint16 nav_timeout_limit_for_waypoint(Point_t waypoint)
+{
+    int16 dx = (int16)waypoint.x - (int16)s_nav_apply_player.x;
+    int16 dy = (int16)waypoint.y - (int16)s_nav_apply_player.y;
+    uint16 cells;
+    uint16 limit;
+
+    if (dx < 0) dx = (int16)-dx;
+    if (dy < 0) dy = (int16)-dy;
+    cells = (uint16)(dx + dy);
+    limit = (uint16)(cells * RECOG_NAV_TICKS_PER_CELL);
+    return (limit > RECOG_NAV_TIMEOUT_TICKS) ? limit : RECOG_NAV_TIMEOUT_TICKS;
 }
 
 /*===================================================================================================================
@@ -847,12 +949,13 @@ static void enter_sub_nav(void)
     s_nav_started  = 0U;
     s_face_started = 0U;
     s_nav_wp_idx   = 0U;
-    s_nav_map_applied = 0U;
     s_subphase_ticks = 0U;        /* B3a: 进入新子阶段, watchdog 清零 */
+    s_nav_timeout_limit = RECOG_NAV_TIMEOUT_TICKS;
 }
 
 static void enter_sub_face(void)
 {
+    app_vision_fusion_snap_cancel();
     s_sub_state    = RECOG_SUB_FACE;
     s_face_started = 0U;
     s_subphase_ticks = 0U;        /* B3a */
@@ -875,6 +978,7 @@ static void enter_sub_next(void)
 
 void App_Recognize_Reset(void)
 {
+    app_vision_fusion_snap_cancel();
     s_sub_state    = RECOG_SUB_INIT;
     s_item_count   = 0U;
     s_box_count    = 0U;
@@ -883,9 +987,10 @@ void App_Recognize_Reset(void)
     s_nav_started  = 0U;
     s_face_started = 0U;
     s_nav_wp_idx   = 0U;
-    s_nav_map_applied = 0U;
+    s_nav_actions_applied = 0U;
     s_map_changed  = 0U;
     s_subphase_ticks = 0U;        /* B3a */
+    s_nav_timeout_limit = RECOG_NAV_TIMEOUT_TICKS;
     sample_state_reset();
     memset(s_items, 0, sizeof(s_items));
     memset(&s_nav_plan, 0, sizeof(s_nav_plan));
@@ -948,20 +1053,40 @@ AppRecognizeStatus_e App_Recognize_Tick(uint8 map[MAP_ROWS][MAP_COLS],
                 {
                     Point_t wp = s_nav_waypoints.points[s_nav_wp_idx];
                     recog_move_to_grid_keep_current_yaw(wp);
+                    s_nav_timeout_limit = nav_timeout_limit_for_waypoint(wp);
                     s_nav_started = 1U;
                     s_subphase_ticks = 0U;
                     return APP_RECOG_RUNNING;
                 }
-                if (s_subphase_ticks > RECOG_NAV_TIMEOUT_TICKS)
+                if (s_subphase_ticks > s_nav_timeout_limit)
                 {
+                    app_vision_fusion_snap_cancel();
+                    chassis_ctrl_stop();
+                    if (s_nav_plan.push_count > 0U)
+                    {
+                        /* 未确认到达的清障段可能已经接触箱子，继续识别会让逻辑地图
+                         * 与真实箱位分叉；整轮失败返航比带错图继续解算更安全。 */
+                        s_sub_state = RECOG_SUB_FAIL;
+                        return APP_RECOG_FAIL;
+                    }
                     s_items[s_cur_idx].visited = 1U;
                     s_items[s_cur_idx].ok      = 0U;
                     enter_sub_next();
                     return APP_RECOG_RUNNING;
                 }
-                if (!chassis_ctrl_is_arrived())
+                if (!recog_nav_arrived_for_waypoint(
+                        (uint8)((s_nav_wp_idx + 1U) >= s_nav_waypoints.count)))
                 {
                     return APP_RECOG_RUNNING;
+                }
+                {
+                    Point_t wp = s_nav_waypoints.points[s_nav_wp_idx];
+                    if (!apply_nav_plan_to_waypoint(map, wp))
+                    {
+                        chassis_ctrl_stop();
+                        s_sub_state = RECOG_SUB_FAIL;
+                        return APP_RECOG_FAIL;
+                    }
                 }
                 s_nav_started = 0U;
                 s_subphase_ticks = 0U;
@@ -969,17 +1094,11 @@ AppRecognizeStatus_e App_Recognize_Tick(uint8 map[MAP_ROWS][MAP_COLS],
                 return APP_RECOG_RUNNING;
             }
 
-            /* 推箱动作全部成功后, 一次性把相同动作应用到主控地图和稳定箱子 ID。 */
-            if (s_nav_plan.push_count > 0U && !s_nav_map_applied)
+            if (s_nav_actions_applied != s_nav_plan.actions.count)
             {
-                if (!apply_nav_plan_to_map(map))
-                {
-                    s_items[s_cur_idx].visited = 1U;
-                    s_items[s_cur_idx].ok = 0U;
-                    enter_sub_next();
-                    return APP_RECOG_RUNNING;
-                }
-                s_nav_map_applied = 1U;
+                chassis_ctrl_stop();
+                s_sub_state = RECOG_SUB_FAIL;
+                return APP_RECOG_FAIL;
             }
             enter_sub_face();
             return APP_RECOG_RUNNING;
@@ -996,10 +1115,13 @@ AppRecognizeStatus_e App_Recognize_Tick(uint8 map[MAP_ROWS][MAP_COLS],
                 s_face_started = 1U;
                 return APP_RECOG_RUNNING;
             }
-            /* B3a: 3s 仍转不到位 → 直接进 SAMPLE 试试 (车头偏一点视觉也可能识别) */
+            /* 车头未确认到位时不得采样，否则相邻物体的旧图案会污染映射。 */
             if (s_subphase_ticks > RECOG_FACE_TIMEOUT_TICKS)
             {
-                enter_sub_sample();
+                chassis_ctrl_stop();
+                s_items[s_cur_idx].visited = 1U;
+                s_items[s_cur_idx].ok = 0U;
+                enter_sub_next();
                 return APP_RECOG_RUNNING;
             }
             if (!chassis_ctrl_is_arrived())
@@ -1128,4 +1250,3 @@ uint8 App_Recognize_Map_Changed(void)
 {
     return s_map_changed;
 }
-#endif /* !APP_RECOGNIZE_USE_CLEAR */

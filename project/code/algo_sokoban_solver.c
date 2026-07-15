@@ -61,6 +61,8 @@ static uint8 sb_frontier_nxt_bm[SB_BITMAP_BYTES];
 
 /** 子地图临时缓冲 */
 static uint8  sb_sub_map[MAP_ROWS][MAP_COLS];
+/* Stage1/2 贪心只会串行执行，复用同一份 BFS 距离缓冲，避免为 Stage2 额外增加 BSS。 */
+static uint8  sb_nav_distance[MAP_ROWS][MAP_COLS];
 
 #define SB_PARENT_START      (5u)
 #define SB_PARENT_PUSH_BASE  (6u)
@@ -765,7 +767,6 @@ static uint8 sokoban_solve_stage1_greedy(const uint8 map[MAP_ROWS][MAP_COLS],
     Point_t targets[SOKOBAN_MAX_BOXES];
     uint8   solved[SOKOBAN_MAX_BOXES]  = {0};
     uint8   t_used[SOKOBAN_MAX_BOXES]  = {0};
-    static uint8 nav_distance[MAP_ROWS][MAP_COLS];
 
     result->is_solved   = 0;
     result->total_boxes = 0;
@@ -778,55 +779,73 @@ static uint8 sokoban_solve_stage1_greedy(const uint8 map[MAP_ROWS][MAP_COLS],
     result->total_boxes = box_n;
     Point_t cur_player = player_pos;
 
-    /* 逐个解算 — 贪心: 先推离当前玩家最近的箱子 */
+    /* 逐个解算：仍按“玩家可接近距离、箱到目标距离”排序，但最近候选无解时
+     * 继续尝试同轮其他箱/目标，避免一个局部死配对把整张可解地图误判无解。 */
     for (uint8 done = 0; done < box_n; done++) {
+        int8 chosen_b = -1;
+        int8 chosen_t = -1;
+        uint8 box_tried[SOKOBAN_MAX_BOXES] = {0};
+        SokoActionSeq_t *sol = &result->sub_solutions[done];
 
-        /* 1. 从当前玩家一次扩散，按实际绕障步数选最近可接近的箱子。 */
-        int8  best_b = -1;
-        uint8 best_d = ALGO_NAV_DISTANCE_UNREACHABLE;
+        /* 从当前玩家一次扩散，得到所有未完成箱子的实际绕障接近距离。 */
         memcpy(sb_sub_map, map, sizeof(sb_sub_map));
         for (uint8 i = 0; i < box_n; i++) {
             if (solved[i]) sb_sub_map[boxes[i].y][boxes[i].x] = MAP_EMPTY;
         }
-        if (!Algo_Nav_BFS_Flood(sb_sub_map, cur_player, 0, nav_distance)) return 0;
-        for (uint8 i = 0; i < box_n; i++) {
-            if (solved[i]) continue;
-            uint16 d = nav_distance_to_box(nav_distance, boxes[i]);
-            if (d < best_d) { best_d = d; best_b = (int8)i; }
-        }
-        if (best_b < 0) return 0;
+        if (!Algo_Nav_BFS_Flood(sb_sub_map, cur_player, 0, sb_nav_distance)) return 0;
 
-        /* 2. 为该箱子分配最近未使用目标 */
-        int8  best_t = -1;
-        int16 best_target_d = 32767;
-        for (uint8 i = 0; i < target_n; i++) {
-            if (t_used[i]) continue;
-            int16 d = (int16)(abs(targets[i].x - boxes[best_b].x)
-                            + abs(targets[i].y - boxes[best_b].y));
-            if (d < best_target_d) {
-                best_target_d = d;
-                best_t = (int8)i;
+        for (uint8 box_try = 0U; box_try < box_n; ++box_try) {
+            int8 best_b = -1;
+            uint16 best_box_d = 0xFFFFU;
+            uint8 target_tried[SOKOBAN_MAX_BOXES] = {0};
+
+            for (uint8 i = 0U; i < box_n; ++i) {
+                uint16 d;
+                if (solved[i] || box_tried[i]) continue;
+                d = nav_distance_to_box(sb_nav_distance, boxes[i]);
+                if ((d < best_box_d) && (d < ALGO_NAV_DISTANCE_UNREACHABLE)) {
+                    best_box_d = d;
+                    best_b = (int8)i;
+                }
             }
+            if (best_b < 0) break;
+            box_tried[(uint8)best_b] = 1U;
+
+            for (uint8 target_try = 0U; target_try < target_n; ++target_try) {
+                int8 best_t = -1;
+                int16 best_target_d = 32767;
+
+                for (uint8 i = 0U; i < target_n; ++i) {
+                    int16 d;
+                    if (t_used[i] || target_tried[i]) continue;
+                    d = (int16)(abs(targets[i].x - boxes[best_b].x)
+                              + abs(targets[i].y - boxes[best_b].y));
+                    if (d < best_target_d) {
+                        best_target_d = d;
+                        best_t = (int8)i;
+                    }
+                }
+                if (best_t < 0) break;
+                target_tried[(uint8)best_t] = 1U;
+
+                build_sub_map(map, boxes, targets, box_n, target_n,
+                              solved, t_used, (uint8)best_b, (uint8)best_t, sb_sub_map);
+                if (sokoban_bfs_single(sb_sub_map, cur_player,
+                                       boxes[best_b], targets[best_t], sol, 1U)) {
+                    chosen_b = best_b;
+                    chosen_t = best_t;
+                    break;
+                }
+            }
+            if (chosen_b >= 0) break;
         }
-        if (best_t < 0) return 0;
+        if (chosen_b < 0 || chosen_t < 0) return 0;
 
-        /* 3. 构建子地图 */
-        build_sub_map(map, boxes, targets, box_n, target_n,
-                      solved, t_used, (uint8)best_b, (uint8)best_t, sb_sub_map);
-
-        /* 4. BFS 解算 */
-        SokoActionSeq_t *sol = &result->sub_solutions[done];
-        if (!sokoban_bfs_single(sb_sub_map, cur_player,
-                                boxes[best_b], targets[best_t], sol, 1U)) {
-            return 0;
-        }
-
-        /* 5. 模拟得到结束位置 */
-        cur_player = simulate_actions(sol, cur_player, boxes[best_b]);
+        cur_player = simulate_actions(sol, cur_player, boxes[chosen_b]);
         result->player_end_pos[done] = cur_player;
 
-        solved[best_b] = 1;
-        t_used[best_t] = 1;
+        solved[(uint8)chosen_b] = 1U;
+        t_used[(uint8)chosen_t] = 1U;
     }
 
     result->is_solved = 1;
@@ -858,34 +877,54 @@ static uint8 sokoban_solve_stage2_greedy(const uint8 map[MAP_ROWS][MAP_COLS],
     result->total_boxes = box_n;
     Point_t cur_player = player_pos;
 
-    /* 按离当前玩家最近的箱子优先顺序依次求解 */
+    /* 按离当前玩家最近的箱子优先顺序依次求解
+     * (与 Stage1 一致改用 BFS 绕障步数: 曼哈顿距离在有墙/箱阻挡时会选中
+     *  "直线近但绕路远"的箱子, 导致整体路径变长甚至选中暂不可达的箱子) */
     for (uint8 done = 0; done < box_n; done++) {
-        int8  best_b = -1;
-        int16 best_d = 32767;
-        for (uint8 i = 0; i < box_n; i++) {
-            if (solved[i]) continue;
-            int16 d = (int16)(abs(boxes[i].x - cur_player.x)
-                            + abs(boxes[i].y - cur_player.y));
-            if (d < best_d) { best_d = d; best_b = (int8)i; }
-        }
-        if (best_b < 0) return 0;
-
-        uint8 ti = box_to_target_idx[best_b];
-        if (ti >= target_n) return 0;
-
-        build_sub_map(map, boxes, targets, box_n, target_n,
-                      solved, t_used, (uint8)best_b, ti, sb_sub_map);
-
+        int8 chosen_b = -1;
+        uint8 box_tried[SOKOBAN_MAX_BOXES] = {0};
         SokoActionSeq_t *sol = &result->sub_solutions[done];
-        if (!sokoban_bfs_single(sb_sub_map, cur_player,
-                                boxes[best_b], targets[ti], sol, 1U)) {
-            return 0;
-        }
 
-        cur_player = simulate_actions(sol, cur_player, boxes[best_b]);
+        memcpy(sb_sub_map, map, sizeof(sb_sub_map));
+        for (uint8 i = 0; i < box_n; i++) {
+            if (solved[i]) sb_sub_map[boxes[i].y][boxes[i].x] = MAP_EMPTY;
+        }
+        if (!Algo_Nav_BFS_Flood(sb_sub_map, cur_player, 0, sb_nav_distance)) return 0;
+
+        /* 固定映射不允许换目标，但最近箱无解时可先推下一只映射合法的箱。 */
+        for (uint8 box_try = 0U; box_try < box_n; ++box_try) {
+            int8 best_b = -1;
+            uint16 best_box_d = 0xFFFFU;
+            uint8 ti;
+
+            for (uint8 i = 0U; i < box_n; ++i) {
+                uint16 d;
+                if (solved[i] || box_tried[i]) continue;
+                d = nav_distance_to_box(sb_nav_distance, boxes[i]);
+                if ((d < best_box_d) && (d < ALGO_NAV_DISTANCE_UNREACHABLE)) {
+                    best_box_d = d;
+                    best_b = (int8)i;
+                }
+            }
+            if (best_b < 0) break;
+            box_tried[(uint8)best_b] = 1U;
+
+            ti = box_to_target_idx[(uint8)best_b];
+            if (ti >= target_n) return 0;
+            build_sub_map(map, boxes, targets, box_n, target_n,
+                          solved, t_used, (uint8)best_b, ti, sb_sub_map);
+            if (sokoban_bfs_single(sb_sub_map, cur_player,
+                                   boxes[best_b], targets[ti], sol, 1U)) {
+                chosen_b = best_b;
+                break;
+            }
+        }
+        if (chosen_b < 0) return 0;
+
+        cur_player = simulate_actions(sol, cur_player, boxes[chosen_b]);
         result->player_end_pos[done] = cur_player;
-        solved[best_b] = 1;
-        t_used[ti] = 1;
+        solved[(uint8)chosen_b] = 1U;
+        t_used[box_to_target_idx[(uint8)chosen_b]] = 1U;
     }
 
     result->is_solved = 1;

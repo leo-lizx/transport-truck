@@ -1059,13 +1059,27 @@ void chassis_ctrl_task_20ms(void)
     }
 #endif
 
-    /* 3) 里程计积分: 车体速度旋转到全局坐标系后累加 (P0-3: seq-lock 写 x/y) */
+    /* 3) 里程计积分: 车体速度旋转到全局坐标系后累加 (P0-3: seq-lock 写 x/y)
+     *
+     * P0-修复 2026-07-08 (yaw=±90° 走错方向根因):
+     *   本工程全局系为地图系 (X 向右, Y 向下=行号增大方向), 与车体系 (X 向右,
+     *   Y 向前) 手性相反。由两条实车已验证事实可唯一确定变换:
+     *     ① 发车航向 180° = 车头朝地图 -Y (APP_GAME_LAUNCH_FACE_YAW_DEG);
+     *     ② 朝物体旋转公式 yaw = atan2f(dx, dy) (提交 ff2f828 实测修正)。
+     *   ⇒ 车头方向在地图系 = (sin ψ, cos ψ), 车体→全局:
+     *        gx = cosψ·vx + sinψ·vy
+     *        gy = -sinψ·vx + cosψ·vy
+     *   旧代码 sin 项符号相反 (gx=c·vx-s·vy, gy=s·vx+c·vy), 与指令端转置矩阵
+     *   联立后实际运动 = R(2ψ)·期望: ψ=0/±180° 时无症状 (sin=0),
+     *   ψ=±90° 时车沿反方向跑而里程计自认为正确 → 永远到不了目标点。
+     *   本处与下方 D 项测量 / POINT_NAV 指令变换 / get_odom_velocity_global_mps
+     *   四处同步修正; chassis_zone 软限位本就使用正确符号, 无需改动。 */
     yaw_rad = s_pose.yaw_deg * CHASSIS_DEG_TO_RAD_F;
     cy = cosf(yaw_rad);
     sy = sinf(yaw_rad);
     {
-        float new_x = s_pose.x_m + (cy * s_fb_vx - sy * s_fb_vy) * CHASSIS_TASK_DT_20MS_S;
-        float new_y = s_pose.y_m + (sy * s_fb_vx + cy * s_fb_vy) * CHASSIS_TASK_DT_20MS_S;
+        float new_x = s_pose.x_m + ( cy * s_fb_vx + sy * s_fb_vy) * CHASSIS_TASK_DT_20MS_S;
+        float new_y = s_pose.y_m + (-sy * s_fb_vx + cy * s_fb_vy) * CHASSIS_TASK_DT_20MS_S;
         pose_write_begin();
         s_pose.x_m = new_x;
         s_pose.y_m = new_y;
@@ -1175,8 +1189,9 @@ void chassis_ctrl_task_20ms(void)
          *              保持轴 kd_hold = pos_kp × HOLD_KD_RATIO (轻阻尼).
          * D 项始终用全局速度 (vxg_meas, vyg_meas) 直接做 PD, 与 axis 独立. */
         {
-            float vxg_meas      = cy * s_fb_vx - sy * s_fb_vy;  /* 全局速度 X */
-            float vyg_meas      = sy * s_fb_vx + cy * s_fb_vy;  /* 全局速度 Y */
+            /* P0-修复 2026-07-08: 与里程计积分同一套车体→全局变换 (见 task_20ms 步骤 3 注释) */
+            float vxg_meas      =  cy * s_fb_vx + sy * s_fb_vy;  /* 全局速度 X */
+            float vyg_meas      = -sy * s_fb_vx + cy * s_fb_vy;  /* 全局速度 Y */
 
             /* D 项低通 (Tesla/Waymo: derivative-on-measurement + IIR LPF) */
             s_v_along_lpf = (1.0f - CHASSIS_POS_D_LPF_ALPHA) * s_v_along_lpf
@@ -1434,9 +1449,9 @@ void chassis_ctrl_task_20ms(void)
         }
         s_nav_yaw_aligned = 1U;
 
-        /* 全局 → 车体坐标变换 */
-        cmd.vx_body_mps =  cy * vxg + sy * vyg;
-        cmd.vy_body_mps = -sy * vxg + cy * vyg;
+        /* 全局 → 车体坐标变换 (车体→全局矩阵的转置, 见 task_20ms 步骤 3 注释) */
+        cmd.vx_body_mps =  cy * vxg - sy * vyg;
+        cmd.vy_body_mps =  sy * vxg + cy * vyg;
         /* 平移时开内环 PI: I_leak 自然滤噪, 消除稳态 1° 静差 */
         cmd.wz_dps = yaw_pi(yerr, 1U, 0U);
         break;
@@ -1698,9 +1713,9 @@ void chassis_ctrl_get_odom_velocity_global_mps(float *out_vx_g, float *out_vy_g)
     sy      = sinf(yaw_rad);
     vx_b    = s_fb_vx;
     vy_b    = s_fb_vy;
-    /* 与里程计积分同一旋转: new_x += (cy*vx - sy*vy)*dt */
-    vxg     = cy * vx_b - sy * vy_b;
-    vyg     = sy * vx_b + cy * vy_b;
+    /* 与里程计积分同一旋转: new_x += (cy*vx + sy*vy)*dt (P0-修复 2026-07-08) */
+    vxg     =  cy * vx_b + sy * vy_b;
+    vyg     = -sy * vx_b + cy * vy_b;
 
     if (out_vx_g != NULL) { *out_vx_g = vxg; }
     if (out_vy_g != NULL) { *out_vy_g = vyg; }

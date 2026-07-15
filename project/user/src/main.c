@@ -119,7 +119,7 @@ static uint32 wait_for_tick(void)
 #define MAIN_RUN_MODE_LEVEL2_TEST     (10)  /* 第二关测试: 收图→固定发车→分类识别→Stage2推箱→回库 */
 
 /* ═══════════ 改下面这行切换运行模式 (0~10) ═══════════ */
-#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_LEVEL2_TEST)  /* mode 0: autonomous multi-level game flow */
+#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_GAME)  /* autonomous multi-level game flow */
 /* ═══════════ 改上面这行切换运行模式 (0~10) ═══════════ */
 
 /* OpenART1 地图链路硬件口: 若实测 UART4 走 D0/D1, 只改下面两行宏. */
@@ -153,6 +153,7 @@ static uint32 wait_for_tick(void)
 #define MAIN_POS_GRID_TO_M_X(g)       (((float)(g) - 0.5f) * CHASSIS_GRID_STEP_X_M)
 #define MAIN_POS_GRID_TO_M_Y(g)       (((float)(g) - 0.5f) * CHASSIS_GRID_STEP_Y_M)
 #define MAIN_POINT_NAV_WARMUP_TICKS   (200U)   /* 200 * 5ms = 1s warmup */
+#define MAIN_LEVEL_TEST_NAV_TIMEOUT_TICKS (6000U) /* 30s per dispatched target */
 
 #if (MAIN_RUN_MODE == MAIN_RUN_MODE_LEVEL1_TEST) || (MAIN_RUN_MODE == MAIN_RUN_MODE_HARDCODED_MAP)
 /* s_soko_selftest_map + main_selftest_char_to_map: 供 HARDCODED_MAP (模式8) 使用.
@@ -228,7 +229,8 @@ typedef enum {
     L1_PHASE_LAUNCH_FIXED,   /* same as mode 8: fixed launch to solve start */
     L1_PHASE_PUSH_BOXES,     /* 逐航点推箱 */
     L1_PHASE_RETURN_HOME,    /* 回发车区起点 */
-    L1_PHASE_DONE            /* 完成驻停 */
+    L1_PHASE_DONE,           /* 完成驻停 */
+    L1_PHASE_FAIL            /* 首张地图或导航失败，锁定驻停 */
 } l1_phase_e;
 
 static SokoFullSolution_t  s_l1_solution;
@@ -240,6 +242,7 @@ static uint8               s_l1_sub_idx      = 0U;
 static uint16              s_l1_wp_idx       = 0U;
 static uint8               s_l1_navigating   = 0U;
 static uint16              s_l1_warmup_ticks = 0U;
+static uint16              s_l1_nav_ticks    = 0U;
 static uint32              s_l1_map_recv_ms  = 0U;
 
 /*
@@ -277,6 +280,20 @@ static void main_l1_solve(void)
            (double)MAIN_POS_HCM_LAUNCH_TARGET_X_GRID,
            (double)MAIN_POS_HCM_LAUNCH_TARGET_Y_GRID,
            (int)start_pos.x, (int)start_pos.y);
+
+    for (r = 0U; r < MAP_ROWS; ++r)
+    {
+        uint8 c;
+        for (c = 0U; c < MAP_COLS; ++c)
+        {
+            if (s_l1_map[r][c] == MAP_BOMB)
+            {
+                printf("L1_ERR=NOT_LEVEL1_BOMB_PRESENT\n");
+                s_l1_solve_ok = 0U;
+                return;
+            }
+        }
+    }
 
     memset(&s_l1_solution, 0, sizeof(s_l1_solution));
     if (!Sokoban_Solve_Stage1(s_l1_map, start_pos, &s_l1_solution))
@@ -358,9 +375,32 @@ static void main_l1_keep_locked_map_fresh(void)
     }
 }
 
+static uint8 main_l1_nav_watchdog_5ms(void)
+{
+    if (s_l1_navigating == 0U)
+    {
+        s_l1_nav_ticks = 0U;
+        return 0U;
+    }
+    if (++s_l1_nav_ticks <= MAIN_LEVEL_TEST_NAV_TIMEOUT_TICKS)
+    {
+        return 0U;
+    }
+
+    chassis_ctrl_stop();
+    s_l1_navigating = 0U;
+    s_l1_phase = L1_PHASE_FAIL;
+    printf("L1_ERR=NAV_TIMEOUT\n");
+    return 1U;
+}
+
 static void main_run_level1_test_5ms(void)
 {
     main_l1_keep_locked_map_fresh();
+    if (main_l1_nav_watchdog_5ms() != 0U)
+    {
+        return;
+    }
 
     switch (s_l1_phase)
     {
@@ -378,10 +418,10 @@ static void main_run_level1_test_5ms(void)
         }
         else
         {
-            /* Bad/partial map: unlock UART and wait for the next OpenART1 frame. */
-            uart_rx_interrupt(MAIN_OPENART1_UART, 1);
-            s_l1_phase = L1_PHASE_WAIT_MAP;
-            printf("L1_UNLOCK_MAP wait next MAP\n");
+            /* 单关测试只消费上电后的首张完整地图；失败后保持锁定，避免误测下一关。 */
+            chassis_ctrl_stop();
+            s_l1_phase = L1_PHASE_FAIL;
+            printf("L1_FAIL first MAP remains locked\n");
         }
         return;
 
@@ -466,7 +506,9 @@ static void main_run_level1_test_5ms(void)
         return;
 
     case L1_PHASE_DONE:
-        /* 永久驻停 */
+    case L1_PHASE_FAIL:
+        /* 单关成功或失败后均永久驻停，只有复位才允许接收下一张地图。 */
+        chassis_ctrl_stop();
         return;
 
     default:
@@ -526,6 +568,7 @@ static uint16              s_l2_wp_idx       = 0U;
 static uint8               s_l2_navigating   = 0U;
 static uint8               s_l2_recog_started = 0U;
 static uint16              s_l2_warmup_ticks = 0U;
+static uint16              s_l2_nav_ticks    = 0U;
 static uint32              s_l2_map_recv_ms  = 0U;
 
 static Point_t main_l2_current_grid(void)
@@ -612,6 +655,13 @@ static void main_l2_wait_map_5ms(void)
         uart_rx_interrupt(MAIN_OPENART1_UART, 0);
         app_link_inject_static_map(s_l2_map);
         s_l2_map_recv_ms = g_link_last_map_ms;
+        if (main_l2_map_has_bomb() != 0U)
+        {
+            chassis_ctrl_stop();
+            s_l2_phase = L2_PHASE_FAIL;
+            printf("L2_ERR=NOT_LEVEL2_BOMB_PRESENT first MAP remains locked\n");
+            return;
+        }
         memset(s_l2_box_to_target, 0, sizeof(s_l2_box_to_target));
         App_Recognize_Reset();
         s_l2_recog_started = 0U;
@@ -713,8 +763,41 @@ static void main_l2_solve(void)
            (int)s_l2_waypoints.count);
 }
 
+static void main_l2_keep_locked_map_fresh(void)
+{
+    if (s_l2_phase != L2_PHASE_WAIT_MAP)
+    {
+        g_link_last_map_ms = app_link_get_ms();
+    }
+}
+
+static uint8 main_l2_nav_watchdog_5ms(void)
+{
+    if (s_l2_navigating == 0U)
+    {
+        s_l2_nav_ticks = 0U;
+        return 0U;
+    }
+    if (++s_l2_nav_ticks <= MAIN_LEVEL_TEST_NAV_TIMEOUT_TICKS)
+    {
+        return 0U;
+    }
+
+    chassis_ctrl_stop();
+    s_l2_navigating = 0U;
+    s_l2_phase = L2_PHASE_FAIL;
+    printf("L2_ERR=NAV_TIMEOUT\n");
+    return 1U;
+}
+
 static void main_run_level2_test_5ms(void)
 {
+    main_l2_keep_locked_map_fresh();
+    if (main_l2_nav_watchdog_5ms() != 0U)
+    {
+        return;
+    }
+
     switch (s_l2_phase)
     {
     case L2_PHASE_WAIT_MAP:
