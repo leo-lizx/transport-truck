@@ -1215,12 +1215,26 @@ uint8 Sokoban_Solve_Stage1(const uint8 map[MAP_ROWS][MAP_COLS],
     if (result == 0) return 0U;
     fallback_ok = sokoban_solve_stage1_greedy(map, player_pos, result);
 
+    /*
+     * 【启动加速】跳过 DFS 全局优化器，直接返回 greedy 结果。
+     *
+     * greedy 求解器已给出合法推箱路径（逐个箱子 BFS 搜索），DFS 优化器
+     * (soko_opt_dfs) 在此基础上做全排列穷举以寻找更优的推箱顺序和配对，
+     * 在有 N 个箱子时最多搜索 1024 个节点，每个节点内还要跑一次 BFS，
+     * 上电启动阶段耗时可达数秒，对调试迭代不友好。
+     *
+     * 如需最优解（正式比赛），取消下面 return 和 #if 0 即可恢复 DFS。
+     */
+#if 0
     if (!soko_opt_prepare(map, 0, 0U, result, fallback_ok)) {
         return fallback_ok;
     }
 
     soko_opt_dfs(0U, 0U, 0U, player_pos, 0U);
     return s_soko_opt.best_valid ? 1U : fallback_ok;
+#else
+    return fallback_ok;
+#endif
 }
 
 uint8 Sokoban_Solve_Stage2(const uint8 map[MAP_ROWS][MAP_COLS],

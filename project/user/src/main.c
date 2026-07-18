@@ -43,6 +43,7 @@
 #include <math.h>       /* sqrtf — POINT_NAV 调试打印用 */
 #include <stdio.h>
 #include <string.h>
+#include "fsl_rtwdog.h"  /* 硬件看门狗: 屏幕 SPI 卡死时 2s 自动复位 */
 
 /*==========================================================================
  *  P0-5: 主循环 5ms tick 节拍 (替代 system_delay_ms 阻塞)
@@ -119,7 +120,7 @@ static uint32 wait_for_tick(void)
 #define MAIN_RUN_MODE_LEVEL2_TEST     (10)  /* 第二关测试: 收图→固定发车→分类识别→Stage2推箱→回库 */
 
 /* ═══════════ 改下面这行切换运行模式 (0~10) ═══════════ */
-#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_GAME)  /* autonomous multi-level game flow */
+#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_HARDCODED_MAP)  /* autonomous multi-level game flow */
 /* ═══════════ 改上面这行切换运行模式 (0~10) ═══════════ */
 
 /* OpenART1 地图链路硬件口: 若实测 UART4 走 D0/D1, 只改下面两行宏. */
@@ -168,6 +169,20 @@ static uint32 wait_for_tick(void)
  */
 static const char s_soko_selftest_map[MAP_ROWS][MAP_COLS + 1] = {
 "################",
+"#-----.--------#",
+"#-#--#--------.#",
+"#-$--#-#---###-#",
+"#--$##-----.$--#",
+"#----------.-#-#",
+"#@---##-#-----$#",
+"#---##-$--#--#-#",
+"#--------#---#-#",
+"#------.#-#-#--#",
+"#----$------.--#",
+"################"
+};
+/* 旧地图:
+"################",
 "#--------------#",
 "#-.--#---------#",
 "#--------------#",
@@ -179,7 +194,7 @@ static const char s_soko_selftest_map[MAP_ROWS][MAP_COLS + 1] = {
 "#------.#-#----#",
 "#------------.-#",
 "################"
-};
+*/
 
 static uint8 main_selftest_char_to_map(char ch)
 {
@@ -2101,9 +2116,17 @@ static void main_apply_debug_wheel_pid(void)
     app_link_init();
 #endif
 
+    /*
+     * IPS200 启动诊断: 复位后等 200ms (ST7789 要求≥120ms), 清一次黑屏.
+     * 仅此一次写入, 后续主循环不写屏(HCM模式跳过 menu_render).
+     * ─ 清屏成功→黑屏, SPI 正常
+     * ─ 卡死在这里→屏幕排线松动/模组损坏, 硬件问题需排查
+     */
     ips200_set_dir(IPS200_CROSSWISE);
     ips200_init(IPS200_TYPE_SPI);
+    system_delay_ms(200);
     ips200_set_font(IPS200_8X16_FONT);
+    ips200_full(RGB565_BLACK);
     ips200_set_color(RGB565_WHITE, RGB565_BLACK);
     key_init(10);
 
@@ -2201,21 +2224,22 @@ static void main_apply_debug_wheel_pid(void)
     pit_ms_init(PIT_CH1, 20);
     pit_ms_init(PIT_CH2, 10);
 
-    // ------------------------------------------------------------------
-    // 5. 主循环: 游戏状态机
-    //    Game_Logic_Task_Run 为非阻塞函数，内部维护推箱子状态机。
-    // ------------------------------------------------------------------
-    // 静态调试阶段可先不运行状态机，改为手动下发网格目标点。
-    // app_chassis_ctrl_move_to_grid(3, 5);
+    /* 硬件看门狗: 屏幕 SPI 卡死时 2s 自动复位, 热启动恢复继续推箱 */
+    {
+        rtwdog_config_t wdt_cfg;
+        RTWDOG_GetDefaultConfig(&wdt_cfg);
+        wdt_cfg.enableRtwdog   = true;
+        wdt_cfg.prescaler      = kRTWDOG_ClockPrescalerDivide256;
+        wdt_cfg.timeoutValue   = 256U;
+        wdt_cfg.enableUpdate   = true;
+        wdt_cfg.workMode.enableDebug = true;
+        RTWDOG_Init(RTWDOG, &wdt_cfg);
+    }
 
     while (1)
     {
-        /*
-         * P0-5: 替代 system_delay_ms(5).
-         * 在此阻塞直到 PIT_CH0 5ms tick 到来, 期间 __WFI 休眠, 任意中断可唤醒.
-         * 注意 wait 必须在每轮主循环工作之前调用, 保证节拍对齐 PIT 边沿.
-         */
         (void)wait_for_tick();
+        RTWDOG_Refresh(RTWDOG);  /* 喂狗: 主循环活着就每 5ms 刷新 */
 
     #if (MAIN_RUN_MODE == MAIN_RUN_MODE_SINGLE_WHEEL)
         /* ⬇⬇⬇ 单轮 PID 打印, 姿态调试阶段这里被 #if 屏蔽 ⬇⬇⬇ */
