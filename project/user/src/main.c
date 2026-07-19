@@ -120,7 +120,7 @@ static uint32 wait_for_tick(void)
 #define MAIN_RUN_MODE_LEVEL2_TEST     (10)  /* 第二关测试: 收图→固定发车→分类识别→Stage2推箱→回库 */
 
 /* ═══════════ 改下面这行切换运行模式 (0~10) ═══════════ */
-#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_HARDCODED_MAP)  /* autonomous multi-level game flow */
+#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_HARDCODED_MAP)  /* 只接收摄像头地图并显示，底盘保持停止 */
 /* ═══════════ 改上面这行切换运行模式 (0~10) ═══════════ */
 
 /* OpenART1 地图链路硬件口: 若实测 UART4 走 D0/D1, 只改下面两行宏. */
@@ -1831,7 +1831,7 @@ static void main_mode5_render_100ms(void)
 /*  ⬇⬇⬇ 姿态闭环调试阶段这里全部被 #if 屏蔽, 不会被编译, 不要删 ⬇⬇⬇          */
 /* ========================================================================== */
 #if (MAIN_RUN_MODE == MAIN_RUN_MODE_SINGLE_WHEEL)
-#define MAIN_PID_DEBUG_WHEEL_INDEX    (CHASSIS_WHEEL_LF)  /* 0=LF, 1=RF, 2=LB, 3=RB */
+#define MAIN_PID_DEBUG_WHEEL_INDEX    (CHASSIS_WHEEL_RB)  /* 0=LF, 1=RF, 2=LB, 3=RB */
 #define MAIN_PID_DEBUG_TARGET_MPS     (0.10f)             /* target wheel speed, m/s */
 #define MAIN_PID_DEBUG_FORCE_PID      (1)                 /* 1=use KP/KI/KD below */
 #define MAIN_PID_DEBUG_KP             (70.0f)
@@ -2462,7 +2462,9 @@ static void main_apply_debug_wheel_pid(void)
 #if (MAIN_RUN_MODE == MAIN_RUN_MODE_OPENART2_TEST)
             main_openart2_test_render_100ms();
 #else
+#if (MAIN_RUN_MODE != MAIN_RUN_MODE_POINT_NAV)
             chassis_menu_render_100ms();
+#endif
 #if (MAIN_RUN_MODE == MAIN_RUN_MODE_STATIC_VERIFY)
             main_mode6_render_100ms();
 #endif

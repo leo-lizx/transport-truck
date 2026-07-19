@@ -64,8 +64,9 @@
 /* ---------------------- 控制模式 ---------------------- */
 
 typedef enum {
-    MODE_YAW_HOLD = 0,      /* 原地航向保持（默认） / rotate_to_deg 复用 */
-    MODE_POINT_NAV,         /* 网格点位导航                              */
+    MODE_STOPPED = 0,       /* PWM 持续关闭，不做位置或航向闭环           */
+    MODE_YAW_HOLD,          /* 原地航向保持 / rotate_to_deg 复用          */
+    MODE_POINT_NAV,         /* 网格点位导航                               */
     MODE_SINGLE_WHEEL_PID_DEBUG /* 单轮 PID 调试（仅一个轮子给目标）        */
 } ctrl_mode_t;
 
@@ -206,7 +207,7 @@ static void pose_read_snapshot(chassis_pose_t *dst)
     dst->yaw_deg = s_pose.yaw_deg;
 }
 
-static volatile ctrl_mode_t s_mode    = MODE_YAW_HOLD;
+static volatile ctrl_mode_t s_mode    = MODE_STOPPED;
 static volatile uint8       s_arrived = 1U;
 /* 1 = 正在执行 rotate_to_deg 原地旋转, 到达角度容忍带后置 s_arrived=1 并清零 */
 static volatile uint8       s_rotate_active = 0U;
@@ -946,7 +947,7 @@ void chassis_ctrl_init(void)
     s_debug_wheel_target_mps = 0.0f;
     s_fb_vx        = 0.0f;
     s_fb_vy        = 0.0f;
-    s_mode         = MODE_YAW_HOLD;
+    s_mode         = MODE_STOPPED;
     s_arrived      = 1U;
 
 #if (CHASSIS_ODOM_YAW_FUSION_ENABLE != 0)
@@ -1097,6 +1098,10 @@ void chassis_ctrl_task_20ms(void)
 
     /* 4) 模式分支 → 生成车体速度指令 */
     switch (s_mode) {
+
+    case MODE_STOPPED:
+        /* chassis_ctrl_stop()/init 已同步清零 PWM；停车期间禁止闭环重新产生命令。 */
+        return;
 
     case MODE_POINT_NAV: {
         float dx   = s_tgt_x_m - s_pose.x_m;
@@ -1586,16 +1591,16 @@ void chassis_ctrl_stop_single_wheel_pid_debug(void)
 {
     if (MODE_SINGLE_WHEEL_PID_DEBUG == s_mode)
     {
+        enter_mode(MODE_STOPPED);
         force_stop();
         chassis_pid_debug_reset();
-        enter_mode(MODE_YAW_HOLD);
     }
     s_arrived = 1U;
 }
 
 void chassis_ctrl_stop(void)
 {
-    enter_mode(MODE_YAW_HOLD);
+    enter_mode(MODE_STOPPED);
     s_arrived = 1U;
     force_stop();
 }

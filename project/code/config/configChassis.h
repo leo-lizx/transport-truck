@@ -485,7 +485,7 @@
 /* (1) 执行器输出 MOTOR_*_OUTPUT_DIR: driver 乘命令，使 +命令 → 物理前进
  *     ★ 占位 +1 已按实车标定填写，换接线/换电机线序后必须重新辨识 */
 #define MOTOR_LF_OUTPUT_DIR                 (+1.0f)
-#define MOTOR_RF_OUTPUT_DIR                 (-1.0f)
+#define MOTOR_RF_OUTPUT_DIR                 (+1.0f)
 #define MOTOR_LB_OUTPUT_DIR                 (+1.0f)
 #define MOTOR_RB_OUTPUT_DIR                 (-1.0f)
 

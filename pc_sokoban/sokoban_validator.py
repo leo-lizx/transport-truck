@@ -1102,8 +1102,8 @@ def _solve_stage_opt(the_map: list, player_pos: tuple,
 
 
 def solve_stage1(the_map: list, player_pos: tuple) -> Optional[dict]:
-    fallback = _solve_stage1_greedy(the_map, player_pos)
-    return _solve_stage_opt(the_map, player_pos, None, fallback)
+    # 镜像固件的启动加速配置：Stage1 跳过 DFS 全局优化器。
+    return _solve_stage1_greedy(the_map, player_pos)
 
 
 def solve_stage2(the_map: list, player_pos: tuple,
