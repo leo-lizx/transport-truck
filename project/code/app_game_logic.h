@@ -64,11 +64,13 @@
 
 // 游戏主流程状态机枚举
 typedef enum {
-    STAGE_WAIT_START = 0,           // 发车区等待
+    STAGE_WAIT_START = 0,           // 返回并停在左侧发车点 (1,5)
+    STAGE_LAUNCH_EXIT,              // 从 (1,5) 驶向上位机触发点 (1,4)
+    STAGE_WAIT_MAP_REFRESH,         // 已到 (1,4)，停车等待上位机刷新地图
     STAGE_RECOGNIZE_MAP,            // 识别地图与箱子
     STAGE_PLAN_PATH,                // 寻路/推箱策略计算
     STAGE_EXECUTE_ACTION,           // 执行推箱动作
-    STAGE_LEVEL_JUDGE,              // 一关完成后判断是否进入下一关
+    STAGE_LEVEL_JUDGE,              // 仅确认本关箱子已全部完成
     STAGE_DEADLOCK_RESET,           // 死局恢复：回发车区静止3秒后重置
     STAGE_DONE,                     // 全流程完成
     STAGE_PAUSE_ON_LINK_LOSS        // 【P0-2】视觉链路超时刹停, 链路恢复后自动续跑

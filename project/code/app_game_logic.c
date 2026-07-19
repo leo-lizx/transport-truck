@@ -13,17 +13,20 @@
  *   LPUART1 ISR 不再直接写它. 业务层各 stage handler 继续裸读 g_game_map 即可,
  *   不会再读到半更新地图.
  */
+#define APP_GAME_LAUNCH_HOME_X       (1U)
+#define APP_GAME_LAUNCH_HOME_Y       (5U)
+#define APP_GAME_LAUNCH_EXIT_X       (1U)
+#define APP_GAME_LAUNCH_EXIT_Y       (4U)
+
 uint8 g_game_map[MAP_ROWS][MAP_COLS];
-Point_t g_player_pos = {(int8)CHASSIS_START_GRID_X, (int8)CHASSIS_START_GRID_Y};
+Point_t g_player_pos = {(int8)APP_GAME_LAUNCH_HOME_X, (int8)APP_GAME_LAUNCH_HOME_Y};
 
 #define GAME_LOGIC_TASK_PERIOD_MS      (5U)
 #define DEADLOCK_RESET_HOLD_MS         (3000U)
 #define DEADLOCK_RESET_HOLD_TICKS      (DEADLOCK_RESET_HOLD_MS / GAME_LOGIC_TASK_PERIOD_MS)
-#define LEVEL_TIME_LIMIT_MS             (900000UL)
-
 /* 赛规: 三个关卡连续比赛。三个关卡均结束后进入 STAGE_DONE 静止收车,
- * 不再无限等待下一张地图 (原 should_enter_next_level 恒为 1 → 永不结束)。
- * 推完箱子立即结束成功关；死局/超时返航并静止 3s 后结束失败关，均计入三关总数。 */
+ * 不再无限等待下一张地图；第三关结束并返航后进入 STAGE_DONE。
+ * 推完箱子后返回发车点；死局返航并静止 3s 后结束失败关，均计入三关总数。 */
 #define APP_GAME_TOTAL_LEVELS          (3U)
 
 /* ==================================================================
@@ -61,13 +64,14 @@ static LinkPauseReason_e s_link_pause_reason = LINK_PAUSE_NONE;
 /* ----- 【P0-8】OOB / 发车 / 死局静止 相关静态变量 ------------------
  * s_failure_reason   : 比赛失败原因, 触发后状态机锁死在 STAGE_DONE
  * s_wait_start_phase : WAIT_START 子相位
- *                       0 = 还未到达起点 (沿用历史 MOVE_TO 行为)
- *                       1 = 已到起点, 等待车被 "完全离开发车区" (人推 / 系统识别)
- * s_default_launch_zone : 当前默认发车区 (左). 后续菜单可改, 默认 LAUNCH_ZONE_LEFT.
+ *                       0 = 正在返回左侧发车点 (1,5)
+ *                       1 = 已到 (1,5), 正在进行发车前视觉校准
  * --------------------------------------------------------------- */
 static GameFailureReason_e s_failure_reason     = GAME_FAIL_NONE;
 static uint8               s_wait_start_phase   = 0U;
-static LaunchZone_e        s_default_launch_zone = LAUNCH_ZONE_LEFT;
+/* (1,4) 位于最左可通行列；旧OOB圆模型会把车体贴左边界误报为越界。
+ * 仅在发车后、车体中心仍位于场内且尚未向右离开边界列时抑制该旧锁存。 */
+static uint8               s_launch_oob_guard_active = 1U;
 
 /* ----- 【B1+B12】地图快照冻结标志 ----------------------------------
  * s_map_freeze: 1 = 主循环入口不再 app_link_get_map_snapshot 覆盖 g_game_map
@@ -98,14 +102,10 @@ static uint8               s_wp_retry_count     = 0U;
 #define WAIT_START_PHASE0_TIMEOUT_TICKS  (2000U)
 static uint16              s_wait_phase0_ticks  = 0U;
 
-/* ----- 自动发车横移 (贴墙摆位 → 单轴驶出发车区) --------------------
- * 摆位约定: 左发车区车左侧贴左墙黄线 / 右发车区车右侧贴右墙黄线.
- * phase 1 由被动"等人推车"改为主动朝场内横移, 横移到位/几何判定
- * "完全离开发车区"即停, 进入识别. 全程锁 yaw, 仅单轴 X 平移.
- *   LAUNCH_EXIT_MARGIN_M       : 目标点超出"完全离开"阈值的余量
- *   LAUNCH_DRIVE_TIMEOUT_TICKS : 4s @5ms 横移超时兜底 → 转 DEADLOCK_RESET
+/* ----- 自动发车 (左侧发车点 (1,5) → 上位机触发点 (1,4)) -----------
+ * 发车不依赖地图；到达 (1,4) 后停车，等待上位机刷新本关地图。
+ * LAUNCH_DRIVE_TIMEOUT_TICKS: 4s @5ms 超时兜底 → 转 DEADLOCK_RESET.
  * --------------------------------------------------------------- */
-#define LAUNCH_EXIT_MARGIN_M         (0.02f)
 #define LAUNCH_DRIVE_TIMEOUT_TICKS   (800U)
 #define LAUNCH_MAP_STABLE_REQUIRED_FRAMES  (5U)
 #define LAUNCH_MAP_STABLE_TIMEOUT_TICKS    (300U)
@@ -114,13 +114,15 @@ static uint16              s_wait_phase0_ticks  = 0U;
 static uint8               s_launch_drive_issued = 0U;
 static uint16              s_launch_drive_ticks  = 0U;
 static uint8               s_launch_retry_count  = 0U;
-static uint8               s_launch_map_ready    = 0U;
 static uint8               s_launch_calib_done   = 0U;
 static uint16              s_launch_calib_ticks  = 0U;
 static uint8               s_launch_map_candidate_valid = 0U;
 static uint8               s_launch_map_stable_count = 0U;
 static uint16              s_launch_map_stable_ticks = 0U;
 static uint32              s_launch_map_last_frame_id = 0U;
+static uint32              s_launch_depart_frame_id = 0U;
+static uint32              s_launch_depart_map_hash = 0U;
+static uint8               s_launch_depart_map_valid = 0U;
 static uint8               s_launch_map_candidate[MAP_ROWS][MAP_COLS];
 static uint8               s_launch_map_observed[MAP_ROWS][MAP_COLS];
 
@@ -137,20 +139,31 @@ static SokoWaypointPath_t    g_bomb_waypoints;
 static uint16                g_bomb_wp_idx = 0;
 
 static uint8                 g_box_to_target[SOKOBAN_MAX_BOXES] = {0};
-static uint8                 g_current_level = 1;
 static ExecMode_e            g_exec_mode = EXEC_NONE;
 
 /* 已结束的关卡数 (成功或按失败流程结束；整场比赛累计，仅上电清零)。 */
 static uint8                 s_levels_finished = 0U;
-/* 正式赛规从车体首次完全驶出发车区开始计本关 900s。死局/超时后的返航和静止
- * 3s 仍属于本关流程，因此只在成功判定或失败返航完成时关闭计时。 */
-static uint8                 s_level_timer_active = 0U;
-static uint8                 s_level_timed_out = 0U;
-static uint32                s_level_start_ms = 0U;
 
 /* ==========================================================================
  *  § 1. 执行上下文 / stage 跳转 / 地图查询工具 (全部需主循环单线程调用)
  * ========================================================================== */
+
+/* 正式比赛固定按第一、二、三关顺序执行。已完成关数是唯一进度来源，
+ * 地图内容只描述本关布局，不参与关号判断。 */
+static uint8 current_level_number(void)
+{
+    if (s_levels_finished >= APP_GAME_TOTAL_LEVELS) {
+        return APP_GAME_TOTAL_LEVELS;
+    }
+    return (uint8)(s_levels_finished + 1U);
+}
+
+static void mark_current_level_finished(void)
+{
+    if (s_levels_finished < APP_GAME_TOTAL_LEVELS) {
+        s_levels_finished++;
+    }
+}
 
 static void reset_launch_map_stability(void)
 {
@@ -187,6 +200,22 @@ static void copy_map(uint8 dst[MAP_ROWS][MAP_COLS],
             dst[r][c] = src[r][c];
         }
     }
+}
+
+/* 仅用于区分驶出前旧图与上位机刷新后的新图；不参与地图合法性判断。 */
+static uint32 map_hash(const uint8 map[MAP_ROWS][MAP_COLS])
+{
+    uint32 hash = 2166136261UL;
+    uint8 r;
+    uint8 c;
+
+    for (r = 0U; r < (uint8)MAP_ROWS; ++r) {
+        for (c = 0U; c < (uint8)MAP_COLS; ++c) {
+            hash ^= (uint32)map[r][c];
+            hash *= 16777619UL;
+        }
+    }
+    return hash;
 }
 
 static uint8 launch_map_is_usable(const uint8 map[MAP_ROWS][MAP_COLS])
@@ -227,13 +256,21 @@ static uint8 launch_map_stability_tick(void)
         return 0U;
     }
 
-    if (frame_id == s_launch_map_last_frame_id) {
+    /* 只接收本次发车指令之后落地的帧。地图可能在车辆行驶到 (1,4) 的途中
+     * 已完成刷新，因此帧栅栏必须取发车前值，不能在到达后重置。 */
+    if ((frame_id == s_launch_depart_frame_id) ||
+        (frame_id == s_launch_map_last_frame_id)) {
         return 0U;
     }
     s_launch_map_last_frame_id = frame_id;
 
     app_link_get_map_snapshot(s_launch_map_observed);
     if (launch_map_is_usable(s_launch_map_observed) == 0U) {
+        reset_launch_map_stability();
+        return 0U;
+    }
+    if ((s_launch_depart_map_valid != 0U) &&
+        (map_hash(s_launch_map_observed) == s_launch_depart_map_hash)) {
         reset_launch_map_stability();
         return 0U;
     }
@@ -280,25 +317,21 @@ static void reset_exec_context(void)
     s_wp_timeout_limit = WAYPOINT_TIMEOUT_TICKS;
     s_wp_retry_count   = 0U;
     s_wait_phase0_ticks = 0U;       /* Issue A: WAIT_START phase 0 计时跨入口清零 */
-    s_launch_drive_issued = 0U;     /* 自动发车横移: 跨入口清零 */
+    s_wait_start_phase = 0U;
+    s_launch_drive_issued = 0U;
     s_launch_drive_ticks  = 0U;
     s_launch_retry_count  = 0U;
-    s_launch_map_ready    = 0U;
     s_launch_calib_done   = 0U;
     s_launch_calib_ticks  = 0U;
+    s_launch_depart_frame_id = 0U;
+    s_launch_depart_map_hash = 0U;
+    s_launch_depart_map_valid = 0U;
     reset_launch_map_stability();
 }
 
 static void goto_stage(GameStage_e next)
 {
     current_stage = next;
-}
-
-static uint8 launch_start_grid_x(void)
-{
-    return (s_default_launch_zone == LAUNCH_ZONE_RIGHT)
-         ? (uint8)CHASSIS_GRID_INNER_MAX_X
-         : (uint8)CHASSIS_START_GRID_X;
 }
 
 static void calibrate_launch_heading(void)
@@ -318,9 +351,9 @@ static void calibrate_launch_heading(void)
  * 炸弹爆破后对 PLAN 那一拍的单拍保护), 不能化简为"纯 stage→freeze 静态表"
  * (那样会改变上述条件与时序语义), 故此处只做集中封装, 不改变任何时序。
  *
- * 冻结 (hold, freeze=1) 点: 发车后/链路恢复进 RECOGNIZE 前、识别完成且地图被清障改动、
+ * 冻结 (hold, freeze=1) 点: 驶出后新地图稳定/链路恢复进 RECOGNIZE 前、识别完成且地图被清障改动、
  *                            炸弹爆破后保护 PLAN_PATH 当拍快照;
- * 解冻 (release, freeze=0) 点: WAIT_START 入口、识别失败、PLAN 完成本拍、
+ * 解冻 (release, freeze=0) 点: WAIT_START/LAUNCH_EXIT/WAIT_MAP_REFRESH、识别失败、PLAN 完成本拍、
  *                              DEADLOCK_RESET 完成、DONE。 */
 static void map_snapshot_freeze(void)
 {
@@ -626,9 +659,9 @@ static uint8 build_push_box_plan(void)
     /* B2: 第 1 关 = 任意箱→任意目标 (Stage1 贪心)
      * 第 2 关 = 必须按数字配对 (Stage2, 用 g_box_to_target[])
      * 第 3 关 = 含炸弹 (Stage2 + 炸弹辅助)
-     * 判据用 g_current_level 而非 map_has_bomb(): 第 2 关无炸弹也必须按映射配对.
+     * 判据只使用固定比赛顺序: 第 2 关无炸弹也必须按映射配对.
      */
-    if (g_current_level >= 2U) {
+    if (current_level_number() >= 2U) {
         if (!Sokoban_Solve_Stage2(g_game_map, g_player_pos,
                                   g_box_to_target,
                                   box_count,
@@ -657,118 +690,65 @@ static uint8 build_push_box_plan(void)
     return 1;
 }
 
-static uint8 should_enter_next_level(void)
-{
-    /* 还没结束三关 → 回发车区等下一张地图; 跑满 → 收车 (STAGE_DONE)。
-     * 若比赛软件在跑满前不再出图, WAIT_START 仍会驻停等待, 与原行为一致。 */
-    return (uint8)(s_levels_finished < APP_GAME_TOTAL_LEVELS);
-}
-
-static void select_level_from_loaded_map(void)
-{
-    /* 正式赛规明确按 level1 -> level2 -> level3 顺序连续进行。地图内容不能可靠
-     * 区分 level1/2（两者都可能没有炸弹），因此关号只能由已结束关数确定。 */
-    uint8 next_level = (uint8)(s_levels_finished + 1U);
-    g_current_level = (next_level <= APP_GAME_TOTAL_LEVELS)
-                    ? next_level
-                    : APP_GAME_TOTAL_LEVELS;
-}
-
 /* ==========================================================================
- *  § 4. Stage 处理器 — WAIT_START / RECOGNIZE / PLAN / EXECUTE / JUDGE
+ *  § 4. Stage 处理器 — WAIT_START / RECOGNIZE / PLAN / EXECUTE / COMPLETE
  *                       / DEADLOCK_RESET / DONE / PAUSE_ON_LINK_LOSS
  * ========================================================================== */
 
-/**
- * 计算自动发车横移的目标车体中心 X (米).
- *   左发车区: 朝右(+X)移到 "发车区右沿 + R + 余量", 刚好让外接圆脱离矩形.
- *   右发车区: 朝左(-X)移到 "发车区左沿 - R - 余量", 镜像对称.
- * 实际停车以 chassis_zone_is_fully_outside_launch() 几何判定为准 (与车宽无关),
- * 此目标点只是给位置环一个"够远"的单轴终点.
- */
-static float launch_drive_target_x_m(LaunchZone_e zone)
+static void prepare_launch_departure(void)
 {
-    float margin = CHASSIS_BODY_RADIUS_M + LAUNCH_EXIT_MARGIN_M;
-    if (zone == LAUNCH_ZONE_RIGHT) {
-        /* 右发车区左沿 = W - 发车区宽; 目标在其左侧 margin 处 ≈ 2.705m */
-        return (CHASSIS_MAP_WIDTH_M - CHASSIS_LAUNCH_ZONE_W_M) - margin;
-    }
-    /* 左发车区右沿 = 发车区宽; 目标在其右侧 margin 处 ≈ 0.495m */
-    return CHASSIS_LAUNCH_ZONE_W_M + margin;
+    /* 上位机只在车到达 (1,4) 后刷新地图。发车前保存帧栅栏和旧图摘要，
+     * 等图阶段据此拒绝仍在连续发送的上一关地图。 */
+    s_launch_depart_frame_id = g_link_map_frame_id;
+    copy_map(s_launch_map_observed, g_game_map);
+    s_launch_depart_map_valid = launch_map_is_usable(s_launch_map_observed);
+    s_launch_depart_map_hash = (s_launch_depart_map_valid != 0U)
+                             ? map_hash(s_launch_map_observed)
+                             : 0U;
+    reset_launch_map_stability();
+    s_launch_map_last_frame_id = s_launch_depart_frame_id;
 }
 
 static void stage_wait_start_handler(void)
 {
-    /* 【P0-8 + 自动发车】WAIT_START 两段式:
-     *   phase 0: 主控主动 MOVE_TO 起点 (车被人放偏时复位到发车区中心)
-     *   phase 1: 等待稳定可用地图 → 朝场内单轴横移 → 进入 RECOGNIZE_MAP
-     *
-     * 摆位约定 (规则提炼 + 用户确认):
-     *   左发车区: 车左侧贴发车区左侧黄线 (x=0 墙线), 发车向右 (+X)
-     *   右发车区: 车右侧贴发车区右侧黄线 (x=W 墙线), 发车向左 (-X)
-     * 由 s_default_launch_zone 决定方向, 逻辑左右对称.
-     *
-     * B1+B12: WAIT_START 在尚未锁定本关地图前解冻地图, 防上一关地图冻结状态残留.
-     *         一旦 s_launch_map_ready=1, 需保持冻结直到进入 RECOGNIZE.
+    /* 仅保留左侧发车区。phase 0 返回 (1,5)，phase 1 完成视觉/航向校准；
+     * 地图在发车和到达 (1,4) 后的等待阶段始终解冻。
      */
-    if (s_launch_map_ready == 0U) {
-        map_snapshot_release();
-    }
+    map_snapshot_release();
+    s_launch_oob_guard_active = 1U;
 
     if (s_wait_start_phase == 0U) {
-        s_wait_phase0_ticks++;          /* B8: phase 0 超时计时 */
+        s_wait_phase0_ticks++;
         if (!is_navigating) {
-            /* 起点按发车区对称: 左区→首列(贴左墙), 右区→末列(贴右墙) */
-            uint8 start_gx = launch_start_grid_x();
-            HAL_CHASSIS_MOVE_TO(start_gx, CHASSIS_START_GRID_Y);
+            HAL_CHASSIS_MOVE_TO(APP_GAME_LAUNCH_HOME_X,
+                                APP_GAME_LAUNCH_HOME_Y);
             is_navigating = 1;
             return;
         }
-        /* B8: 10s 仍到不了 → 跳过自动复位, 让操作员手动放车 */
+        /* 返航10s仍未到位时停车并重新下发，禁止从未知位置直接发车。 */
         if (s_wait_phase0_ticks > WAIT_START_PHASE0_TIMEOUT_TICKS) {
             chassis_ctrl_stop();
             is_navigating = 0;
             s_wait_phase0_ticks = 0U;
-            s_launch_drive_issued = 0U;
-            s_launch_drive_ticks  = 0U;
-            s_launch_map_ready    = 0U;
-            reset_launch_map_stability();
-            s_wait_start_phase  = 1U;
             return;
         }
         if (!chassis_nav_arrived_for_waypoint()) return;
 
+        chassis_ctrl_stop();
         is_navigating = 0;
         s_wait_phase0_ticks = 0U;
-        s_launch_drive_issued = 0U;
-        s_launch_drive_ticks  = 0U;
-        s_launch_map_ready    = 0U;
-        reset_launch_map_stability();
-        calibrate_launch_heading();
-        s_wait_start_phase  = 1U;
-        return;
-    }
-
-    /* phase 1: 先等下一关地图稳定，再自动横移驶出发车区 (主动发车) */
-    if (s_launch_map_ready == 0U) {
-        chassis_ctrl_stop();
-        if (launch_map_stability_tick() == 0U) {
+        if (s_levels_finished >= APP_GAME_TOTAL_LEVELS) {
+            goto_stage(STAGE_DONE);       /* 第三关也先返回 (1,5) 再收车 */
             return;
         }
-
-        reset_exec_context();
-        calibrate_launch_heading();
-        s_launch_map_ready = 1U;
-        map_snapshot_freeze();       /* 发车后沿用已确认地图, 防移动中旧帧/抖动覆盖 */
-        select_level_from_loaded_map();
-        clear_box_target_mapping();
-        App_Recognize_Reset();
+        s_launch_calib_done = 0U;
+        s_launch_calib_ticks = 0U;
+        s_wait_start_phase = 1U;
         return;
     }
 
     /* 关间强视觉校准 (发车前最后一步):
-     *   车已静止在发车区, 视觉延迟可被静止窗口充分消化 —— 这是整关精度最高、
-     *   最适合用视觉校正的时机。用到站 Snap 状态机对当前发车格做多帧表决:
+     *   车已静止在 (1,5)，用到站 Snap 状态机对该格做多帧表决:
      *     - 表决通过 → x/y 被拉到视觉表决格中心 (Snap 内部已写 pose);
      *     - 随后 calibrate_launch_heading() 复位航向到 180° (只改 yaw, 保留 Snap 的 x/y);
      *   有 LAUNCH_CALIB_TIMEOUT_TICKS 兜底, 视觉给不出结果也照常发车, 绝不卡死。 */
@@ -777,8 +757,8 @@ static void stage_wait_start_handler(void)
         s_launch_calib_ticks++;
 #if CHASSIS_VISION_SNAP_ON_ARRIVE_ENABLE
         if (s_link_alive != 0U) {
-            float calib_x_m = chassis_grid_x_to_m(launch_start_grid_x());
-            float calib_y_m = chassis_grid_y_to_m((uint8)CHASSIS_START_GRID_Y);
+            float calib_x_m = chassis_grid_x_to_m(APP_GAME_LAUNCH_HOME_X);
+            float calib_y_m = chassis_grid_y_to_m(APP_GAME_LAUNCH_HOME_Y);
             app_vision_snap_state_e st;
             app_vision_fusion_snap_request(calib_x_m, calib_y_m);
             st = app_vision_fusion_snap_state();
@@ -796,35 +776,39 @@ static void stage_wait_start_handler(void)
         return;
     }
 
-    /* 已完全离开发车区 → 发车成功, 进入识别 */
-    if (chassis_zone_is_fully_outside_launch(s_default_launch_zone)) {
-        chassis_ctrl_stop();
-        if (s_level_timer_active == 0U) {
-            s_level_start_ms = app_link_get_ms();
-            s_level_timer_active = 1U;
-            s_level_timed_out = 0U;
-        }
-        s_launch_drive_issued = 0U;
-        s_launch_drive_ticks  = 0U;
-        s_launch_map_ready    = 0U;
-        s_wait_start_phase = 0U;     /* 重置子相位, 供后续 LEVEL_JUDGE 复用 */
-        map_snapshot_freeze();       /* B12: 进 RECOGNIZE 前锁定地图, 防 s_items[] 错位 */
-        App_Recognize_Reset();       /* 进入 RECOGNIZE 前清识别 tour 状态 */
-        goto_stage(STAGE_RECOGNIZE_MAP);
-        return;
-    }
+    reset_exec_context();
+    map_snapshot_release();
+    clear_box_target_mapping();
+    App_Recognize_Reset();
+    prepare_launch_departure();
+    goto_stage(STAGE_LAUNCH_EXIT);
+}
 
-    /* 首次进入: 朝场内下发一次单轴横移目标 (锁当前 yaw, Y 不动) */
-    if (!s_launch_drive_issued) {
-        chassis_pose_t pose = chassis_ctrl_get_pose();
-        chassis_ctrl_move_to_m(launch_drive_target_x_m(s_default_launch_zone),
-                               pose.y_m, pose.yaw_deg);
+static void stage_launch_exit_handler(void)
+{
+    map_snapshot_release();
+
+    if (s_launch_drive_issued == 0U) {
+        chassis_ctrl_move_to_m(chassis_grid_x_to_m(APP_GAME_LAUNCH_EXIT_X),
+                               chassis_grid_y_to_m(APP_GAME_LAUNCH_EXIT_Y),
+                               APP_GAME_LAUNCH_FACE_YAW_DEG);
         s_launch_drive_issued = 1U;
         s_launch_drive_ticks  = 0U;
         return;
     }
 
-    /* 横移超时兜底: 重发一次; 仍超时则转死局复位 (避免卡死) */
+    /* 赛规以上位机网格 (1,4) 为刷新触发点，因此以该航点到达为发车成功，
+     * 不再用车体外接圆完全离开旧发车区几何作为硬门槛。 */
+    if (chassis_nav_arrived_for_waypoint()) {
+        chassis_ctrl_stop();
+        s_launch_drive_issued = 0U;
+        s_launch_drive_ticks = 0U;
+        s_launch_retry_count = 0U;
+        goto_stage(STAGE_WAIT_MAP_REFRESH);
+        return;
+    }
+
+    /* 发车超时兜底: 重发一次; 仍超时则转死局复位。 */
     s_launch_drive_ticks++;
     if (s_launch_drive_ticks >= LAUNCH_DRIVE_TIMEOUT_TICKS) {
         chassis_ctrl_stop();
@@ -834,11 +818,25 @@ static void stage_wait_start_handler(void)
             s_launch_retry_count = 1U;   /* 允许重发一次 */
         } else {
             s_launch_retry_count = 0U;
-            s_wait_start_phase = 0U;
             reset_exec_context();
             goto_stage(STAGE_DEADLOCK_RESET);
         }
     }
+}
+
+static void stage_wait_map_refresh_handler(void)
+{
+    /* 到达 (1,4) 后保持停车和地图解冻；只有上位机刷新出的稳定新图才可
+     * 进入识别，避免用发车前旧图规划本关。 */
+    map_snapshot_release();
+    if (launch_map_stability_tick() == 0U) {
+        return;
+    }
+
+    clear_box_target_mapping();
+    App_Recognize_Reset();
+    map_snapshot_freeze();
+    goto_stage(STAGE_RECOGNIZE_MAP);
 }
 
 static void stage_recognize_handler(void)
@@ -852,7 +850,7 @@ static void stage_recognize_handler(void)
      * ============================================================ */
     AppRecognizeStatus_e r = App_Recognize_Tick(g_game_map, g_player_pos,
                                                 map_has_bomb(),
-                                                g_current_level,
+                                                current_level_number(),
                                                 g_box_to_target);
     switch (r)
     {
@@ -987,21 +985,15 @@ static void stage_level_judge_handler(void)
         return;
     }
 
-    /* 箱子已全部推完 = 本关成功结束，计数一次。 */
-    s_level_timer_active = 0U;
-    s_level_timed_out = 0U;
-    if (s_levels_finished < 0xFFU) {
-        s_levels_finished++;
-    }
+    /* 箱子已全部推完 = 本关成功结束。所有关卡均先返回 (1,5)；
+     * 前两关随后再驶到 (1,4) 触发新图，第三关返航后收车。 */
+    chassis_ctrl_stop();
+    mark_current_level_finished();
 
-    if (should_enter_next_level()) {
-        reset_exec_context();
-        goto_stage(STAGE_WAIT_START);
-        return;
-    }
-
-    /* 三关全部完成 → 正常收车, 维持静止 (非失败, s_failure_reason 保持 NONE). */
-    goto_stage(STAGE_DONE);
+    map_snapshot_release();
+    reset_exec_context();
+    App_Recognize_Reset();
+    goto_stage(STAGE_WAIT_START);
 }
 
 static void stage_deadlock_reset_handler(void)
@@ -1011,9 +1003,8 @@ static void stage_deadlock_reset_handler(void)
      * (规则: 返回发车区静止 3s = 系统重置)
      */
     if (!is_navigating) {
-        /* 回位坐标按当前发车区对称: 左区→首列(贴左墙), 右区→末列(贴右墙).
-         * 原写死 CHASSIS_START_GRID_X 会让右发车区复位到左侧, 跑错方向。 */
-        HAL_CHASSIS_MOVE_TO(launch_start_grid_x(), CHASSIS_START_GRID_Y);
+        HAL_CHASSIS_MOVE_TO(APP_GAME_LAUNCH_HOME_X,
+                            APP_GAME_LAUNCH_HOME_Y);
         is_navigating = 1;
         return;
     }
@@ -1024,7 +1015,7 @@ static void stage_deadlock_reset_handler(void)
 
     /* 必须 "在发车区内" + chassis_zone_is_static() (内部已含 3s 持续判定).
      * chassis_zone_is_static 由 chassis_zone_tick() 周期更新, 在 Run() 入口已调一次. */
-    if (!chassis_zone_is_in_launch(s_default_launch_zone)) {
+    if (!chassis_zone_is_in_launch(LAUNCH_ZONE_LEFT)) {
         return;     /* 还未真正回到发车区, 继续等里程计/视觉拉车进入 */
     }
     if (!chassis_zone_is_static()) {
@@ -1032,16 +1023,11 @@ static void stage_deadlock_reset_handler(void)
     }
 
     /* 回发车区静止 3s = 本关失败流程完成；失败关也占用三关中的一关。 */
-    s_level_timer_active = 0U;
-    s_level_timed_out = 0U;
-    if (s_levels_finished < 0xFFU) {
-        s_levels_finished++;
-    }
+    mark_current_level_finished();
 
     map_snapshot_release();      /* B12: DEADLOCK 复位 → 解冻地图, 视觉端权威 */
-    if (should_enter_next_level()) {
+    if (s_levels_finished < APP_GAME_TOTAL_LEVELS) {
         reset_exec_context();
-        s_wait_start_phase = 0U; /* 下一关重新走 "复位→等地图→发车" */
         App_Recognize_Reset();
         goto_stage(STAGE_WAIT_START);
         return;
@@ -1104,12 +1090,15 @@ void Game_Get_Recognize_Debug(AppRecognizeDebug_t *out)
 /*
  * 越界检测 — 主循环侧调用, 仅在以下条件满足时 *判定+触发*:
  *   1) 链路在线 (避免 PAUSE 期间陈旧位姿误触发)
- *   2) 当前不在 WAIT_START / PAUSE_ON_LINK_LOSS / DONE
+ *   2) 当前不在发车/返航、PAUSE_ON_LINK_LOSS、DONE
  *   3) 尚未失败过 (s_failure_reason==NONE)
  * 一旦触发: 立即 chassis_ctrl_stop() + 切 STAGE_DONE + 锁失败原因
  */
 static void check_out_of_bounds(void)
 {
+    chassis_pose_t pose;
+    float safe_center_margin_m;
+
     if (s_failure_reason != GAME_FAIL_NONE) {
         return;     /* 已失败, 状态机锁死在 DONE, 不重复判 */
     }
@@ -1117,14 +1106,31 @@ static void check_out_of_bounds(void)
         return;     /* PAUSE 优先, 链路掉线期间不判 OOB */
     }
     if (current_stage == STAGE_WAIT_START ||
+        current_stage == STAGE_DEADLOCK_RESET ||
         current_stage == STAGE_PAUSE_ON_LINK_LOSS ||
         current_stage == STAGE_DONE) {
+        chassis_zone_clear_oob();
         return;
+    }
+
+    if (s_launch_oob_guard_active != 0U) {
+        pose = chassis_ctrl_get_pose();
+        safe_center_margin_m = CHASSIS_BODY_RADIUS_M - CHASSIS_OOB_HYSTERESIS_M;
+        if (pose.x_m >= safe_center_margin_m) {
+            s_launch_oob_guard_active = 0U;
+            chassis_zone_clear_oob();
+            return;
+        }
+        if ((pose.x_m >= 0.0f) &&
+            (pose.y_m >= safe_center_margin_m) &&
+            (pose.y_m <= (CHASSIS_MAP_HEIGHT_M - safe_center_margin_m))) {
+            chassis_zone_clear_oob();
+            return;
+        }
     }
 
     if (chassis_zone_is_out_of_bounds()) {
         s_failure_reason = GAME_FAIL_OUT_OF_BOUNDS;
-        s_level_timer_active = 0U;
         chassis_ctrl_stop();
         is_navigating = 0U;
         goto_stage(STAGE_DONE);
@@ -1146,18 +1152,16 @@ static uint8 recognize_stage_needs_class_link(void)
     {
         return 0U;
     }
-    if ((g_current_level <= 1U) && (map_has_bomb() == 0U))
-    {
-        return 0U;
-    }
-    return 1U;
+    return (uint8)(current_level_number() >= 2U);
 }
 
 static void enter_link_pause(LinkPauseReason_e reason)
 {
-    /* 失败返航/最终驻停不依赖视觉地图。若在返航途中因掉线切 PAUSE，恢复逻辑
-     * 会误进识别并跳过“回发车区静止 3s”的正式赛规闭环。 */
-    if ((current_stage == STAGE_DEADLOCK_RESET) ||
+    /* 返回 (1,5)、驶向 (1,4)、失败返航和最终驻停均不依赖地图内容。
+     * 这些阶段只记录链路状态，不切 PAUSE，避免地图尚未刷新反而阻止发车。 */
+    if ((current_stage == STAGE_WAIT_START) ||
+        (current_stage == STAGE_LAUNCH_EXIT) ||
+        (current_stage == STAGE_DEADLOCK_RESET) ||
         (current_stage == STAGE_DONE)) {
         s_link_alive = 0U;
         s_link_pause_reason = reason;
@@ -1185,13 +1189,28 @@ static void recover_from_link_pause(void)
         is_navigating  = 0U;
         if (s_stage_resume == STAGE_WAIT_START)
         {
-            /* 发车区掉线恢复后必须重新稳定取图并正常发车，不能绕过 WAIT_START
-             * 直接进入识别。保留 phase 0/1，以便继续返航或等待发车。 */
+            /* 返航掉线恢复后重新到 (1,5)，随后仍按“先发车、后等图”执行。 */
             reset_exec_context();
             map_snapshot_release();
             clear_box_target_mapping();
             App_Recognize_Reset();
             current_stage = STAGE_WAIT_START;
+            return;
+        }
+        if (s_stage_resume == STAGE_LAUNCH_EXIT)
+        {
+            /* 保留发车前帧栅栏；只重发 (1,4) 目标，避免漏掉移动期间已刷新的地图。 */
+            s_launch_drive_issued = 0U;
+            s_launch_drive_ticks = 0U;
+            map_snapshot_release();
+            current_stage = STAGE_LAUNCH_EXIT;
+            return;
+        }
+        if (s_stage_resume == STAGE_WAIT_MAP_REFRESH)
+        {
+            reset_launch_map_stability();
+            map_snapshot_release();
+            current_stage = STAGE_WAIT_MAP_REFRESH;
             return;
         }
         if ((s_stage_resume == STAGE_DEADLOCK_RESET) ||
@@ -1261,39 +1280,9 @@ static void update_link_state(void)
 static void stage_pause_on_link_loss_handler(void)
 {
     /* 视觉链路掉线期间维持静止, 不读 g_game_map, 不下发新目标.
-     * 链路恢复由 update_link_state() 按暂停前阶段回 WAIT_START 或 RECOGNIZE_MAP.
+     * 链路恢复由 update_link_state() 按暂停前阶段回 WAIT_MAP_REFRESH 或 RECOGNIZE_MAP.
      * 此处刻意保持空, 避免反复调用 chassis_ctrl_stop() 把 PID 积分清得过频.
      */
-}
-
-static void check_level_timeout(void)
-{
-    uint32 elapsed_ms;
-
-    if ((s_level_timer_active == 0U) || (s_level_timed_out != 0U)) {
-        return;
-    }
-    if ((s_link_alive == 0U) ||
-        (current_stage == STAGE_WAIT_START) ||
-        (current_stage == STAGE_LEVEL_JUDGE) ||
-        (current_stage == STAGE_DEADLOCK_RESET) ||
-        (current_stage == STAGE_DONE) ||
-        (current_stage == STAGE_PAUSE_ON_LINK_LOSS)) {
-        return;
-    }
-
-    /* 无符号减法天然兼容 app_link 32bit 毫秒时基回环。掉线期间不动车，恢复后
-     * elapsed 仍包含掉线时间，并会立即按正式赛规转入超时返航。 */
-    elapsed_ms = (uint32)(app_link_get_ms() - s_level_start_ms);
-    if (elapsed_ms < LEVEL_TIME_LIMIT_MS) {
-        return;
-    }
-
-    s_level_timed_out = 1U;
-    chassis_ctrl_stop();
-    App_Recognize_Reset();
-    reset_exec_context();
-    goto_stage(STAGE_DEADLOCK_RESET);
 }
 
 void Game_Logic_Task_Run(void)
@@ -1340,6 +1329,14 @@ void Game_Logic_Task_Run(void)
             stage_wait_start_handler();
             break;
 
+        case STAGE_LAUNCH_EXIT:
+            stage_launch_exit_handler();
+            break;
+
+        case STAGE_WAIT_MAP_REFRESH:
+            stage_wait_map_refresh_handler();
+            break;
+
         case STAGE_RECOGNIZE_MAP:
             stage_recognize_handler();
             break;
@@ -1374,7 +1371,4 @@ void Game_Logic_Task_Run(void)
             break;
     }
 
-    /* 放在本拍状态处理之后：若最后一个箱子恰在 900s 边界完成，LEVEL_JUDGE
-     * 可先关闭计时；其他状态即使本拍刚下发目标，也会在这里立即停车返航。 */
-    check_level_timeout();
 }
