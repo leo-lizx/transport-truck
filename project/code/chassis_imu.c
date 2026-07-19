@@ -228,13 +228,14 @@ static uint8 still_detect_step(float raw_dps, float *out_mean, float *out_var)
 void chassis_imu_init(void)
 {
     float gyro_z_sum_dps = 0.0f; /* 标定窗口内角速度累计值 */
-    uint16 sample_count = 1000U; /* 标定采样次数 */
+    uint16 sample_count = (uint16)CHASSIS_IMU_STILL_WINDOW_LEN;
     uint16 i;                    /* 采样循环计数 */
 
     /* 步骤 1: 初始化底层 IMU 设备。 */
     imu660rb_init();
 
-    /* 步骤 2: 在静止状态采样偏航轴角速度，估计零偏。 */
+    /* 步骤 2: 按正式 5ms 控制采样周期估计零偏。采样窗口与在线静止检测
+     * 保持一致，避免原 1ms 轮询重复读取尚未更新的 IMU 输出寄存器。 */
     for (i = 0U; i < sample_count; ++i)
     {
         imu660rb_get_gyro();
@@ -242,7 +243,7 @@ void chassis_imu_init(void)
          *   gyro_z_sum_dps += imu660rb_gyro_transition(imu660rb_gyro_z);
          */
         gyro_z_sum_dps += imu_yaw_gyro_raw_dps();
-        system_delay_ms(1);
+        system_delay_ms(5);
     }
 
     /* 步骤 3: 计算并保存平均零偏。 */

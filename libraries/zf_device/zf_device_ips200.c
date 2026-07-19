@@ -493,6 +493,18 @@ void ips200_set_font (ips200_font_size_enum font)
 }
 
 //-------------------------------------------------------------------------------------------------------------------
+// 函数简介     设置 IPS200 背光状态
+// 参数说明     enable          0 关闭背光，非 0 打开背光
+// 返回参数     void
+// 使用示例     ips200_set_backlight(1);
+// 备注信息     初始化期间保持关闭，首帧绘制完成后再打开可隐藏花屏与逐行刷新过程
+//-------------------------------------------------------------------------------------------------------------------
+void ips200_set_backlight (uint8 enable)
+{
+    IPS200_BL((0U != enable) ? 1U : 0U);
+}
+
+//-------------------------------------------------------------------------------------------------------------------
 // 函数简介     设置显示颜色
 // 参数说明     pen             颜色格式 RGB565 或者可以使用 zf_common_font.h 内 rgb565_color_enum 枚举值或者自行写入
 // 参数说明     bgcolor         颜色格式 RGB565 或者可以使用 zf_common_font.h 内 rgb565_color_enum 枚举值或者自行写入
@@ -1160,7 +1172,7 @@ void ips200_init (ips200_type_enum type_select)
         fast_gpio_init(IPS200_DC_PIN_SPI,   GPO, GPIO_LOW , FAST_GPO_PUSH_PULL);
         fast_gpio_init(ips_rst_pin,         GPO, GPIO_LOW , FAST_GPO_PUSH_PULL);
         fast_gpio_init(ips_cs_pin,  		GPO, GPIO_HIGH, FAST_GPO_PUSH_PULL);
-        fast_gpio_init(ips_bl_pin,          GPO, GPIO_HIGH, FAST_GPO_PUSH_PULL);
+        fast_gpio_init(ips_bl_pin,          GPO, GPIO_LOW , FAST_GPO_PUSH_PULL);
     }
     else
     {
@@ -1189,17 +1201,21 @@ void ips200_init (ips200_type_enum type_select)
     ips200_set_dir(ips200_display_dir);
     ips200_set_color(ips200_pencolor, ips200_bgcolor);
     
-    IPS200_BL(1);
+    /* Keep the panel hidden until the caller has rendered a complete frame. */
+    IPS200_BL(0);
     IPS200_RST(0);  
     system_delay_ms(5);
     IPS200_RST(1);      
-    system_delay_ms(5);
+    /* ST7789V: SLPOUT must not be sent until 120 ms after HW reset release. */
+    system_delay_ms(120);
     
     if(IPS200_TYPE_SPI == ips200_display_type)
     {
         IPS200_CS(0);
     }
     ips200_write_command(0x11);
+    /* ST7789V needs at least 5 ms before accepting subsequent commands. */
+    system_delay_ms(5);
     ips200_write_command(0x36);
     switch(ips200_display_dir)
     {
@@ -1284,6 +1300,5 @@ void ips200_init (ips200_type_enum type_select)
         IPS200_CS(1);
     }
 
-    ips200_clear();                                                             // 初始化为白屏
     ips200_debug_init();
 }

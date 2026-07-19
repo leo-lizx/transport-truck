@@ -949,7 +949,7 @@ static void enter_sub_nav(void)
     s_nav_started  = 0U;
     s_face_started = 0U;
     s_nav_wp_idx   = 0U;
-    s_subphase_ticks = 0U;        /* B3a: 进入新子阶段, watchdog 清零 */
+    s_subphase_ticks = 0U;        /* B3a: 进入新子阶段, 超时计数清零 */
     s_nav_timeout_limit = RECOG_NAV_TIMEOUT_TICKS;
 }
 

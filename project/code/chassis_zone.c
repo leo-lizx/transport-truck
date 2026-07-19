@@ -238,14 +238,19 @@ void chassis_zone_tick(void)
         return;
     }
 
-    /* 车体外接圆穿出最外圈围墙 > HYSTERESIS 才置位 */
+    /* 车体外接圆穿出完整物理场地 > HYSTERESIS 才置位。
+     * 里程计原点在可通行内场左上边界，所以物理外边界包含负向围墙余量。 */
     cx = cur.x_m;
     cy = cur.y_m;
     outside_field = 0U;
-    if ((cx + CHASSIS_BODY_RADIUS_M) > (CHASSIS_MAP_WIDTH_M  + CHASSIS_OOB_HYSTERESIS_M)) outside_field = 1U;
-    if ((cx - CHASSIS_BODY_RADIUS_M) < (0.0f                 - CHASSIS_OOB_HYSTERESIS_M)) outside_field = 1U;
-    if ((cy + CHASSIS_BODY_RADIUS_M) > (CHASSIS_MAP_HEIGHT_M + CHASSIS_OOB_HYSTERESIS_M)) outside_field = 1U;
-    if ((cy - CHASSIS_BODY_RADIUS_M) < (0.0f                 - CHASSIS_OOB_HYSTERESIS_M)) outside_field = 1U;
+    if ((cx + CHASSIS_BODY_RADIUS_M) >
+        (CHASSIS_MAP_WIDTH_M + CHASSIS_FIELD_MARGIN_X_M + CHASSIS_OOB_HYSTERESIS_M)) outside_field = 1U;
+    if ((cx - CHASSIS_BODY_RADIUS_M) <
+        (-CHASSIS_FIELD_MARGIN_X_M - CHASSIS_OOB_HYSTERESIS_M)) outside_field = 1U;
+    if ((cy + CHASSIS_BODY_RADIUS_M) >
+        (CHASSIS_MAP_HEIGHT_M + CHASSIS_FIELD_MARGIN_Y_M + CHASSIS_OOB_HYSTERESIS_M)) outside_field = 1U;
+    if ((cy - CHASSIS_BODY_RADIUS_M) <
+        (-CHASSIS_FIELD_MARGIN_Y_M - CHASSIS_OOB_HYSTERESIS_M)) outside_field = 1U;
 
     if (outside_field) {
         s_zone_oob_latched = 1U;

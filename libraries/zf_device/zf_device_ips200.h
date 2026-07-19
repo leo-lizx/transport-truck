@@ -153,6 +153,7 @@ extern  gpio_pin_enum                   ips_cs_pin;
 
 void    ips200_clear                    (void);
 void    ips200_full                     (const uint16 color);
+void    ips200_set_backlight            (uint8 enable);
 void    ips200_set_dir                  (ips200_dir_enum dir);
 void    ips200_set_font                 (ips200_font_size_enum font);
 void    ips200_set_color                (const uint16 pen, const uint16 bgcolor);
