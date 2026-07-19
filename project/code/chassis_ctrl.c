@@ -20,6 +20,7 @@
 #include "chassis_pid.h"
 #include "chassis_mecanum.h"
 #include "chassis_mpc.h"     /* P0-MPC: 直线行驶 MPC 驱动轴纵向速度规划                   */
+#include "chassis_arrival.h"
 #include "app_link.h"        /* P0-3: 软限位改用 app_link_get_map_snapshot() 拿一致地图副本   */
 #include "zf_common_headfile.h"  /* P0-3: __DMB() / __disable_irq() 内存屏障与临界区          */
 #include <math.h>
@@ -40,7 +41,7 @@
 /* Yaw 串级 P-PI 内环: 前馈 + PI 直接输出 PWM, 自动克服静摩擦.
  * 外环(yaw_pi): angle_err → wz_cmd (纯 P)
  * 内环(本段):   wz_cmd - wz_actual → PWM (PI), 取代旧 GAIN×wz 开环 */
-#define CHASSIS_YAW_PWM_GAIN              (1000.0f)    /* 已废弃, 由内环 PI 替代 */
+#define CHASSIS_YAW_PWM_GAIN              (0.0f)    /* 已废弃, 由内环 PI 替代 */
 
 /* 保持轴直接 PWM 前馈: 绕过轮速 PID, 把车体速度 (vx,vy) 直接换算成 PWM.
  *   问题同 yaw: 保持轴输出 0.06m/s → 轮速 PID 只给 40×0.06=2.4PWM → 无力纠偏.
@@ -54,8 +55,8 @@
  * target 变大又恢复 → PWM 跳变 → 表现为输出“段段起止”。
  * 将阈值调到 0.005 m/s, 让 yaw±1° 场景 (target ≈0.023) 有 4.5x 余量,
  * 小抖动不会再跳变 → PWM 输出连续. */
-#define WHEEL_STOP_TARGET_EPS_MPS         (0.005f)  /* 原 0.015, 调小防小角度阈值跳变 */
-#define WHEEL_STOP_FEEDBACK_EPS_MPS       (0.010f)  /* 原 0.030, 同步调小 */
+#define WHEEL_STOP_TARGET_EPS_MPS         (0.000f)  /* 原 0.015, 调小防小角度阈值跳变 */
+#define WHEEL_STOP_FEEDBACK_EPS_MPS       (2.00f)  /* 原 0.030, 同步调小 */
 
 /* 软限位保护参数 / 软限位 helpers / apply_soft_limit_guard()
  * 已于 2026-05-13 迁至 chassis_zone.c (chassis_zone_apply_soft_limit_guard).
@@ -235,6 +236,8 @@ static float s_yaw_rate_i  = 0.0f;
 static float s_yaw_adrc_z1 = 0.0f;
 static float s_yaw_adrc_z2 = 0.0f;
 static float s_yaw_adrc_u  = 0.0f;
+/* 到位驻留计数器: 连续 N 拍满足到位条件 → 判到达, 防止单拍噪声误触 */
+static uint16 s_arrival_dwell_cnt = 0U;
 /* 逐轴到位: X/Y 各自判断 |err|≤EPSILON, 两轴都到位→整体 arrived */
 static uint8 s_axis_x_arrived = 0U;
 static uint8 s_axis_y_arrived = 0U;
@@ -817,8 +820,25 @@ static float yaw_pi(float err, uint8 enable_rate_loop, uint8 allow_inpos_lock)
         }
 #endif
         if (!mpc_ok) {
-            wz_target = sqrt_controller(err,
-                                        g_chassis_tune_params.yaw_kp,
+            /* 小误差增益调度: 微小角度(≤2°)时降低外环增益, 消 PI 追猎抖动.
+             *   |err|≥2° → 全增益 (KP=10)
+             *   |err|≤0.5° → 30% 增益 (KP≈3), wz_target 从 5→1.5dps, 不再过冲
+             *   0.5~2° → 线性过渡, 避免增益突变引发新抖动 */
+            float yaw_kp_eff = g_chassis_tune_params.yaw_kp;
+            {
+                float abs_err = fabsf(err);
+                if (abs_err < 2.0f) {
+                    float ratio;
+                    if (abs_err < 0.5f) {
+                        ratio = 0.30f;   /* 极小误差: 30% 增益, 几乎不追 */
+                    } else {
+                        /* 0.5°→2.0°: ratio 从 0.30 线性过渡到 1.00 */
+                        ratio = 0.30f + (abs_err - 0.5f) / (2.0f - 0.5f) * (1.0f - 0.30f);
+                    }
+                    yaw_kp_eff *= ratio;
+                }
+            }
+            wz_target = sqrt_controller(err, yaw_kp_eff,
                                         CHASSIS_YAW_ACCEL_MAX_DPS2);
         }
 
@@ -826,8 +846,14 @@ static float yaw_pi(float err, uint8 enable_rate_loop, uint8 allow_inpos_lock)
                                     -g_chassis_tune_params.max_yaw_speed_dps,
                                      g_chassis_tune_params.max_yaw_speed_dps);
 
-        /* ── 内环 PI: 仅静止时开启, 平动时关 ── */
-        if (enable_rate_loop) {
+        /* ── 内环 PI: 静止保持始终开启, 平动时可独立关闭 ── */
+#if (CHASSIS_YAW_RATE_PI_MOVE_ENABLE != 0)
+        if (enable_rate_loop)
+#else
+        /* 移动时关闭内环 PI, 仅静止保持(allow_inpos_lock=1)时开启 */
+        if (enable_rate_loop && allow_inpos_lock)
+#endif
+        {
             rate_err = wz_target - yaw_rate_dps;
         } else {
             rate_err = 0.0f;
@@ -846,7 +872,14 @@ static float yaw_pi(float err, uint8 enable_rate_loop, uint8 allow_inpos_lock)
         kp_v = CHASSIS_YAW_RATE_KP * rate_err;
         ki_v = CHASSIS_YAW_RATE_KI * s_yaw_i;
 
-        wz = wz_target + kp_v + ki_v;
+        /* PI 总输出限幅: 防止 kp_v + ki_v 过大喧宾夺主, 盖过 sqrt_ctrl 规划 */
+        {
+            float pi_total = kp_v + ki_v;
+            pi_total = chassis_clamp_f(pi_total,
+                                       -CHASSIS_YAW_RATE_PI_LIMIT_DPS,
+                                        CHASSIS_YAW_RATE_PI_LIMIT_DPS);
+            wz = wz_target + pi_total;
+        }
     }
 
     wz = chassis_clamp_f(wz,
@@ -893,6 +926,7 @@ static void enter_mode(ctrl_mode_t m)
     s_axis_hold_x_m     = s_pose.x_m;
     s_axis_hold_y_m     = s_pose.y_m;
     s_nav_yaw_aligned   = 0U;   /* 起步 yaw 门控: 每个新目标都重新对齐一次 */
+    s_arrival_dwell_cnt = 0U;   /* 到位驻留计数器清零: 新目标重新累计 */
     {
         uint8 pid_i;
         for (pid_i = 0U; pid_i < (uint8)CHASSIS_WHEEL_COUNT; ++pid_i) {
@@ -1109,53 +1143,81 @@ void chassis_ctrl_task_20ms(void)
          * 【层1~4】位置驱动
          *
          * 流程:
-         *   层1: dist ≤ EPSILON → 一拍姿态闭环保持, 然后置 s_arrived=1
-         *   层2: s_arrived && dist ≤ HOLD_EXIT(10cm) → 驻车保持 (Schmitt上界)
+         *   层1: X/Y 实时误差均 ≤ EPSILON → 立即冻结平移并驻留确认
+         *   层2: s_arrived && dist ≤ HOLD_EXIT → 驻车保持 (Schmitt上界)
          *   层3: s_arrived && dist > HOLD_EXIT → 大扰动, 重启驱动 (Schmitt下界)
          *   层4: 正常位置驱动 (brake_cap + axis-by-axis PD)
          * ================================================================*/
 
         /* ================================================================
-         * 【层1】到位进入判定 (Schmitt-trigger 上边界)
+         * 【层1】到位驻留判定
          *
-         * Schmitt 双阈值说明:
-         *   进入保持: dist ≤ EPSILON → 立即置 s_arrived=1
-         *   离开保持: dist > HOLD_EXIT → 清 s_arrived, 重启位置驱动
+         *   进入驻留: X/Y 实时误差均在 EPSILON 内 → 立即清平移 ramp
+         *   到达确认: 位置 + 速度 + yaw 连续满足 N 拍 → 置 s_arrived=1
+         *   驻留失败: 任一轴离开 EPSILON → 清计数并恢复该轴位置驱动
+         *   到达后释放: dist > HOLD_EXIT → 清 s_arrived, 重启位置驱动
          *
-         *   单阈值的问题: 到位停下后任何小扰动(>6cm)立即重激活位置 P,
-         *   以 ~0.12 m/s 冲回 → 过冲到另一侧 → 反向冲 → 欠阻尼震荡.
-         *   4cm 的滞后带让小扰动在保持圈内自然衰减, 不触发驱动.
-         *
-         * 当前调试阶段先只看位置: 只要进误差圈, 就认为该目标完成.
-         * yaw 精校/速度稳定都不参与到达判断, 避免车已经到点却长时间不切下一个目标.
+         *   单阈值会让到位后的微小扰动立即重激活位置环；EPSILON 与
+         *   HOLD_EXIT 之间的滞后区让扰动在驻车状态下自然衰减。
          * ----------------------------------------------------------------*/
         /* P0-修复 2026-06-07: 到达时清 s_ramp.
          * 原设计: 只设 cmd=0, 靠 ramp_filter 缓慢衰减 → 车带着速度
          *   冲出 10cm(HOLD_EXIT) → 下一拍 ISR 层3 清 s_arrived → 主循环
          *   永远抓不到 arrived=1 → 不切航点 → 串口显示 arrived 始终为 0.
          * 清 ramp 让轮速目标立刻归零, PID+breakaway 主动制动, 不再冲过头. */
-        /* P0-修复 2026-07-17: 逐轴到位 + yaw + 速度 三重判断。
-         *   仅位置到达不够 — 车可能瞬入 EPSILON 但还在转/滑, 判到达后立刻切下一目标
-         *   但实际未停稳 → 冲过下一目标或走歪. */
-        {
-            float yerr = chassis_normalize_angle_deg(s_tgt_yaw_deg - s_pose.yaw_deg);
-            uint8 pos_ok = (dist <= CHASSIS_TARGET_REACHED_EPSILON_M)
-                        || ((s_axis_x_arrived != 0U) && (s_axis_y_arrived != 0U));
-            uint8 yaw_ok = (fabsf(yerr) <= CHASSIS_YAW_INPOS_EXIT_DEG);
+        /* 到位驻留: 实时 X/Y 都进入窗口后立即冻结平移，再连续确认速度与航向。
+         * 不能用锁存的 axis_arrived 代替实时位置，否则滑出窗口后仍会继续计数；
+         * 也不能等计满后才清 ramp，否则 400ms 驻留期仍可能越点反复修正。 */
+        if (0U == s_arrived) {
+            uint8 pos_ok = (fabsf(dx) <= CHASSIS_TARGET_REACHED_EPSILON_M)
+                        && (fabsf(dy) <= CHASSIS_TARGET_REACHED_EPSILON_M);
             float fb_speed = sqrtf(s_fb_vx * s_fb_vx + s_fb_vy * s_fb_vy);
             uint8 vel_ok = (fb_speed <= 0.12f);
+            float yerr_arrival = chassis_normalize_angle_deg(s_tgt_yaw_deg - s_pose.yaw_deg);
+            float wz_arrival = 0.0f;
+            uint8 yaw_ok = 0U;
+            chassis_arrival_decision_t arrival_decision;
 
-            if ((0U == s_arrived) && pos_ok && yaw_ok && vel_ok) {
-                s_arrived = 1U;
-                g_chassis_arrival_count++;
-                s_yaw_in_position = 0;
-                s_axis_x_arrived  = 0U;
-                s_axis_y_arrived  = 0U;
-                s_ramp = (chassis_body_speed_cmd_t){0};
+            /* 只在已经进入位置窗口后运行静止航向环，避免正常导航路径重复调用 yaw_pi。
+             * 驻留计数以 Schmitt 锁状态为准：进入 0.3° 后停止微调，漂到 0.7° 外才重启。 */
+            if (pos_ok != 0U) {
+                wz_arrival = yaw_pi(yerr_arrival, 1U, 1U);
+                yaw_ok = s_yaw_in_position;
+            }
+
+            arrival_decision = chassis_arrival_dwell_update(
+                &s_arrival_dwell_cnt,
+                pos_ok,
+                vel_ok,
+                yaw_ok,
+                CHASSIS_ARRIVAL_DWELL_COUNT);
+
+            if (arrival_decision.hold_translation != 0U) {
+                s_ramp.vx_body_mps = 0.0f;
+                s_ramp.vy_body_mps = 0.0f;
+                s_pos_i = 0.0f;
+                s_pos_i_hold = 0.0f;
                 cmd.vx_body_mps = 0.0f;
                 cmd.vy_body_mps = 0.0f;
-                cmd.wz_dps      = 0.0f;
+                cmd.wz_dps = wz_arrival;
+
+                if (arrival_decision.arrived != 0U) {
+                    s_arrived = 1U;
+                    g_chassis_arrival_count++;
+                    s_axis_x_arrived  = 0U;
+                    s_axis_y_arrived  = 0U;
+                    cmd.wz_dps        = 0.0f;
+                }
                 break;
+            }
+
+            /* 驻留期间若某轴滑出实时位置窗口，解除该轴锁存状态，
+             * 让下方逐轴控制器确实重新拉回目标，而不是继续相信旧到位标志。 */
+            if (fabsf(dx) > CHASSIS_TARGET_REACHED_EPSILON_M) {
+                s_axis_x_arrived = 0U;
+            }
+            if (fabsf(dy) > CHASSIS_TARGET_REACHED_EPSILON_M) {
+                s_axis_y_arrived = 0U;
             }
         }
         if (s_arrived && (dist <= CHASSIS_POS_HOLD_EXIT_M)) {
@@ -1182,6 +1244,7 @@ void chassis_ctrl_task_20ms(void)
             s_pos_i_hold    = 0.0f;
             s_yaw_i         = 0.0f;  /* yaw 积分同步清零 */
             s_yaw_rate_i    = 0.0f;  /* 内环 PI 积分清零 */
+            s_arrival_dwell_cnt = 0U;  /* 驻留计数器清零: 重新驱动需重新确认 */
             s_ramp.vx_body_mps = 0.0f;  /* 清 ramp, 防旧残值污染新驱动方向 */
             s_ramp.vy_body_mps = 0.0f;
             s_axis_hold_x_m = s_pose.x_m;  /* 更新保持轴锚点到当前位置 */
@@ -1261,6 +1324,7 @@ void chassis_ctrl_task_20ms(void)
                         s_pos_i          = 0.0f;
                         s_pos_i_hold     = 0.0f;
                         s_ramp.vx_body_mps = 0.0f;
+                        s_ramp.vy_body_mps = 0.0f;
                         vxg = 0.0f;
                         vyg = 0.0f;
                     } else {
@@ -1298,6 +1362,8 @@ void chassis_ctrl_task_20ms(void)
                         s_axis_hold_y_m  = s_tgt_y_m;
                         s_pos_i          = 0.0f;
                         s_pos_i_hold     = 0.0f;
+                        s_ramp.vx_body_mps = 0.0f;
+                        s_ramp.vy_body_mps = 0.0f;
                         vxg = 0.0f;
                         vyg = 0.0f;
                     } else {
@@ -1437,7 +1503,7 @@ void chassis_ctrl_task_20ms(void)
         /* 全局 → 车体坐标变换 (车体→全局矩阵的转置, 见 task_20ms 步骤 3 注释) */
         cmd.vx_body_mps =  cy * vxg - sy * vyg;
         cmd.vy_body_mps =  sy * vxg + cy * vyg;
-        /* 平移时开内环 PI: I_leak 自然滤噪, 消除稳态 1° 静差 */
+        /* 平移时开内环 PI: 微小误差走增益调度消抖, 不小角度硬锁 */
         cmd.wz_dps = yaw_pi(yerr, 1U, 0U);
         break;
     }

@@ -36,18 +36,27 @@ board: MIMXRT1064-EVK
  * Definitions
  ******************************************************************************/
 
+#define BOARD_ARM_PLL_LOOP_DIVIDER_528M   (88U)
+#define BOARD_ARM_PLL_LOOP_DIVIDER_600M   (100U)
+#define BOARD_DCDC_TARGET_528M            (0x0FU) /* 1.175V: 1.15V minimum plus one 25mV step. */
+#define BOARD_DCDC_TARGET_600M            (0x13U) /* 1.275V overdrive target. */
+
+static void BOARD_BootClockRUNForCore(uint32_t core_clock_hz);
+
 /*******************************************************************************
  * Variables
  ******************************************************************************/
 /* System clock frequency. */
 extern uint32_t SystemCoreClock;
+/* Requested by clock_init() before BOARD_InitBootClocks() is called. */
+extern uint32_t system_clock;
 
 /*******************************************************************************
  ************************ BOARD_InitBootClocks function ************************
  ******************************************************************************/
 void BOARD_InitBootClocks(void)
 {
-    BOARD_BootClockRUN();
+    BOARD_BootClockRUNForCore(system_clock);
 }
 
 /*******************************************************************************
@@ -58,7 +67,7 @@ void BOARD_InitBootClocks(void)
 name: BOARD_BootClockRUN
 called_from_default_init: true
 outputs:
-- {id: AHB_CLK_ROOT.outFreq, value: 600 MHz}
+- {id: AHB_CLK_ROOT.outFreq, value: 528 MHz}
 - {id: CAN_CLK_ROOT.outFreq, value: 40 MHz}
 - {id: CKIL_SYNC_CLK_ROOT.outFreq, value: 32.768 kHz}
 - {id: CLK_1M.outFreq, value: 1 MHz}
@@ -71,17 +80,17 @@ outputs:
 - {id: FLEXIO2_CLK_ROOT.outFreq, value: 30 MHz}
 - {id: FLEXSPI2_CLK_ROOT.outFreq, value: 2880/11 MHz}
 - {id: FLEXSPI_CLK_ROOT.outFreq, value: 2880/11 MHz}
-- {id: IPG_CLK_ROOT.outFreq, value: 150 MHz}
+- {id: IPG_CLK_ROOT.outFreq, value: 132 MHz}
 - {id: LCDIF_CLK_ROOT.outFreq, value: 67.5 MHz}
 - {id: LPI2C_CLK_ROOT.outFreq, value: 60 MHz}
 - {id: LPSPI_CLK_ROOT.outFreq, value: 105.6 MHz}
-- {id: LVDS1_CLK.outFreq, value: 1.2 GHz}
-- {id: PERCLK_CLK_ROOT.outFreq, value: 75 MHz}
+- {id: LVDS1_CLK.outFreq, value: 1.056 GHz}
+- {id: PERCLK_CLK_ROOT.outFreq, value: 66 MHz}
 - {id: PLL7_MAIN_CLK.outFreq, value: 24 MHz}
 - {id: SAI1_CLK_ROOT.outFreq, value: 1080/17 MHz}
 - {id: SAI2_CLK_ROOT.outFreq, value: 1080/17 MHz}
 - {id: SAI3_CLK_ROOT.outFreq, value: 1080/17 MHz}
-- {id: SEMC_CLK_ROOT.outFreq, value: 75 MHz}
+- {id: SEMC_CLK_ROOT.outFreq, value: 66 MHz}
 - {id: SPDIF0_CLK_ROOT.outFreq, value: 30 MHz}
 - {id: TRACE_CLK_ROOT.outFreq, value: 352/3 MHz}
 - {id: UART_CLK_ROOT.outFreq, value: 80 MHz}
@@ -100,7 +109,7 @@ settings:
 - {id: CCM.TRACE_PODF.scale, value: '3', locked: true}
 - {id: CCM_ANALOG.PLL1_BYPASS.sel, value: CCM_ANALOG.PLL1}
 - {id: CCM_ANALOG.PLL1_PREDIV.scale, value: '1', locked: true}
-- {id: CCM_ANALOG.PLL1_VDIV.scale, value: '50', locked: true}
+- {id: CCM_ANALOG.PLL1_VDIV.scale, value: '44', locked: true}
 - {id: CCM_ANALOG.PLL2.denom, value: '1', locked: true}
 - {id: CCM_ANALOG.PLL2.div, value: '22'}
 - {id: CCM_ANALOG.PLL2.num, value: '0', locked: true}
@@ -133,8 +142,13 @@ sources:
  ******************************************************************************/
 const clock_arm_pll_config_t armPllConfig_BOARD_BootClockRUN =
     {
-        .loopDivider = 100,                       /* PLL loop divider, Fout = Fin * 50 */
+        .loopDivider = BOARD_ARM_PLL_LOOP_DIVIDER_528M, /* 24MHz * 88 / 2 / ARM_PODF(2) = 528MHz */
         .src = 0,                                 /* Bypass clock source, 0 - OSC 24M, 1 - CLK1_P and CLK1_N */
+    };
+static const clock_arm_pll_config_t s_armPllConfig_600M =
+    {
+        .loopDivider = BOARD_ARM_PLL_LOOP_DIVIDER_600M, /* 24MHz * 100 / 2 / ARM_PODF(2) = 600MHz */
+        .src = 0,
     };
 const clock_sys_pll_config_t sysPllConfig_BOARD_BootClockRUN =
     {
@@ -153,6 +167,22 @@ const clock_usb_pll_config_t usb1PllConfig_BOARD_BootClockRUN =
  ******************************************************************************/
 void BOARD_BootClockRUN(void)
 {
+    BOARD_BootClockRUNForCore(BOARD_BOOTCLOCKRUN_CORE_CLOCK);
+}
+
+static void BOARD_BootClockRUNForCore(uint32_t core_clock_hz)
+{
+    const clock_arm_pll_config_t *selected_arm_pll = &armPllConfig_BOARD_BootClockRUN;
+    uint32_t selected_core_clock_hz = BOARD_BOOTCLOCKRUN_CORE_CLOCK_528M;
+    uint32_t selected_dcdc_target = BOARD_DCDC_TARGET_528M;
+
+    if (BOARD_BOOTCLOCKRUN_CORE_CLOCK_600M == core_clock_hz)
+    {
+        selected_arm_pll = &s_armPllConfig_600M;
+        selected_core_clock_hz = BOARD_BOOTCLOCKRUN_CORE_CLOCK_600M;
+        selected_dcdc_target = BOARD_DCDC_TARGET_600M;
+    }
+
     /* Init RTC OSC clock frequency. */
     CLOCK_SetRtcXtalFreq(32768U);
     /* Enable 1MHz clock output. */
@@ -172,14 +202,15 @@ void BOARD_BootClockRUN(void)
     /* Setting PeriphClk2Mux and PeriphMux to provide stable clock before PLLs are initialed */
     CLOCK_SetMux(kCLOCK_PeriphClk2Mux, 1); /* Set PERIPH_CLK2 MUX to OSC */
     CLOCK_SetMux(kCLOCK_PeriphMux, 1);     /* Set PERIPH_CLK MUX to PERIPH_CLK2 */
-    /* Setting the VDD_SOC to 1.275V. It is necessary to config AHB to 600Mhz. */
-    DCDC->REG3 = (DCDC->REG3 & (~DCDC_REG3_TRG_MASK)) | DCDC_REG3_TRG(0x13);
+    /* Set VDD_SOC before raising the ARM clock. 528MHz uses a lower target to
+     * reduce cold-start demand; 600MHz retains the original overdrive target. */
+    DCDC->REG3 = (DCDC->REG3 & (~DCDC_REG3_TRG_MASK)) | DCDC_REG3_TRG(selected_dcdc_target);
     /* Waiting for DCDC_STS_DC_OK bit is asserted */
     while (DCDC_REG0_STS_DC_OK_MASK != (DCDC_REG0_STS_DC_OK_MASK & DCDC->REG0))
     {
     }
     /* Init ARM PLL. */
-    CLOCK_InitArmPll(&armPllConfig_BOARD_BootClockRUN);
+    CLOCK_InitArmPll(selected_arm_pll);
     /* In SDK projects, SDRAM (configured by SEMC) will be initialized in either debug script or dcd.
      * With this macro SKIP_SYSCLK_INIT, system pll (selected to be SEMC source clock in SDK projects) will be left unchanged.
      * Note: If another clock source is selected for SEMC, user may want to avoid changing that clock as well.*/
@@ -450,6 +481,6 @@ void BOARD_BootClockRUN(void)
     /* Disable clock out2. */
     CCM->CCOSR &= ~CCM_CCOSR_CLKO2_EN_MASK;
     /* Set SystemCoreClock variable. */
-    SystemCoreClock = BOARD_BOOTCLOCKRUN_CORE_CLOCK;
+    SystemCoreClock = selected_core_clock_hz;
 }
 

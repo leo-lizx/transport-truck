@@ -78,24 +78,24 @@
 #define CHASSIS_WHEEL_PID_DEFAULT_KD        (1.0f)
 
 /* ---- 左前轮 LF (Wheel 0) ---- */
-#define CHASSIS_WHEEL_PID_LF_KP             (70.0f)
-#define CHASSIS_WHEEL_PID_LF_KI             (20.0f)
-#define CHASSIS_WHEEL_PID_LF_KD             (0.0f)
+#define CHASSIS_WHEEL_PID_LF_KP             (200.0f)
+#define CHASSIS_WHEEL_PID_LF_KI             (50.0f)
+#define CHASSIS_WHEEL_PID_LF_KD             (10.0f)
 
 /* ---- 右前轮 RF (Wheel 1) ---- */
-#define CHASSIS_WHEEL_PID_RF_KP             (70.0f)
-#define CHASSIS_WHEEL_PID_RF_KI             (20.0f)
-#define CHASSIS_WHEEL_PID_RF_KD             (0.0f)
+#define CHASSIS_WHEEL_PID_RF_KP             (200.0f)
+#define CHASSIS_WHEEL_PID_RF_KI             (50.0f)
+#define CHASSIS_WHEEL_PID_RF_KD             (10.0f)
 
 /* ---- 左后轮 LB (Wheel 2) ---- */
-#define CHASSIS_WHEEL_PID_LB_KP             (70.0f)
-#define CHASSIS_WHEEL_PID_LB_KI             (20.0f)
-#define CHASSIS_WHEEL_PID_LB_KD             (0.0f)
+#define CHASSIS_WHEEL_PID_LB_KP             (200.0f)
+#define CHASSIS_WHEEL_PID_LB_KI             (50.0f)
+#define CHASSIS_WHEEL_PID_LB_KD             (10.0f)
 
 /* ---- 右后轮 RB (Wheel 3) ---- */
-#define CHASSIS_WHEEL_PID_RB_KP             (70.0f)
-#define CHASSIS_WHEEL_PID_RB_KI             (20.0f)
-#define CHASSIS_WHEEL_PID_RB_KD             (0.0f)
+#define CHASSIS_WHEEL_PID_RB_KP             (200.0f)
+#define CHASSIS_WHEEL_PID_RB_KI             (50.0f)
+#define CHASSIS_WHEEL_PID_RB_KD             (10.0f)
 
 /* ---- 兼容宏 (旧名称) ---- */
 #define CHASSIS_WHEEL_PID_KP                CHASSIS_WHEEL_PID_DEFAULT_KP
@@ -113,7 +113,7 @@
 #define CHASSIS_YAW_KP                      (10.0f)
 
 /** sqrt_controller 最大减速度 (°/s²): 决定刹车距离 */
-#define CHASSIS_YAW_ACCEL_MAX_DPS2          (1500.0f)
+#define CHASSIS_YAW_ACCEL_MAX_DPS2          (1000.0f)
 
 /** 最大旋转速度 (°/s) */
 #define CHASSIS_MAX_YAW_SPEED_DPS           (400.0f)
@@ -123,14 +123,23 @@
 /** 1=级联 sqrt+PI, 0=回退单环 PID */
 #define CHASSIS_YAW_USE_CASCADED_CTRL       (1)
 
-/** 内环 P: rate_err(°/s) → wz 修正 (°/s) */
-#define CHASSIS_YAW_RATE_KP                 (0.450f)
+/** 1=移动时开启内环速率 PI (叠加到 wz_target), 0=移动时只用外环 sqrt_ctrl
+ *  静止保持 (MODE_YAW_HOLD) 不受此宏影响, 始终开启内环 PI. */
+#define CHASSIS_YAW_RATE_PI_MOVE_ENABLE     (1)
 
-/** 内环 I 增益: ∫rate_err → wz 修正. 自动克服静摩擦 */
-#define CHASSIS_YAW_RATE_KI                 (2.0f)
+/** 内环 P: rate_err(°/s) → wz 修正 (°/s).
+ *  0.30 在跟踪精度和噪声放大之间平衡: MPC 输出 100dps 时, KP 贡献 30dps 修正. */
+#define CHASSIS_YAW_RATE_KP                 (0.0050f)
+
+/** 内环 I 增益: ∫rate_err → wz 修正. 自动克服静摩擦.
+ *  0.80 配合 I_LEAK=0.001: 稳态偏航力矩被持续抵消, 1~2°静差不再残留. */
+#define CHASSIS_YAW_RATE_KI                 (0.0020f)
 
 /** 内环 I 上限 (°/s): 积分最多贡献的角速度 */
 #define CHASSIS_YAW_RATE_I_LIMIT            (40.0f)
+
+/** 内环 PI 总输出限幅 (°/s): kp_v + ki_v 的硬上限, 防止 PI 过度修正喧宾夺主 */
+#define CHASSIS_YAW_RATE_PI_LIMIT_DPS       (40.0f)
 
 /** 内环 I 泄漏系数: 每拍 I *= 1-LEAK, 防卷绕且自然衰减 */
 #define CHASSIS_YAW_RATE_I_LEAK             (0.01f)
@@ -138,13 +147,13 @@
 /* ---- 到位锁 ---- */
 
 /** 进入在位锁: |err| < 此值 */
-#define CHASSIS_YAW_INPOS_ENTER_DEG         (0.40f)
+#define CHASSIS_YAW_INPOS_ENTER_DEG         (0.70f)
 
 /** 退出在位锁: |err| > 此值 */
-#define CHASSIS_YAW_INPOS_EXIT_DEG          (2.0f)
+#define CHASSIS_YAW_INPOS_EXIT_DEG          (0.70f)
 
 /** 即位锁需车体稳定: |rate| < 此值 */
-#define CHASSIS_YAW_INPOS_SETTLE_DPS        (8.0f)
+#define CHASSIS_YAW_INPOS_SETTLE_DPS        (15.0f)
 
 /** 角速度加减速限制 (°/s²): 同时用于 yaw sqrt 曲线和下游 ramp */
 #define CHASSIS_CMD_ACCEL_LIMIT_DPS2        (5000.0f)
@@ -191,6 +200,11 @@
 /* 推箱子1格=20cm, 0.025=1/8格足够。若要5mm精度需配合编码器零漂校准 */
 #define CHASSIS_TARGET_REACHED_EPSILON_M    (0.010f)
 
+/** 到位驻留确认次数 (20ms/次): 连续 N 次同时满足位置+速度+角度条件才判到达。
+ *  单拍 odom 噪声/瞬态过冲可能让 dist 瞬间掉进 EPSILON, 不加驻留会误触到达。
+ *  20 次 = 400ms 驻留, 覆盖 2~3 个刹车周期, 确保是真停稳而非瞬态路过。 */
+#define CHASSIS_ARRIVAL_DWELL_COUNT         (20U)
+
 /** 到位后 Schmitt 滞后释放阈值 (米) — 10cm 覆盖惯性滑移 */
 /** P0-修复 2026-06-30: 0.15→0.30。原值过小，小幅过冲即触发回弹震荡。
  *   配合 BRAKE_FLOOR 降低后，惯性过冲通常 <5cm，30cm 余量充足。 */
@@ -209,11 +223,11 @@
  *  P0-修复 2026-05-11 (拐点停留+走斜线): 10.50→4.50
  *  (KP=10.5 时 linear_dist=accel/KP²≈0.027m → 冲过头) */
 /* P0-修复 2026-07-17: 4.50→5.50, 加快逼近和D项阻尼, 远距不冲近距快停 */
-#define CHASSIS_POS_KP                      (4.50f)
+#define CHASSIS_POS_KP                      (6.50f)
 
 /** 位置环沿程积分增益 — 消除静摩擦稳态残差。从 0 起调，+0.05/次 */
 /* P0-修复 2026-07-17: 0.30→0.50, 近端更快累积克服静摩擦, 缩短末段停留 */
-#define CHASSIS_POS_KI                      (0.30f)
+#define CHASSIS_POS_KI                      (0.80f)
 
 /** 线速度最大加速度 (m/s²)
  *  P0-调参 2026-05-08: 3.00→5.00，加快爬坡/刹车
@@ -233,22 +247,22 @@
  *  P0-修复 2026-07-17: 逐轴刹车已独立用|dx|/|dy|防冲头, D 项只做轻量速度阻尼. */
 /* kd=KP×0.30=1.65, 适中阻尼: 远距高速有制动力不冲, 近距不拖死 */
 /* kd=5.50×0.40=2.20, 强阻尼拽住车速, 配合低FLOOR刹进EPSILON */
-#define CHASSIS_POS_KD_RATIO                (0.60f)
-#define CHASSIS_POS_HOLD_KD_RATIO           (0.60f)
+#define CHASSIS_POS_KD_RATIO                (0.50f)
+#define CHASSIS_POS_HOLD_KD_RATIO           (0.80f)
 /* 0.50→0.05: 刹车区从55cm缩到~10cm, 太大会让车过早限速, 不影响防冲 */
 #define CHASSIS_POS_BRAKE_MARGIN_M          (-0.004f)
-#define CHASSIS_POS_I_LIMIT_RATIO           (0.20f)
+#define CHASSIS_POS_I_LIMIT_RATIO           (0.40f)
 #define CHASSIS_POS_I_BAND_RATIO            (0.8f)
 #define CHASSIS_POS_AXIS_SWITCH_RATIO       (0.6f)
-#define CHASSIS_POS_HOLD_SPEED_RATIO        (0.35f)
+#define CHASSIS_POS_HOLD_SPEED_RATIO        (0.80f)
 
 /** 保持轴死区 (m) — 滤除编码器量化噪声 (~2~5mm)，远小于 EPSILON
  *  P0-修复 2026-06-07: 原无死区，噪声被 sqrt_ctrl 放大 → Y 方向持续微幅震荡 */
-#define CHASSIS_POS_HOLD_DEAD_ZONE_M        (0.002f)
+#define CHASSIS_POS_HOLD_DEAD_ZONE_M        (0.0005f)
 
 /** D 项低通滤波系数 α (一阶 IIR) — 截止 ≈ α/(2π·dt)
  *  0.10 @ 20ms → 截止≈0.8Hz，衰减 odom 高频噪声 */
-#define CHASSIS_POS_D_LPF_ALPHA             (0.10f)
+#define CHASSIS_POS_D_LPF_ALPHA             (0.20f)
 
 /** brake_cap 末段最小有效速度 (m/s) — 克服静摩擦，确保推进到 EPSILON 内
  *  P0-修复 2026-06-30: 0.65→0.15。0.65 刹车距离 7cm > EPSILON 2.5cm → 必定过冲。
@@ -257,7 +271,7 @@
 /* P0-修复 2026-07-17: 0.15→0.06, 刹车区末段最低速减半, 配合 KD 翻倍平滑停入 EPSILON. */
 /* 0.06→0.10: 略高以克服静摩擦, 配合 KD=1.65 刹得住不过冲 */
 /* 降到 0.02: 仅克服静摩擦的最低推力, 不强制推车冲过 EPSILON */
-#define CHASSIS_POS_BRAKE_FLOOR_MPS         (0.50f)
+#define CHASSIS_POS_BRAKE_FLOOR_MPS         (1.0f)
 
 /* ============================================================
  * §D IMU / 卡尔曼滤波 / 编码器融合
@@ -281,7 +295,7 @@
 #define CHASSIS_IMU_GYRO_DEADZONE_DPS       (0.003f)
 
 /** Yaw 角速度一阶低通系数 (0,1] — 越小越平滑 */
-#define CHASSIS_IMU_GYRO_LPF_ALPHA          (0.1f)
+#define CHASSIS_IMU_GYRO_LPF_ALPHA          (0.2f)
 
 /** 静止时在线零偏慢修正系数 (EMA) */
 #define CHASSIS_IMU_BIAS_ADAPT_ALPHA        (0.002f)
@@ -421,22 +435,22 @@
 /* LF (Wheel 0)
  * P0-修复 2026-06-07: TARGET_EPS=0+FB_STATIC=2.10→breakaway 永远激活，
  * 位置环收拢时指令小幅正负交替→breakaway 跟跳 2000PWM→把车甩出极限环 */
-#define CHASSIS_WHEEL_BREAKAWAY_LF_TARGET_EPS_MPS          (0.0f)
+#define CHASSIS_WHEEL_BREAKAWAY_LF_TARGET_EPS_MPS          (0.01f)
 #define CHASSIS_WHEEL_BREAKAWAY_LF_PWM_FLOOR               (750.0f)
 #define CHASSIS_WHEEL_BREAKAWAY_LF_FB_STATIC_EPS_MPS       (1.90f)
 
 /* RF (Wheel 1) */
-#define CHASSIS_WHEEL_BREAKAWAY_RF_TARGET_EPS_MPS          (0.0f)
+#define CHASSIS_WHEEL_BREAKAWAY_RF_TARGET_EPS_MPS          (0.01f)
 #define CHASSIS_WHEEL_BREAKAWAY_RF_PWM_FLOOR               (750.0f)
 #define CHASSIS_WHEEL_BREAKAWAY_RF_FB_STATIC_EPS_MPS       (1.90f)
 
 /* LB (Wheel 2) */
-#define CHASSIS_WHEEL_BREAKAWAY_LB_TARGET_EPS_MPS          (0.0f)
+#define CHASSIS_WHEEL_BREAKAWAY_LB_TARGET_EPS_MPS          (0.01f)
 #define CHASSIS_WHEEL_BREAKAWAY_LB_PWM_FLOOR               (750.0f)
 #define CHASSIS_WHEEL_BREAKAWAY_LB_FB_STATIC_EPS_MPS       (1.90f)
 
 /* RB (Wheel 3) */
-#define CHASSIS_WHEEL_BREAKAWAY_RB_TARGET_EPS_MPS          (0.0f)
+#define CHASSIS_WHEEL_BREAKAWAY_RB_TARGET_EPS_MPS          (0.01f)
 #define CHASSIS_WHEEL_BREAKAWAY_RB_PWM_FLOOR               (750.0f)
 #define CHASSIS_WHEEL_BREAKAWAY_RB_FB_STATIC_EPS_MPS       (1.90f)
 
@@ -485,7 +499,7 @@
 /* (1) 执行器输出 MOTOR_*_OUTPUT_DIR: driver 乘命令，使 +命令 → 物理前进
  *     ★ 占位 +1 已按实车标定填写，换接线/换电机线序后必须重新辨识 */
 #define MOTOR_LF_OUTPUT_DIR                 (+1.0f)
-#define MOTOR_RF_OUTPUT_DIR                 (-1.0f)
+#define MOTOR_RF_OUTPUT_DIR                 (+1.0f)
 #define MOTOR_LB_OUTPUT_DIR                 (+1.0f)
 #define MOTOR_RB_OUTPUT_DIR                 (-1.0f)
 
@@ -635,7 +649,7 @@
 #define CHASSIS_MPC_ENABLE                      (1)
 
 /** 预测步数 (20ms/步), N=10 → 200ms 前瞻 */
-#define CHASSIS_MPC_HORIZON_N                   (10)
+#define CHASSIS_MPC_HORIZON_N                   (40)
 
 /** QP 决策变量维度 = HORIZON_N */
 #define CHASSIS_MPC_H_DIM                       (CHASSIS_MPC_HORIZON_N)
@@ -644,13 +658,13 @@
 #define CHASSIS_MPC_H_PACKED                    ((CHASSIS_MPC_H_DIM) * ((CHASSIS_MPC_H_DIM) + 1) / 2)
 
 /** 位置精度权重 (m⁻²): 大→冲得快/停得猛, 小→柔和但可能不到位 */
-#define CHASSIS_MPC_Q_POS                       (10.0f)
+#define CHASSIS_MPC_Q_POS                       (140.0f)
 
 /** 速度幅值代价 (s²/m²): 大→巡航速度降低, 小→更接近 v_max */
-#define CHASSIS_MPC_R_VEL                       (0.07f)
+#define CHASSIS_MPC_R_VEL                       (0.02f)
 
 /** 速度平滑代价 (s²/m²): 大→加减速柔和, 小→响应快但可能 jerk */
-#define CHASSIS_MPC_R_SMOOTH                    (0.850f)
+#define CHASSIS_MPC_R_SMOOTH                    (0.650f)
 
 /** 终端位置额外权重因子: Q_term = Q_POS * 此值 */
 #define CHASSIS_MPC_QF_FACTOR                   (3.0f)
@@ -678,10 +692,13 @@
 /** 1=MPC 接管航向旋转, 0=回退 sqrt_controller */
 #define CHASSIS_MPC_YAW_ENABLE                  (1)
 
-/** Yaw 角度精度权重 (°⁻²): 大→转得猛/停得准, 小→柔和 */
-#define CHASSIS_MPC_YAW_Q_POS                   (0.300f)
+/** Yaw 角度精度权重 (°⁻²): 大→转得猛/停得准, 小→柔和.
+ *  H 矩阵中实际贡献 = Q_POS × dt² × (N+QF) = Q_POS × 0.006,
+ *  需要 ≥ 0.04 才能与 R_VEL 抗衡. Q_POS=12 时 pos 贡献 ≈ 0.072, 与 R_VEL 持平. */
+#define CHASSIS_MPC_YAW_Q_POS                   (1.80f)
 
-/** Yaw 角速度代价 (s²/°²): 大→转速降低, 小→更接近 max_yaw_speed */
+/** Yaw 角速度代价 (s²/°²): 大→转速降低, 小→更接近 max_yaw_speed.
+ *  Q_POS=12 + R_VEL=0.04 组合: err=5°→320dps, err=2°→140dps, err=0.5°→35dps. */
 #define CHASSIS_MPC_YAW_R_VEL                   (0.10f)
 
 /** Yaw 角速度平滑代价: 大→加速柔和, 小→响应快 */
@@ -693,7 +710,9 @@
 /** 角度误差超此值回退 sqrt_controller (°) */
 #define CHASSIS_MPC_YAW_FALLBACK_ERR_DEG        (120.0f)
 
-/** 角度误差低于此值不用 MPC (°): 近端 in-pos 锁接管 */
-#define CHASSIS_MPC_YAW_MIN_DEG                 (0.30f)
+/** 角度误差低于此值不用 MPC (°): 交棒给增益调度 sqrt_controller.
+ *  0.50 处 sqrt_ctrl(KP_eff≈3) → wz≈1.5dps, 与 MPC 末端输出平滑衔接.
+ *  设太小(0.2) MPC 会输出 ≈0.5dps 的无效微调, 浪费 CPU 且无实际效果. */
+#define CHASSIS_MPC_YAW_MIN_DEG                 (0.50f)
 
 #endif /* _CONFIG_CHASSIS_H_ */

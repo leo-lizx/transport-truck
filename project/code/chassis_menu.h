@@ -3,6 +3,12 @@
 
 #include "chassis_config.h"
 
+/* 1=启用调试菜单生命周期（IPS/按键/Flash 参数加载/周期扫描与渲染）。
+ * 设为 0 可在无屏幕模式下排查启动问题。 */
+#ifndef CHASSIS_MENU_ENABLE
+#define CHASSIS_MENU_ENABLE (1)
+#endif
+
 /*
  * 菜单模块公共接口：
  * - init: 系统启动时调用一次，加载当前底盘参数并初始化菜单状态。

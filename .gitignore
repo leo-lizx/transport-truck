@@ -72,3 +72,11 @@ project/code/plan.md
 .worktrees/
 __pycache__/
 *.pyc
+
+# Codex 生成的本地设计/实施过程文档，不参与固件编译与小车全程运行
+/docs/superpowers/
+
+# 仅在电脑端验证本次改动的临时回归测试，不加入 IAR/RT1064 固件
+/project/code/tests/test_chassis_arrival.c
+/project/code/tests/test_chassis_arrival_config.py
+/project/code/tests/test_clock_profile.py

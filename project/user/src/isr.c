@@ -67,12 +67,14 @@ void PIT_IRQHandler(void)
         chassis_ctrl_task_20ms();  // 20ms: 编码器 + 里程计 + PID + 导航
     }
     
+#if (CHASSIS_MENU_ENABLE != 0)
     if(pit_flag_get(PIT_CH2))
     {
         pit_flag_clear(PIT_CH2);
 
         chassis_menu_task_10ms();
     }
+#endif
     
     if(pit_flag_get(PIT_CH3))
     {
@@ -83,20 +85,20 @@ void PIT_IRQHandler(void)
 }
 
 void LPUART1_IRQHandler(void)
-{ /* P0-1 改造说明:
-     *   LPUART1 (B12/B13) 现在用于 OpenART2 分类数据接收；debug 已切到 UART8。
-     *   debug 模块只用 TX, RX 由本协议层独占, 因此这里直接把字节交给
-     *   app_link_isr_feed_class_byte() 而不再喂 debug 环形缓冲 (避免 64B 缓冲溢出).
+{ /* P0-1: UART1 (B12/B13) 复用为 debug 调试串口 + OpenART2 分类数据接收.
+     *   ─ debug_interrupr_handler() 用 uart_query_byte (非破坏性读), 仅喂 debug 环形缓冲
+     *   ─ OpenART2 分类链路用 uart_read_byte (破坏性读), 消费该字节
+     *   ─ 在纯调试模式(SINGLE_WHEEL/YAW_HOLD/POINT_NAV 等)下 OpenART2 不活跃, 不影响调试
      *   ─ 字节级零拷贝, 单次中断耗时 < 5 ?s.
-     *   ─ 状态机内部已做溢出/超时/同步保护, 不会卡死.
      */
     if(kLPUART_RxDataRegFullFlag & LPUART_GetStatusFlags(LPUART1))
     {
-        uint8 rx_byte = uart_read_byte(UART_1);         /* 读 LPUART1 数据寄存器并清 RDRF */
+        debug_interrupr_handler();                       /* debug 环形缓冲: 非破坏性读取 */
+        uint8 rx_byte = uart_read_byte(UART_1);          /* 读 LPUART1 数据寄存器并清 RDRF */
         app_link_isr_feed_class_byte(rx_byte);
     }
 
-        
+
     LPUART_ClearStatusFlags(LPUART1, kLPUART_RxOverrunFlag);    // 不允许删除
 }
 

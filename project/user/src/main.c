@@ -34,6 +34,7 @@
 ********************************************************************************************************************/
 
 #include "zf_common_headfile.h"
+#include "clock_config.h"
 #include "chassis_ctrl.h"
 #include "chassis_pid.h"
 #include "chassis_menu.h"
@@ -1843,7 +1844,9 @@ static void main_mode5_render_100ms(void)
 /* ========================================================================== */
 
 /* 菜单渲染分频 (主循环 5ms tick * N), N=20 => 100ms 刷一次 */
+#if (CHASSIS_MENU_ENABLE != 0)
 #define MAIN_MENU_RENDER_DIV          (20U)
+#endif
 
 #if (MAIN_RUN_MODE == MAIN_RUN_MODE_OPENART2_TEST)
 #define OA2_TEST_STALE_MS             (500U)
@@ -2085,9 +2088,11 @@ static void main_apply_debug_wheel_pid(void)
 /* ========================================================================== */
  int main(void)
 {
+#if (CHASSIS_MENU_ENABLE != 0)
     uint8 menu_render_div = 0U;
+#endif
 
-    clock_init(SYSTEM_CLOCK_600M);  // 不可删除
+    clock_init(BOARD_BOOTCLOCKRUN_CORE_CLOCK);  // 默认528MHz，降低电池冷启动的VDD_SOC需求
     debug_init();                   // 调试端口初始化
 
     // ------------------------------------------------------------------
@@ -2116,6 +2121,7 @@ static void main_apply_debug_wheel_pid(void)
     app_link_init();
 #endif
 
+#if (CHASSIS_MENU_ENABLE != 0)
     /*
      * IPS200 启动诊断: 复位后等 200ms (ST7789 要求≥120ms), 清一次黑屏.
      * 仅此一次写入, 后续主循环不写屏(HCM模式跳过 menu_render).
@@ -2129,6 +2135,7 @@ static void main_apply_debug_wheel_pid(void)
     ips200_full(RGB565_BLACK);
     ips200_set_color(RGB565_WHITE, RGB565_BLACK);
     key_init(10);
+#endif
 
     // ------------------------------------------------------------------
     // 3. 底盘控制子系统初始化 + 调参菜单
@@ -2136,7 +2143,9 @@ static void main_apply_debug_wheel_pid(void)
     //    注意: 调用此函数前请确保车模静止放置在平面上
     // ------------------------------------------------------------------
     chassis_ctrl_init();
+#if (CHASSIS_MENU_ENABLE != 0)
     chassis_menu_init();
+#endif
 #if (MAIN_RUN_MODE == MAIN_RUN_MODE_LEVEL1_TEST) || (MAIN_RUN_MODE == MAIN_RUN_MODE_HARDCODED_MAP) || (MAIN_RUN_MODE == MAIN_RUN_MODE_LEVEL2_TEST)
     /* 模式7/8固定发车: 上电先把里程计放在 (1,5.5), 暖机后沿 Y 轴平移到 (1,5). */
     chassis_ctrl_set_pose(MAIN_POS_GRID_TO_M_X(MAIN_POS_HCM_HOME_X_GRID),
@@ -2218,13 +2227,16 @@ static void main_apply_debug_wheel_pid(void)
 
     // ------------------------------------------------------------------
     // 4. PIT 定时中断初始化
-    //    CH0: 5ms 姿态采样  CH1: 20ms 底盘闭环  CH2: 10ms 菜单扫描（渲染在主循环）
+    //    CH0: 5ms 姿态采样  CH1: 20ms 底盘闭环
+    //    菜单开启时 CH2: 10ms 按键扫描（渲染在主循环）
     // ------------------------------------------------------------------
     pit_ms_init(PIT_CH0, 5);
     pit_ms_init(PIT_CH1, 20);
+#if (CHASSIS_MENU_ENABLE != 0)
     pit_ms_init(PIT_CH2, 10);
+#endif
 
-    /* 硬件看门狗: 屏幕 SPI 卡死时 2s 自动复位, 热启动恢复继续推箱 */
+    /* 硬件看门狗: 主循环卡死时 2s 自动复位 */
     {
         rtwdog_config_t wdt_cfg;
         RTWDOG_GetDefaultConfig(&wdt_cfg);
@@ -2454,6 +2466,7 @@ static void main_apply_debug_wheel_pid(void)
         Game_Logic_Task_Run();          /* 推箱子状态机 (非阻塞) */
     #endif
 
+#if (CHASSIS_MENU_ENABLE != 0)
         /* 菜单渲染放到主循环，避免在 PIT 中断内刷屏造成控制节拍抖动。 */
         menu_render_div++;
         if (menu_render_div >= MAIN_MENU_RENDER_DIV)
@@ -2471,6 +2484,7 @@ static void main_apply_debug_wheel_pid(void)
 #endif
 #endif
         }
+#endif
 
         /* P0-5: 节拍由 wait_for_tick() 在循环顶部统一接管, 此处不再 system_delay_ms */
     }
