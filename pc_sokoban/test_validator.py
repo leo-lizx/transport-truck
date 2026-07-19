@@ -35,6 +35,30 @@ r = sv.solve_stage1(m2, (5, 7))
 assert r is not None, "Stage1 应有解"
 print(f"总步数: {r['total_steps']}")
 
+# 测试2a: Stage1 公开入口应镜像固件，直接使用 greedy 而非 DFS 全局优化。
+print("\n=== 测试2a: Stage1 跳过 DFS 优化 ===")
+m2a, p2a, err2a = sv.parse_map_text("""
+################
+#----------.---#
+#--------------#
+#--------#-#---#
+#-----#-##-----#
+#----#--$------#
+#--##--#---.---#
+#--------------#
+#----##--###---#
+#------$-------#
+#--------@-----#
+################
+""")
+assert err2a == "", err2a
+greedy2a = sv._solve_stage1_greedy(m2a, p2a)
+stage1_2a = sv.solve_stage1(m2a, p2a)
+assert greedy2a is not None
+assert greedy2a['total_steps'] == 38
+assert stage1_2a == greedy2a
+print("Stage1 与固件一致，直接返回 greedy 的 38 步解。")
+
 # 测试3: 地图生成
 print("\n=== 测试3: 地图生成 ===")
 for seed in [1, 2, 42]:

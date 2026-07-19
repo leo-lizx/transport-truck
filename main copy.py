@@ -8,6 +8,7 @@
 #   - 物理抗反光：手动锁定曝光，关闭增益和白平衡。
 #   - 极速提取：废弃 Python 循环，使用底层的 img.get_statistics() 获取 11x11 众数。
 #   - 降维打击：废弃高耗时的巴氏距离，采用加权欧氏距离（L通道降权，过滤高光）。
+#   - 动态定位（新增）：利用 TAG16H5 码实现自动四角逆透视映射，并进行降频采样节约算力。
 # ======================================================================
 
 import sensor, image, time, math
@@ -98,12 +99,14 @@ DEBUG_DRAW_ROI = True
 # ----------------------------------------------------------------------
 ROWS, COLS = 12, 16
 
-# 场地四角外侧格子的中心点坐标（需根据实际场地微调）
+# 【修改注】：这里从绝对坐标变成了“初始占位符”。
+# 场地四角外侧格子的中心点坐标，系统运行后将由 AprilTag 动态刷新覆盖。
+# 如果系统刚上电或某个角被短暂遮挡，字典将维持最后一次识别的坐标（充当安全垫防崩溃）。
 GRID_CORNERS = {
-    "tl": (29.5, 55.0),  # 左上
-    "tr": (277.6, 50.0), # 右上
-    "bl": (30.0, 233.0), # 左下
-    "br": (282.8, 233.0),# 右下
+    "tl": (29.5, 55.0),  # 左上 ID: 15
+    "tr": (277.6, 50.0), # 右上 ID: 16
+    "bl": (30.0, 233.0), # 左下 ID: 18
+    "br": (282.8, 233.0),# 右下 ID: 17
 }
 
 GRID_K1 = +0.000000
@@ -136,7 +139,7 @@ def calc_grid_point(x_idx, y_idx, img_w, img_h):
     return int(center_x + dx * scale), int(center_y + dy * scale)
 
 def draw_calibration_overlay(img, img_w, img_h):
-    """绘制标定框，帮助手动对齐摄像头视角"""
+    """绘制标定框，帮助手动对齐摄像头视角或确认 AprilTag 动态映射是否生效"""
     tl = calc_grid_point(0, 0, img_w, img_h)
     tr = calc_grid_point(COLS - 1, 0, img_w, img_h)
     bl = calc_grid_point(0, ROWS - 1, img_w, img_h)
@@ -368,10 +371,38 @@ while(True):
     car_found = False
     tl_pt = tr_pt = bl_pt = br_pt = None
 
+    # ==================================================================
+    # --- 阶段 A0：AprilTag 动态四角定位 (新增：TAG16H5 识别与降频优化) ---
+    # 【算力优化】：AprilTag 识别是耗时运算，由于场地四个角物理位置相对固定，
+    # 系统采用降频机制，每 5 帧仅触发一次全图检索，将算力留给网格分类主逻辑。
+    # 遮挡安全垫：若某帧未检测到Tag，GRID_CORNERS 依然保留上一次的有效坐标。
+    # ==================================================================
+    if frame_cnt % 5 == 0:
+        # 替换为更简单的 TAG16H5 家族，提升识别速度
+        for tag in img.find_apriltags(families=image.TAG16H5):
+            tag_id = tag.id()
+            tag_cx, tag_cy = tag.cx(), tag.cy()
+            
+            # 根据场地布局更新四角逆透视物理基准点坐标
+            if tag_id == 15:
+                GRID_CORNERS["tl"] = (tag_cx, tag_cy)
+            elif tag_id == 16:
+                GRID_CORNERS["tr"] = (tag_cx, tag_cy)
+            elif tag_id == 17:
+                GRID_CORNERS["br"] = (tag_cx, tag_cy)
+            elif tag_id == 18:
+                GRID_CORNERS["bl"] = (tag_cx, tag_cy)
+                
+            # 可视化：若开启调试，在画面上画出被识别的Tag轮廓和ID，方便现场对正
+            if DEBUG_DRAW_ROI:
+                img.draw_rectangle(tag.rect(), color=(255, 0, 0))
+                img.draw_cross(tag_cx, tag_cy, color=(0, 255, 0))
+                img.draw_string(tag_cx, tag_cy, "ID:" + str(tag_id), color=(255, 255, 0))
+
     # --- 阶段 A：扫描解析赛道 ---
     for y_idx in range(ROWS):
         for x_idx in range(COLS):
-            # 获取物理逆透视坐标点
+            # 获取物理逆透视坐标点 (该坐标在阶段A0已通过 AprilTag 动态校准)
             tx, ty = calc_grid_point(x_idx, y_idx, img_w, img_h)
 
             if 0 <= tx < img_w and 0 <= ty < img_h:
@@ -417,7 +448,8 @@ while(True):
         print("\033[H", end="") # 清屏
         print("FPS: %0.1f | 小车坐标: (%d, %d)" % (clock.fps(), car_x, car_y))
         if CALIB_SHOW_CORNERS and tl_pt is not None:
-            print("基准: TL=%s TR=%s BL=%s BR=%s" % (tl_pt, tr_pt, bl_pt, br_pt))
+            # 这里的基准坐标已是 AprilTag 实时动态获取的值
+            print("动态基准: TL=%s TR=%s BL=%s BR=%s" % (tl_pt, tr_pt, bl_pt, br_pt))
 
         # 打印字符地图阵列
         for r in range(ROWS):
