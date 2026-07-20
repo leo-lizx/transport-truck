@@ -2,6 +2,7 @@
 #include "chassis_config.h"
 #include <string.h>
 #include <stdlib.h>     /* abs() */
+#include <math.h>       /* sqrtf() */
 
 /*===========================================================================
  *  [algo_sokoban_solver.c] 推箱子求解 + 导航 BFS + 炸弹策略
@@ -10,11 +11,11 @@
  *  @periph none                  纯算法 (BFS 导航 + 推箱子求解器 + 死局检测)
  *---------------------------------------------------------------------------
  *  分区索引:
- *    § 1. 内部常量 / 静态数组 / 位图压缩 BFS 状态          [L  10±]
+ *    § 1. 内部常量 / 静态数组 / 推宏 A* 状态                [L  10±]
  *    § 2. 导航 BFS (Algo_Nav_BFS, 原 algo_bfs_scout)              [L  62±]
  *    § 3. 观察点查找 (Algo_Find_Nearest_Box_Observe_Point)         [L  78±]
- *    § 4. 单箱 BFS 动作层 (sb_encode/decode/bm/nibble + bfs_single) [L 220±]
- *    § 5. Stage1/2 多箱分解与件谎检测 (extract/simulate/deadlock)[L 425±]
+ *    § 4. 单箱推宏 A*（箱格+上次推向，导航 BFS 连接）       [L 220±]
+ *    § 5. Stage1/2 多箱分解与死局检测 (extract/simulate/deadlock)[L 425±]
  *    § 6. 炸弹策略 (Find_Bomb_Wall / Apply_Bomb_Explosion / Push_Bomb)[L 685±]
  *    § 7. 动作序列 → 航点路径 (Sokoban_Actions_To_Waypoints)     [L 789±]
  *===========================================================================*/
@@ -27,45 +28,38 @@
 static const int8 s_dr[4] = { -1,  1,  0,  0 };
 static const int8 s_dc[4] = {  0,  0, -1,  1 };
 
-/** 单箱 BFS 状态空间大小 = MAP_ROWS × MAP_COLS × MAP_ROWS × MAP_COLS */
-#define SB_RC           (MAP_ROWS * MAP_COLS)               /* 192   */
-#define SB_STATE_COUNT  ((uint32)SB_RC * (uint32)SB_RC)     /* 36864 */
-#define SB_BITMAP_BYTES ((SB_STATE_COUNT + 7u) / 8u)
-#define SB_NIBBLE_BYTES ((SB_STATE_COUNT + 1u) / 2u)
+/**
+ * 单箱宏状态只记录“箱子格 + 上一次推箱方向”。玩家在一次推箱后必然位于
+ * 箱子反方向相邻格，故无需把玩家全坐标并入状态。
+ *
+ * 旧动作层 BFS 有 192*192=36864 个状态、约 31.5KB BSS；宏状态 A* 仅
+ * 192*4=768 个状态，行走段按需调用导航 BFS，既降低内存也把转弯停站成本
+ * 纳入搜索目标。
+ */
+#define SB_RC                   (MAP_ROWS * MAP_COLS)       /* 192 */
+#define SB_MACRO_STATE_COUNT    (SB_RC * 4U)                /* 768 */
+#define SB_MACRO_BITMAP_BYTES   ((SB_MACRO_STATE_COUNT + 7U) / 8U)
+#define SB_MACRO_PREV_NONE      (0xFFFFU)
+#define SB_MACRO_COST_INF       (0xFFFFFFFFUL)
 
-/* O1.3 单箱 BFS 层数(=解步数)上限。
- * 取 SOKOBAN_MAX_ACTIONS: 任何步数 > 该值的解都会在下方回溯阶段
- * (steps >= SOKOBAN_MAX_ACTIONS → return 0) 被判为不可用, 故在 BFS 阶段
- * 提前以同一阈值收手与"找到后再丢弃"完全等价, 只是省去多余层的扫描, 不改变可用解。 */
-#define SB_MAX_BFS_LAYERS  (SOKOBAN_MAX_ACTIONS)
+/* 与正式执行层一致的规划标尺（毫秒量级，不用于精确物理仿真）。 */
+#define SOKO_COST_MOVE_MS       (100UL)
+#define SOKO_COST_WAYPOINT_MS   (400UL)
+#define SOKO_COST_SNAP_MS       (200UL)
 
-/*===========================================================================
- *  静态数组（位图压缩版）
- *
- *  sb_parent_nibble[i] (4bit / 状态):
- *      0       = 未访问
- *      1..4    = 到达该状态的普通移动动作编号 + 1
- *      5       = 起始状态标记
- *      6..9    = 到达该状态的推箱动作编号 + 6
- *
- *  sb_visited_bm     : 已访问状态位图
- *  sb_frontier_cur_bm: 当前层前沿位图
- *  sb_frontier_nxt_bm: 下一层前沿位图
- *
- *  总内存约: 18KB + 4.5KB * 3 ≈ 31.5KB
- *===========================================================================*/
-static uint8 sb_parent_nibble[SB_NIBBLE_BYTES];
-static uint8 sb_visited_bm[SB_BITMAP_BYTES];
-static uint8 sb_frontier_cur_bm[SB_BITMAP_BYTES];
-static uint8 sb_frontier_nxt_bm[SB_BITMAP_BYTES];
+static uint32 sb_macro_cost[SB_MACRO_STATE_COUNT];
+static uint16 sb_macro_prev[SB_MACRO_STATE_COUNT];
+static uint8  sb_macro_open[SB_MACRO_BITMAP_BYTES];
+static uint8  sb_macro_closed[SB_MACRO_BITMAP_BYTES];
+static uint16 sb_macro_reverse[SB_MACRO_STATE_COUNT];
+static uint8  sb_macro_base_map[MAP_ROWS][MAP_COLS];
+static uint8  sb_macro_walk_map[MAP_ROWS][MAP_COLS];
+static NavPath_t sb_macro_walk_path;
 
 /** 子地图临时缓冲 */
 static uint8  sb_sub_map[MAP_ROWS][MAP_COLS];
 /* Stage1/2 贪心只会串行执行，复用同一份 BFS 距离缓冲，避免为 Stage2 额外增加 BSS。 */
 static uint8  sb_nav_distance[MAP_ROWS][MAP_COLS];
-
-#define SB_PARENT_START      (5u)
-#define SB_PARENT_PUSH_BASE  (6u)
 
 /*===========================================================================
  *  原 algo_bfs_scout.c 实现（合并到本文件）
@@ -324,238 +318,309 @@ static uint8 nav_distance_to_box(const uint8 distance_steps[MAP_ROWS][MAP_COLS],
  *  内联辅助函数
  *===========================================================================*/
 
-/** 状态 → 扁平索引 */
 /* ==========================================================================
- *  § 4. 单箱 BFS 动作层 — 位图压缩状态空间 + 推箱完备性検查
+ *  § 4. 单箱推宏 A* — 状态=(箱子格, 上次推向)，边=绕行到箱后并推一步
  * ========================================================================== */
 
-static inline uint16 sb_encode(int8 pr, int8 pc, int8 br, int8 bc)
-{
-    return (uint16)(((uint16)(pr * MAP_COLS + pc)) * SB_RC
-                  + (uint16)(br * MAP_COLS + bc));
-}
-
-/** 扁平索引 → 状态分量 */
-static inline void sb_decode(uint16 idx, int8 *pr, int8 *pc, int8 *br, int8 *bc)
-{
-    uint16 player_part = idx / SB_RC;
-    uint16 box_part    = idx % SB_RC;
-    *pr = (int8)(player_part / MAP_COLS);
-    *pc = (int8)(player_part % MAP_COLS);
-    *br = (int8)(box_part    / MAP_COLS);
-    *bc = (int8)(box_part    % MAP_COLS);
-}
-
-/** 检查 (r, c) 是否在地图内且可通行（空地 / 目标点） */
 static inline uint8 sb_is_free(const uint8 map[MAP_ROWS][MAP_COLS], int8 r, int8 c)
 {
-    if (!map_is_inner_cell(r, c)) return 0;
-    return (map[r][c] == MAP_EMPTY || map[r][c] == MAP_TARGET) ? 1 : 0;
+    if (!map_is_inner_cell(r, c)) return 0U;
+    return (map[r][c] == MAP_EMPTY || map[r][c] == MAP_TARGET) ? 1U : 0U;
 }
 
-/** 位图: 读取 bit */
 static inline uint8 sb_bm_test(const uint8 *bm, uint16 idx)
 {
-    return (uint8)((bm[idx >> 3] >> (idx & 7u)) & 1u);
+    return (uint8)((bm[idx >> 3] >> (idx & 7U)) & 1U);
 }
 
-/** 位图: 写入 bit=1 */
 static inline void sb_bm_set(uint8 *bm, uint16 idx)
 {
-    bm[idx >> 3] |= (uint8)(1u << (idx & 7u));
+    bm[idx >> 3] |= (uint8)(1U << (idx & 7U));
 }
 
-/** 4bit 数组: 获取值 */
-static inline uint8 sb_nibble_get(const uint8 *arr, uint16 idx)
+static inline void sb_bm_clear(uint8 *bm, uint16 idx)
 {
-    uint8 v = arr[idx >> 1];
-    if (idx & 1u) {
-        return (uint8)((v >> 4) & 0x0Fu);
-    }
-    return (uint8)(v & 0x0Fu);
+    bm[idx >> 3] &= (uint8)~(uint8)(1U << (idx & 7U));
 }
 
-/** 4bit 数组: 写入值 (0..15) */
-static inline void sb_nibble_set(uint8 *arr, uint16 idx, uint8 val)
+static inline uint16 sb_macro_encode(Point_t box, uint8 push_dir)
 {
-    uint8 *p = &arr[idx >> 1];
-    if (idx & 1u) {
-        *p = (uint8)((*p & 0x0Fu) | ((val & 0x0Fu) << 4));
-    } else {
-        *p = (uint8)((*p & 0xF0u) | (val & 0x0Fu));
-    }
+    return (uint16)(((uint16)(box.y * MAP_COLS + box.x) * 4U) + push_dir);
 }
 
-/*===========================================================================
- *  核心：单箱 BFS 求解
- *
- *  状态 = (玩家行, 玩家列, 箱子行, 箱子列)
- *  转移 = 玩家尝试 4 方向移动:
- *        - 若移入箱子位置 → 推箱（箱子目标格必须可通行）
- *        - 否则 → 普通行走（目标格必须可通行且非箱子位置）
- *  目标 = 箱子坐标到达 target
- *===========================================================================*/
+static inline Point_t sb_macro_box(uint16 state)
+{
+    Point_t box;
+    uint16 cell = (uint16)(state / 4U);
+    box.y = (int8)(cell / MAP_COLS);
+    box.x = (int8)(cell % MAP_COLS);
+    return box;
+}
+
+static inline void soko_push_bit_set(SokoActionSeq_t *seq, uint16 index)
+{
+    seq->push_bitmap[index >> 3] |= (uint8)(1U << (index & 7U));
+}
+
+static inline uint8 soko_push_bit_test(const SokoActionSeq_t *seq, uint16 index)
+{
+    return (uint8)((seq->push_bitmap[index >> 3] >> (index & 7U)) & 1U);
+}
+
+static uint8 soko_action_from_points(Point_t from, Point_t to, uint8 *dir)
+{
+    if (!dir) return 0U;
+    for (uint8 d = 0U; d < 4U; ++d) {
+        if ((int8)(from.y + s_dr[d]) == to.y &&
+            (int8)(from.x + s_dc[d]) == to.x) {
+            *dir = d;
+            return 1U;
+        }
+    }
+    return 0U;
+}
+
+static uint8 soko_seq_append(SokoActionSeq_t *seq, uint8 dir, uint8 is_push)
+{
+    uint16 index;
+    if (!seq || dir >= 4U || seq->count >= SOKOBAN_MAX_ACTIONS) return 0U;
+    index = seq->count++;
+    seq->actions[index] = (SokoAction_e)dir;
+    if (is_push) soko_push_bit_set(seq, index);
+    return 1U;
+}
+
+/** 计算一次“走到箱后并推一步”的执行时间标尺。 */
+static uint32 sb_macro_edge_cost(const NavPath_t *walk,
+                                 Point_t walk_start,
+                                 uint8 previous_push_dir,
+                                 uint8 push_dir)
+{
+    Point_t prev = walk_start;
+    uint8 last_dir = previous_push_dir;
+    uint8 had_walk = 0U;
+    uint32 cost = 0UL;
+
+    for (uint16 i = 0U; i < walk->step_count; ++i) {
+        uint8 dir;
+        if (!soko_action_from_points(prev, walk->path[i], &dir)) return SB_MACRO_COST_INF;
+        cost += SOKO_COST_MOVE_MS;
+        if (last_dir >= 4U || dir != last_dir) cost += SOKO_COST_WAYPOINT_MS;
+        last_dir = dir;
+        prev = walk->path[i];
+        had_walk = 1U;
+    }
+
+    cost += SOKO_COST_MOVE_MS;
+    if (last_dir >= 4U || push_dir != last_dir) cost += SOKO_COST_WAYPOINT_MS;
+
+    /* 连续同向推仍属于同一个关键航段，只计一次 Snap。 */
+    if (had_walk || previous_push_dir >= 4U || push_dir != previous_push_dir) {
+        cost += SOKO_COST_SNAP_MS;
+    }
+    return cost;
+}
+
+/** 检查一条推宏边并返回其导航路径与代价。 */
+static uint8 sb_macro_make_edge(const uint8 sub_map[MAP_ROWS][MAP_COLS],
+                                Point_t player,
+                                Point_t box,
+                                Point_t target,
+                                uint8 push_dir,
+                                uint8 previous_push_dir,
+                                uint8 block_other_targets,
+                                uint32 *edge_cost)
+{
+    Point_t stand;
+    Point_t box_next;
+
+    stand.y = (int8)(box.y - s_dr[push_dir]);
+    stand.x = (int8)(box.x - s_dc[push_dir]);
+    box_next.y = (int8)(box.y + s_dr[push_dir]);
+    box_next.x = (int8)(box.x + s_dc[push_dir]);
+
+    if (!sb_is_free(sub_map, stand.y, stand.x) ||
+        !sb_is_free(sub_map, box_next.y, box_next.x)) {
+        return 0U;
+    }
+    if (block_other_targets &&
+        sub_map[box_next.y][box_next.x] == MAP_TARGET &&
+        !(box_next.x == target.x && box_next.y == target.y)) {
+        return 0U;
+    }
+
+    memcpy(sb_macro_walk_map, sub_map, sizeof(sb_macro_walk_map));
+    sb_macro_walk_map[box.y][box.x] = MAP_WALL;
+    if (!Algo_Nav_BFS(sb_macro_walk_map, player, stand, &sb_macro_walk_path)) return 0U;
+
+    if (edge_cost) {
+        *edge_cost = sb_macro_edge_cost(&sb_macro_walk_path,
+                                        player,
+                                        previous_push_dir,
+                                        push_dir);
+    }
+    return 1U;
+}
+
 static uint8 sokoban_bfs_single(const uint8 sub_map[MAP_ROWS][MAP_COLS],
                                 Point_t player, Point_t box, Point_t target,
                                 SokoActionSeq_t *sol,
                                 uint8 block_other_targets)
 {
-    uint16 start_idx, goal_idx = 0;
-    uint8 found = 0;
+    uint16 goal_state = SB_MACRO_PREV_NONE;
 
-    if (0 == sol) return 0;
+    if (!sol) return 0U;
     if (!map_is_inner_cell(player.y, player.x) ||
         !map_is_inner_cell(box.y, box.x) ||
         !map_is_inner_cell(target.y, target.x)) {
-        return 0;
+        return 0U;
     }
 
-    sol->count = 0;
-    memset(sb_parent_nibble, 0, sizeof(sb_parent_nibble));
-    memset(sb_visited_bm, 0, sizeof(sb_visited_bm));
-    memset(sb_frontier_cur_bm, 0, sizeof(sb_frontier_cur_bm));
-    memset(sb_frontier_nxt_bm, 0, sizeof(sb_frontier_nxt_bm));
+    sol->count = 0U;
+    memset(sol->push_bitmap, 0, sizeof(sol->push_bitmap));
+    if (box.y == target.y && box.x == target.x) return 1U;
 
-    /* 起点已是终点 */
-    if (box.y == target.y && box.x == target.x) return 1;
+    memcpy(sb_macro_base_map, sub_map, sizeof(sb_macro_base_map));
+    sb_macro_base_map[box.y][box.x] = MAP_EMPTY;
 
-    start_idx = sb_encode(player.y, player.x, box.y, box.x);
-    sb_nibble_set(sb_parent_nibble, start_idx, 5u);   /* 标记为起始 */
-    sb_bm_set(sb_visited_bm, start_idx);
-    sb_bm_set(sb_frontier_cur_bm, start_idx);
+    for (uint16 i = 0U; i < SB_MACRO_STATE_COUNT; ++i) {
+        sb_macro_cost[i] = SB_MACRO_COST_INF;
+        sb_macro_prev[i] = SB_MACRO_PREV_NONE;
+    }
+    memset(sb_macro_open, 0, sizeof(sb_macro_open));
+    memset(sb_macro_closed, 0, sizeof(sb_macro_closed));
 
-    uint16 layers = 0;
+    /* 由任意初始玩家位置产生第一推。 */
+    for (uint8 d = 0U; d < 4U; ++d) {
+        uint32 edge_cost;
+        Point_t next_box;
+        uint16 state;
+        if (!sb_macro_make_edge(sb_macro_base_map, player, box, target, d,
+                                (uint8)SOKO_ACT_NONE,
+                                block_other_targets, &edge_cost)) {
+            continue;
+        }
+        next_box.y = (int8)(box.y + s_dr[d]);
+        next_box.x = (int8)(box.x + s_dc[d]);
+        state = sb_macro_encode(next_box, d);
+        if (edge_cost < sb_macro_cost[state]) {
+            sb_macro_cost[state] = edge_cost;
+            sb_macro_prev[state] = SB_MACRO_PREV_NONE;
+            sb_bm_set(sb_macro_open, state);
+        }
+    }
+
     while (1) {
-        uint8 has_next = 0;
+        uint16 current = SB_MACRO_PREV_NONE;
+        uint32 best_f = SB_MACRO_COST_INF;
 
-        /* O1.3: 层数(=解步数)达到上限仍未命中, 与"找到超长解后被回溯丢弃"等价, 直接判无解。 */
-        if (++layers > (uint16)SB_MAX_BFS_LAYERS) return 0;
+        for (uint16 state = 0U; state < SB_MACRO_STATE_COUNT; ++state) {
+            Point_t state_box;
+            uint32 heuristic;
+            uint32 f;
+            if (!sb_bm_test(sb_macro_open, state)) continue;
+            state_box = sb_macro_box(state);
+            heuristic = (uint32)(abs(state_box.x - target.x) +
+                                 abs(state_box.y - target.y)) * SOKO_COST_MOVE_MS;
+            f = sb_macro_cost[state] + heuristic;
+            if (f < best_f) {
+                best_f = f;
+                current = state;
+            }
+        }
+        if (current == SB_MACRO_PREV_NONE) return 0U;
 
-        memset(sb_frontier_nxt_bm, 0, sizeof(sb_frontier_nxt_bm));
+        sb_bm_clear(sb_macro_open, current);
+        sb_bm_set(sb_macro_closed, current);
 
-        /* O1.1b: 前沿位图通常很稀疏(典型层宽 50~200 状态), 旧实现逐位扫描全部
-         * 36864 个状态索引。改为逐字节遍历位图: 空字节(占绝大多数)一次比较即跳过,
-         * 只对置位字节展开其 8 个比特。避免解码海量未置位状态, 显著降低单层耗时。
-         * (未使用 __builtin_ctz: 该 GCC 内建在 IAR/ICCARM 下不保证可用, 改用可移植写法。) */
-        for (uint16 byi = 0; byi < (uint16)SB_BITMAP_BYTES; byi++) {
-            uint8 bits = sb_frontier_cur_bm[byi];
-            if (bits == 0u) continue;
+        {
+            Point_t current_box = sb_macro_box(current);
+            uint8 previous_dir = (uint8)(current & 3U);
+            Point_t current_player;
+            current_player.y = (int8)(current_box.y - s_dr[previous_dir]);
+            current_player.x = (int8)(current_box.x - s_dc[previous_dir]);
 
-          for (uint8 b = 0u; b < 8u; b++) {
-            int8 pr, pc, br, bc;
-            uint16 cur_idx;
-            if ((bits & (uint8)(1u << b)) == 0u) continue;
-
-            cur_idx = (uint16)(byi * 8u + b);
-            sb_decode(cur_idx, &pr, &pc, &br, &bc);
-
-            for (int d = 0; d < 4; d++) {
-                int8 npr = pr + s_dr[d];
-                int8 npc = pc + s_dc[d];
-                int8 nbr, nbc;
-                uint8 is_push = 0U;
-
-                if (npr == br && npc == bc) {
-                    /* ---------- 推箱 ---------- */
-                    nbr = br + s_dr[d];
-                    nbc = bc + s_dc[d];
-                    if (!sb_is_free(sub_map, nbr, nbc)) continue;
-                    if (block_other_targets &&
-                        sub_map[nbr][nbc] == MAP_TARGET &&
-                        !(nbr == target.y && nbc == target.x)) {
-                        continue;
-                    }
-                    is_push = 1U;
-                } else {
-                    /* ---------- 普通行走 ---------- */
-                    if (!sb_is_free(sub_map, npr, npc)) continue;
-                    nbr = br;
-                    nbc = bc;
-                }
-
-                uint16 nidx = sb_encode(npr, npc, nbr, nbc);
-                if (sb_bm_test(sb_visited_bm, nidx)) continue;   /* 已访问 */
-
-                sb_bm_set(sb_visited_bm, nidx);
-                sb_bm_set(sb_frontier_nxt_bm, nidx);
-                sb_nibble_set(sb_parent_nibble, nidx,
-                              is_push ? (uint8)(d + SB_PARENT_PUSH_BASE) : (uint8)(d + 1));
-                has_next = 1;
-
-                /* 箱子到达目标 → 成功 */
-                if (nbr == target.y && nbc == target.x) {
-                    goal_idx = nidx;
-                    found = 1;
-                    break;
-                }
+            if (current_box.x == target.x && current_box.y == target.y) {
+                goal_state = current;
+                break;
             }
 
-            if (found) break;
-          }                        /* end for b  (字节内 8 个比特) */
-          if (found) break;
-        }                          /* end for byi (位图字节) */
-
-        if (found) break;
-        if (!has_next) return 0;   /* 无新前沿, 无解 */
-
-        memcpy(sb_frontier_cur_bm, sb_frontier_nxt_bm, sizeof(sb_frontier_cur_bm));
+            for (uint8 d = 0U; d < 4U; ++d) {
+                uint32 edge_cost;
+                uint32 next_cost;
+                Point_t next_box;
+                uint16 next_state;
+                if (!sb_macro_make_edge(sb_macro_base_map, current_player, current_box,
+                                        target, d, previous_dir,
+                                        block_other_targets, &edge_cost)) {
+                    continue;
+                }
+                next_box.y = (int8)(current_box.y + s_dr[d]);
+                next_box.x = (int8)(current_box.x + s_dc[d]);
+                next_state = sb_macro_encode(next_box, d);
+                if (sb_bm_test(sb_macro_closed, next_state)) continue;
+                next_cost = sb_macro_cost[current] + edge_cost;
+                if (next_cost < sb_macro_cost[next_state]) {
+                    sb_macro_cost[next_state] = next_cost;
+                    sb_macro_prev[next_state] = current;
+                    sb_bm_set(sb_macro_open, next_state);
+                }
+            }
+        }
     }
 
-    /* -------- 从终态反向回溯提取动作序列 -------- */
+    /* 反转推宏链，再逐段重建完整行走+推箱动作。 */
     {
-        SokoAction_e rev_buf[SOKOBAN_MAX_ACTIONS];
-        uint16 steps = 0;
-        uint16 idx   = goal_idx;
+        uint16 macro_count = 0U;
+        uint16 state = goal_state;
+        Point_t cur_player = player;
+        Point_t cur_box = box;
 
-        while (sb_nibble_get(sb_parent_nibble, idx) != SB_PARENT_START) {
-            uint8 parent_code = sb_nibble_get(sb_parent_nibble, idx);
-            uint8 is_push;
-            uint8 act;
-            if (steps >= SOKOBAN_MAX_ACTIONS) return 0;
-            if (parent_code >= SB_PARENT_PUSH_BASE) {
-                act = (uint8)(parent_code - SB_PARENT_PUSH_BASE);
-                is_push = 1U;
-            } else {
-                act = (uint8)(parent_code - 1U);
-                is_push = 0U;
-            }
-            rev_buf[steps++] = (SokoAction_e)act;
-
-            /* 还原前驱状态 */
-            int8 pr2, pc2, br2, bc2;
-            sb_decode(idx, &pr2, &pc2, &br2, &bc2);
-
-            int8 prev_pr = pr2 - s_dr[act];
-            int8 prev_pc = pc2 - s_dc[act];
-
-            int8 prev_br, prev_bc;
-            if (is_push) {
-                /* 推箱: 箱子之前在玩家现在的位置 */
-                prev_br = pr2;
-                prev_bc = pc2;
-            } else {
-                /* 普通行走: 箱子未动 */
-                prev_br = br2;
-                prev_bc = bc2;
-            }
-
-            idx = sb_encode(prev_pr, prev_pc, prev_br, prev_bc);
+        while (state != SB_MACRO_PREV_NONE) {
+            if (macro_count >= SB_MACRO_STATE_COUNT) return 0U;
+            sb_macro_reverse[macro_count++] = state;
+            state = sb_macro_prev[state];
         }
 
-        /* 倒序 → 正序 */
-        sol->count = steps;
-        for (uint16 i = 0; i < steps; i++) {
-            sol->actions[i] = rev_buf[steps - 1 - i];
+        for (uint16 ri = macro_count; ri > 0U; --ri) {
+            uint16 push_state = sb_macro_reverse[ri - 1U];
+            uint8 push_dir = (uint8)(push_state & 3U);
+            Point_t stand;
+            Point_t walk_prev = cur_player;
+            stand.y = (int8)(cur_box.y - s_dr[push_dir]);
+            stand.x = (int8)(cur_box.x - s_dc[push_dir]);
+
+            memcpy(sb_macro_walk_map, sb_macro_base_map, sizeof(sb_macro_walk_map));
+            sb_macro_walk_map[cur_box.y][cur_box.x] = MAP_WALL;
+            if (!Algo_Nav_BFS(sb_macro_walk_map, cur_player, stand,
+                              &sb_macro_walk_path)) {
+                return 0U;
+            }
+            for (uint16 wi = 0U; wi < sb_macro_walk_path.step_count; ++wi) {
+                uint8 walk_dir;
+                if (!soko_action_from_points(walk_prev,
+                                             sb_macro_walk_path.path[wi],
+                                             &walk_dir) ||
+                    !soko_seq_append(sol, walk_dir, 0U)) {
+                    return 0U;
+                }
+                walk_prev = sb_macro_walk_path.path[wi];
+            }
+            if (!soko_seq_append(sol, push_dir, 1U)) return 0U;
+
+            cur_player = cur_box;
+            cur_box.y = (int8)(cur_box.y + s_dr[push_dir]);
+            cur_box.x = (int8)(cur_box.x + s_dc[push_dir]);
         }
     }
-    return 1;
+    return 1U;
 }
 
 /*===========================================================================
  *  辅助：在地图上提取指定类型元素坐标
  *===========================================================================*/
 /* ==========================================================================
- *  § 5. Stage1/2 多箱分解 + 件谎检测 (extract / simulate / deadlock)
+ *  § 5. Stage1/2 多箱分解 + 死局检测 (extract / simulate / deadlock)
  * ========================================================================== */
 
 static uint8 extract_elements(const uint8 map[MAP_ROWS][MAP_COLS],
@@ -944,6 +1009,7 @@ static uint8 sokoban_solve_stage2_greedy(const uint8 map[MAP_ROWS][MAP_COLS],
 #define SOKO_OPT_BRANCH_BOX_LIMIT      (5U)
 #define SOKO_OPT_STAGE1_NODE_LIMIT_5   (1024UL)
 #define SOKO_OPT_INF_COST              (0xFFFFU)
+#define SOKO_STAGE1_PAIR_LIMIT         (256UL)
 
 typedef struct {
     uint8 b;
@@ -952,7 +1018,19 @@ typedef struct {
 } SokoOptCandidate_t;
 
 typedef struct {
+    uint8 initialized;
+    uint8 solved_mask;
+    uint8 target_mask;
+    uint8 candidate_count;
+    uint8 next_candidate;
+    Point_t player;
+    uint32 cost;
+    SokoOptCandidate_t candidates[SOKOBAN_MAX_BOXES * SOKOBAN_MAX_BOXES];
+} SokoStage1Frame_t;
+
+typedef struct {
     const uint8 (*map)[MAP_COLS];
+    uint8 map_copy[MAP_ROWS][MAP_COLS];
     Point_t boxes[SOKOBAN_MAX_BOXES];
     Point_t targets[SOKOBAN_MAX_BOXES];
     uint8 box_n;
@@ -964,11 +1042,16 @@ typedef struct {
     uint32 node_limit;
     uint8  hit_limit;
     uint8  best_valid;
-    uint16 best_cost;
+    uint32 best_cost;
 
     SokoActionSeq_t cur_seq[SOKOBAN_MAX_BOXES];
     Point_t         cur_end[SOKOBAN_MAX_BOXES];
     SokoFullSolution_t *out;
+
+    SokoSearchStatus_e stage1_status;
+    Point_t stage1_home;
+    uint8 stage1_depth;
+    SokoStage1Frame_t stage1_frames[SOKOBAN_MAX_BOXES + 1U];
 } SokoOptContext_t;
 
 static SokoOptContext_t s_soko_opt;
@@ -1206,35 +1289,259 @@ static uint8 soko_opt_prepare(const uint8 map[MAP_ROWS][MAP_COLS],
     return 1U;
 }
 
+/** 动作段的正式执行成本：每格行驶、每个方向航点停站、含推箱航段 Snap。 */
+static uint32 soko_seq_time_cost(const SokoActionSeq_t *seq)
+{
+    uint32 cost = 0UL;
+    uint16 segment_start = 0U;
+
+    if (!seq) return SB_MACRO_COST_INF;
+    for (uint16 i = 0U; i < seq->count; ++i) {
+        uint8 segment_end;
+        cost += SOKO_COST_MOVE_MS;
+        segment_end = (uint8)((i + 1U >= seq->count) ||
+                              (seq->actions[i] != seq->actions[i + 1U]));
+        if (!segment_end) continue;
+
+        cost += SOKO_COST_WAYPOINT_MS;
+        for (uint16 j = segment_start; j <= i; ++j) {
+            if (soko_push_bit_test(seq, j)) {
+                cost += SOKO_COST_SNAP_MS;
+                break;
+            }
+        }
+        segment_start = (uint16)(i + 1U);
+    }
+    return cost;
+}
+
+static uint32 soko_stage1_return_cost(Point_t player, Point_t home)
+{
+    int16 dx = (int16)home.x - (int16)player.x;
+    int16 dy = (int16)home.y - (int16)player.y;
+    uint32 cost = SOKO_COST_SNAP_MS;  /* 回库终点始终保留一次关键校正 */
+
+    if (dx != 0 || dy != 0) {
+        float distance_cells = sqrtf((float)(dx * dx + dy * dy));
+        cost += (uint32)(distance_cells * (float)SOKO_COST_MOVE_MS + 0.5f);
+        cost += SOKO_COST_WAYPOINT_MS; /* 直达库位仅产生一个停车航点 */
+    }
+    return cost;
+}
+
+static void soko_stage1_prepare_frame(SokoStage1Frame_t *frame)
+{
+    if (!frame || frame->initialized) return;
+    frame->initialized = 1U;
+    frame->candidate_count = 0U;
+    frame->next_candidate = 0U;
+
+    memcpy(sb_sub_map, s_soko_opt.map_copy, sizeof(sb_sub_map));
+    for (uint8 bi = 0U; bi < s_soko_opt.box_n; ++bi) {
+        if (frame->solved_mask & (uint8)(1U << bi)) {
+            sb_sub_map[s_soko_opt.boxes[bi].y][s_soko_opt.boxes[bi].x] = MAP_EMPTY;
+        }
+    }
+    if (!Algo_Nav_BFS_Flood(sb_sub_map, frame->player, 0, sb_nav_distance)) return;
+
+    for (uint8 bi = 0U; bi < s_soko_opt.box_n; ++bi) {
+        uint8 box_distance;
+        if (frame->solved_mask & (uint8)(1U << bi)) continue;
+        box_distance = nav_distance_to_box(sb_nav_distance, s_soko_opt.boxes[bi]);
+        if (box_distance >= ALGO_NAV_DISTANCE_UNREACHABLE) continue;
+
+        for (uint8 ti = 0U; ti < s_soko_opt.target_n; ++ti) {
+            int16 target_distance;
+            SokoOptCandidate_t *candidate;
+            if (frame->target_mask & (uint8)(1U << ti)) continue;
+            candidate = &frame->candidates[frame->candidate_count++];
+            target_distance = (int16)(abs(s_soko_opt.targets[ti].x -
+                                           s_soko_opt.boxes[bi].x) +
+                                      abs(s_soko_opt.targets[ti].y -
+                                           s_soko_opt.boxes[bi].y));
+            candidate->b = bi;
+            candidate->t = ti;
+            /* 先按玩家真实绕障接近距离选箱，再按箱到目标距离选配对。 */
+            candidate->h = (int16)((int16)box_distance * 32 + target_distance);
+        }
+    }
+    soko_sort_candidates(frame->candidates, frame->candidate_count);
+}
+
+static void soko_stage1_save_best(uint32 cost)
+{
+    if (!s_soko_opt.out) return;
+    s_soko_opt.out->total_boxes = s_soko_opt.box_n;
+    s_soko_opt.out->is_solved = 1U;
+    for (uint8 i = 0U; i < s_soko_opt.box_n; ++i) {
+        s_soko_opt.out->sub_solutions[i] = s_soko_opt.cur_seq[i];
+        s_soko_opt.out->player_end_pos[i] = s_soko_opt.cur_end[i];
+    }
+    s_soko_opt.best_cost = cost;
+    s_soko_opt.best_valid = 1U;
+}
+
+uint8 Sokoban_Stage1_Search_Begin(const uint8 map[MAP_ROWS][MAP_COLS],
+                                 Point_t player_pos,
+                                 Point_t home_pos)
+{
+    SokoStage1Frame_t *root;
+    if (!map || !map_is_inner_cell(player_pos.y, player_pos.x) ||
+        !map_is_inner_cell(home_pos.y, home_pos.x)) {
+        return 0U;
+    }
+
+    memset(&s_soko_opt, 0, sizeof(s_soko_opt));
+    memcpy(s_soko_opt.map_copy, map, sizeof(s_soko_opt.map_copy));
+    s_soko_opt.map = s_soko_opt.map_copy;
+    s_soko_opt.box_n = extract_elements(map, MAP_BOX,
+                                        s_soko_opt.boxes,
+                                        SOKOBAN_MAX_BOXES);
+    s_soko_opt.target_n = extract_elements(map, MAP_TARGET,
+                                           s_soko_opt.targets,
+                                           SOKOBAN_MAX_BOXES);
+    if (s_soko_opt.box_n == 0U ||
+        s_soko_opt.box_n != s_soko_opt.target_n ||
+        s_soko_opt.box_n > SOKOBAN_MAX_BOXES) {
+        s_soko_opt.stage1_status = SOKO_SEARCH_FAILED;
+        return 0U;
+    }
+
+    s_soko_opt.fixed_mapping = 0U;
+    s_soko_opt.stage1_home = home_pos;
+    s_soko_opt.stage1_depth = 0U;
+    s_soko_opt.best_cost = SB_MACRO_COST_INF;
+    s_soko_opt.node_limit = (s_soko_opt.box_n <= SOKO_OPT_EXACT_BOX_LIMIT)
+                          ? 0UL : SOKO_STAGE1_PAIR_LIMIT;
+    s_soko_opt.stage1_status = SOKO_SEARCH_RUNNING;
+
+    root = &s_soko_opt.stage1_frames[0];
+    root->solved_mask = 0U;
+    root->target_mask = 0U;
+    root->player = player_pos;
+    root->cost = 0UL;
+    root->initialized = 0U;
+    return 1U;
+}
+
+SokoSearchStatus_e Sokoban_Stage1_Search_Step(uint8 max_pair_evals,
+                                              SokoFullSolution_t *result)
+{
+    uint8 evaluated = 0U;
+    if (s_soko_opt.stage1_status != SOKO_SEARCH_RUNNING) {
+        return s_soko_opt.stage1_status;
+    }
+    if (!result) {
+        s_soko_opt.stage1_status = SOKO_SEARCH_FAILED;
+        return s_soko_opt.stage1_status;
+    }
+    if (!s_soko_opt.out) {
+        memset(result, 0, sizeof(*result));
+        s_soko_opt.out = result;
+    } else if (s_soko_opt.out != result) {
+        s_soko_opt.stage1_status = SOKO_SEARCH_FAILED;
+        return s_soko_opt.stage1_status;
+    }
+    if (max_pair_evals == 0U) max_pair_evals = 1U;
+
+    while (evaluated < max_pair_evals) {
+        SokoStage1Frame_t *frame =
+            &s_soko_opt.stage1_frames[s_soko_opt.stage1_depth];
+
+        if (s_soko_opt.stage1_depth >= s_soko_opt.box_n) {
+            uint32 return_cost = soko_stage1_return_cost(frame->player,
+                                                         s_soko_opt.stage1_home);
+            if (return_cost != SB_MACRO_COST_INF &&
+                frame->cost <= (SB_MACRO_COST_INF - return_cost) &&
+                (!s_soko_opt.best_valid ||
+                 frame->cost + return_cost < s_soko_opt.best_cost)) {
+                soko_stage1_save_best(frame->cost + return_cost);
+            }
+            --s_soko_opt.stage1_depth;
+            continue;
+        }
+
+        soko_stage1_prepare_frame(frame);
+        if (frame->next_candidate >= frame->candidate_count ||
+            (s_soko_opt.best_valid && frame->cost >= s_soko_opt.best_cost)) {
+            if (s_soko_opt.stage1_depth == 0U) {
+                s_soko_opt.stage1_status = s_soko_opt.best_valid
+                                          ? SOKO_SEARCH_SOLVED
+                                          : SOKO_SEARCH_FAILED;
+                return s_soko_opt.stage1_status;
+            }
+            --s_soko_opt.stage1_depth;
+            continue;
+        }
+
+        if (s_soko_opt.node_limit != 0UL &&
+            s_soko_opt.node_count >= s_soko_opt.node_limit) {
+            s_soko_opt.stage1_status = s_soko_opt.best_valid
+                                      ? SOKO_SEARCH_SOLVED
+                                      : SOKO_SEARCH_FAILED;
+            return s_soko_opt.stage1_status;
+        }
+
+        {
+            SokoOptCandidate_t candidate =
+                frame->candidates[frame->next_candidate++];
+            uint8 depth = s_soko_opt.stage1_depth;
+            uint32 seq_cost;
+            uint32 next_cost;
+            SokoStage1Frame_t *child;
+
+            ++s_soko_opt.node_count;
+            ++evaluated;
+            if (!soko_opt_solve_pair(frame->solved_mask,
+                                     frame->target_mask,
+                                     candidate.b,
+                                     candidate.t,
+                                     frame->player,
+                                     &s_soko_opt.cur_seq[depth],
+                                     &s_soko_opt.cur_end[depth])) {
+                continue;
+            }
+            seq_cost = soko_seq_time_cost(&s_soko_opt.cur_seq[depth]);
+            if (seq_cost == SB_MACRO_COST_INF ||
+                frame->cost > (SB_MACRO_COST_INF - seq_cost)) {
+                continue;
+            }
+            next_cost = frame->cost + seq_cost;
+            if (s_soko_opt.best_valid && next_cost >= s_soko_opt.best_cost) continue;
+
+            child = &s_soko_opt.stage1_frames[depth + 1U];
+            child->initialized = 0U;
+            child->solved_mask = (uint8)(frame->solved_mask |
+                                         (uint8)(1U << candidate.b));
+            child->target_mask = (uint8)(frame->target_mask |
+                                         (uint8)(1U << candidate.t));
+            child->player = s_soko_opt.cur_end[depth];
+            child->cost = next_cost;
+            s_soko_opt.stage1_depth = (uint8)(depth + 1U);
+        }
+    }
+    return SOKO_SEARCH_RUNNING;
+}
+
+void Sokoban_Stage1_Search_Cancel(void)
+{
+    s_soko_opt.stage1_status = SOKO_SEARCH_IDLE;
+    s_soko_opt.out = 0;
+}
+
 uint8 Sokoban_Solve_Stage1(const uint8 map[MAP_ROWS][MAP_COLS],
                            Point_t player_pos,
                            SokoFullSolution_t *result)
 {
-    uint8 fallback_ok;
+    SokoSearchStatus_e status;
+    if (!result || !Sokoban_Stage1_Search_Begin(map, player_pos, player_pos)) return 0U;
+    do {
+        status = Sokoban_Stage1_Search_Step(255U, result);
+    } while (status == SOKO_SEARCH_RUNNING);
 
-    if (result == 0) return 0U;
-    fallback_ok = sokoban_solve_stage1_greedy(map, player_pos, result);
-
-    /*
-     * 【启动加速】跳过 DFS 全局优化器，直接返回 greedy 结果。
-     *
-     * greedy 求解器已给出合法推箱路径（逐个箱子 BFS 搜索），DFS 优化器
-     * (soko_opt_dfs) 在此基础上做全排列穷举以寻找更优的推箱顺序和配对，
-     * 在有 N 个箱子时最多搜索 1024 个节点，每个节点内还要跑一次 BFS，
-     * 上电启动阶段耗时可达数秒，对调试迭代不友好。
-     *
-     * 如需最优解（正式比赛），取消下面 return 和 #if 0 即可恢复 DFS。
-     */
-#if 0
-    if (!soko_opt_prepare(map, 0, 0U, result, fallback_ok)) {
-        return fallback_ok;
-    }
-
-    soko_opt_dfs(0U, 0U, 0U, player_pos, 0U);
-    return s_soko_opt.best_valid ? 1U : fallback_ok;
-#else
-    return fallback_ok;
-#endif
+    if (status == SOKO_SEARCH_SOLVED) return 1U;
+    /* 非正式同步调用保留原贪心兜底；正式游戏使用分时接口，不阻塞 5ms tick。 */
+    return sokoban_solve_stage1_greedy(map, player_pos, result);
 }
 
 uint8 Sokoban_Solve_Stage2(const uint8 map[MAP_ROWS][MAP_COLS],
@@ -1392,8 +1699,9 @@ uint16 Sokoban_Actions_To_Waypoints(const SokoAction_e *actions,
                                     Point_t start_pos,
                                     SokoWaypointPath_t *wp_path)
 {
+    if (!wp_path) return 0U;
     wp_path->count = 0;
-    if (count == 0) return 0;
+    if (!actions || count == 0U) return 0U;
 
     int8 cx = start_pos.x;
     int8 cy = start_pos.y;
@@ -1408,11 +1716,64 @@ uint16 Sokoban_Actions_To_Waypoints(const SokoAction_e *actions,
             if (wp_path->count < SOKOBAN_MAX_WAYPOINTS) {
                 wp_path->points[wp_path->count].x = cx;
                 wp_path->points[wp_path->count].y = cy;
+                wp_path->kinds[wp_path->count] = (uint8)SOKO_WP_WALK;
                 wp_path->count++;
             }
         }
     }
     return wp_path->count;
+}
+
+uint16 Sokoban_Seq_To_Waypoints(const SokoActionSeq_t *seq,
+                                Point_t start_pos,
+                                SokoWaypointPath_t *wp_path)
+{
+    int8 cx;
+    int8 cy;
+    uint8 segment_has_push = 0U;
+
+    if (!wp_path) return 0U;
+    wp_path->count = 0U;
+    if (!seq || seq->count == 0U) return 0U;
+
+    cx = start_pos.x;
+    cy = start_pos.y;
+    for (uint16 i = 0U; i < seq->count; ++i) {
+        uint8 dir = (uint8)seq->actions[i];
+        if (dir >= 4U) return 0U;
+        cx = (int8)(cx + s_dc[dir]);
+        cy = (int8)(cy + s_dr[dir]);
+        if (soko_push_bit_test(seq, i)) segment_has_push = 1U;
+
+        if (i + 1U >= seq->count || seq->actions[i] != seq->actions[i + 1U]) {
+            if (wp_path->count >= SOKOBAN_MAX_WAYPOINTS) return 0U;
+            wp_path->points[wp_path->count].x = cx;
+            wp_path->points[wp_path->count].y = cy;
+            wp_path->kinds[wp_path->count] = segment_has_push
+                                           ? (uint8)SOKO_WP_CRITICAL
+                                           : (uint8)SOKO_WP_WALK;
+            ++wp_path->count;
+            segment_has_push = 0U;
+        }
+    }
+    return wp_path->count;
+}
+
+uint8 Sokoban_Build_Return_Waypoints(const uint8 map[MAP_ROWS][MAP_COLS],
+                                     Point_t player_pos,
+                                     Point_t home_pos,
+                                     SokoWaypointPath_t *wp_path)
+{
+    (void)map;
+    (void)player_pos;
+
+    if (!wp_path || !map_is_inner_cell(home_pos.y, home_pos.x)) return 0U;
+
+    /* 通关后虚拟墙/炸弹不再约束车体：直接向库位下发一个关键航点。 */
+    wp_path->points[0] = home_pos;
+    wp_path->kinds[0] = (uint8)SOKO_WP_CRITICAL;
+    wp_path->count = 1U;
+    return 1U;
 }
 
 /*===========================================================================

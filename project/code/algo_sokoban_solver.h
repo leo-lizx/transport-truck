@@ -11,7 +11,7 @@
  *     4. 解算结果为方向动作序列，可转换为车模导航路点
  *
  *   三阶段支持：
- *     Stage1 — 任意箱配任意目标（贪心分配，最近优先）
+ *     Stage1 — 任意箱配任意目标（连续计时时间成本全局搜索）
  *     Stage2 — 指定箱→目标映射（分类模式）
  *     Stage3 — 炸弹墙体求解辅助函数
  *
@@ -69,6 +69,7 @@ typedef struct {
 #define SOKOBAN_MAX_BOXES       8       // 地图中最大箱子数量
 #define SOKOBAN_MAX_ACTIONS     500     // 单次推箱最大步数
 #define SOKOBAN_MAX_WAYPOINTS   200     // 路点数组上限
+#define SOKOBAN_PUSH_BITMAP_BYTES ((SOKOBAN_MAX_ACTIONS + 7U) / 8U)
 #define ALGO_NAV_DISTANCE_UNREACHABLE (0xFFU)
 
 /* ======================================================================
@@ -87,12 +88,20 @@ typedef enum {
 /** 单个子问题的动作序列 */
 typedef struct {
     SokoAction_e actions[SOKOBAN_MAX_ACTIONS];
+    uint8        push_bitmap[SOKOBAN_PUSH_BITMAP_BYTES]; /* 1=该步实际推动箱子/炸弹 */
     uint16       count;         // 有效动作数量
 } SokoActionSeq_t;
+
+/** 航点类型：普通空走航点不需要视觉 Snap；关键航点需要。 */
+typedef enum {
+    SOKO_WP_WALK = 0,
+    SOKO_WP_CRITICAL
+} SokoWaypointKind_e;
 
 /** 路点路径（仅保留转弯点，供车模逐点导航） */
 typedef struct {
     Point_t  points[SOKOBAN_MAX_WAYPOINTS];
+    uint8    kinds[SOKOBAN_MAX_WAYPOINTS];
     uint16   count;
 } SokoWaypointPath_t;
 
@@ -154,14 +163,10 @@ uint8 Algo_Nav_Is_Reachable(const uint8 reach[MAP_ROWS][MAP_COLS],
                             Point_t target);
 
 /**
- * @brief  第一阶段求解 — 任意箱→任意目标（基础模式）
+ * @brief  第一阶段同步求解 — 任意箱→任意目标（PC/自测兼容入口）
  *
- * 使用"地图分解 + 贪心分配 + 单箱 BFS":
- *   1. 提取地图中所有箱子和目标
- *   2. 贪心选取最近的箱子，为其分配最近的目标
- *   3. 构建子地图（其余箱子→墙，其余目标→空地）
- *   4. BFS 解算单箱推送路径
- *   5. 循环直到所有箱子完成
+ * 使用时间成本全局搜索 + 单箱推宏 A*；正式 5ms 主循环应使用下面的
+ * Begin/Step 分时接口，避免在单次 Game_Logic_Task_Run 中同步完成全部规划。
  *
  * @param  map         当前地图
  * @param  player_pos  玩家初始坐标
@@ -171,6 +176,31 @@ uint8 Algo_Nav_Is_Reachable(const uint8 reach[MAP_ROWS][MAP_COLS],
 uint8 Sokoban_Solve_Stage1(const uint8 map[MAP_ROWS][MAP_COLS],
                            Point_t player_pos,
                            SokoFullSolution_t *result);
+
+/** 第一关分时搜索状态。 */
+typedef enum {
+    SOKO_SEARCH_IDLE = 0,
+    SOKO_SEARCH_RUNNING,
+    SOKO_SEARCH_SOLVED,
+    SOKO_SEARCH_FAILED
+} SokoSearchStatus_e;
+
+/**
+ * @brief 启动第一关分时全局搜索。
+ *
+ * 搜索目标为“动作时间 + 航点停站/Snap + 完成后直线到 home_pos 的返库时间”。
+ * 本模块不可重入；Begin 后只能由同一主循环周期调用 Step，直至终态或 Cancel。
+ */
+uint8 Sokoban_Stage1_Search_Begin(const uint8 map[MAP_ROWS][MAP_COLS],
+                                 Point_t player_pos,
+                                 Point_t home_pos);
+
+/** 每次最多评估 max_pair_evals 个箱-目标候选，适合拆到 5ms tick 中运行。 */
+SokoSearchStatus_e Sokoban_Stage1_Search_Step(uint8 max_pair_evals,
+                                              SokoFullSolution_t *result);
+
+/** 取消尚未结束的第一关分时搜索并释放上下文。 */
+void Sokoban_Stage1_Search_Cancel(void);
 
 /**
  * @brief  第二阶段求解 — 指定箱→目标映射（分类模式）
@@ -235,6 +265,22 @@ uint16 Sokoban_Actions_To_Waypoints(const SokoAction_e *actions,
                                     uint16 count,
                                     Point_t start_pos,
                                     SokoWaypointPath_t *wp_path);
+
+/** 根据动作中的 push_bitmap 生成带关键性标记的航点。 */
+uint16 Sokoban_Seq_To_Waypoints(const SokoActionSeq_t *seq,
+                                Point_t start_pos,
+                                SokoWaypointPath_t *wp_path);
+
+/**
+ * @brief 关卡完成后的直线返库航点。
+ *
+ * 通关后不再按虚拟墙和炸弹绕行，只生成一个指向车库的关键航点，供底盘
+ * POINT_NAV 直接走直线，并在到达后执行视觉 Snap/航向校准。
+ */
+uint8 Sokoban_Build_Return_Waypoints(const uint8 map[MAP_ROWS][MAP_COLS],
+                                     Point_t player_pos,
+                                     Point_t home_pos,
+                                     SokoWaypointPath_t *wp_path);
 
 /**
  * @brief  在地图上模拟炸弹爆炸，清除以 (wall_pos) 为中心的 3×3 内墙

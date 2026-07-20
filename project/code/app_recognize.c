@@ -1003,12 +1003,13 @@ AppRecognizeStatus_e App_Recognize_Tick(uint8 map[MAP_ROWS][MAP_COLS],
                                         uint8 level,
                                         uint8 box_to_target_out[SOKOBAN_MAX_BOXES])
 {
+    (void)has_bomb;  /* 第一关即使含炸弹也不需要数字分类；炸弹由规划失败兜底处理。 */
     switch (s_sub_state)
     {
         case RECOG_SUB_INIT:
         {
-            /* Stage1 简单贪心模式不需要识别: 关 1 且地图无炸弹直接放行 */
-            if ((level <= 1U) && (has_bomb == 0U))
+            /* 第一关无数字配对要求，跳过整圈分类 Tour，缩短连续计时总时长。 */
+            if (level <= 1U)
             {
                 return APP_RECOG_DONE_NO_NEED;
             }

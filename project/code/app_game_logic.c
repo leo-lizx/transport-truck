@@ -138,6 +138,12 @@ static SokoActionSeq_t       g_bomb_action_seq;
 static SokoWaypointPath_t    g_bomb_waypoints;
 static uint16                g_bomb_wp_idx = 0;
 
+/* 通关后忽略虚拟墙/炸弹，直接向库位下发一个关键航点。 */
+static SokoWaypointPath_t    g_return_waypoints;
+static uint16                g_return_wp_idx = 0U;
+static uint8                 g_return_path_valid = 0U;
+static uint8                 s_home_snap_fresh = 0U;
+
 static uint8                 g_box_to_target[SOKOBAN_MAX_BOXES] = {0};
 static ExecMode_e            g_exec_mode = EXEC_NONE;
 
@@ -325,6 +331,7 @@ static uint8 map_stability_tick(uint32 baseline_frame_id,
 
 static void reset_exec_context(void)
 {
+    Sokoban_Stage1_Search_Cancel();
     g_soko_solution.is_solved = 0;
     g_soko_solution.total_boxes = 0;
     g_soko_waypoints.count = 0;
@@ -334,6 +341,10 @@ static void reset_exec_context(void)
 
     g_bomb_waypoints.count = 0;
     g_bomb_wp_idx = 0;
+    g_return_waypoints.count = 0U;
+    g_return_wp_idx = 0U;
+    g_return_path_valid = 0U;
+    s_home_snap_fresh = 0U;
     g_exec_mode = EXEC_NONE;
     is_navigating = 0;
     s_wp_timeout_ticks = 0U;        /* B3b: 航点超时计数清零 */
@@ -484,12 +495,17 @@ static void sync_player_pos(void)
  *  § 2. 航点执行公用逻辑 (chassis_nav_arrived / exec_waypoints_common)
  * ========================================================================== */
 
-static uint8 chassis_nav_arrived_for_waypoint(void)
+static uint8 chassis_nav_arrived_for_waypoint(uint8 require_snap)
 {
     if (chassis_ctrl_is_arrived() == 0U)
     {
         app_vision_fusion_snap_cancel();
         return 0U;
+    }
+
+    if (require_snap == 0U) {
+        app_vision_fusion_snap_cancel();
+        return 1U;
     }
 
 #if CHASSIS_VISION_SNAP_ON_ARRIVE_ENABLE
@@ -566,7 +582,8 @@ static uint8 exec_waypoints_common(const SokoWaypointPath_t *wp, uint16 *wp_idx)
 
     /* B3b: 航点超时保护 — 超时(随段长放宽)先重发, 再超时切 DEADLOCK_RESET */
     s_wp_timeout_ticks++;
-    if (!chassis_nav_arrived_for_waypoint()) {
+    if (!chassis_nav_arrived_for_waypoint(
+            (uint8)(wp->kinds[*wp_idx] == (uint8)SOKO_WP_CRITICAL))) {
         if (s_wp_timeout_ticks > s_wp_timeout_limit) {
             if (s_wp_retry_count == 0U) {
                 /* 第 1 次超时: 刹停后重发同一航点 (可能是 Snap 表决卡住) */
@@ -608,9 +625,8 @@ static uint8 exec_push_box_solution(void)
             return 1;
         }
 
-        Sokoban_Actions_To_Waypoints(
-            g_soko_solution.sub_solutions[g_soko_sub_idx].actions,
-            g_soko_solution.sub_solutions[g_soko_sub_idx].count,
+        Sokoban_Seq_To_Waypoints(
+            &g_soko_solution.sub_solutions[g_soko_sub_idx],
             g_player_pos,                              /* B5: 用实时格而非 BFS 预测格 */
             &g_soko_waypoints);
         g_soko_wp_idx = 0;
@@ -661,14 +677,31 @@ static uint8 build_bomb_plan(Point_t blocked_target)
         return 0;
     }
 
-    Sokoban_Actions_To_Waypoints(g_bomb_action_seq.actions,
-                                 g_bomb_action_seq.count,
-                                 g_player_pos,
-                                 &g_bomb_waypoints);
+    Sokoban_Seq_To_Waypoints(&g_bomb_action_seq,
+                             g_player_pos,
+                             &g_bomb_waypoints);
     g_bomb_wp_idx = 0;
     g_exec_mode = EXEC_PUSH_BOMB;
     is_navigating = 0;
     return 1;
+}
+
+static uint8 activate_push_box_solution(void)
+{
+    if (!g_soko_solution.is_solved || g_soko_solution.total_boxes == 0U) {
+        return 0U;
+    }
+
+    g_soko_sub_idx = 0U;
+    if (Sokoban_Seq_To_Waypoints(&g_soko_solution.sub_solutions[0],
+                                 g_player_pos,
+                                 &g_soko_waypoints) == 0U) {
+        return 0U;
+    }
+    g_soko_wp_idx = 0U;
+    g_exec_mode = EXEC_PUSH_BOX;
+    is_navigating = 0U;
+    return 1U;
 }
 
 static uint8 build_push_box_plan(void)
@@ -679,38 +712,20 @@ static uint8 build_push_box_plan(void)
         return 1;
     }
 
-    /* B2: 第 1 关 = 任意箱→任意目标 (Stage1 贪心)
+    /* B2: 第 1 关由 stage_plan_handler 的分时搜索分支处理；
      * 第 2 关 = 必须按数字配对 (Stage2, 用 g_box_to_target[])
      * 第 3 关 = 含炸弹 (Stage2 + 炸弹辅助)
      * 判据只使用固定比赛顺序: 第 2 关无炸弹也必须按映射配对.
      */
-    if (current_level_number() >= 2U) {
-        if (!Sokoban_Solve_Stage2(g_game_map, g_player_pos,
-                                  g_box_to_target,
-                                  box_count,
-                                  &g_soko_solution)) {
-            return 0;
-        }
-    } else {
-        if (!Sokoban_Solve_Stage1(g_game_map, g_player_pos,
-                                  &g_soko_solution)) {
-            return 0;
-        }
-    }
-
-    if (!g_soko_solution.is_solved || g_soko_solution.total_boxes == 0) {
+    if (current_level_number() < 2U ||
+        !Sokoban_Solve_Stage2(g_game_map, g_player_pos,
+                              g_box_to_target,
+                              box_count,
+                              &g_soko_solution)) {
         return 0;
     }
 
-    g_soko_sub_idx = 0;
-    Sokoban_Actions_To_Waypoints(g_soko_solution.sub_solutions[0].actions,
-                                 g_soko_solution.sub_solutions[0].count,
-                                 g_player_pos,
-                                 &g_soko_waypoints);
-    g_soko_wp_idx = 0;
-    g_exec_mode = EXEC_PUSH_BOX;
-    is_navigating = 0;
-    return 1;
+    return activate_push_box_solution();
 }
 
 /* ==========================================================================
@@ -767,31 +782,37 @@ void Game_Logic_Init(void)
 
 static void stage_wait_start_handler(void)
 {
-    /* 仅保留左侧发车区。phase 0 返回 (1,5)，phase 1 完成视觉/航向校准；
+    /* 仅保留左侧发车区。phase 0 直线返回 (1,5)，phase 1 完成视觉/航向校准；
      * 地图在发车和到达 (1,4) 后的等待阶段始终解冻。
      */
     map_snapshot_release();
 
     if (s_wait_start_phase == 0U) {
-        s_wait_phase0_ticks++;
-        if (!is_navigating) {
-            HAL_CHASSIS_MOVE_TO(APP_GAME_LAUNCH_HOME_X,
-                                APP_GAME_LAUNCH_HOME_Y);
-            is_navigating = 1;
-            return;
+        if (g_return_path_valid != 0U) {
+            if (!exec_waypoints_common(&g_return_waypoints, &g_return_wp_idx)) return;
+            g_return_path_valid = 0U;
+        } else {
+            s_wait_phase0_ticks++;
+            if (!is_navigating) {
+                HAL_CHASSIS_MOVE_TO(APP_GAME_LAUNCH_HOME_X,
+                                    APP_GAME_LAUNCH_HOME_Y);
+                is_navigating = 1;
+                return;
+            }
+            /* 航点生成异常时仍直达库位；10s 未到则停车重发。 */
+            if (s_wait_phase0_ticks > WAIT_START_PHASE0_TIMEOUT_TICKS) {
+                chassis_ctrl_stop();
+                is_navigating = 0;
+                s_wait_phase0_ticks = 0U;
+                return;
+            }
+            if (!chassis_nav_arrived_for_waypoint(1U)) return;
         }
-        /* 返航10s仍未到位时停车并重新下发，禁止从未知位置直接发车。 */
-        if (s_wait_phase0_ticks > WAIT_START_PHASE0_TIMEOUT_TICKS) {
-            chassis_ctrl_stop();
-            is_navigating = 0;
-            s_wait_phase0_ticks = 0U;
-            return;
-        }
-        if (!chassis_nav_arrived_for_waypoint()) return;
 
         chassis_ctrl_stop();
         is_navigating = 0;
         s_wait_phase0_ticks = 0U;
+        s_home_snap_fresh = 1U;
         if (s_levels_finished >= APP_GAME_TOTAL_LEVELS) {
             goto_stage(STAGE_DONE);       /* 第三关也先返回 (1,5) 再收车 */
             return;
@@ -810,6 +831,13 @@ static void stage_wait_start_handler(void)
     if (s_launch_calib_done == 0U) {
         chassis_ctrl_stop();
         s_launch_calib_ticks++;
+        if (s_home_snap_fresh != 0U) {
+            /* phase 0 的最终关键航点刚完成 Snap，直接复用，避免重复静止表决。 */
+            s_home_snap_fresh = 0U;
+            calibrate_launch_heading();
+            s_launch_calib_done = 1U;
+            return;
+        }
 #if CHASSIS_VISION_SNAP_ON_ARRIVE_ENABLE
         if (s_link_alive != 0U) {
             float calib_x_m = chassis_grid_x_to_m(APP_GAME_LAUNCH_HOME_X);
@@ -854,7 +882,7 @@ static void stage_launch_exit_handler(void)
 
     /* 赛规以上位机网格 (1,4) 为刷新触发点，因此以该航点到达为发车成功，
      * 不再用车体外接圆完全离开旧发车区几何作为硬门槛。 */
-    if (chassis_nav_arrived_for_waypoint()) {
+    if (chassis_nav_arrived_for_waypoint(1U)) {
         chassis_ctrl_stop();
         s_launch_drive_issued = 0U;
         s_launch_drive_ticks = 0U;
@@ -919,7 +947,7 @@ static void stage_recognize_handler(void)
 {
     /* ============================================================
      * 识别 tour 子状态机驱动 (app_recognize.c):
-     *   - Stage1 简单贪心模式 (level=1 且无炸弹) → DONE_NO_NEED 直接放行
+     *   - Stage1 无数字配对要求（有无炸弹均同）→ DONE_NO_NEED 直接放行
      *   - Stage2/3: 遍历每个箱子和目标的观察点, 多数票投出 class_id,
      *               配对成 box→target 映射写入 g_box_to_target[]
      *   - 不可达或视觉持续无识别 → DEADLOCK_RESET 复位重试
@@ -995,19 +1023,53 @@ static uint8 try_build_breakout_bomb(void)
 
 static void stage_plan_handler(void)
 {
-    if (g_soko_exec_init) {
-        return;
-    }
-
-    g_soko_exec_init = 1;
-    /* 当前 handler 内同步完成规划; 从下一拍开始可恢复视觉地图刷新。 */
-    map_snapshot_release();
-
-    if (get_map_box_count() == 0) {
+    if (get_map_box_count() == 0U) {
+        Sokoban_Stage1_Search_Cancel();
         goto_stage(STAGE_LEVEL_JUDGE);
         return;
     }
 
+    if (current_level_number() == 1U) {
+        SokoSearchStatus_e search_status;
+        Point_t home = { (int8)APP_GAME_LAUNCH_HOME_X,
+                         (int8)APP_GAME_LAUNCH_HOME_Y };
+
+        if (g_soko_exec_init == 0U) {
+            g_soko_exec_init = 1U;
+            if (!Sokoban_Stage1_Search_Begin(g_game_map, g_player_pos, home)) {
+                map_snapshot_release();
+                if (try_build_breakout_bomb()) goto_stage(STAGE_EXECUTE_ACTION);
+                else goto_stage(STAGE_DEADLOCK_RESET);
+                return;
+            }
+            /* Begin 已复制规划地图；后续分时搜索不依赖视觉快照持续冻结。 */
+            map_snapshot_release();
+            return;
+        }
+
+        /* 每个 5ms tick 只评估一个箱-目标候选，控制单拍最坏耗时。 */
+        search_status = Sokoban_Stage1_Search_Step(1U, &g_soko_solution);
+        if (search_status == SOKO_SEARCH_RUNNING) return;
+        Sokoban_Stage1_Search_Cancel();
+        if (search_status == SOKO_SEARCH_SOLVED && activate_push_box_solution()) {
+            goto_stage(STAGE_EXECUTE_ACTION);
+            return;
+        }
+        if (try_build_breakout_bomb()) {
+            goto_stage(STAGE_EXECUTE_ACTION);
+            return;
+        }
+        goto_stage(STAGE_DEADLOCK_RESET);
+        return;
+    }
+
+    if (g_soko_exec_init) {
+        return;
+    }
+
+    g_soko_exec_init = 1U;
+    /* 第二、三关保留固定映射同步规划；规划完成后恢复视觉地图刷新。 */
+    map_snapshot_release();
     if (build_push_box_plan()) {
         goto_stage(STAGE_EXECUTE_ACTION);
         return;
@@ -1061,13 +1123,22 @@ static void stage_level_judge_handler(void)
         return;
     }
 
-    /* 箱子已全部推完 = 本关成功结束。所有关卡均先返回 (1,5)；
+    /* 箱子已全部推完 = 本关成功结束。所有关卡均直线返回 (1,5)；
      * 前两关随后再驶到 (1,4) 触发新图，第三关返航后收车。 */
     chassis_ctrl_stop();
     mark_current_level_finished();
 
-    map_snapshot_release();
     reset_exec_context();
+    {
+        Point_t home = { (int8)APP_GAME_LAUNCH_HOME_X,
+                         (int8)APP_GAME_LAUNCH_HOME_Y };
+        if (Sokoban_Build_Return_Waypoints(g_game_map, g_player_pos,
+                                           home, &g_return_waypoints)) {
+            g_return_path_valid = 1U;
+            g_return_wp_idx = 0U;
+        }
+    }
+    map_snapshot_release();
     App_Recognize_Reset();
     goto_stage(STAGE_WAIT_START);
 }
@@ -1085,7 +1156,7 @@ static void stage_deadlock_reset_handler(void)
         return;
     }
 
-    if (!chassis_nav_arrived_for_waypoint()) return;
+    if (!chassis_nav_arrived_for_waypoint(1U)) return;
 
     is_navigating = 0;
 

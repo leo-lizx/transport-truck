@@ -48,7 +48,7 @@ typedef enum
 {
     APP_RECOG_RUNNING = 0,    /* 仍在识别中, 继续 tick                                  */
     APP_RECOG_DONE_OK,        /* 全部物体识别完成, 映射已写入 g_box_to_target[]         */
-    APP_RECOG_DONE_NO_NEED,   /* 当前关卡不需要识别 (如 Stage1 简单贪心), 直接进 PLAN  */
+    APP_RECOG_DONE_NO_NEED,   /* 当前关卡不需要数字识别 (如 Stage1), 直接进 PLAN */
     APP_RECOG_FAIL            /* 物体不可达 / 视觉持续无识别 → 上层应切 DEADLOCK_RESET */
 } AppRecognizeStatus_e;
 
