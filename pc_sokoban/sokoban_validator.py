@@ -9,8 +9,8 @@ sokoban_validator.py — 推箱子算法 PC 端验证器
 
 功能:
   - 自动生成随机地图（可指定种子）
-  - 支持三阶段模式（Stage1 贪心 / Stage2 指定映射 / Stage3 炸弹）
-  - 调用 BFS 求解器，输出完整方向指令字符串
+  - 支持三阶段模式（Stage1 时间优化 / Stage2 指定映射 / Stage3 炸弹）
+  - 调用推宏 A* 求解器，输出完整方向指令字符串
   - 逐步动画模拟，区分"行走"与"推箱"动作
   - 对每步路径进行合法性校验
   - 通关条件实时判断
@@ -21,6 +21,8 @@ import sys
 import time
 import random
 import copy
+import heapq
+import math
 from collections import deque
 from typing import Optional, List, Tuple, Dict
 
@@ -698,15 +700,61 @@ def plan_scout_phase_v2(the_map: list, player_start: tuple,
 
 
 # ============================================================
-# 单箱 BFS 推箱求解器
+# 单箱推宏 A* 求解器
 # ============================================================
+
+SOKO_COST_MOVE_MS = 100
+SOKO_COST_WAYPOINT_MS = 400
+SOKO_COST_SNAP_MS = 200
+
+
+def _action_from_points(src: tuple, dst: tuple) -> Optional[int]:
+    for d in range(4):
+        if (src[0] + DR[d], src[1] + DC[d]) == dst:
+            return d
+    return None
+
+
+def _macro_edge(sub_map: list, player: tuple, box: tuple, target: tuple,
+                push_dir: int, previous_push_dir: Optional[int],
+                block_other_targets: bool) -> Optional[tuple]:
+    stand = (box[0] - DR[push_dir], box[1] - DC[push_dir])
+    next_box = (box[0] + DR[push_dir], box[1] + DC[push_dir])
+    if not (is_free(sub_map, *stand) and is_free(sub_map, *next_box)):
+        return None
+    if (block_other_targets and sub_map[next_box[0]][next_box[1]] == TARGET
+            and next_box != target):
+        return None
+
+    walk_map = [row[:] for row in sub_map]
+    walk_map[box[0]][box[1]] = WALL
+    walk_path = nav_bfs(walk_map, player, stand)
+    if walk_path is None:
+        return None
+
+    cost = 0
+    last_dir = previous_push_dir
+    for src, dst in zip(walk_path, walk_path[1:]):
+        d = _action_from_points(src, dst)
+        if d is None:
+            return None
+        cost += SOKO_COST_MOVE_MS
+        if last_dir is None or d != last_dir:
+            cost += SOKO_COST_WAYPOINT_MS
+        last_dir = d
+
+    cost += SOKO_COST_MOVE_MS
+    if last_dir is None or push_dir != last_dir:
+        cost += SOKO_COST_WAYPOINT_MS
+    if len(walk_path) > 1 or previous_push_dir is None or push_dir != previous_push_dir:
+        cost += SOKO_COST_SNAP_MS
+    return next_box, walk_path, cost
 
 def sokoban_bfs_single(sub_map: list, player: tuple, box: tuple,
                        target: tuple,
                        block_other_targets: bool = True) -> Optional[list]:
     """
-    单箱推箱 BFS 求解。
-    状态 = (player_r, player_c, box_r, box_c)。
+    单箱推宏 A*。状态=(box_r, box_c, last_push_dir)，普通行走由导航 BFS 连接。
     返回动作序列 [0..3]，无解返回 None。
     对应 C 代码 sokoban_bfs_single()。
     """
@@ -715,65 +763,89 @@ def sokoban_bfs_single(sub_map: list, player: tuple, box: tuple,
     if box == target:
         return []
 
-    start = (player[0], player[1], box[0], box[1])
-    # parent: state -> (prev_state, action)
-    parent: Dict[tuple, Optional[tuple]] = {start: None}
-    # O1.3: 镜像 C 端 SB_MAX_BFS_LAYERS —— 步数(=BFS 深度)超过 SOKOBAN_MAX_ACTIONS
-    # 的解在 C 端会被回溯阶段判为不可用, 这里同样不再向更深层扩展, 保持两端一致。
-    depth: Dict[tuple, int] = {start: 0}
-    queue = deque([start])
+    work_map = [row[:] for row in sub_map]
+    work_map[box[0]][box[1]] = EMPTY
 
-    found_state = None
+    best_cost: Dict[tuple, int] = {}
+    parent: Dict[tuple, Optional[tuple]] = {}
+    queue = []
 
-    while queue and found_state is None:
-        pr, pc, br, bc = state = queue.popleft()
-        cur_depth = depth[state]
-        if cur_depth >= SOKOBAN_MAX_ACTIONS:
-            continue   # 再扩展将超过最大可用步数, 等价于无可用解
+    for d in range(4):
+        edge = _macro_edge(work_map, player, box, target, d, None,
+                           block_other_targets)
+        if edge is None:
+            continue
+        next_box, _, edge_cost = edge
+        state = (next_box[0], next_box[1], d)
+        if edge_cost < best_cost.get(state, 10 ** 18):
+            best_cost[state] = edge_cost
+            parent[state] = None
+            heuristic = (abs(next_box[0] - target[0])
+                         + abs(next_box[1] - target[1])) * SOKO_COST_MOVE_MS
+            heapq.heappush(queue, (edge_cost + heuristic, edge_cost, state))
+
+    closed = set()
+    goal_state = None
+    while queue:
+        _, cost, state = heapq.heappop(queue)
+        if state in closed or cost != best_cost.get(state):
+            continue
+        closed.add(state)
+        br, bc, previous_dir = state
+        cur_box = (br, bc)
+        cur_player = (br - DR[previous_dir], bc - DC[previous_dir])
+        if cur_box == target:
+            goal_state = state
+            break
+
         for d in range(4):
-            npr = pr + DR[d]
-            npc = pc + DC[d]
-            nbr, nbc = br, bc
-
-            if npr == br and npc == bc:
-                # 推箱：箱子前方必须可通行
-                nbr = br + DR[d]
-                nbc = bc + DC[d]
-                if not is_free(sub_map, nbr, nbc):
-                    continue
-                if (block_other_targets and sub_map[nbr][nbc] == TARGET
-                        and (nbr, nbc) != target):
-                    continue
-            else:
-                # 行走：目标格可通行且不是箱子所在格
-                if not is_free(sub_map, npr, npc):
-                    continue
-
-            new_state = (npr, npc, nbr, nbc)
-            if new_state in parent:
+            edge = _macro_edge(work_map, cur_player, cur_box, target, d,
+                               previous_dir, block_other_targets)
+            if edge is None:
                 continue
+            next_box, _, edge_cost = edge
+            next_state = (next_box[0], next_box[1], d)
+            next_cost = cost + edge_cost
+            if next_state in closed or next_cost >= best_cost.get(next_state, 10 ** 18):
+                continue
+            best_cost[next_state] = next_cost
+            parent[next_state] = state
+            heuristic = (abs(next_box[0] - target[0])
+                         + abs(next_box[1] - target[1])) * SOKO_COST_MOVE_MS
+            heapq.heappush(queue, (next_cost + heuristic, next_cost, next_state))
 
-            parent[new_state] = (state, d)
-            depth[new_state] = cur_depth + 1
-
-            if nbr == target[0] and nbc == target[1]:
-                found_state = new_state
-                break
-
-            queue.append(new_state)
-
-    if found_state is None:
+    if goal_state is None:
         return None
 
-    # 回溯动作
-    actions = []
-    state = found_state
-    while parent[state] is not None:
-        prev_state, act = parent[state]
-        actions.append(act)
-        state = prev_state
+    macro_states = []
+    state = goal_state
+    while state is not None:
+        macro_states.append(state)
+        state = parent[state]
+    macro_states.reverse()
 
-    return list(reversed(actions))
+    actions = []
+    cur_player = player
+    cur_box = box
+    for _, _, push_dir in macro_states:
+        stand = (cur_box[0] - DR[push_dir], cur_box[1] - DC[push_dir])
+        walk_map = [row[:] for row in work_map]
+        walk_map[cur_box[0]][cur_box[1]] = WALL
+        walk_path = nav_bfs(walk_map, cur_player, stand)
+        if walk_path is None:
+            return None
+        for src, dst in zip(walk_path, walk_path[1:]):
+            d = _action_from_points(src, dst)
+            if d is None:
+                return None
+            actions.append(d)
+        actions.append(push_dir)
+        if len(actions) > SOKOBAN_MAX_ACTIONS:
+            return None
+        cur_player = cur_box
+        cur_box = (cur_box[0] + DR[push_dir], cur_box[1] + DC[push_dir])
+
+    return actions
 
 
 # ============================================================
@@ -984,6 +1056,7 @@ def _solve_stage2_greedy(the_map: list, player_pos: tuple,
 OPT_EXACT_BOX_LIMIT = 3
 OPT_BRANCH_BOX_LIMIT = 5
 OPT_STAGE1_NODE_LIMIT_5 = 1024
+STAGE1_PAIR_LIMIT = 256
 
 
 def _solution_cost(sol: Optional[dict]) -> int:
@@ -1101,9 +1174,160 @@ def _solve_stage_opt(the_map: list, player_pos: tuple,
     return best
 
 
-def solve_stage1(the_map: list, player_pos: tuple) -> Optional[dict]:
-    # 镜像固件的启动加速配置：Stage1 跳过 DFS 全局优化器。
-    return _solve_stage1_greedy(the_map, player_pos)
+def _push_flags(actions: list, player: tuple, box: tuple) -> list:
+    flags = []
+    pr, pc = player
+    br, bc = box
+    for d in actions:
+        npr, npc = pr + DR[d], pc + DC[d]
+        pushed = (npr, npc) == (br, bc)
+        flags.append(pushed)
+        if pushed:
+            br, bc = br + DR[d], bc + DC[d]
+        pr, pc = npr, npc
+    return flags
+
+
+def sequence_time_cost(actions: list, push_flags: list) -> int:
+    """镜像固件：行驶 + 每个方向航点停站 + 含推箱航段 Snap。"""
+    cost = 0
+    segment_start = 0
+    for i, _ in enumerate(actions):
+        cost += SOKO_COST_MOVE_MS
+        segment_end = i + 1 == len(actions) or actions[i] != actions[i + 1]
+        if segment_end:
+            cost += SOKO_COST_WAYPOINT_MS
+            if any(push_flags[segment_start:i + 1]):
+                cost += SOKO_COST_SNAP_MS
+            segment_start = i + 1
+    return cost
+
+
+def _path_to_actions(path: list) -> list:
+    result = []
+    for src, dst in zip(path, path[1:]):
+        d = _action_from_points(src, dst)
+        if d is None:
+            return []
+        result.append(d)
+    return result
+
+
+def build_return_path(the_map: list, player_pos: tuple,
+                      home_pos: tuple = (5, 1)) -> Optional[dict]:
+    """镜像固件：通关后忽略虚拟障碍，只下发一个直达库位航点。"""
+    del the_map
+    if not is_inner(*home_pos):
+        return None
+    distance_cells = math.hypot(home_pos[0] - player_pos[0],
+                                home_pos[1] - player_pos[1])
+    move_cost = int(distance_cells * SOKO_COST_MOVE_MS + 0.5)
+    waypoint_cost = SOKO_COST_WAYPOINT_MS if distance_cells > 0.0 else 0
+    return {
+        'actions': [],
+        'waypoints': [(home_pos, 'critical')],
+        'time_cost_ms': move_cost + waypoint_cost + SOKO_COST_SNAP_MS,
+        'direct': True,
+    }
+
+
+def _solve_stage1_time_opt(the_map: list, player_pos: tuple,
+                           home_pos: tuple) -> Optional[dict]:
+    boxes = extract_elements(the_map, BOX)
+    targets = extract_elements(the_map, TARGET)
+    n = len(boxes)
+    if n == 0 or n != len(targets) or n > MAX_BOXES:
+        return None
+
+    best = None
+    best_cost = 10 ** 18
+    cur_solutions = []
+    node_limit = 0 if n <= OPT_EXACT_BOX_LIMIT else STAGE1_PAIR_LIMIT
+    node_count = 0
+    hit_limit = False
+
+    def dfs(solved_mask: int, target_mask: int,
+            cur_player: tuple, cost: int) -> None:
+        nonlocal best, best_cost, node_count, hit_limit
+        depth = len(cur_solutions)
+        if cost >= best_cost or hit_limit:
+            return
+        if depth >= n:
+            return_plan = build_return_path(the_map, cur_player, home_pos)
+            if return_plan is None:
+                return
+            total_cost = cost + return_plan['time_cost_ms']
+            if total_cost < best_cost:
+                best_cost = total_cost
+                best = {
+                    'sub_solutions': [dict(s) for s in cur_solutions],
+                    'boxes': boxes,
+                    'targets': targets,
+                    'total_steps': sum(len(s['actions']) for s in cur_solutions),
+                    'time_cost_ms': total_cost,
+                    'return_plan': return_plan,
+                    'pair_evaluations': node_count,
+                }
+            return
+
+        nav_map = [row[:] for row in the_map]
+        for bi, box_pos in enumerate(boxes):
+            if solved_mask & (1 << bi):
+                nav_map[box_pos[0]][box_pos[1]] = EMPTY
+        distance = nav_bfs_distance_flood(nav_map, cur_player)
+        candidates = []
+        for bi in range(n):
+            if solved_mask & (1 << bi):
+                continue
+            box_distance = _box_nav_distance(distance, boxes[bi])
+            if box_distance >= 10 ** 9:
+                continue
+            for ti in range(n):
+                if target_mask & (1 << ti):
+                    continue
+                target_distance = (abs(targets[ti][0] - boxes[bi][0])
+                                   + abs(targets[ti][1] - boxes[bi][1]))
+                candidates.append((box_distance * 32 + target_distance, bi, ti))
+        candidates.sort(key=lambda item: item[0])
+
+        solved = [bool(solved_mask & (1 << i)) for i in range(n)]
+        target_used = [bool(target_mask & (1 << i)) for i in range(n)]
+        for _, bi, ti in candidates:
+            if node_limit and node_count >= node_limit:
+                hit_limit = True
+                return
+            node_count += 1
+            sub = build_sub_map(the_map, boxes, targets, solved, target_used, bi, ti)
+            actions = sokoban_bfs_single(sub, cur_player, boxes[bi], targets[ti])
+            if actions is None:
+                continue
+            push_flags = _push_flags(actions, cur_player, boxes[bi])
+            next_cost = cost + sequence_time_cost(actions, push_flags)
+            if next_cost >= best_cost:
+                continue
+            next_player, _ = simulate_actions(actions, cur_player, boxes[bi])
+            cur_solutions.append({
+                'actions': actions,
+                'push_flags': push_flags,
+                'box_idx': bi,
+                'target_idx': ti,
+                'player_end': next_player,
+            })
+            dfs(solved_mask | (1 << bi), target_mask | (1 << ti),
+                next_player, next_cost)
+            cur_solutions.pop()
+            if hit_limit:
+                return
+
+    dfs(0, 0, player_pos, 0)
+    return best
+
+
+def solve_stage1(the_map: list, player_pos: tuple,
+                 home_pos: Optional[tuple] = None) -> Optional[dict]:
+    """第一关全箱完成、时间成本优化；home_pos 默认保持兼容，取起点。"""
+    return _solve_stage1_time_opt(the_map, player_pos,
+                                  player_pos if home_pos is None else home_pos)
 
 
 def solve_stage2(the_map: list, player_pos: tuple,
@@ -1361,7 +1585,7 @@ def solve_stage3(the_map: list, player_pos: tuple,
       6. 用 Stage1 (任意映射) 或 Stage2 (固定映射) 继续推剩余箱子
 
     box_to_target_idx: 若给定 → 爆炸后用 Stage2 (固定映射) 求解;
-                        否则走 Stage1 贪心.
+                        否则走 Stage1 时间成本优化.
     """
     bombs = extract_elements(the_map, BOMB)
     if not bombs:
@@ -1416,7 +1640,8 @@ def solve_stage3(the_map: list, player_pos: tuple,
 
 def solve_full(the_map: list, player_pos: tuple,
                box_to_target_idx: Optional[list] = None,
-               max_rounds: int = MAX_BOXES + 2) -> Optional[dict]:
+               max_rounds: int = MAX_BOXES + 2,
+               home_pos: tuple = (5, 1)) -> Optional[dict]:
     """
     迭代多炸弹完整求解 —— 与固件 app_game_logic 的 stage_plan/stage_execute 循环一致:
 
@@ -1464,7 +1689,7 @@ def solve_full(the_map: list, player_pos: tuple,
         if box_to_target_idx:
             push = solve_stage2(work, player, box_to_target_idx)
         else:
-            push = solve_stage1(work, player)
+            push = solve_stage1(work, player, home_pos=home_pos)
 
         if push is not None:
             cur = player
@@ -1477,7 +1702,8 @@ def solve_full(the_map: list, player_pos: tuple,
                 })
                 cur = sub['player_end']
             return {'phases': phases, 'is_solved': True,
-                    'map_after': work, 'player_after': cur}
+                    'map_after': work, 'player_after': cur,
+                    'return_plan': push.get('return_plan')}
 
         # 需炸弹 (镜像 stage_plan_handler 决策链)
         dead, dbox = check_deadlock(work)
@@ -1595,7 +1821,7 @@ def solve_level(stage: int, the_map: list, player_pos: tuple,
 
     push_result = None
     if stage == 1:
-        push_result = solve_stage1(the_map, work_player)
+        push_result = solve_stage1(the_map, work_player, home_pos=(5, 1))
     elif stage == 2:
         # 优先用侦查得到的映射; 外部显式传入则覆盖
         if box_to_target is None:
@@ -2027,6 +2253,24 @@ def actions_to_waypoints(actions: list, start_pos: tuple) -> list:
         c += DC[d]
         if i == len(actions) - 1 or actions[i] != actions[i + 1]:
             waypoints.append((r, c))
+    return waypoints
+
+
+def actions_to_typed_waypoints(actions: list, push_flags: list,
+                               start_pos: tuple) -> list:
+    """转弯点压缩，并标记含推动作的关键航段。"""
+    if len(actions) != len(push_flags):
+        raise ValueError("actions 与 push_flags 长度必须一致")
+    waypoints = []
+    r, c = start_pos
+    segment_has_push = False
+    for i, d in enumerate(actions):
+        r += DR[d]
+        c += DC[d]
+        segment_has_push = segment_has_push or bool(push_flags[i])
+        if i + 1 == len(actions) or actions[i] != actions[i + 1]:
+            waypoints.append(((r, c), 'critical' if segment_has_push else 'walk'))
+            segment_has_push = False
     return waypoints
 
 
@@ -2491,7 +2735,7 @@ def prompt_int(msg: str, lo: int, hi: int, default: int) -> int:
 
 
 def stage1_flow(the_map: list, player_pos: tuple, use_unicode: bool) -> None:
-    print("\n[Stage1] 贪心分配模式：最近箱子→最近目标")
+    print("\n[Stage1] 连续计时时间优化：推箱 + 航点 + Snap + 返库")
     print("  正在求解...", end='', flush=True)
     t0 = time.time()
     result = solve_stage1(the_map, player_pos)

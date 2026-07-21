@@ -4,7 +4,7 @@ sokoban_car_sim.py — 推箱子"整车流程"验证器 (车载屏幕 UI 版)
 本验证器**完全复刻车上屏幕 (chassis_menu.c / IPS200) 的推箱子 UI**, 并
 **严格按照固件 app_game_logic.c 的整车状态机流程**模拟运动:
 
-    STAGE_WAIT_START  → 发车流程 (回起点 → 单轴横移驶出发车区)
+    STAGE_WAIT_START  → 发车流程 (回 (5,1) → 上移至 (4,1))
     STAGE_RECOGNIZE_MAP → 识别地图 (第 2/3 关: 先逐个去箱子/目标面前观察)
     STAGE_PLAN_PATH   → 规划 (第1关贪心 / 第2关按数字配对 / 第3关含炸弹)
     STAGE_EXECUTE_ACTION → 执行 (推箱; 第3关先推炸弹炸墙再推箱)
@@ -38,6 +38,7 @@ from sokoban_validator import (
     plan_scout_phase_v2,
     solve_full,
     solve_level,
+    build_return_path,
     check_deadlock,
     apply_bomb_explosion,
     _make_empty_map,
@@ -48,26 +49,20 @@ from sokoban_validator import (
 UP, DOWN, LEFT, RIGHT = 0, 1, 2, 3
 
 # ============================================================
-# 发车区几何 (来自 chassis_config.h)
-#   左发车区 col 1 起步 → 横移到 col 3 完全离开
-#   右发车区 col 14 起步 → 横移到 col 12 完全离开
-#   起步行 = CHASSIS_START_GRID_Y = 6
+# 正式固件发车契约 (app_game_logic.c)
+#   唯一库位 (row=5,col=1) → 地图刷新触发格 (row=4,col=1)
 # ============================================================
-START_ROW = 6
+START_ROW = 5
 ZONE_LEFT = 'left'
-ZONE_RIGHT = 'right'
+ZONE_RIGHT = 'right'  # 仅保留旧存档兼容；运行时统一按左库位处理
 
 
 def launch_cells(zone: str) -> Tuple[tuple, tuple, list]:
-    """返回 (起步格, 驶出格, 横移走廊格列表[起步..驶出])。"""
-    if zone == ZONE_RIGHT:
-        start = (START_ROW, INNER_C_MAX)        # (6,14)
-        exit_c = (START_ROW, INNER_C_MAX - 2)   # (6,12)
-        corridor = [(START_ROW, c) for c in (INNER_C_MAX, INNER_C_MAX - 1, INNER_C_MAX - 2)]
-    else:
-        start = (START_ROW, INNER_C_MIN)        # (6,1)
-        exit_c = (START_ROW, INNER_C_MIN + 2)   # (6,3)
-        corridor = [(START_ROW, c) for c in (INNER_C_MIN, INNER_C_MIN + 1, INNER_C_MIN + 2)]
+    """返回正式比赛唯一的 (起步格, 触发格, 发车走廊)。"""
+    del zone
+    start = (5, 1)
+    exit_c = (4, 1)
+    corridor = [start, exit_c]
     return start, exit_c, corridor
 
 
@@ -185,12 +180,11 @@ def _info_from_map_text(text: str, level: int,
     if err:
         raise ValueError(err)
 
-    pr, pc = player_pos
-    zone = ZONE_RIGHT if pc > MAP_COLS // 2 else ZONE_LEFT
+    zone = ZONE_LEFT
     start, exit_c, _ = launch_cells(zone)
-    if player_pos != start:
-        start = player_pos
-        exit_c = player_pos
+    # 文本中的旧 @ 只作为格式占位；整车仿真始终使用当前固件固定库位。
+    the_map[start[0]][start[1]] = EMPTY
+    the_map[exit_c[0]][exit_c[1]] = EMPTY
 
     box_count = len(extract_elements(the_map, BOX))
     target_count = len(extract_elements(the_map, TARGET))
@@ -261,7 +255,7 @@ def _save_custom_map(name: str, text: str, level: int,
 
 
 # ============================================================
-# 地图生成 (强制玩家从发车区起步, 预留横移走廊, 校验可解)
+# 地图生成 (强制玩家从左库位起步, 预留向上发车走廊, 校验可解)
 # ============================================================
 
 def _inner_list() -> list:
@@ -552,7 +546,7 @@ class CarSim:
             self.target_class_by_pos[p] = self.target_class[j]
 
         self.player = self.start
-        self.last_dir = RIGHT if self.zone == ZONE_LEFT else LEFT
+        self.last_dir = UP
         self.steps = 0
         self.frames: List[dict] = []
         self.log: List[str] = []
@@ -655,25 +649,24 @@ class CarSim:
         self.player = self.start
         self._snap('WAIT_START', 'phase0: 回到发车起点')
         self.log.append(f"[WAIT_START] 起点 {self._xy(self.start)}")
-        sr, sc = self.start
-        er, ec = self.exit
-        step = RIGHT if ec > sc else LEFT
-        c = sc
-        while c != ec:
-            self._step(step, 'WAIT_START', 'phase1: 单轴横移驶出发车区')
-            c = self.player[1]
-        self._snap('WAIT_START', '发车成功: 已完全离开发车区')
-        self.log.append(f"[WAIT_START] 发车 → 驶出至 {self._xy(self.exit)}")
+        while self.player != self.exit:
+            pr, pc = self.player
+            er, ec = self.exit
+            if pr != er:
+                step = DOWN if er > pr else UP
+            else:
+                step = RIGHT if ec > pc else LEFT
+            self._step(step, 'WAIT_START', 'phase1: 驶向地图刷新触发格')
+        self._snap('WAIT_START', '发车成功: 已到地图刷新触发格')
+        self.log.append(f"[WAIT_START] 发车 → 触发格 {self._xy(self.exit)}")
 
     # ---- 阶段 2: 识别 ----
     def recognize(self):
-        # 与固件 App_Recognize 完全一致: 仅当 "第1关 且 地图无炸弹" 才跳过识别;
-        # 只要 level>=2 或 地图里有炸弹, 都必须逐个去箱子/目标前观察.
-        has_bomb = len(self.bombs) > 0
-        if self.level < 2 and not has_bomb:
-            self.recog_summary = '第1关无炸弹: 无需识别 (DONE_NO_NEED)'
-            self._snap('RECOGNIZE', '第1关地图简单且无炸弹, 跳过识别')
-            self.log.append('[RECOGNIZE] 跳过 (NO_NEED: 第1关且无炸弹)')
+        # 第一关没有数字配对要求，即使存在炸弹也跳过分类 Tour。
+        if self.level < 2:
+            self.recog_summary = '第1关: 无需数字分类 (DONE_NO_NEED)'
+            self._snap('RECOGNIZE', '第1关跳过数字分类')
+            self.log.append('[RECOGNIZE] 跳过 (NO_NEED: 第1关)')
             self.mapping = None
             return
 
@@ -702,17 +695,14 @@ class CarSim:
 
         self.player = scout['player_after_scout']
         # 映射使用规则 (镜像 build_push_box_plan):
-        #   - 第 1 关 (即便地图含炸弹): 规划用 Stage1 贪心, 不强制数字映射;
+        #   - 第 1 关 (即便地图含炸弹): 规划用 Stage1 时间优化, 不做数字映射;
         #   - 第 2/3 关: 全部识别成功时按数字映射 (Stage2), 否则置 None 待炸墙后贪心.
         mp = scout.get('box_to_target_idx')
         if self.level >= 2:
             self.mapping = mp if (scout.get('all_visited') and mp) else None
         else:
             self.mapping = None
-        if self.level < 2:
-            self.recog_summary = '识别完成 (第1关含炸弹: 规划仍用贪心)'
-            self.log.append('[RECOGNIZE] 第1关含炸弹: 已遍历观察, 规划用 Stage1 贪心')
-        elif self.mapping:
+        if self.mapping:
             self.recog_summary = '识别完成, 已生成 箱→目标 映射'
             self.log.append(f"[RECOGNIZE] 映射 box→target = {self.mapping}")
         else:
@@ -722,9 +712,9 @@ class CarSim:
 
     # ---- 阶段 3/4: 规划 + 执行 ----
     def plan_and_execute(self):
-        self._snap('PLAN', '规划推箱/炸弹路径 (BFS)')
+        self._snap('PLAN', '规划推箱/炸弹路径 (推宏 A* + 时间成本搜索)')
         fm = self.full_map()
-        res = solve_full(fm, self.player, self.mapping)
+        res = solve_full(fm, self.player, self.mapping, home_pos=self.start)
         if res is None or not res['is_solved']:
             self._snap('DEADLOCK', '无解 → 回发车区静止 3s 复位')
             self.log.append('[DEADLOCK_RESET] 规划失败')
@@ -738,6 +728,16 @@ class CarSim:
             # 每炸完一颗炸弹, 固件会回 PLAN 重新规划 → 我们已用 solve_full 一次展开
             if ph['kind'] == 'bomb':
                 self._snap('PLAN', '爆破完成, 重新规划剩余推箱')
+
+        return_plan = build_return_path(self.full_map(), self.player, self.start)
+        if return_plan is None:
+            self._snap('DEADLOCK', '通关但库位坐标无效')
+            self.log.append('[WAIT_START] 直线返库目标无效')
+            return False
+        self._snap('WAIT_START', '通关后忽略虚拟障碍，直线返库')
+        self.player = self.start
+        self._snap('WAIT_START', '返库终点关键 Snap + 航向校准')
+        self.log.append(f"[WAIT_START] 直线返库 → {self._xy(self.start)}")
         return True
 
     def _exec_push(self, ph: dict):
@@ -936,8 +936,6 @@ def launch_gui():
     zfrm.grid(row=4, column=1, sticky='w')
     tk.Radiobutton(zfrm, text='左', variable=zone_var, value=ZONE_LEFT, bg='#15171e',
                    fg='#c0caf5', selectcolor='#2c324a', activebackground='#15171e').pack(side='left')
-    tk.Radiobutton(zfrm, text='右', variable=zone_var, value=ZONE_RIGHT, bg='#15171e',
-                   fg='#c0caf5', selectcolor='#2c324a', activebackground='#15171e').pack(side='left')
 
     mk_label(panel, '速度 (ms/帧)').grid(row=5, column=0, sticky='w', pady=2)
     speed_var = tk.IntVar(value=120)
@@ -1092,12 +1090,9 @@ def launch_gui():
                                text='*** PASS ***', fill=COL_OK, font=F_TXT)
 
     def _draw_zone(fr):
-        # 仅画发车区一格列描边 (col 1 或 14, row 5-6 附近)
-        if zone_var.get() == ZONE_RIGHT:
-            c = INNER_C_MAX
-        else:
-            c = INNER_C_MIN
-        for r in (START_ROW - 1, START_ROW):
+        # 正式比赛唯一左库位及其上方地图刷新触发格。
+        c = INNER_C_MIN
+        for r in (4, 5):
             x0, y0, x1, y1 = cell_rect(r, c)
             canvas.create_rectangle(x0 + 1, y0 + 1, x1 - 1, y1 - 1, outline=COL_ZONE, dash=(2, 2))
 

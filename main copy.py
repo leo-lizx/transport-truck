@@ -8,7 +8,6 @@
 #   - 物理抗反光：手动锁定曝光，关闭增益和白平衡。
 #   - 极速提取：废弃 Python 循环，使用底层的 img.get_statistics() 获取 11x11 众数。
 #   - 降维打击：废弃高耗时的巴氏距离，采用加权欧氏距离（L通道降权，过滤高光）。
-#   - 动态定位（新增）：利用 TAG16H5 码实现自动四角逆透视映射，并进行降频采样节约算力。
 # ======================================================================
 
 import sensor, image, time, math
@@ -99,14 +98,12 @@ DEBUG_DRAW_ROI = True
 # ----------------------------------------------------------------------
 ROWS, COLS = 12, 16
 
-# 【修改注】：这里从绝对坐标变成了“初始占位符”。
-# 场地四角外侧格子的中心点坐标，系统运行后将由 AprilTag 动态刷新覆盖。
-# 如果系统刚上电或某个角被短暂遮挡，字典将维持最后一次识别的坐标（充当安全垫防崩溃）。
+# 场地四角外侧格子的中心点坐标（需根据实际场地微调）
 GRID_CORNERS = {
-    "tl": (29.5, 55.0),  # 左上 ID: 15
-    "tr": (277.6, 50.0), # 右上 ID: 16
-    "bl": (30.0, 233.0), # 左下 ID: 18
-    "br": (282.8, 233.0),# 右下 ID: 17
+    "tl": (27.5, 47.0),  # 左上
+    "tr": (282.6, 40.0), # 右上
+    "bl": (32.0, 229.0), # 左下
+    "br": (287.8, 226.0),# 右下
 }
 
 GRID_K1 = +0.000000
@@ -139,7 +136,7 @@ def calc_grid_point(x_idx, y_idx, img_w, img_h):
     return int(center_x + dx * scale), int(center_y + dy * scale)
 
 def draw_calibration_overlay(img, img_w, img_h):
-    """绘制标定框，帮助手动对齐摄像头视角或确认 AprilTag 动态映射是否生效"""
+    """绘制标定框，帮助手动对齐摄像头视角"""
     tl = calc_grid_point(0, 0, img_w, img_h)
     tr = calc_grid_point(COLS - 1, 0, img_w, img_h)
     bl = calc_grid_point(0, ROWS - 1, img_w, img_h)
@@ -189,6 +186,14 @@ BOX_BRIGHT_RGB = (247, 255, 66)
 BOMB_DARK_RGB = (181, 28, 58)         # 炸弹（*）
 BOMB_BRIGHT_RGB = (255, 40, 82)
 
+# 颜色匹配的置信度限制：保留现有实测色值，只阻止“仅仅相对更像炸弹”的格子被强制判为炸弹。
+COLOR_UNKNOWN_MAX_DIST = 100.0
+BOMB_MAX_MATCH_DIST = 45.0
+BOMB_MIN_LEAD_DIST = 15.0
+WALL_TEXTURE_L_STDEV = 15.0
+WALL_TEXTURE_MAX_DIST = 70.0
+WALL_TEXTURE_BONUS_DIST = 15.0
+
 # 【架构保留】：依然保留所有靶点字典，作为纯色匹配和特征检测失败时的安全垫 (Fallback)
 SYMBOL_MAP_RGB = {
     "#": (WALL_DARK_RGB, WALL_BRIGHT_RGB),
@@ -228,13 +233,20 @@ for sym, tpls in SYMBOL_MAP_RGB.items():
     SYMBOL_MAP_LABTarget[sym] = [rgb_to_lab(rgb) for rgb in tpls]
 
 
-def find_best_symbol_by_mode(l_mode, a_mode, b_mode):
+def classify_symbol_by_features(l_mode, a_mode, b_mode, l_stdev):
     """
-    【核心优化算子】：纯色物体的靶向匹配（箱子、炸弹、终点、空地）
-    计算实测区域色彩与模板库的加权欧氏距离。保留了 L 通道 0.2 的降权处理。
+    使用现有 LAB 色值模板匹配格子，并对墙和炸弹增加置信度约束。
+
+    炸弹必须既足够接近炸弹模板，又明显优于其他类别；否则退回最接近的
+    非炸弹类别。具有明暗纹理的区域在墙颜色距离合理时，给墙有限优先级。
     """
     best_sym = "-"
     min_dist = 999999.0
+    best_non_bomb_sym = "-"
+    best_non_bomb_dist = 999999.0
+    best_non_wall_dist = 999999.0
+    wall_dist = 999999.0
+    bomb_dist = 999999.0
 
     for sym, lab_targets in SYMBOL_MAP_LABTarget.items():
         for target in lab_targets:
@@ -246,8 +258,42 @@ def find_best_symbol_by_mode(l_mode, a_mode, b_mode):
                 min_dist = dist
                 best_sym = sym
 
+            if sym != "*" and dist < best_non_bomb_dist:
+                best_non_bomb_dist = dist
+                best_non_bomb_sym = sym
+
+            if sym != "#" and dist < best_non_wall_dist:
+                best_non_wall_dist = dist
+
+            if sym == "#" and dist < wall_dist:
+                wall_dist = dist
+            elif sym == "*" and dist < bomb_dist:
+                bomb_dist = dist
+
     # 距离阈值保护：如果偏离所有已知色块过大，判定为背景空地
-    if min_dist > 100:
+    if min_dist > COLOR_UNKNOWN_MAX_DIST:
+        return "-"
+
+    bomb_is_confident = (
+        bomb_dist <= BOMB_MAX_MATCH_DIST and
+        bomb_dist + BOMB_MIN_LEAD_DIST <= best_non_bomb_dist
+    )
+    if bomb_is_confident:
+        return "*"
+
+    # 亮度离散是墙的辅助证据，只允许它在颜色距离接近时纠正结果。
+    wall_has_texture = l_stdev > WALL_TEXTURE_L_STDEV
+    wall_color_is_plausible = (
+        wall_dist <= WALL_TEXTURE_MAX_DIST and
+        wall_dist <= best_non_wall_dist + WALL_TEXTURE_BONUS_DIST
+    )
+    if wall_has_texture and wall_color_is_plausible:
+        return "#"
+
+    # 炸弹没有通过严格门槛时，不再因“相对最近”而输出炸弹。
+    if best_sym == "*":
+        if best_non_bomb_dist <= COLOR_UNKNOWN_MAX_DIST:
+            return best_non_bomb_sym
         return "-"
 
     return best_sym
@@ -306,25 +352,9 @@ def classify_cell(img, x, y, img_w, img_h):
     if stats.a_mean() < -5 and stats.b_stdev() > 15 and stats.a_stdev() > 5 and stats.l_mean() > 25:
         return "H"
 
-    # 【防误判策略 2：主色调双重校验】-> 严格锁定围墙 (#)
-    if stats.l_stdev() > 15:
-        # 核心修复：如果是压在“黄箱子/蓝空地”的交界处，l_stdev 也会很大
-        # 但交界处的“主导颜色（众数）”一定会是黄色或蓝色，而绝对不会是墙壁的黑灰色！
-        # 所以我们用 find_best_symbol_by_mode 测一下它的底色
-        wall_check_sym = find_best_symbol_by_mode(l_mode, a_mode, b_mode)
-
-        # 只有当明暗离散度大，且主色调确实像墙壁时，才判定为墙壁
-        if wall_check_sym == "#":
-            return "#"
-        # 如果 l_stdev > 18 但颜色不像墙，说明是“伪装成墙的色块交界处”，不 return，继续往下走
-
-    # ======================================================================
-    # 【特征 3：纯色靶向匹配】
-    # 如果不是车，也不是真的墙，或者是交界处的残影，统统交给纯色欧氏距离去收底
-    # ======================================================================
-    primary_sym = find_best_symbol_by_mode(l_mode, a_mode, b_mode)
-
-    return primary_sym
+    # 墙和炸弹在一次模板遍历中完成颜色匹配与置信度判定。
+    return classify_symbol_by_features(
+        l_mode, a_mode, b_mode, stats.l_stdev())
 
 
 # ----------------------------------------------------------------------
@@ -371,38 +401,10 @@ while(True):
     car_found = False
     tl_pt = tr_pt = bl_pt = br_pt = None
 
-    # ==================================================================
-    # --- 阶段 A0：AprilTag 动态四角定位 (新增：TAG16H5 识别与降频优化) ---
-    # 【算力优化】：AprilTag 识别是耗时运算，由于场地四个角物理位置相对固定，
-    # 系统采用降频机制，每 5 帧仅触发一次全图检索，将算力留给网格分类主逻辑。
-    # 遮挡安全垫：若某帧未检测到Tag，GRID_CORNERS 依然保留上一次的有效坐标。
-    # ==================================================================
-    if frame_cnt % 5 == 0:
-        # 替换为更简单的 TAG16H5 家族，提升识别速度
-        for tag in img.find_apriltags(families=image.TAG16H5):
-            tag_id = tag.id()
-            tag_cx, tag_cy = tag.cx(), tag.cy()
-            
-            # 根据场地布局更新四角逆透视物理基准点坐标
-            if tag_id == 15:
-                GRID_CORNERS["tl"] = (tag_cx, tag_cy)
-            elif tag_id == 16:
-                GRID_CORNERS["tr"] = (tag_cx, tag_cy)
-            elif tag_id == 17:
-                GRID_CORNERS["br"] = (tag_cx, tag_cy)
-            elif tag_id == 18:
-                GRID_CORNERS["bl"] = (tag_cx, tag_cy)
-                
-            # 可视化：若开启调试，在画面上画出被识别的Tag轮廓和ID，方便现场对正
-            if DEBUG_DRAW_ROI:
-                img.draw_rectangle(tag.rect(), color=(255, 0, 0))
-                img.draw_cross(tag_cx, tag_cy, color=(0, 255, 0))
-                img.draw_string(tag_cx, tag_cy, "ID:" + str(tag_id), color=(255, 255, 0))
-
     # --- 阶段 A：扫描解析赛道 ---
     for y_idx in range(ROWS):
         for x_idx in range(COLS):
-            # 获取物理逆透视坐标点 (该坐标在阶段A0已通过 AprilTag 动态校准)
+            # 获取物理逆透视坐标点
             tx, ty = calc_grid_point(x_idx, y_idx, img_w, img_h)
 
             if 0 <= tx < img_w and 0 <= ty < img_h:
@@ -448,8 +450,7 @@ while(True):
         print("\033[H", end="") # 清屏
         print("FPS: %0.1f | 小车坐标: (%d, %d)" % (clock.fps(), car_x, car_y))
         if CALIB_SHOW_CORNERS and tl_pt is not None:
-            # 这里的基准坐标已是 AprilTag 实时动态获取的值
-            print("动态基准: TL=%s TR=%s BL=%s BR=%s" % (tl_pt, tr_pt, bl_pt, br_pt))
+            print("基准: TL=%s TR=%s BL=%s BR=%s" % (tl_pt, tr_pt, bl_pt, br_pt))
 
         # 打印字符地图阵列
         for r in range(ROWS):

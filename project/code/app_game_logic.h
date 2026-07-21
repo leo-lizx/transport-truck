@@ -73,7 +73,8 @@ typedef enum {
     STAGE_LEVEL_JUDGE,              // 仅确认本关箱子已全部完成
     STAGE_DEADLOCK_RESET,           // 死局恢复：回发车区静止3秒后重置
     STAGE_DONE,                     // 全流程完成
-    STAGE_PAUSE_ON_LINK_LOSS        // 【P0-2】视觉链路超时刹停, 链路恢复后自动续跑
+    STAGE_PAUSE_ON_LINK_LOSS,       // 【P0-2】视觉链路超时刹停
+    STAGE_WAIT_RECOVERY_MAP         // 断链恢复：停车等待新鲜稳定地图后重规划
 } GameStage_e;
 
 // 地图全局变量 (由副镜头串口解析后写入此数组)
@@ -81,6 +82,9 @@ extern uint8 g_game_map[MAP_ROWS][MAP_COLS];
 
 // 业务调度函数
 void Game_Logic_Task_Run(void);
+
+/* 正式比赛状态初始化，上电后从第一关开始。 */
+void Game_Logic_Init(void);
 
 /* ==================================================================
  * 【P0-2】链路状态查询接口

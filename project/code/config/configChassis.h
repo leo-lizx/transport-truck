@@ -184,6 +184,10 @@
 /** Y 方向单步步长 (米) = 2.00 / 10 */
 #define CHASSIS_GRID_STEP_Y_M               (CHASSIS_MAP_HEIGHT_M / (float)CHASSIS_GRID_INNER_ROWS)
 
+/** 最外围墙在 X/Y 方向的物理厚度：各占一个网格 */
+#define CHASSIS_FIELD_MARGIN_X_M            (CHASSIS_GRID_STEP_X_M)
+#define CHASSIS_FIELD_MARGIN_Y_M            (CHASSIS_GRID_STEP_Y_M)
+
 /** 兼容旧代码 (不建议新代码使用) */
 #define CHASSIS_GRID_CELL_SIZE_M            CHASSIS_GRID_STEP_X_M
 

@@ -121,7 +121,7 @@ static uint32 wait_for_tick(void)
 #define MAIN_RUN_MODE_LEVEL2_TEST     (10)  /* 第二关测试: 收图→固定发车→分类识别→Stage2推箱→回库 */
 
 /* ═══════════ 改下面这行切换运行模式 (0~10) ═══════════ */
-#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_HARDCODED_MAP)  /* 只接收摄像头地图并显示，底盘保持停止 */
+#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_GAME)  /* 正式比赛：三关连续计时完整流程 */
 /* ═══════════ 改上面这行切换运行模式 (0~10) ═══════════ */
 
 /* OpenART1 地图链路硬件口: 若实测 UART4 走 D0/D1, 只改下面两行宏. */
@@ -164,9 +164,8 @@ static uint32 wait_for_tick(void)
  * 固定自测图: 由用户编辑的竖版地图整理为 12x16 横版格式.
  * 目的: 保留原始关卡结构, 同时满足求解器固定 12 行 16 列的输入约束.
  *
- * 注: 地图本身不带发车位置标记 (无 '@'), 发车格写死为
- *     (CHASSIS_START_GRID_X, CHASSIS_START_GRID_Y) = (1, 6),
- *     与 chassis_config.h / 底层 init 完全一致.
+ * 注: 地图中的 '@' 仅便于阅读；本模式求解起点由
+ *     MAIN_POS_HCM_SOLVE_START_(X/Y)_GRID = (1,5) 决定。
  */
 static const char s_soko_selftest_map[MAP_ROWS][MAP_COLS + 1] = {
 "################",

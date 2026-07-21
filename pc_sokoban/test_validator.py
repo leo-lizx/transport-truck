@@ -24,8 +24,8 @@ valid, msg = sv.validate_path(m, sol, (5, 2), (3, 3))
 assert valid, f"路径校验失败: {msg}"
 print(f"路径校验: {msg}")
 
-# 测试2: Stage1 贪心
-print("\n=== 测试2: Stage1 贪心（2箱） ===")
+# 测试2: Stage1 时间优化
+print("\n=== 测试2: Stage1 时间优化（2箱） ===")
 m2 = sv._make_empty_map()
 m2[2][2] = sv.BOX
 m2[2][12] = sv.BOX
@@ -35,8 +35,8 @@ r = sv.solve_stage1(m2, (5, 7))
 assert r is not None, "Stage1 应有解"
 print(f"总步数: {r['total_steps']}")
 
-# 测试2a: Stage1 公开入口应镜像固件，直接使用 greedy 而非 DFS 全局优化。
-print("\n=== 测试2a: Stage1 跳过 DFS 优化 ===")
+# 测试2a: Stage1 公开入口按“执行 + 返库”时间成本优于原贪心。
+print("\n=== 测试2a: Stage1 连续计时时间优化 ===")
 m2a, p2a, err2a = sv.parse_map_text("""
 ################
 #----------.---#
@@ -56,8 +56,20 @@ greedy2a = sv._solve_stage1_greedy(m2a, p2a)
 stage1_2a = sv.solve_stage1(m2a, p2a)
 assert greedy2a is not None
 assert greedy2a['total_steps'] == 38
-assert stage1_2a == greedy2a
-print("Stage1 与固件一致，直接返回 greedy 的 38 步解。")
+assert stage1_2a is not None
+
+greedy_cost2a = 0
+cur2a = p2a
+for sub2a in greedy2a['sub_solutions']:
+    flags2a = sv._push_flags(sub2a['actions'], cur2a,
+                             greedy2a['boxes'][sub2a['box_idx']])
+    greedy_cost2a += sv.sequence_time_cost(sub2a['actions'], flags2a)
+    cur2a = sub2a['player_end']
+greedy_return2a = sv.build_return_path(m2a, cur2a, p2a)
+assert greedy_return2a is not None
+greedy_cost2a += greedy_return2a['time_cost_ms']
+assert stage1_2a['time_cost_ms'] < greedy_cost2a
+print(f"原贪心 {greedy_cost2a}ms → 时间优化 {stage1_2a['time_cost_ms']}ms")
 
 # 测试3: 地图生成
 print("\n=== 测试3: 地图生成 ===")
@@ -239,5 +251,61 @@ sub11_near = sv.build_sub_map(
 )
 assert sv.sokoban_bfs_single(sub11_near, (5, 2), boxes11[0], targets11[0]) is not None
 print("Pass-through target candidate is rejected; current target remains valid.")
+
+# Test 12: current six-box first-level regression. The objective includes the
+# direct return to the formal garage and must beat the old feasible greedy plan.
+print("\n=== Test 12: Stage1 six-box continuous-time regression ===")
+m12, _, err12 = sv.parse_map_text("""
+################
+#-----.--------#
+#-#--#--------.#
+#-$--#-#---###-#
+#--$##-----.$--#
+#----------.-#-#
+#@---##-#-----$#
+#---##-$--#--#-#
+#--------#---#-#
+#------.#-#-#--#
+#----$------.--#
+################
+""")
+assert err12 == "", err12
+p12 = (5, 1)
+greedy12 = sv._solve_stage1_greedy(m12, p12)
+opt12 = sv.solve_stage1(m12, p12, home_pos=(5, 1))
+assert greedy12 is not None and opt12 is not None
+greedy_cost12 = 0
+cur12 = p12
+for sub12 in greedy12['sub_solutions']:
+    flags12 = sv._push_flags(sub12['actions'], cur12,
+                             greedy12['boxes'][sub12['box_idx']])
+    greedy_cost12 += sv.sequence_time_cost(sub12['actions'], flags12)
+    cur12 = sub12['player_end']
+ret12 = sv.build_return_path(m12, cur12, (5, 1))
+assert ret12 is not None
+greedy_cost12 += ret12['time_cost_ms']
+assert opt12['total_steps'] <= 85
+assert opt12['time_cost_ms'] < greedy_cost12
+assert opt12['return_plan']['direct']
+assert opt12['return_plan']['waypoints'] == [((5, 1), 'critical')]
+print(f"greedy={greedy12['total_steps']}步/{greedy_cost12}ms, "
+      f"optimized={opt12['total_steps']}步/{opt12['time_cost_ms']}ms")
+
+print("\n=== Test 13: typed waypoints and direct return ===")
+typed13 = sv.actions_to_typed_waypoints(
+    [sv.DIR_LETTER.index('R'), sv.DIR_LETTER.index('R'),
+     sv.DIR_LETTER.index('D'), sv.DIR_LETTER.index('D')],
+    [False, True, False, False],
+    (5, 1),
+)
+assert typed13 == [((5, 3), 'critical'), ((7, 3), 'walk')]
+m13 = sv._make_empty_map()
+m13[5][2] = sv.WALL
+ret13 = sv.build_return_path(m13, (5, 3), (5, 1))
+assert ret13 is not None and ret13['direct']
+assert ret13['actions'] == []
+assert ret13['waypoints'] == [((5, 1), 'critical')]
+assert ret13['time_cost_ms'] == 800
+print("普通转弯/关键推箱航点标记正确，返库直线忽略虚拟墙。")
 print("\n=============================")
 print("所有测试通过！")
