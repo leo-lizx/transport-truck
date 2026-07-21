@@ -8,8 +8,6 @@
 #   - 物理抗反光：手动锁定曝光，关闭增益和白平衡。
 #   - 极速提取：废弃 Python 循环，使用底层的 img.get_statistics() 获取 11x11 众数。
 #   - 降维打击：废弃高耗时的巴氏距离，采用加权欧氏距离（L通道降权，过滤高光）。
-#   - 自动定位：引入 Apriltag (TAG16H5) 自动检测四个角点并更新透视映射 (新增)。
-#   - 内存与查表：预分配数组，局部函数指针查表，大幅降低 GC 与属性访问耗时 (新增)。
 # ======================================================================
 
 import sensor, image, time, math
@@ -93,25 +91,18 @@ def send_heartbeat_if_due():
 # 调试开关：控制是否绘制采样 ROI 的矩形边框用于视觉调试
 # - 在比赛或正式运行时建议设为 False 以节省绘制开销
 # - 在开发或现场标定时设为 True 便于观察每个网格的采样区域
-DEBUG_DRAW_ROI = False # 【额外帧率优化】：默认关闭 ROI 边框绘制，极大释放 CPU 与屏幕输出耗时
-
+DEBUG_DRAW_ROI = True
 # ----------------------------------------------------------------------
 # 3. 网格采样与逆透视映射
 # ----------------------------------------------------------------------
 ROWS, COLS = 12, 16
 
-# 【新增】：AprilTag 标定 ID 常量映射 (防止魔术数字，加速比对)
-TAG_ID_TL = 15
-TAG_ID_TR = 16
-TAG_ID_BR = 17
-TAG_ID_BL = 18
-
-# 场地四角外侧格子的中心点坐标（需根据实际场地微调，现已加入自动更新）
+# 场地四角外侧格子的中心点坐标（需根据实际场地微调）
 GRID_CORNERS = {
-    "tl": (27.5, 47.0),  # 左上 (Tag 15)
-    "tr": (282.6, 40.0), # 右上 (Tag 16)
-    "bl": (32.0, 229.0), # 左下 (Tag 18)
-    "br": (287.8, 226.0),# 右下 (Tag 17)
+    "tl": (17, 20.0),  # 左上
+    "tr": (256, 10.0), # 右上
+    "bl": (15.0, 207.0), # 左下
+    "br": (263.0, 207.0),# 右下
 }
 
 GRID_K1 = +0.000000
@@ -124,6 +115,22 @@ def calc_grid_point(x_idx, y_idx, img_w, img_h):
     """基于四角点进行双线性插值，计算网格真实物理坐标映射到像素的坐标"""
     u = x_idx / (COLS - 1)
     v = y_idx / (ROWS - 1)
+    # ========================================================
+    # 【新增】：极速非线性透视/畸变补偿 (抛物线推拉)
+    # 作用：在不影响 0 和 1 这两端边框的前提下，专门对中间的网格进行推拉。
+    # 针对你“中间偏右”的问题，我们给 U 加上一个负的补偿值把它向左拉。
+    # ========================================================
+    COMP_U = -0.03  # 左右补偿系数：负数向左拉，正数向右推 (建议从 -0.02 到 -0.08 之间微调)
+    COMP_V = -0.03   # 上下补偿系数：如果中间行偏上或偏下，同样调这个值
+
+    u = u + COMP_U * u * (1.0 - u)
+    v = v + COMP_V * v * (1.0 - v)
+    # ========================================================
+
+    tl_x, tl_y = GRID_CORNERS["tl"]
+    tr_x, tr_y = GRID_CORNERS["tr"]
+    bl_x, bl_y = GRID_CORNERS["bl"]
+    br_x, br_y = GRID_CORNERS["br"]
 
     tl_x, tl_y = GRID_CORNERS["tl"]
     tr_x, tr_y = GRID_CORNERS["tr"]
@@ -308,7 +315,8 @@ def classify_symbol_by_features(l_mode, a_mode, b_mode, l_stdev):
 
 def classify_cell(img, x, y, img_w, img_h):
     """
-    利用底层硬件加速，通过标准差(stdev)和众数(mode)
+    【算力解放入口】：多维统计特征判别器 (O(1) 复杂度)
+    彻底废弃 Python 层面的像素遍历！利用底层硬件加速，通过标准差(stdev)和众数(mode)
     实现对“纹理”、“双色”和“纯色”的降维打击分类。
     """
     radius = 5  # 采样半径 5 = 11x11 范围 (共 121 个像素点一起统计)
@@ -384,8 +392,10 @@ def find_car_single(map_list):
 
 def build_map_with_single_car(map_list, car_found, car_x, car_y):
     """输出洗牌：在发给 STM32 的包中，抹去H/T，统一换成唯一标志符 @ """
-    # 【额外帧率优化】：使用列表推导代替逐个 append() 循环，极大降低运行时耗时
-    merged = ["-" if (ch == "H" or ch == "T") else ch for ch in map_list]
+    merged = []
+    for ch in map_list:
+        if ch == "H" or ch == "T": merged.append("-")
+        else: merged.append(ch)
 
     if car_found and 0 <= car_x < COLS and 0 <= car_y < ROWS:
         merged[car_y * COLS + car_x] = "@"
@@ -395,61 +405,29 @@ def build_map_with_single_car(map_list, car_found, car_x, car_y):
 # ======================================================================
 # 6. 系统主循环 (正常运行)
 # ======================================================================
-# 【额外帧率优化】：将 map_list 在循环外静态预分配内存，防止每帧循环内动态增删产生大量内存碎片
-map_list = ["-"] * (ROWS * COLS)
-
 while(True):
     clock.tick()
     img = sensor.snapshot()
     frame_cnt += 1
 
     img_w, img_h = img.width(), img.height()
+    map_list = []
     car_x, car_y = 225, 225    #没识别到小车时，发送无效坐标，以防止主控误判车的位置
     car_found = False
     tl_pt = tr_pt = bl_pt = br_pt = None
 
-    # --- 阶段 A0：AprilTag 自动定位与透视校正矩阵更新 ---
-    # 【新增自动定位】：扫描 TAG16H5 家族标签并更新四个角点
-    apriltags = img.find_apriltags(families=image.TAG16H5)
-
-    if not apriltags:
-        # 【新增调试可视化】：一个都没识别到时，在屏幕左上角显示 False
-        img.draw_string(10, 10, "False", color=(255, 0, 0), scale=2)
-    else:
-        for tag in apriltags:
-            # 【新增调试可视化】：识别到 AprilTag 码后，用红框标出
-            img.draw_rectangle(tag.rect(), color=(255, 0, 0))
-
-            tid = tag.id()
-            cx, cy = tag.cx(), tag.cy()
-            # 采用平滑滤波(IIR)更新角点坐标，防止定位框在单帧内因噪点剧烈跳动
-            alpha = 0.4
-            if tid == TAG_ID_TL:
-                GRID_CORNERS["tl"] = (GRID_CORNERS["tl"][0]*(1-alpha) + cx*alpha, GRID_CORNERS["tl"][1]*(1-alpha) + cy*alpha)
-            elif tid == TAG_ID_TR:
-                GRID_CORNERS["tr"] = (GRID_CORNERS["tr"][0]*(1-alpha) + cx*alpha, GRID_CORNERS["tr"][1]*(1-alpha) + cy*alpha)
-            elif tid == TAG_ID_BR:
-                GRID_CORNERS["br"] = (GRID_CORNERS["br"][0]*(1-alpha) + cx*alpha, GRID_CORNERS["br"][1]*(1-alpha) + cy*alpha)
-            elif tid == TAG_ID_BL:
-                GRID_CORNERS["bl"] = (GRID_CORNERS["bl"][0]*(1-alpha) + cx*alpha, GRID_CORNERS["bl"][1]*(1-alpha) + cy*alpha)
-
     # --- 阶段 A：扫描解析赛道 ---
-    # 【额外帧率优化】：提取局部函数查表（Local Pointer Cache），减少点号运算符(`.`)的对象属性访问开销
-    _calc = calc_grid_point
-    _classify = classify_cell
-    idx = 0
-
     for y_idx in range(ROWS):
         for x_idx in range(COLS):
             # 获取物理逆透视坐标点
-            tx, ty = _calc(x_idx, y_idx, img_w, img_h)
+            tx, ty = calc_grid_point(x_idx, y_idx, img_w, img_h)
 
             if 0 <= tx < img_w and 0 <= ty < img_h:
-                # 获取该点 11x11 范围的元素分类并直接索引赋值
-                map_list[idx] = _classify(img, tx, ty, img_w, img_h)
+                # 获取该点 11x11 范围的元素分类
+                char = classify_cell(img, tx, ty, img_w, img_h)
+                map_list.append(char)
             else:
-                map_list[idx] = "-"
-            idx += 1
+                map_list.append("-")
 
     # --- 阶段 B：坐标解算 ---
     # 新逻辑：不再寻找相邻的 H/T 配对，只要检测到 H 或 T 即判定为车辆（整张地图只允许一辆车）
