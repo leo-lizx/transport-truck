@@ -59,19 +59,19 @@
 #define HAL_VISION_GET_BOX_CLASS_ID()  (0)
 // ==========================================
 
-/* Formal game launch heading calibration: car nose faces map -Y in the launch zone. */
-#define APP_GAME_LAUNCH_FACE_YAW_DEG   (180.0f)
+/* Formal launch debug baseline: match hardcoded-map mode and lock yaw to 0 degrees. */
+#define APP_GAME_LAUNCH_FACE_YAW_DEG   (0.0f)
 
 // 游戏主流程状态机枚举
 typedef enum {
-    STAGE_WAIT_START = 0,           // 返回并停在左侧发车点 (1,5)
+    STAGE_WAIT_START = 0,           // 首次从 (1,5) 发车；关间返回并停在 (1,5)
     STAGE_LAUNCH_EXIT,              // 从 (1,5) 驶向上位机触发点 (1,4)
     STAGE_WAIT_MAP_REFRESH,         // 已到 (1,4)，停车等待上位机刷新地图
     STAGE_RECOGNIZE_MAP,            // 识别地图与箱子
     STAGE_PLAN_PATH,                // 寻路/推箱策略计算
     STAGE_EXECUTE_ACTION,           // 执行推箱动作
     STAGE_LEVEL_JUDGE,              // 仅确认本关箱子已全部完成
-    STAGE_DEADLOCK_RESET,           // 死局恢复：回发车区静止3秒后重置
+    STAGE_DEADLOCK_RESET,           // 异常停车：自动死局返航/重置暂时关闭
     STAGE_DONE,                     // 全流程完成
     STAGE_PAUSE_ON_LINK_LOSS,       // 【P0-2】视觉链路超时刹停
     STAGE_WAIT_RECOVERY_MAP         // 断链恢复：停车等待新鲜稳定地图后重规划
@@ -83,7 +83,7 @@ extern uint8 g_game_map[MAP_ROWS][MAP_COLS];
 // 业务调度函数
 void Game_Logic_Task_Run(void);
 
-/* 正式比赛状态初始化，上电后从第一关开始。 */
+/* 正式比赛状态初始化：上电已在 (1,5)，从第一关发车准备开始。 */
 void Game_Logic_Init(void);
 
 /* ==================================================================
@@ -96,21 +96,6 @@ void Game_Logic_Init(void);
  * 用途: 菜单 / IPS 显示、调试上位机查询。
  * ================================================================== */
 uint8 Game_Link_Is_Alive(void);
-
-/* ==================================================================
- * 【P0-8】比赛失败原因枚举 + 查询接口
- *   GAME_FAIL_NONE          : 无失败 (正常运行 / 正常完赛)
- *   GAME_FAIL_OUT_OF_BOUNDS : 车体越过最外圈围墙, 比赛立即终止
- * 用途: 调试上位机 / 菜单显示原因; 状态机决定是否切 STAGE_DONE.
- * 注意: 触发后 Game_Logic_Task_Run 会强制 chassis_ctrl_stop() 并切 STAGE_DONE,
- *       业务侧不会再回到 RECOGNIZE_MAP/PLAN_PATH 等任何执行态.
- * ================================================================== */
-typedef enum {
-    GAME_FAIL_NONE = 0,
-    GAME_FAIL_OUT_OF_BOUNDS
-} GameFailureReason_e;
-
-GameFailureReason_e Game_Get_Failure_Reason(void);
 
 /* ==================================================================
  * 【B17】识别 tour 进度查询接口 (转发自 App_Recognize_Get_Debug)

@@ -1476,6 +1476,14 @@ SokoSearchStatus_e Sokoban_Stage1_Search_Step(uint8 max_pair_evals,
 
         if (s_soko_opt.node_limit != 0UL &&
             s_soko_opt.node_count >= s_soko_opt.node_limit) {
+            /* 多箱简单图通常很早即可得到完整分支；若 256 次预算内恰好尚未走到叶子，
+             * 只在这个罕见终点调用已有贪心解，避免把可解地图误报成死局。 */
+            if (!s_soko_opt.best_valid &&
+                sokoban_solve_stage1_greedy(s_soko_opt.map_copy,
+                                            s_soko_opt.stage1_frames[0].player,
+                                            result)) {
+                s_soko_opt.best_valid = 1U;
+            }
             s_soko_opt.stage1_status = s_soko_opt.best_valid
                                       ? SOKO_SEARCH_SOLVED
                                       : SOKO_SEARCH_FAILED;

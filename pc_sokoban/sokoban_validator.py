@@ -423,6 +423,38 @@ def plan_scout_phase(the_map: list, player_start: tuple,
 EXACT_SCOUT_ITEM_LIMIT = 6
 
 
+def static_push_distances(the_map: list, target: tuple,
+                          walls_removable: bool = False) -> list:
+    """反向推箱距离；放宽其他箱子/目标，只保留墙体和内场边界的必要约束。"""
+    distance = [[None] * MAP_COLS for _ in range(MAP_ROWS)]
+
+    def cell_open(r: int, c: int) -> bool:
+        if not is_inner(r, c):
+            return False
+        if walls_removable:
+            return True
+        return the_map[r][c] not in (WALL, BOMB)
+
+    if not cell_open(*target):
+        return distance
+
+    distance[target[0]][target[1]] = 0
+    queue = deque([target])
+    while queue:
+        cur_r, cur_c = queue.popleft()
+        next_distance = distance[cur_r][cur_c] + 1
+        for d in range(4):
+            prev_r, prev_c = cur_r - DR[d], cur_c - DC[d]
+            stand_r, stand_c = prev_r - DR[d], prev_c - DC[d]
+            if (not cell_open(prev_r, prev_c)
+                    or not cell_open(stand_r, stand_c)
+                    or distance[prev_r][prev_c] is not None):
+                continue
+            distance[prev_r][prev_c] = next_distance
+            queue.append((prev_r, prev_c))
+    return distance
+
+
 def plan_scout_phase_v2(the_map: list, player_start: tuple,
                          box_classes: Optional[list] = None,
                          target_classes: Optional[list] = None) -> dict:
@@ -648,6 +680,12 @@ def plan_scout_phase_v2(the_map: list, player_start: tuple,
                 ok = False
                 break
 
+            walls_removable = bool(extract_elements(the_map, BOMB))
+            push_distance = {
+                target_idx: static_push_distances(
+                    the_map, targets[target_idx], walls_removable)
+                for target_idx in group_targets
+            }
             best_cost = None
             best_assign = None
             used = [False] * len(group_targets)
@@ -666,8 +704,9 @@ def plan_scout_phase_v2(the_map: list, player_start: tuple,
                 for local_ti, target_idx in enumerate(group_targets):
                     if used[local_ti]:
                         continue
-                    target_pos = targets[target_idx]
-                    step_cost = abs(box_pos[0] - target_pos[0]) + abs(box_pos[1] - target_pos[1])
+                    step_cost = push_distance[target_idx][box_pos[0]][box_pos[1]]
+                    if step_cost is None:
+                        continue
                     used[local_ti] = True
                     cur_assign[depth] = target_idx
                     dfs(depth + 1, cur_cost + step_cost)
@@ -1320,7 +1359,28 @@ def _solve_stage1_time_opt(the_map: list, player_pos: tuple,
                 return
 
     dfs(0, 0, player_pos, 0)
-    return best
+    if best is not None or not hit_limit:
+        return best
+
+    # 镜像正式固件：仅在多箱搜索预算耗尽且尚无完整叶子时，用已有贪心解保底。
+    fallback = _solve_stage1_greedy(the_map, player_pos)
+    if fallback is None:
+        return None
+    fallback_cost = 0
+    cur_player = player_pos
+    for sub in fallback['sub_solutions']:
+        flags = _push_flags(sub['actions'], cur_player,
+                            boxes[sub['box_idx']])
+        sub['push_flags'] = flags
+        fallback_cost += sequence_time_cost(sub['actions'], flags)
+        cur_player = sub['player_end']
+    return_plan = build_return_path(the_map, cur_player, home_pos)
+    if return_plan is None:
+        return None
+    fallback['time_cost_ms'] = fallback_cost + return_plan['time_cost_ms']
+    fallback['return_plan'] = return_plan
+    fallback['pair_evaluations'] = node_count
+    return fallback
 
 
 def solve_stage1(the_map: list, player_pos: tuple,

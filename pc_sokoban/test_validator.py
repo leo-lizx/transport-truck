@@ -136,8 +136,8 @@ assert order8a == [('target', 1), ('target', 0), ('box', 0), ('box', 1)], order8
 assert len(scout8a['scout_actions']) == 12, len(scout8a['scout_actions'])
 print(f"  顺序: {order8a}  侦查步数: {len(scout8a['scout_actions'])}")
 
-# 测试8b: 同图案多箱/多目标时按组内最短距离匹配
-print("\n=== 测试8b: 重复图案最短匹配 ===")
+# 测试8b: 同图案多箱/多目标时按组内最少静态推数匹配
+print("\n=== 测试8b: 重复图案最少推数匹配 ===")
 m8b = sv._make_empty_map()
 m8b[2][2] = sv.BOX
 m8b[8][10] = sv.BOX
@@ -151,6 +151,31 @@ scout8b = sv.plan_scout_phase_v2(
 assert scout8b['all_visited']
 assert scout8b['box_to_target_idx'] == [1, 0], scout8b['box_to_target_idx']
 print(f"  重复 class=1 映射: {scout8b['box_to_target_idx']} (期望 [1, 0])")
+
+# Test 8c: 重复类别不能只按曼哈顿距离配对。贴上边界的箱子无法向下起推，
+# 旧映射会选 [1,0] 并判无解；静态反向推箱距离应改选可解的 [0,1]。
+print("\n=== 测试8c: 重复类别静态推送可行性 ===")
+m8c, p8c, err8c = sv.parse_map_text("""
+################
+#-$-----.------#
+#-.------------#
+#--------------#
+#--------------#
+#--------------#
+#-----$--#-----#
+#--------------#
+#@-------#-----#
+#--------------#
+#---#-----#----#
+################
+""")
+assert err8c == "", err8c
+scout8c = sv.plan_scout_phase_v2(m8c, p8c, [1, 1], [1, 1])
+assert scout8c['all_visited']
+assert scout8c['box_to_target_idx'] == [0, 1], scout8c['box_to_target_idx']
+assert sv.solve_stage2(m8c, scout8c['player_after_scout'],
+                       scout8c['box_to_target_idx']) is not None
+print("静态不可推的近目标被排除，同类别映射选择可解组合 [0, 1]。")
 
 # 测试9: V2 + Stage2 完整求解 (走真实路径)
 print("\n=== 测试9: V2 完整求解 ===")
@@ -290,6 +315,18 @@ assert opt12['return_plan']['direct']
 assert opt12['return_plan']['waypoints'] == [((5, 1), 'critical')]
 print(f"greedy={greedy12['total_steps']}步/{greedy_cost12}ms, "
       f"optimized={opt12['total_steps']}步/{opt12['time_cost_ms']}ms")
+
+print("\n=== Test 12b: Stage1 pair-budget fallback ===")
+old_pair_limit12b = sv.STAGE1_PAIR_LIMIT
+try:
+    sv.STAGE1_PAIR_LIMIT = 1
+    fallback12b = sv.solve_stage1(m12, p12, home_pos=(5, 1))
+finally:
+    sv.STAGE1_PAIR_LIMIT = old_pair_limit12b
+assert fallback12b is not None
+assert fallback12b['pair_evaluations'] == 1
+assert fallback12b['return_plan']['direct']
+print("预算耗尽且尚无完整叶子时，保留贪心可行解而不误报死局。")
 
 print("\n=== Test 13: typed waypoints and direct return ===")
 typed13 = sv.actions_to_typed_waypoints(

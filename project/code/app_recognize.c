@@ -10,11 +10,12 @@
  *   2. 6 个以内物体用精确 tour 选首项；更多物体退化为 BFS 最近观察点
  *   3. 对每个物体:
  *        - 找观察点: 与物体 4-邻接的可立足空地, BFS 求最近
- *        - 以最近的 90° 基准航向移动到观察点，最终航点做视觉 Snap
+ *        - 以最近的 90° 基准航向移动到观察点，仅依赖里程计到位
  *        - 旋转车头朝物体 (chassis_ctrl_rotate_to_deg + chassis_ctrl_is_arrived)
  *        - 等多数票稳定: 在 SAMPLE_WINDOW_MS 内统计 BOX_CLASS 帧, 占比 ≥ MAJORITY_THRESH 即确认
  *        - 保持采样后的车头角, 直接继续下一个物体
- *   4. 所有 box → class_id, target → class_id 收齐后, 按相同 class_id 配对生成 g_box_to_target[]
+ *   4. 所有 box → class_id, target → class_id 收齐后, 按相同 class_id 与静态推送可达性配对生成
+ *      g_box_to_target[]，避免仅按直线距离把贴边箱分给无法起推的目标
  *
  * 资源:
  *   - 全部 static (BSS), 不可重入, 不可在 ISR 调用
@@ -24,7 +25,6 @@
 #include "app_recognize.h"
 #include "app_recognize_clear.h"
 #include "app_link.h"
-#include "app_vision_fusion.h"
 #include "chassis_ctrl.h"
 #include "chassis_config.h"
 #include <math.h>
@@ -129,6 +129,9 @@ static uint8  s_tour_edge_cost[RECOG_TOUR_MAX_CANDIDATES][RECOG_TOUR_MAX_CANDIDA
 static uint16 s_tour_dp[RECOG_TOUR_MASK_COUNT][RECOG_TOUR_MAX_CANDIDATES];
 static uint8  s_tour_first[RECOG_TOUR_MASK_COUNT][RECOG_TOUR_MAX_CANDIDATES];
 static AppRecogClearPlan_t s_pick_clear_plan;
+/* 重复类别匹配 scratch：反向推箱 BFS 共用一张距离图和一个 12×16 队列，约 0.6KB BSS。 */
+static Point_t s_match_queue[MAP_ROWS * MAP_COLS];
+static uint16  s_match_cost[SOKOBAN_MAX_BOXES][SOKOBAN_MAX_BOXES];
 
 /*===================================================================================================================
  * 内部工具
@@ -175,36 +178,10 @@ static void recog_move_to_grid_keep_current_yaw(Point_t target)
                            chassis_snap_yaw_to_cardinal_deg(pose.yaw_deg));
 }
 
-/* 识别巡航仅在每个物体的最终观察航点做视觉 Snap。中间转弯点继续使用
- * odom 到位即可，避免每段额外等待最多 800ms；最终点校准后再计算朝物体 yaw。 */
-static uint8 recog_nav_arrived_for_waypoint(uint8 require_snap)
+/* 识别巡航的中间点与最终观察点均只使用编码器和陀螺仪到位。 */
+static uint8 recog_nav_arrived(void)
 {
-    if (chassis_ctrl_is_arrived() == 0U)
-    {
-        app_vision_fusion_snap_cancel();
-        return 0U;
-    }
-
-#if CHASSIS_VISION_SNAP_ON_ARRIVE_ENABLE
-    if (require_snap != 0U)
-    {
-        float target_x_m = 0.0f;
-        float target_y_m = 0.0f;
-        app_vision_snap_state_e state;
-
-        chassis_ctrl_get_point_nav_target_m(&target_x_m, &target_y_m);
-        app_vision_fusion_snap_request(target_x_m, target_y_m);
-        state = app_vision_fusion_snap_state();
-        return (uint8)((state == APP_VISION_SNAP_DONE) ||
-                       (state == APP_VISION_SNAP_TIMEOUT) ||
-                       (state == APP_VISION_SNAP_REJECT));
-    }
-#else
-    (void)require_snap;
-#endif
-
-    app_vision_fusion_snap_cancel();
-    return 1U;
+    return chassis_ctrl_is_arrived();
 }
 
 /*===================================================================================================================
@@ -626,19 +603,68 @@ static uint8 item_class_at(uint8 kind, int8 x, int8 y, uint8 *class_id)
     return 0U;
 }
 
-static uint16 point_manhattan_cost(Point_t a, Point_t b)
+static uint8 match_static_cell_open(const uint8 map[MAP_ROWS][MAP_COLS],
+                                    int8 y,
+                                    int8 x,
+                                    uint8 walls_removable)
 {
-    int16 dx = (int16)a.x - (int16)b.x;
-    int16 dy = (int16)a.y - (int16)b.y;
-
-    if (dx < 0) { dx = (int16)-dx; }
-    if (dy < 0) { dy = (int16)-dy; }
-    return (uint16)(dx + dy);
+    if (x < (int8)CHASSIS_GRID_INNER_MIN_X ||
+        x > (int8)CHASSIS_GRID_INNER_MAX_X ||
+        y < (int8)CHASSIS_GRID_INNER_MIN_Y ||
+        y > (int8)CHASSIS_GRID_INNER_MAX_Y) {
+        return 0U;
+    }
+    if (walls_removable != 0U) {
+        return 1U;
+    }
+    return (uint8)(map[y][x] != MAP_WALL && map[y][x] != MAP_BOMB);
 }
 
-static void search_min_cost_match(const Point_t box_pos[SOKOBAN_MAX_BOXES],
-                                  const Point_t tgt_pos[SOKOBAN_MAX_BOXES],
-                                  const uint8 group_boxes[SOKOBAN_MAX_BOXES],
+/**
+ * 从目标反向枚举箱位。反向一步 cur→prev 等价于正向把箱子从 prev 推到 cur，
+ * 因而 prev 后方的站位也必须可用。其他箱子/目标按最终会消失处理；有炸弹时内部墙
+ * 也按可能被炸除处理，只保留永远不能越过的内场边界约束。
+ */
+static void build_static_push_distance(const uint8 map[MAP_ROWS][MAP_COLS],
+                                       Point_t target,
+                                       uint8 walls_removable)
+{
+    static const int8 dr[4] = {-1, 1, 0, 0};
+    static const int8 dc[4] = {0, 0, -1, 1};
+    uint16 head = 0U;
+    uint16 tail = 0U;
+
+    memset(s_pick_distance, 0xFF, sizeof(s_pick_distance));
+    if (!match_static_cell_open(map, target.y, target.x, walls_removable)) {
+        return;
+    }
+
+    s_pick_distance[target.y][target.x] = 0U;
+    s_match_queue[tail++] = target;
+    while (head < tail) {
+        Point_t cur = s_match_queue[head++];
+        uint8 next_distance = (uint8)(s_pick_distance[cur.y][cur.x] + 1U);
+
+        for (uint8 d = 0U; d < 4U; ++d) {
+            Point_t prev;
+            Point_t stand;
+            prev.x = (int8)(cur.x - dc[d]);
+            prev.y = (int8)(cur.y - dr[d]);
+            stand.x = (int8)(prev.x - dc[d]);
+            stand.y = (int8)(prev.y - dr[d]);
+
+            if (!match_static_cell_open(map, prev.y, prev.x, walls_removable) ||
+                !match_static_cell_open(map, stand.y, stand.x, walls_removable) ||
+                s_pick_distance[prev.y][prev.x] != 0xFFU) {
+                continue;
+            }
+            s_pick_distance[prev.y][prev.x] = next_distance;
+            s_match_queue[tail++] = prev;
+        }
+    }
+}
+
+static void search_min_cost_match(const uint8 group_boxes[SOKOBAN_MAX_BOXES],
                                   const uint8 group_targets[SOKOBAN_MAX_BOXES],
                                   uint8 group_count,
                                   uint8 depth,
@@ -669,13 +695,12 @@ static void search_min_cost_match(const Point_t box_pos[SOKOBAN_MAX_BOXES],
         uint16 step_cost;
         if ((used_mask & bit) != 0U) { continue; }
 
-        step_cost = point_manhattan_cost(box_pos[group_boxes[depth]],
-                                         tgt_pos[group_targets[i]]);
+        step_cost = s_match_cost[group_boxes[depth]][group_targets[i]];
+        if (step_cost == 0xFFFFU) { continue; }
         if ((uint16)(cur_cost + step_cost) < cur_cost) { continue; }
 
         cur_assign[depth] = group_targets[i];
-        search_min_cost_match(box_pos, tgt_pos,
-                              group_boxes, group_targets,
+        search_min_cost_match(group_boxes, group_targets,
                               group_count,
                               (uint8)(depth + 1U),
                               (uint8)(used_mask | bit),
@@ -687,6 +712,7 @@ static void search_min_cost_match(const Point_t box_pos[SOKOBAN_MAX_BOXES],
 }
 
 static uint8 build_box_to_target_mapping(const uint8 map[MAP_ROWS][MAP_COLS],
+                                         uint8 has_bomb,
                                          uint8 box_to_target_out[SOKOBAN_MAX_BOXES])
 {
     uint8 box_class[SOKOBAN_MAX_BOXES];
@@ -743,7 +769,16 @@ static uint8 build_box_to_target_mapping(const uint8 map[MAP_ROWS][MAP_COLS],
     if (box_idx_in_extract != tgt_idx_in_extract)  { return 0U; }
     if (box_idx_in_extract == 0U)                  { return 0U; }
 
-    /* 同 class_id 内按箱→目标曼哈顿总代价最小做一一匹配。 */
+    /* 先计算每个箱→目标的静态最少推数；0xFFFF 表示连放宽后的推送几何都不可达。 */
+    for (uint8 ti = 0U; ti < tgt_idx_in_extract; ++ti) {
+        build_static_push_distance(map, tgt_pos[ti], has_bomb);
+        for (uint8 bi = 0U; bi < box_idx_in_extract; ++bi) {
+            uint8 distance = s_pick_distance[box_pos[bi].y][box_pos[bi].x];
+            s_match_cost[bi][ti] = (distance == 0xFFU) ? 0xFFFFU : (uint16)distance;
+        }
+    }
+
+    /* 同 class_id 内只保留静态可推组合，并按总推数最小做一一匹配。 */
     {
         uint8 box_done[SOKOBAN_MAX_BOXES] = {0};
         uint8 bi;
@@ -779,8 +814,7 @@ static uint8 build_box_to_target_mapping(const uint8 map[MAP_ROWS][MAP_COLS],
 
             memset(cur_assign, 0, sizeof(cur_assign));
             memset(best_assign, 0, sizeof(best_assign));
-            search_min_cost_match(box_pos, tgt_pos,
-                                  group_boxes, group_targets,
+            search_min_cost_match(group_boxes, group_targets,
                                   group_box_count,
                                   0U, 0U, 0U,
                                   &best_cost,
@@ -955,7 +989,6 @@ static void enter_sub_nav(void)
 
 static void enter_sub_face(void)
 {
-    app_vision_fusion_snap_cancel();
     s_sub_state    = RECOG_SUB_FACE;
     s_face_started = 0U;
     s_subphase_ticks = 0U;        /* B3a */
@@ -978,7 +1011,6 @@ static void enter_sub_next(void)
 
 void App_Recognize_Reset(void)
 {
-    app_vision_fusion_snap_cancel();
     s_sub_state    = RECOG_SUB_INIT;
     s_item_count   = 0U;
     s_box_count    = 0U;
@@ -1003,7 +1035,6 @@ AppRecognizeStatus_e App_Recognize_Tick(uint8 map[MAP_ROWS][MAP_COLS],
                                         uint8 level,
                                         uint8 box_to_target_out[SOKOBAN_MAX_BOXES])
 {
-    (void)has_bomb;  /* 第一关即使含炸弹也不需要数字分类；炸弹由规划失败兜底处理。 */
     switch (s_sub_state)
     {
         case RECOG_SUB_INIT:
@@ -1061,7 +1092,6 @@ AppRecognizeStatus_e App_Recognize_Tick(uint8 map[MAP_ROWS][MAP_COLS],
                 }
                 if (s_subphase_ticks > s_nav_timeout_limit)
                 {
-                    app_vision_fusion_snap_cancel();
                     chassis_ctrl_stop();
                     if (s_nav_plan.push_count > 0U)
                     {
@@ -1075,8 +1105,7 @@ AppRecognizeStatus_e App_Recognize_Tick(uint8 map[MAP_ROWS][MAP_COLS],
                     enter_sub_next();
                     return APP_RECOG_RUNNING;
                 }
-                if (!recog_nav_arrived_for_waypoint(
-                        (uint8)((s_nav_wp_idx + 1U) >= s_nav_waypoints.count)))
+                if (!recog_nav_arrived())
                 {
                     return APP_RECOG_RUNNING;
                 }
@@ -1166,7 +1195,7 @@ AppRecognizeStatus_e App_Recognize_Tick(uint8 map[MAP_ROWS][MAP_COLS],
             /* 已全部识别完 → 配对 */
             if (all_resolved())
             {
-                if (build_box_to_target_mapping(map, box_to_target_out))
+                if (build_box_to_target_mapping(map, has_bomb, box_to_target_out))
                 {
                     s_sub_state = RECOG_SUB_DONE;
                     return APP_RECOG_DONE_OK;
@@ -1190,7 +1219,7 @@ AppRecognizeStatus_e App_Recognize_Tick(uint8 map[MAP_ROWS][MAP_COLS],
                 return APP_RECOG_RUNNING;
             }
             /* 所有物体都尝试过仍未全识别 → 配对失败 */
-            if (build_box_to_target_mapping(map, box_to_target_out))
+            if (build_box_to_target_mapping(map, has_bomb, box_to_target_out))
             {
                 s_sub_state = RECOG_SUB_DONE;
                 return APP_RECOG_DONE_OK;

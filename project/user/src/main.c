@@ -44,7 +44,7 @@
 #include <math.h>       /* sqrtf — POINT_NAV 调试打印用 */
 #include <stdio.h>
 #include <string.h>
-#include "fsl_rtwdog.h"  /* 硬件看门狗: 屏幕 SPI 卡死时 2s 自动复位 */
+#include "fsl_rtwdog.h"  /* 非正式比赛模式使用的 2s 硬件看门狗 */
 
 /*==========================================================================
  *  P0-5: 主循环 5ms tick 节拍 (替代 system_delay_ms 阻塞)
@@ -89,7 +89,7 @@ static uint32 wait_for_tick(void)
 }
 
 /*===========================================================================
- *  顶层运行模式开关 —— 编译期八选一, 烧录时只有一种模式生效
+ *  顶层运行模式开关 —— 编译期十二选一, 烧录时只有一种模式生效
  *  ────────────────────────────────────────────────────────────────
  *  调试递进建议:
  *    ③ 单轮 → ② 航向 → ③ 四角 → ④ 摄像头显示 → ⑤ 解算验证 → ⑧ 硬编码 → ⑦ 第一关 → ① 正式比赛
@@ -107,6 +107,7 @@ static uint32 wait_for_tick(void)
  *   8   MAIN_RUN_MODE_HARDCODED_MAP         ✅    代码内置          固定发车: 上电解算→Y轴平移发车→推箱→回库
  *   9   MAIN_RUN_MODE_OPENART2_TEST         ❌    OpenART2 UART1   分类链路自测: 只显示 BOX_CLASS, 车不动
  *   10  MAIN_RUN_MODE_LEVEL2_TEST           ✅    OpenART1+2       第二关单测: 收图→发车→分类→Stage2推箱→回库
+ *   11  MAIN_RUN_MODE_BOARD_TEST            ❌    无               新主板自测: 屏幕显示 yaw、活动编码器轮号和轮速
  *=========================================================================*/
 #define MAIN_RUN_MODE_GAME            (0)   /* 正式比赛: 完整视觉+推箱+底盘闭环 */
 #define MAIN_RUN_MODE_YAW_HOLD        (1)   /* 航向保持: 车不动, IMU 锁角度调 yaw PID */
@@ -119,10 +120,11 @@ static uint32 wait_for_tick(void)
 #define MAIN_RUN_MODE_HARDCODED_MAP   (8)   /* 硬编码地图: 上电解算→Y轴平移发车→跑→回发车点 */
 #define MAIN_RUN_MODE_OPENART2_TEST   (9)   /* OpenART2 分类链路测试: 屏幕显示 BOX/TARGET/NONE, 车不动 */
 #define MAIN_RUN_MODE_LEVEL2_TEST     (10)  /* 第二关测试: 收图→固定发车→分类识别→Stage2推箱→回库 */
+#define MAIN_RUN_MODE_BOARD_TEST      (11)  /* 新主板测试: 屏幕显示 yaw 和手转车轮的编码器反馈 */
 
-/* ═══════════ 改下面这行切换运行模式 (0~10) ═══════════ */
-#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_GAME)  /* 正式比赛：三关连续计时完整流程 */
-/* ═══════════ 改上面这行切换运行模式 (0~10) ═══════════ */
+/* ═══════════ 改下面这行切换运行模式 (0~11) ═══════════ */
+#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_SINGLE_WHEEL)
+/* ═══════════ 改上面这行切换运行模式 (0~11) ═══════════ */
 
 /* OpenART1 地图链路硬件口: 若实测 UART4 走 D0/D1, 只改下面两行宏. */
 #define MAIN_OPENART1_UART            (UART_4)
@@ -143,6 +145,9 @@ static uint32 wait_for_tick(void)
 /* ========================================================================== */
 #define MAIN_POS_NAV_START_X_GRID     (1.0f)
 #define MAIN_POS_NAV_START_Y_GRID     (5.5f)
+
+#define MAIN_POS_GAME_START_X_GRID    (1.0f)
+#define MAIN_POS_GAME_START_Y_GRID    (5.0f)
 
 #define MAIN_POS_HCM_HOME_X_GRID      (MAIN_POS_NAV_START_X_GRID)
 #define MAIN_POS_HCM_HOME_Y_GRID      (MAIN_POS_NAV_START_Y_GRID)
@@ -1847,6 +1852,70 @@ static void main_mode5_render_100ms(void)
 #define MAIN_MENU_RENDER_DIV          (20U)
 #endif
 
+#if (MAIN_RUN_MODE == MAIN_RUN_MODE_BOARD_TEST) && (CHASSIS_MENU_ENABLE != 0)
+/* 20ms 采样下单个脉冲约为 0.01m/s，LPF 首次响应约 0.003m/s。 */
+#define MAIN_BOARD_TEST_WHEEL_ACTIVE_MPS  (0.002f)
+
+static void main_board_test_render_100ms(void)
+{
+    static uint8 layout_drawn = 0U;
+    chassis_pose_t pose = chassis_ctrl_get_pose();
+    float wheel_speed_mps[CHASSIS_WHEEL_COUNT];
+    float active_speed_mps = 0.0f;
+    float max_abs_speed_mps = 0.0f;
+    const char *active_wheel = "NONE";
+    uint8 active_index = (uint8)CHASSIS_WHEEL_COUNT;
+    uint8 i;
+
+    chassis_ctrl_get_wheel_feedback_snapshot(wheel_speed_mps);
+    for (i = 0U; i < (uint8)CHASSIS_WHEEL_COUNT; ++i)
+    {
+        float abs_speed_mps = fabsf(wheel_speed_mps[i]);
+        if (abs_speed_mps > max_abs_speed_mps)
+        {
+            max_abs_speed_mps = abs_speed_mps;
+            active_index = i;
+        }
+    }
+
+    if (max_abs_speed_mps >= MAIN_BOARD_TEST_WHEEL_ACTIVE_MPS)
+    {
+        active_speed_mps = wheel_speed_mps[active_index];
+        switch (active_index)
+        {
+        case CHASSIS_WHEEL_LF: active_wheel = "LF"; break;
+        case CHASSIS_WHEEL_RF: active_wheel = "RF"; break;
+        case CHASSIS_WHEEL_LB: active_wheel = "LB"; break;
+        case CHASSIS_WHEEL_RB: active_wheel = "RB"; break;
+        default: break;
+        }
+    }
+
+    if (0U == layout_drawn)
+    {
+        ips200_full(RGB565_BLACK);
+        ips200_set_color(RGB565_WHITE, RGB565_BLACK);
+        ips200_show_string(0U, 0U, "BOARD SENSOR TEST");
+        ips200_show_string(0U, 48U, "YAW:");
+        ips200_show_string(0U, 96U, "WHEEL:");
+        ips200_show_string(0U, 144U, "SPEED:");
+        ips200_show_string(136U, 144U, "m/s");
+        layout_drawn = 1U;
+    }
+
+    ips200_set_color(RGB565_WHITE, RGB565_BLACK);
+    ips200_show_string(56U, 48U, "          ");
+    ips200_show_float(56U, 48U, pose.yaw_deg, 3U, 1U);
+    ips200_show_string(112U, 48U, "deg");
+
+    ips200_show_string(64U, 96U, "          ");
+    ips200_show_string(64U, 96U, active_wheel);
+
+    ips200_show_string(64U, 144U, "          ");
+    ips200_show_float(64U, 144U, active_speed_mps, 2U, 3U);
+}
+#endif
+
 #if (MAIN_RUN_MODE == MAIN_RUN_MODE_OPENART2_TEST)
 #define OA2_TEST_STALE_MS             (500U)
 
@@ -2085,7 +2154,8 @@ static void main_apply_debug_wheel_pid(void)
 /* ========================================================================== */
 /*  ⬆⬆⬆ 单轮 PID 调试辅助函数结束 ⬆⬆⬆                                          */
 /* ========================================================================== */
- int main(void)
+
+int main(void)
 {
 #if (CHASSIS_MENU_ENABLE != 0)
     uint8 menu_render_div = 0U;
@@ -2133,6 +2203,9 @@ static void main_apply_debug_wheel_pid(void)
     ips200_set_font(IPS200_8X16_FONT);
     ips200_full(RGB565_BLACK);
     ips200_set_color(RGB565_WHITE, RGB565_BLACK);
+    ips200_show_string(0U, 0U, "SYSTEM INITIALIZING");
+    /* ips200_init() keeps C18 backlight off until the caller completes its first frame. */
+    ips200_set_backlight(1U);
     key_init(10);
 #endif
 
@@ -2151,9 +2224,9 @@ static void main_apply_debug_wheel_pid(void)
                           MAIN_POS_GRID_TO_M_Y(MAIN_POS_HCM_HOME_Y_GRID),
                           0.0f);
 #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_GAME)
-    /* 正式比赛: 发车区人工摆车时车头朝地图 -Y, 以 180° 写入全局 yaw 基准. */
-    chassis_ctrl_set_pose(MAIN_POS_GRID_TO_M_X(MAIN_POS_NAV_START_X_GRID),
-                          MAIN_POS_GRID_TO_M_Y(MAIN_POS_NAV_START_Y_GRID),
+    /* 正式比赛上电时车辆已经位于 (1,5)，只需从该点驶向 (1,4)。 */
+    chassis_ctrl_set_pose(MAIN_POS_GRID_TO_M_X(MAIN_POS_GAME_START_X_GRID),
+                          MAIN_POS_GRID_TO_M_Y(MAIN_POS_GAME_START_Y_GRID),
                           APP_GAME_LAUNCH_FACE_YAW_DEG);
 #else
     /* 解算/导航起点: 整数格约定 (1, 5.5) → 自动换算成米送入里程计原点. */
@@ -2200,6 +2273,12 @@ static void main_apply_debug_wheel_pid(void)
 #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_OPENART2_TEST)
     printf("OA2_BOOT wait BOX_CLASS from OpenART2 (UART1)...\n");
     chassis_ctrl_stop();
+#elif (MAIN_RUN_MODE == MAIN_RUN_MODE_BOARD_TEST)
+    /* 新主板测试只采集 IMU/编码器，保持四路电机 PWM 关闭。 */
+    chassis_ctrl_stop();
+  #if (CHASSIS_MENU_ENABLE != 0)
+    main_board_test_render_100ms();
+  #endif
 #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_LEVEL1_TEST)
     /* 第一关测试模式:
      *   等待 OpenART1 发来地图 → 冻结该地图 → 解算 → 固定发车 → 跑航点 → 回固定发车点.
@@ -2217,7 +2296,8 @@ static void main_apply_debug_wheel_pid(void)
     chassis_ctrl_hold_yaw(0.0f);
     main_hcm_solve();   /* 同步解算, 结果写入 s_hcm_solve_ok */
 #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_GAME)
-    /* 游戏模式: 设置发车区 -Y 航向基准, 等待状态机调度. */
+    /* 游戏模式: 锁定 0° 发车航向基准，等待编码器/陀螺仪发车状态机调度。 */
+    Game_Logic_Init();
     chassis_ctrl_hold_yaw(APP_GAME_LAUNCH_FACE_YAW_DEG);
 #else
     /* 游戏模式: 设置初始航向基准, 等待状态机调度. */
@@ -2235,7 +2315,8 @@ static void main_apply_debug_wheel_pid(void)
     pit_ms_init(PIT_CH2, 10);
 #endif
 
-    /* 硬件看门狗: 主循环卡死时 2s 自动复位 */
+#if (MAIN_RUN_MODE != MAIN_RUN_MODE_GAME)
+    /* 非正式比赛模式: 主循环卡死时由硬件看门狗在 2s 后复位。 */
     {
         rtwdog_config_t wdt_cfg;
         RTWDOG_GetDefaultConfig(&wdt_cfg);
@@ -2246,11 +2327,14 @@ static void main_apply_debug_wheel_pid(void)
         wdt_cfg.workMode.enableDebug = true;
         RTWDOG_Init(RTWDOG, &wdt_cfg);
     }
+#endif
 
     while (1)
     {
         (void)wait_for_tick();
+#if (MAIN_RUN_MODE != MAIN_RUN_MODE_GAME)
         RTWDOG_Refresh(RTWDOG);  /* 喂狗: 主循环活着就每 5ms 刷新 */
+#endif
 
     #if (MAIN_RUN_MODE == MAIN_RUN_MODE_SINGLE_WHEEL)
         /* ⬇⬇⬇ 单轮 PID 打印, 姿态调试阶段这里被 #if 屏蔽 ⬇⬇⬇ */
@@ -2452,6 +2536,8 @@ static void main_apply_debug_wheel_pid(void)
         main_run_static_verify_5ms();
     #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_OPENART2_TEST)
         main_run_openart2_test_5ms();
+    #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_BOARD_TEST)
+        /* yaw 与编码器采样均由 PIT 周期任务完成，主循环只负责屏幕刷新。 */
     #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_LEVEL1_TEST)
         main_run_level1_test_5ms();
         main_run_level1_test_log_50ms();
@@ -2473,6 +2559,8 @@ static void main_apply_debug_wheel_pid(void)
             menu_render_div = 0U;
 #if (MAIN_RUN_MODE == MAIN_RUN_MODE_OPENART2_TEST)
             main_openart2_test_render_100ms();
+#elif (MAIN_RUN_MODE == MAIN_RUN_MODE_BOARD_TEST)
+            main_board_test_render_100ms();
 #else
 #if (MAIN_RUN_MODE != MAIN_RUN_MODE_POINT_NAV)
             chassis_menu_render_100ms();

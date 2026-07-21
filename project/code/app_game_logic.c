@@ -1,6 +1,5 @@
 #include "app_game_logic.h"
 #include "app_link.h"      /* P0-2: 读取 OpenART1/2 链路时戳; P0-3: 拷贝 seq-lock 地图快照 */
-#include "app_vision_fusion.h"
 #include "app_recognize.h"
 
 /*
@@ -21,12 +20,9 @@
 uint8 g_game_map[MAP_ROWS][MAP_COLS];
 Point_t g_player_pos = {(int8)APP_GAME_LAUNCH_HOME_X, (int8)APP_GAME_LAUNCH_HOME_Y};
 
-#define GAME_LOGIC_TASK_PERIOD_MS      (5U)
-#define DEADLOCK_RESET_HOLD_MS         (3000U)
-#define DEADLOCK_RESET_HOLD_TICKS      (DEADLOCK_RESET_HOLD_MS / GAME_LOGIC_TASK_PERIOD_MS)
 /* 赛规: 三个关卡连续比赛。三个关卡均结束后进入 STAGE_DONE 静止收车,
  * 不再无限等待下一张地图；第三关结束并返航后进入 STAGE_DONE。
- * 推完箱子后返回发车点；死局返航并静止 3s 后结束失败关，均计入三关总数。 */
+ * 推完箱子后返回发车点；死局自动返航/重置暂时关闭，异常时停车等待。 */
 #define APP_GAME_TOTAL_LEVELS          (3U)
 
 /* ==================================================================
@@ -61,13 +57,11 @@ typedef enum
 
 static LinkPauseReason_e s_link_pause_reason = LINK_PAUSE_NONE;
 
-/* ----- 【P0-8】OOB / 发车 / 死局静止 相关静态变量 ------------------
- * s_failure_reason   : 比赛失败原因, 触发后状态机锁死在 STAGE_DONE
+/* ----- 发车相关静态变量 ------------------------------------
  * s_wait_start_phase : WAIT_START 子相位
  *                       0 = 正在返回左侧发车点 (1,5)
- *                       1 = 已到 (1,5), 正在进行发车前视觉校准
+ *                       1 = 已到 (1,5), 正在保持 0 度并等待底盘稳定
  * --------------------------------------------------------------- */
-static GameFailureReason_e s_failure_reason     = GAME_FAIL_NONE;
 static uint8               s_wait_start_phase   = 0U;
 
 /* ----- 【B1+B12】地图快照冻结标志 ----------------------------------
@@ -80,7 +74,7 @@ static uint8               s_map_freeze         = 0U;
 
 /* ----- 【B3b】航点执行超时保护 -------------------------------------
  * 单航点最长允许执行时长下限 = 5s @ 5ms/tick = 1000 tick.
- * 超时后先重发一次 MOVE_TO; 第二次仍超时切 STAGE_DEADLOCK_RESET.
+ * 超时后先重发一次 MOVE_TO; 第二次仍超时切到异常停车状态。
  *
  * O8.3: 固定 5s 对"绕大圈的长航段"易误触发。改为按本段曼哈顿格距线性放宽:
  *   limit = max(WAYPOINT_TIMEOUT_TICKS, 段格距 × WAYPOINT_TICKS_PER_CELL)
@@ -101,18 +95,16 @@ static uint16              s_wait_phase0_ticks  = 0U;
 
 /* ----- 自动发车 (左侧发车点 (1,5) → 上位机触发点 (1,4)) -----------
  * 发车不依赖地图；到达 (1,4) 后停车，等待上位机刷新本关地图。
- * LAUNCH_DRIVE_TIMEOUT_TICKS: 4s @5ms 超时兜底 → 转 DEADLOCK_RESET.
+ * LAUNCH_DRIVE_TIMEOUT_TICKS: 4s @5ms 超时兜底 → 重发一次，再失败则停车。
  * --------------------------------------------------------------- */
 #define LAUNCH_DRIVE_TIMEOUT_TICKS   (800U)
+#define LAUNCH_WARMUP_TICKS          (200U)    /* 1s @5ms, 与硬编码模式发车暖机一致 */
 #define LAUNCH_MAP_STABLE_REQUIRED_FRAMES  (5U)
 #define LAUNCH_MAP_STABLE_TIMEOUT_TICKS    (300U)
-/* 关间强校准兜底时限: 2s @5ms. 视觉给不出稳定表决时到时放行发车, 永不阻塞。 */
-#define LAUNCH_CALIB_TIMEOUT_TICKS   (400U)
 static uint8               s_launch_drive_issued = 0U;
 static uint16              s_launch_drive_ticks  = 0U;
 static uint8               s_launch_retry_count  = 0U;
-static uint8               s_launch_calib_done   = 0U;
-static uint16              s_launch_calib_ticks  = 0U;
+static uint16              s_launch_warmup_ticks = 0U;
 static uint8               s_launch_map_candidate_valid = 0U;
 static uint8               s_launch_map_stable_count = 0U;
 static uint16              s_launch_map_stable_ticks = 0U;
@@ -137,12 +129,6 @@ static Point_t               g_bomb_wall_pos;
 static SokoActionSeq_t       g_bomb_action_seq;
 static SokoWaypointPath_t    g_bomb_waypoints;
 static uint16                g_bomb_wp_idx = 0;
-
-/* 通关后忽略虚拟墙/炸弹，直接向库位下发一个关键航点。 */
-static SokoWaypointPath_t    g_return_waypoints;
-static uint16                g_return_wp_idx = 0U;
-static uint8                 g_return_path_valid = 0U;
-static uint8                 s_home_snap_fresh = 0U;
 
 static uint8                 g_box_to_target[SOKOBAN_MAX_BOXES] = {0};
 static ExecMode_e            g_exec_mode = EXEC_NONE;
@@ -341,10 +327,6 @@ static void reset_exec_context(void)
 
     g_bomb_waypoints.count = 0;
     g_bomb_wp_idx = 0;
-    g_return_waypoints.count = 0U;
-    g_return_wp_idx = 0U;
-    g_return_path_valid = 0U;
-    s_home_snap_fresh = 0U;
     g_exec_mode = EXEC_NONE;
     is_navigating = 0;
     s_wp_timeout_ticks = 0U;        /* B3b: 航点超时计数清零 */
@@ -355,8 +337,7 @@ static void reset_exec_context(void)
     s_launch_drive_issued = 0U;
     s_launch_drive_ticks  = 0U;
     s_launch_retry_count  = 0U;
-    s_launch_calib_done   = 0U;
-    s_launch_calib_ticks  = 0U;
+    s_launch_warmup_ticks = 0U;
     s_launch_depart_frame_id = 0U;
     s_launch_depart_map_hash = 0U;
     s_launch_depart_map_valid = 0U;
@@ -365,16 +346,12 @@ static void reset_exec_context(void)
 
 static void goto_stage(GameStage_e next)
 {
+    if (next == STAGE_DEADLOCK_RESET) {
+        /* 自动死局返航/重置暂时关闭；仍保留异常检测，触发时只停车。 */
+        chassis_ctrl_stop();
+        is_navigating = 0U;
+    }
     current_stage = next;
-}
-
-static void calibrate_launch_heading(void)
-{
-    chassis_pose_t pose = chassis_ctrl_get_pose();
-
-    chassis_ctrl_set_pose(pose.x_m,
-                          pose.y_m,
-                          APP_GAME_LAUNCH_FACE_YAW_DEG);
 }
 
 /* O8.2: 地图快照冻结开关的集中入口。
@@ -387,8 +364,7 @@ static void calibrate_launch_heading(void)
  *
  * 冻结 (hold, freeze=1) 点: 驶出后新地图稳定/链路恢复进 RECOGNIZE 前、识别完成且地图被清障改动、
  *                            炸弹爆破后保护 PLAN_PATH 当拍快照;
- * 解冻 (release, freeze=0) 点: WAIT_START/LAUNCH_EXIT/WAIT_MAP_REFRESH、识别失败、PLAN 完成本拍、
- *                              DEADLOCK_RESET 完成、DONE。 */
+ * 解冻 (release, freeze=0) 点: WAIT_START/LAUNCH_EXIT/WAIT_MAP_REFRESH、识别失败、PLAN 完成本拍、DONE。 */
 static void map_snapshot_freeze(void)
 {
     s_map_freeze = 1U;
@@ -479,59 +455,13 @@ static void sync_player_pos(void)
     }
 }
 
-/*
- * 航点到位判定: odom 到位 + (可选) 视觉到站 Snap 状态机。
- *
- * 行为:
- *   1) chassis_ctrl_is_arrived() == 0  → 直接返回 0 (并取消可能未结束的 Snap, 防跨航点串扰)。
- *   2) 启用 Snap 时:
- *        - 链路掉线 → 取消 Snap 并放行 (避免靠不上视觉时卡死);
- *        - 否则把当前导航目标米坐标喂给 app_vision_fusion_snap_request(), 状态机内部处理短静止+表决+Snap;
- *        - 状态 ∈ {DONE, TIMEOUT, REJECT} 视为放行 (REJECT 时按 odom 兜底);
- *        - 状态 == PENDING / IDLE 视为继续等待。
- *   3) 关闭 Snap → 直接 odom 到位即放行。
- */
-/* ==========================================================================
+/* ===========================================================================
  *  § 2. 航点执行公用逻辑 (chassis_nav_arrived / exec_waypoints_common)
  * ========================================================================== */
 
-static uint8 chassis_nav_arrived_for_waypoint(uint8 require_snap)
+static uint8 chassis_nav_arrived(void)
 {
-    if (chassis_ctrl_is_arrived() == 0U)
-    {
-        app_vision_fusion_snap_cancel();
-        return 0U;
-    }
-
-    if (require_snap == 0U) {
-        app_vision_fusion_snap_cancel();
-        return 1U;
-    }
-
-#if CHASSIS_VISION_SNAP_ON_ARRIVE_ENABLE
-    if (s_link_alive == 0U)
-    {
-        app_vision_fusion_snap_cancel();
-        return 1U;
-    }
-    {
-        float tx_m = 0.0f;
-        float ty_m = 0.0f;
-        app_vision_snap_state_e st;
-        chassis_ctrl_get_point_nav_target_m(&tx_m, &ty_m);
-        app_vision_fusion_snap_request(tx_m, ty_m);
-        st = app_vision_fusion_snap_state();
-        if ((st == APP_VISION_SNAP_DONE)    ||
-            (st == APP_VISION_SNAP_TIMEOUT) ||
-            (st == APP_VISION_SNAP_REJECT))
-        {
-            return 1U;
-        }
-        return 0U;
-    }
-#else
-    return 1U;
-#endif
+    return chassis_ctrl_is_arrived();
 }
 
 /* O8.3: 按"当前格 → 目标航点格"的曼哈顿距离给出本段超时上限.
@@ -580,20 +510,19 @@ static uint8 exec_waypoints_common(const SokoWaypointPath_t *wp, uint16 *wp_idx)
         return 0;
     }
 
-    /* B3b: 航点超时保护 — 超时(随段长放宽)先重发, 再超时切 DEADLOCK_RESET */
+    /* B3b: 航点超时保护 — 超时(随段长放宽)先重发, 再超时停车。 */
     s_wp_timeout_ticks++;
-    if (!chassis_nav_arrived_for_waypoint(
-            (uint8)(wp->kinds[*wp_idx] == (uint8)SOKO_WP_CRITICAL))) {
+    if (!chassis_nav_arrived()) {
         if (s_wp_timeout_ticks > s_wp_timeout_limit) {
             if (s_wp_retry_count == 0U) {
-                /* 第 1 次超时: 刹停后重发同一航点 (可能是 Snap 表决卡住) */
+                /* 第 1 次超时: 刹停后重发同一航点。 */
                 ++s_wp_retry_count;
                 chassis_ctrl_stop();
                 is_navigating = 0U;
                 s_wp_timeout_ticks = 0U;
                 return 0;
             }
-            /* 第 2 次仍超时 → 进入死局复位流程 */
+            /* 第 2 次仍超时 → 停车等待人工处理。 */
             s_wp_retry_count   = 0U;
             s_wp_timeout_ticks = 0U;
             chassis_ctrl_stop();
@@ -770,92 +699,61 @@ void Game_Logic_Init(void)
     s_link_ever_alive = 0U;
     s_stage_resume = STAGE_WAIT_START;
     s_link_pause_reason = LINK_PAUSE_NONE;
-    s_failure_reason = GAME_FAIL_NONE;
     s_levels_finished = 0U;
     reset_exec_context();
+    /* 上电发车位置就是 (1,5)，首次启动跳过返航子阶段；关间返航仍从 phase 0 开始。 */
+    s_wait_start_phase = 1U;
     map_snapshot_release();
     clear_box_target_mapping();
     App_Recognize_Reset();
-    chassis_zone_clear_oob();
     memset(g_game_map, 0, sizeof(g_game_map));
 }
 
 static void stage_wait_start_handler(void)
 {
-    /* 仅保留左侧发车区。phase 0 直线返回 (1,5)，phase 1 完成视觉/航向校准；
+    /* 仅保留左侧发车区。phase 0 依靠里程计返回 (1,5)，phase 1 保持 0° 并暖机；
      * 地图在发车和到达 (1,4) 后的等待阶段始终解冻。
      */
     map_snapshot_release();
 
     if (s_wait_start_phase == 0U) {
-        if (g_return_path_valid != 0U) {
-            if (!exec_waypoints_common(&g_return_waypoints, &g_return_wp_idx)) return;
-            g_return_path_valid = 0U;
-        } else {
-            s_wait_phase0_ticks++;
-            if (!is_navigating) {
-                HAL_CHASSIS_MOVE_TO(APP_GAME_LAUNCH_HOME_X,
-                                    APP_GAME_LAUNCH_HOME_Y);
-                is_navigating = 1;
-                return;
-            }
-            /* 航点生成异常时仍直达库位；10s 未到则停车重发。 */
-            if (s_wait_phase0_ticks > WAIT_START_PHASE0_TIMEOUT_TICKS) {
-                chassis_ctrl_stop();
-                is_navigating = 0;
-                s_wait_phase0_ticks = 0U;
-                return;
-            }
-            if (!chassis_nav_arrived_for_waypoint(1U)) return;
+        s_wait_phase0_ticks++;
+        if (!is_navigating) {
+            /* 返航全程锁定 0°，避免继承识别巡游后的任意车头角。 */
+            chassis_ctrl_move_to_m(chassis_grid_x_to_m(APP_GAME_LAUNCH_HOME_X),
+                                   chassis_grid_y_to_m(APP_GAME_LAUNCH_HOME_Y),
+                                   APP_GAME_LAUNCH_FACE_YAW_DEG);
+            is_navigating = 1;
+            return;
         }
+        /* 10s 未到则停车重发，不进入死局自动恢复。 */
+        if (s_wait_phase0_ticks > WAIT_START_PHASE0_TIMEOUT_TICKS) {
+            chassis_ctrl_stop();
+            is_navigating = 0;
+            s_wait_phase0_ticks = 0U;
+            return;
+        }
+        if (!chassis_nav_arrived()) return;
 
-        chassis_ctrl_stop();
+        /* 到库后继续做 0° 航向保持，直到下一次发车目标下发。 */
+        chassis_ctrl_hold_yaw(APP_GAME_LAUNCH_FACE_YAW_DEG);
         is_navigating = 0;
         s_wait_phase0_ticks = 0U;
-        s_home_snap_fresh = 1U;
         if (s_levels_finished >= APP_GAME_TOTAL_LEVELS) {
             goto_stage(STAGE_DONE);       /* 第三关也先返回 (1,5) 再收车 */
             return;
         }
-        s_launch_calib_done = 0U;
-        s_launch_calib_ticks = 0U;
         s_wait_start_phase = 1U;
         return;
     }
 
-    /* 关间强视觉校准 (发车前最后一步):
-     *   车已静止在 (1,5)，用到站 Snap 状态机对该格做多帧表决:
-     *     - 表决通过 → x/y 被拉到视觉表决格中心 (Snap 内部已写 pose);
-     *     - 随后 calibrate_launch_heading() 复位航向到 180° (只改 yaw, 保留 Snap 的 x/y);
-     *   有 LAUNCH_CALIB_TIMEOUT_TICKS 兜底, 视觉给不出结果也照常发车, 绝不卡死。 */
-    if (s_launch_calib_done == 0U) {
-        chassis_ctrl_stop();
-        s_launch_calib_ticks++;
-        if (s_home_snap_fresh != 0U) {
-            /* phase 0 的最终关键航点刚完成 Snap，直接复用，避免重复静止表决。 */
-            s_home_snap_fresh = 0U;
-            calibrate_launch_heading();
-            s_launch_calib_done = 1U;
-            return;
-        }
-#if CHASSIS_VISION_SNAP_ON_ARRIVE_ENABLE
-        if (s_link_alive != 0U) {
-            float calib_x_m = chassis_grid_x_to_m(APP_GAME_LAUNCH_HOME_X);
-            float calib_y_m = chassis_grid_y_to_m(APP_GAME_LAUNCH_HOME_Y);
-            app_vision_snap_state_e st;
-            app_vision_fusion_snap_request(calib_x_m, calib_y_m);
-            st = app_vision_fusion_snap_state();
-            if ((st != APP_VISION_SNAP_DONE)    &&
-                (st != APP_VISION_SNAP_TIMEOUT) &&
-                (st != APP_VISION_SNAP_REJECT)  &&
-                (s_launch_calib_ticks < LAUNCH_CALIB_TIMEOUT_TICKS)) {
-                return;              /* 表决进行中, 继续等 (受时限约束) */
-            }
-            app_vision_fusion_snap_cancel();
-        }
-#endif
-        calibrate_launch_heading();  /* 航向复位 180°, 保留 Snap 校正后的 x/y */
-        s_launch_calib_done = 1U;
+    /* 与硬编码模式保持相同的发车前置条件：只保持 0°，等待 IMU KF、编码器和
+     * 速度滤波稳定后再发车。这里禁止运行时 set_pose，避免 PIT 已运行时重写
+     * yaw/KF/odom 基准产生瞬态不一致。 */
+    if (s_launch_warmup_ticks == 0U) {
+        chassis_ctrl_hold_yaw(APP_GAME_LAUNCH_FACE_YAW_DEG);
+    }
+    if (++s_launch_warmup_ticks < LAUNCH_WARMUP_TICKS) {
         return;
     }
 
@@ -882,7 +780,7 @@ static void stage_launch_exit_handler(void)
 
     /* 赛规以上位机网格 (1,4) 为刷新触发点，因此以该航点到达为发车成功，
      * 不再用车体外接圆完全离开旧发车区几何作为硬门槛。 */
-    if (chassis_nav_arrived_for_waypoint(1U)) {
+    if (chassis_nav_arrived()) {
         chassis_ctrl_stop();
         s_launch_drive_issued = 0U;
         s_launch_drive_ticks = 0U;
@@ -950,7 +848,7 @@ static void stage_recognize_handler(void)
      *   - Stage1 无数字配对要求（有无炸弹均同）→ DONE_NO_NEED 直接放行
      *   - Stage2/3: 遍历每个箱子和目标的观察点, 多数票投出 class_id,
      *               配对成 box→target 映射写入 g_box_to_target[]
-     *   - 不可达或视觉持续无识别 → DEADLOCK_RESET 复位重试
+     *   - 不可达或视觉持续无识别 → 停车等待人工处理
      * ============================================================ */
     AppRecognizeStatus_e r = App_Recognize_Tick(g_game_map, g_player_pos,
                                                 map_has_bomb(),
@@ -982,14 +880,11 @@ static void stage_recognize_handler(void)
     }
 }
 
-/* O8.1: 破局炸弹决策链 (由 stage_plan_handler 内联链抽出, 逐分支等价)。
- * 保持原有优先级与"死局短路"语义:
- *   1) 角落/冻结死局: 仅尝试"死箱最近目标"这一种破局, 失败即放弃 (返回 0 → 调用方进死局复位),
- *      刻意不再尝试策略 2/3 —— 与历史控制流一致;
- *   2) 非死局: 先试"玩家走不到的目标", 再试"有炸弹时的通用破局";
+/* O8.1: 破局炸弹决策链 (由 stage_plan_handler 内联链抽出)。
+ *   1) 角落/冻结死局: 先尝试"死箱最近目标"；失败后继续后续策略，避免漏掉其他可行爆破点;
+ *   2) 再试"玩家走不到的目标", 最后试"有炸弹时的通用破局";
  *   任一成功 → 返回 1 (炸弹段已就绪)；全部失败 → 返回 0。
- * 说明: 未采用方案 O8.1 的函数指针表 —— 其统一"逐项回退"语义会抹掉上面的死局短路,
- *       改变行为; 这里以单函数提取达到"消嵌套/集中决策"的同等可读性目标且零行为变更。 */
+ */
 static uint8 try_build_breakout_bomb(void)
 {
     Point_t dead_box = { -1, -1 };
@@ -997,7 +892,9 @@ static uint8 try_build_breakout_bomb(void)
 
     if (Sokoban_Is_Deadlock(g_game_map, &dead_box)) {
         blocked_target = choose_nearest_target(dead_box);
-        return (uint8)((blocked_target.x >= 0) && build_bomb_plan(blocked_target));
+        if ((blocked_target.x >= 0) && build_bomb_plan(blocked_target)) {
+            return 1;
+        }
     }
 
     blocked_target.x = -1;
@@ -1098,7 +995,7 @@ static void stage_execute_handler(void)
              * 若视觉端在推炸弹过程中把 wall_pos 改写成 BOMB(被推到位时), 上面只清 WALL→EMPTY,
              * BOMB 残留, 必须再补一次. 幂等. */
             g_game_map[g_bomb_wall_pos.y][g_bomb_wall_pos.x] = MAP_EMPTY;
-            /* B1: 主控本地权威, 锁定地图; 直到本关结束(WAIT_START / DONE / DEADLOCK_RESET) 才解冻.
+            /* B1: 主控本地权威, 锁定地图; 直到本关结束(WAIT_START / DONE) 才解冻.
              * 视觉端不一定在 1 帧内同步爆炸结果, 防 g_game_map 被陈旧帧覆盖. */
             map_snapshot_freeze();
             reset_exec_context();
@@ -1123,21 +1020,12 @@ static void stage_level_judge_handler(void)
         return;
     }
 
-    /* 箱子已全部推完 = 本关成功结束。所有关卡均直线返回 (1,5)；
+    /* 箱子已全部推完 = 本关成功结束。所有关卡均保持 0° 返回 (1,5)；
      * 前两关随后再驶到 (1,4) 触发新图，第三关返航后收车。 */
     chassis_ctrl_stop();
     mark_current_level_finished();
 
     reset_exec_context();
-    {
-        Point_t home = { (int8)APP_GAME_LAUNCH_HOME_X,
-                         (int8)APP_GAME_LAUNCH_HOME_Y };
-        if (Sokoban_Build_Return_Waypoints(g_game_map, g_player_pos,
-                                           home, &g_return_waypoints)) {
-            g_return_path_valid = 1U;
-            g_return_wp_idx = 0U;
-        }
-    }
     map_snapshot_release();
     App_Recognize_Reset();
     goto_stage(STAGE_WAIT_START);
@@ -1145,42 +1033,8 @@ static void stage_level_judge_handler(void)
 
 static void stage_deadlock_reset_handler(void)
 {
-    /* 【P0-8】死局重置: 改为 "在发车区内 + 静止 ≥3s" 几何判据,
-     * 不再依赖 wall-clock tick, 与 chassis_zone_is_static() (PIT 5ms tick) 同源.
-     * (规则: 返回发车区静止 3s = 系统重置)
-     */
-    if (!is_navigating) {
-        HAL_CHASSIS_MOVE_TO(APP_GAME_LAUNCH_HOME_X,
-                            APP_GAME_LAUNCH_HOME_Y);
-        is_navigating = 1;
-        return;
-    }
-
-    if (!chassis_nav_arrived_for_waypoint(1U)) return;
-
-    is_navigating = 0;
-
-    /* 必须 "在发车区内" + chassis_zone_is_static() (内部已含 3s 持续判定).
-     * chassis_zone_is_static 由 chassis_zone_tick() 周期更新, 在 Run() 入口已调一次. */
-    if (!chassis_zone_is_in_launch(LAUNCH_ZONE_LEFT)) {
-        return;     /* 还未真正回到发车区, 继续等里程计/视觉拉车进入 */
-    }
-    if (!chassis_zone_is_static()) {
-        return;     /* 还未静止满 3s */
-    }
-
-    /* 回发车区静止 3s = 本关失败流程完成；失败关也占用三关中的一关。 */
-    mark_current_level_finished();
-
-    map_snapshot_release();      /* B12: DEADLOCK 复位 → 解冻地图, 视觉端权威 */
-    if (s_levels_finished < APP_GAME_TOTAL_LEVELS) {
-        reset_exec_context();
-        App_Recognize_Reset();
-        goto_stage(STAGE_WAIT_START);
-        return;
-    }
-
-    goto_stage(STAGE_DONE);
+    /* 死局自动返航/重置暂时关闭。goto_stage() 进入本状态时已停车，
+     * 此处不增加新动作，等待人工处理或重启。 */
 }
 
 static void stage_done_handler(void)
@@ -1208,21 +1062,13 @@ static void stage_done_handler(void)
  *    LOSS 触发瞬间调用一次, handler 内不再重复调.)
  * ================================================================== */
 
-/* ==========================================================================
- *  § 5. 外部查询 API + 链路守护 + 越界检测 + 任务主入口
+/* ===========================================================================
+ *  § 5. 外部查询 API + 链路守护 + 任务主入口
  * ========================================================================== */
 
 uint8 Game_Link_Is_Alive(void)
 {
     return s_link_alive;
-}
-
-/* ==================================================================
- * 【P0-8】对外查询: 比赛失败原因
- * ================================================================== */
-GameFailureReason_e Game_Get_Failure_Reason(void)
-{
-    return s_failure_reason;
 }
 
 /* ==================================================================
@@ -1232,38 +1078,6 @@ GameFailureReason_e Game_Get_Failure_Reason(void)
 void Game_Get_Recognize_Debug(AppRecognizeDebug_t *out)
 {
     App_Recognize_Get_Debug(out);
-}
-
-/*
- * 越界检测 — 主循环侧调用, 仅在以下条件满足时 *判定+触发*:
- *   1) 链路在线 (避免 PAUSE 期间陈旧位姿误触发)
- *   2) 当前不在发车/返航、PAUSE_ON_LINK_LOSS、DONE
- *   3) 尚未失败过 (s_failure_reason==NONE)
- * 一旦触发: 立即 chassis_ctrl_stop() + 切 STAGE_DONE + 锁失败原因
- */
-static void check_out_of_bounds(void)
-{
-    if (s_failure_reason != GAME_FAIL_NONE) {
-        return;     /* 已失败, 状态机锁死在 DONE, 不重复判 */
-    }
-    if (!s_link_alive) {
-        return;     /* PAUSE 优先, 链路掉线期间不判 OOB */
-    }
-    if (current_stage == STAGE_WAIT_START ||
-        current_stage == STAGE_DEADLOCK_RESET ||
-        current_stage == STAGE_PAUSE_ON_LINK_LOSS ||
-        current_stage == STAGE_WAIT_RECOVERY_MAP ||
-        current_stage == STAGE_DONE) {
-        chassis_zone_clear_oob();
-        return;
-    }
-
-    if (chassis_zone_is_out_of_bounds()) {
-        s_failure_reason = GAME_FAIL_OUT_OF_BOUNDS;
-        chassis_ctrl_stop();
-        is_navigating = 0U;
-        goto_stage(STAGE_DONE);
-    }
 }
 
 static uint32 link_silence_ms(uint32 now_ms, uint32 last_ms)
@@ -1428,12 +1242,6 @@ void Game_Logic_Task_Run(void)
     /* P0-2: 链路监控总闸 — 必须先于状态分发                                      */
     update_link_state();
 
-    /* P0-8: 几何判定 tick (速度估算 / 静止累计 / OOB 滞回), 必须先于 check_out_of_bounds */
-    chassis_zone_tick();
-
-    /* P0-8: 越界总闸 — 在链路监控之后, 在状态分发之前. 触发即锁 STAGE_DONE. */
-    check_out_of_bounds();
-
     /* P0-3: 链路在线时刷新 g_game_map 私有快照 (seq-lock 拷贝).
      *       链路 LOSS 期间不刷新；链路恢复后在 WAIT_RECOVERY_MAP 重取稳定新图。
      *       上电首帧到达前 s_link_alive=0, g_game_map 维持 BSS 0 = MAP_EMPTY, 业务侧无副作用.
@@ -1445,24 +1253,7 @@ void Game_Logic_Task_Run(void)
         app_link_get_map_snapshot(g_game_map);
     }
 
-    /* OpenART 低频位姿融合 + 一致性监控:
-     * 必须在 sync_player_pos 之前把视觉触发的硬重定位写回 odom, 否则本拍的 g_player_pos 仍是漂移值。
-     * - app_vision_fusion_task           : 运动中连续软融合 (默认编译为空)。
-     * - app_vision_fusion_consistency_tick: 大幅打滑/搬车时硬重定位 (安全网)。
-     * 链路掉线或处于 STAGE_DONE/PAUSE 时, 全部"不允许"，避免基于陈旧或冻结状态做判定。
-     */
-    {
-        uint8 allow_continuous = (uint8)((s_link_alive != 0U) &&
-                                          (current_stage != STAGE_DONE) &&
-                                          (current_stage != STAGE_WAIT_RECOVERY_MAP));
-        uint8 allow_consistency = (uint8)((s_link_alive != 0U) &&
-                                          (current_stage != STAGE_DONE) &&
-                                          (current_stage != STAGE_PAUSE_ON_LINK_LOSS) &&
-                                          (current_stage != STAGE_WAIT_RECOVERY_MAP));
-        app_vision_fusion_task(allow_continuous);
-        app_vision_fusion_consistency_tick(allow_consistency);
-    }
-
+    /* 底盘位姿只来自编码器里程计与陀螺仪；视觉只更新地图和分类。 */
     sync_player_pos();
 
     switch (current_stage) {

@@ -503,7 +503,7 @@
 /* (1) 执行器输出 MOTOR_*_OUTPUT_DIR: driver 乘命令，使 +命令 → 物理前进
  *     ★ 占位 +1 已按实车标定填写，换接线/换电机线序后必须重新辨识 */
 #define MOTOR_LF_OUTPUT_DIR                 (+1.0f)
-#define MOTOR_RF_OUTPUT_DIR                 (+1.0f)
+#define MOTOR_RF_OUTPUT_DIR                 (-1.0f)
 #define MOTOR_LB_OUTPUT_DIR                 (+1.0f)
 #define MOTOR_RB_OUTPUT_DIR                 (-1.0f)
 
@@ -577,10 +577,10 @@
 #define CHASSIS_VISION_MAX_STEP_M               (0.08f)
 #endif
 
-/* ---- 2) 到站 Snap (事件驱动；推荐默认开) ---- */
+/* ---- 2) 到站 Snap (正式比赛关闭，底盘仅使用编码器 + 陀螺仪) ---- */
 
 #ifndef CHASSIS_VISION_SNAP_ON_ARRIVE_ENABLE
-#define CHASSIS_VISION_SNAP_ON_ARRIVE_ENABLE    (1)
+#define CHASSIS_VISION_SNAP_ON_ARRIVE_ENABLE    (0)
 #endif
 
 #ifndef CHASSIS_VISION_SNAP_VOTE_FRAMES
@@ -611,10 +611,10 @@
 #define CHASSIS_VISION_SNAP_MAX_GAP_CELLS       (1U)
 #endif
 
-/* ---- 3) 运动中一致性监控 (安全网) ---- */
+/* ---- 3) 运动中一致性监控 (正式比赛关闭) ---- */
 
 #ifndef CHASSIS_VISION_CONSISTENCY_ENABLE
-#define CHASSIS_VISION_CONSISTENCY_ENABLE       (1)
+#define CHASSIS_VISION_CONSISTENCY_ENABLE       (0)
 #endif
 
 #ifndef CHASSIS_VISION_CONSISTENCY_PERIOD_MS

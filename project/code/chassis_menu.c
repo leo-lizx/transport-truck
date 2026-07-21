@@ -63,16 +63,12 @@ typedef struct
 #define MENU_COLOR_TARGET              MENU_RGB565(231U, 0U, 255U)
 #define MENU_COLOR_BOX                 MENU_RGB565(148U, 178U, 0U)
 #define MENU_COLOR_BOMB                MENU_RGB565(255U, 24U, 74U)
-#define MENU_COLOR_CAR                 RGB565_CYAN
 
 static uint8 s_flash_ready = 0U;
 static uint8 s_need_full_refresh = 1U;
 static uint8 s_last_map_ready = 0xFFU;
-static uint32 s_last_car_frame_id = 0U;
 static uint8 s_cached_map[APP_LINK_MAP_ROWS][APP_LINK_MAP_COLS];  /* 缓存上一帧地图, 用于变化检测 */
 static uint8 s_map_cached = 0U;                                    /* s_cached_map 是否有效 */
-static uint8 s_last_car_x = 0xFFU;                                 /* 上一帧小车格 X (0xFF=无效) */
-static uint8 s_last_car_y = 0xFFU;                                 /* 上一帧小车格 Y */
 
 static uint32 menu_flash_checksum(const uint32 *words, uint16 word_count)
 {
@@ -187,27 +183,6 @@ static uint8 menu_map_frame_is_fresh(uint32 *age_ms_out)
     return (age_ms <= MENU_MAP_STALE_MS) ? 1U : 0U;
 }
 
-static void menu_invalidate_stale_car(uint8 map_ready, app_link_car_snapshot_t *car)
-{
-    uint32 now_ms;
-    uint32 car_age_ms;
-
-    if (car == NULL) { return; }
-
-    if ((0U == map_ready) || (0U == car->valid))
-    {
-        car->valid = 0U;
-        return;
-    }
-
-    now_ms = app_link_get_ms();
-    car_age_ms = now_ms - car->stamp_ms;
-    if (car_age_ms > MENU_MAP_STALE_MS)
-    {
-        car->valid = 0U;
-    }
-}
-
 static uint16 menu_cell_color(uint8 cell)
 {
     switch (cell)
@@ -245,7 +220,7 @@ static void menu_draw_static_layout(uint8 map_ready)
     ips200_full(MENU_COLOR_BG);
 
     ips200_set_color(MENU_COLOR_TITLE, MENU_COLOR_BG);
-    ips200_show_string(0U, 0U, "VISUAL MAP MONITOR");
+    ips200_show_string(0U, 0U, "MAP / CLASS MONITOR");
 
     ips200_set_color(MENU_COLOR_TEXT, MENU_COLOR_BG);
     ips200_show_string(MENU_SIDE_X, 32U, "LEGEND");
@@ -253,13 +228,11 @@ static void menu_draw_static_layout(uint8 map_ready)
     ips200_show_string(234U, 72U, "BOX");
     ips200_show_string(234U, 92U, "TARGET");
     ips200_show_string(234U, 112U, "BOMB");
-    ips200_show_string(234U, 132U, "CAR");
 
     menu_fill_rect(216U, 52U, 12U, 12U, MENU_COLOR_WALL);
     menu_fill_rect(216U, 72U, 12U, 12U, MENU_COLOR_BOX);
     menu_fill_rect(216U, 92U, 12U, 12U, MENU_COLOR_TARGET);
     menu_fill_rect(216U, 112U, 12U, 12U, MENU_COLOR_BOMB);
-    menu_fill_rect(216U, 132U, 12U, 12U, MENU_COLOR_CAR);
 
     ips200_show_string(MENU_SIDE_X, MENU_RECOG_Y, "OBJ: --");
     ips200_show_string(MENU_SIDE_X, MENU_RECOG_Y + 16U, "I:--/-- C:--");
@@ -268,7 +241,7 @@ static void menu_draw_static_layout(uint8 map_ready)
     menu_draw_grid_lines();
 
     ips200_set_color(MENU_COLOR_TEXT, MENU_COLOR_BG);
-    ips200_show_string(0U, 188U, "CAR: --,--  YAW:        deg");
+    ips200_show_string(0U, 188U, "YAW:        deg");
     ips200_show_string(0U, 206U, "POSE X:      Y:      IMU:");
 
     ips200_set_color(map_ready ? MENU_COLOR_OK : MENU_COLOR_WAIT, MENU_COLOR_BG);
@@ -298,47 +271,7 @@ static void menu_draw_map_cells(const uint8 map[APP_LINK_MAP_ROWS][APP_LINK_MAP_
     }
 }
 
-static void menu_draw_car_marker(const app_link_car_snapshot_t *car)
-{
-    uint16 x;
-    uint16 y;
-
-    if ((car == NULL) || (0U == car->valid) ||
-        (car->car_x >= APP_LINK_MAP_COLS) || (car->car_y >= APP_LINK_MAP_ROWS))
-    {
-        return;
-    }
-
-    x = (uint16)(MENU_MAP_ORIGIN_X + (uint16)car->car_x * MENU_CELL_SIZE + 2U);
-    y = (uint16)(MENU_MAP_ORIGIN_Y + (uint16)car->car_y * MENU_CELL_SIZE + 2U);
-
-    menu_fill_rect(x, y, (uint16)(MENU_CELL_SIZE - 3U), (uint16)(MENU_CELL_SIZE - 3U), MENU_COLOR_CAR);
-}
-
-/*
- * 小车移走后，用地图原始颜色恢复该格子（抹掉青色的车标记）。
- * 仅在 s_map_cached 有效时调用，使用缓存的地图数据。
- */
-static void menu_restore_cell(uint8 grid_x, uint8 grid_y)
-{
-    uint16 x, y, color;
-
-    if ((0U == s_map_cached) ||
-        (grid_x >= APP_LINK_MAP_COLS) || (grid_y >= APP_LINK_MAP_ROWS))
-    {
-        return;
-    }
-
-    x = (uint16)(MENU_MAP_ORIGIN_X + (uint16)grid_x * MENU_CELL_SIZE + MENU_CELL_GAP);
-    y = (uint16)(MENU_MAP_ORIGIN_Y + (uint16)grid_y * MENU_CELL_SIZE + MENU_CELL_GAP);
-    color = menu_cell_color(s_cached_map[grid_y][grid_x]);
-    menu_fill_rect(x, y,
-                   (uint16)(MENU_CELL_SIZE - MENU_CELL_GAP),
-                   (uint16)(MENU_CELL_SIZE - MENU_CELL_GAP),
-                   color);
-}
-
-static void menu_draw_dynamic_text(uint8 map_ready, uint32 map_age_ms, const app_link_car_snapshot_t *car)
+static void menu_draw_dynamic_text(uint8 map_ready, uint32 map_age_ms)
 {
     chassis_pose_t pose = chassis_ctrl_get_pose();
     float imu_yaw_deg = chassis_imu_get_yaw_deg();
@@ -357,20 +290,9 @@ static void menu_draw_dynamic_text(uint8 map_ready, uint32 map_age_ms, const app
 
     menu_clear_text_line(188U);
     ips200_set_color(MENU_COLOR_TEXT, MENU_COLOR_BG);
-    ips200_show_string(0U, 188U, "CAR:");
-    if ((car != NULL) && (0U != car->valid))
-    {
-        ips200_show_uint(40U, 188U, car->car_x, 2U);
-        ips200_show_string(58U, 188U, ",");
-        ips200_show_uint(66U, 188U, car->car_y, 2U);
-    }
-    else
-    {
-        ips200_show_string(40U, 188U, "--,--");
-    }
-    ips200_show_string(104U, 188U, "YAW:");
-    ips200_show_float(144U, 188U, pose.yaw_deg, 5U, 1U);
-    ips200_show_string(200U, 188U, "deg");
+    ips200_show_string(0U, 188U, "YAW:");
+    ips200_show_float(40U, 188U, pose.yaw_deg, 5U, 1U);
+    ips200_show_string(96U, 188U, "deg");
 
     menu_clear_text_line(206U);
     ips200_set_color(MENU_COLOR_TEXT, MENU_COLOR_BG);
@@ -391,7 +313,6 @@ void chassis_menu_init(void)
 
     s_need_full_refresh = 1U;
     s_last_map_ready = 0xFFU;
-    s_last_car_frame_id = 0U;
 }
 
 void chassis_menu_task_10ms(void)
@@ -406,14 +327,11 @@ void chassis_menu_task_10ms(void)
 void chassis_menu_render_100ms(void)
 {
     uint8 map[APP_LINK_MAP_ROWS][APP_LINK_MAP_COLS];
-    app_link_car_snapshot_t car;
     uint32 map_age_ms = 0U;
     uint8 map_ready;
     uint8 full_refresh;
 
     map_ready = menu_map_frame_is_fresh(&map_age_ms);
-    app_link_get_car_snapshot(&car);
-    menu_invalidate_stale_car(map_ready, &car);
 
     /*
      * 全屏刷新仅在以下情况触发:
@@ -433,7 +351,6 @@ void chassis_menu_render_100ms(void)
     if (map_ready)
     {
         uint8 map_changed = 0U;
-        uint8 car_moved   = 0U;
 
         app_link_get_map_snapshot(map);
 
@@ -444,39 +361,14 @@ void chassis_menu_render_100ms(void)
             map_changed = 1U;
         }
 
-        /* 比对小车是否移动 */
-        if ((0U != car.valid) &&
-            (car.car_x < APP_LINK_MAP_COLS) && (car.car_y < APP_LINK_MAP_ROWS))
-        {
-            if ((car.car_x != s_last_car_x) || (car.car_y != s_last_car_y))
-            {
-                car_moved = 1U;
-            }
-        }
-
         if (0U != map_changed)
         {
-            /* 地图内容变了 → 全量重绘格子 + 车标记 */
+            /* 地图内容变了 → 全量重绘格子。 */
             menu_draw_map_cells(map);
-            menu_draw_car_marker(&car);
             memcpy(s_cached_map, map, sizeof(s_cached_map));
             s_map_cached = 1U;
         }
-        else if (0U != car_moved)
-        {
-            /* 地图没变, 仅小车移动 → 恢复旧格 + 画新格 */
-            menu_restore_cell(s_last_car_x, s_last_car_y);
-            menu_draw_car_marker(&car);
-        }
-        /* else: 地图和小车都没变 → 不碰地图区域, 屏幕保持静止 */
-
-        /* 记录本帧小车位置, 供下一帧移动检测 */
-        if (0U != car.valid)
-        {
-            s_last_car_x = car.car_x;
-            s_last_car_y = car.car_y;
-        }
-        s_last_car_frame_id = car.frame_id;
+        /* else: 地图没变 → 不碰地图区域, 屏幕保持静止 */
     }
     else
     {
@@ -486,7 +378,6 @@ void chassis_menu_render_100ms(void)
             menu_fill_rect(MENU_MAP_ORIGIN_X, MENU_MAP_ORIGIN_Y,
                            MENU_MAP_W, MENU_MAP_H, MENU_COLOR_BG);
             menu_draw_grid_lines();
-            s_last_car_frame_id = 0U;
             s_map_cached = 0U;
         }
     }
@@ -494,7 +385,7 @@ void chassis_menu_render_100ms(void)
     /*
      * 动态文字行每 100ms 必刷新:
      *   - AGE 数值持续更新 → 用户看到数字在跳就知道摄像头还在工作
-     *   - 小车坐标 / 航向角 / 位姿也同步刷新
+     *   - 陀螺仪/里程计航向与位姿也同步刷新
      */
-    menu_draw_dynamic_text(map_ready, map_age_ms, &car);
+    menu_draw_dynamic_text(map_ready, map_age_ms);
 }

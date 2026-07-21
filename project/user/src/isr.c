@@ -85,16 +85,10 @@ void PIT_IRQHandler(void)
 }
 
 void LPUART1_IRQHandler(void)
-{ /* P0-1: UART1 (B12/B13) 复用为 debug 调试串口 + OpenART2 分类数据接收.
-     *   ─ debug_interrupr_handler() 用 uart_query_byte (非破坏性读), 仅喂 debug 环形缓冲
-     *   ─ OpenART2 分类链路用 uart_read_byte (破坏性读), 消费该字节
-     *   ─ 在纯调试模式(SINGLE_WHEEL/YAW_HOLD/POINT_NAV 等)下 OpenART2 不活跃, 不影响调试
-     *   ─ 字节级零拷贝, 单次中断耗时 < 5 ?s.
-     */
+{ /* UART1 (B12/B13) 由 OpenART2 分类链路独占，避免其他接收器提前消费视觉字节。 */
     if(kLPUART_RxDataRegFullFlag & LPUART_GetStatusFlags(LPUART1))
     {
-        debug_interrupr_handler();                       /* debug 环形缓冲: 非破坏性读取 */
-        uint8 rx_byte = uart_read_byte(UART_1);          /* 读 LPUART1 数据寄存器并清 RDRF */
+        uint8 rx_byte = uart_read_byte(UART_1);
         app_link_isr_feed_class_byte(rx_byte);
     }
 
@@ -163,9 +157,7 @@ void LPUART8_IRQHandler(void)
 {
     if(kLPUART_RxDataRegFullFlag & LPUART_GetStatusFlags(LPUART8))
     {
-        // 接收中断
-        wireless_module_uart_handler();
-        
+        debug_interrupr_handler();
     }
         
     LPUART_ClearStatusFlags(LPUART8, kLPUART_RxOverrunFlag);    // 不允许删除

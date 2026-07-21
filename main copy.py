@@ -24,7 +24,7 @@ sensor.skip_frames(time = 2000)        # 让感光元件稳定
 # 【关键物理防御】：锁定感光参数，拒绝环境光干扰
 sensor.set_auto_gain(False)            # 关闭自动增益，防止暗处噪点放大
 sensor.set_auto_whitebal(False)        # 关闭白平衡，防止色温漂移导致“认错颜色”
-sensor.set_auto_exposure(False, exposure_us=750) # 手动锁定曝光时间(8ms)
+sensor.set_auto_exposure(False, exposure_us=900) # 手动锁定曝光时间(8ms)
                                        # 注意：采用较暗的视角，以提升准确率
                                        # 这能大幅抑制 PVC 场地的反光亮斑
 
@@ -91,8 +91,7 @@ def send_heartbeat_if_due():
 # 调试开关：控制是否绘制采样 ROI 的矩形边框用于视觉调试
 # - 在比赛或正式运行时建议设为 False 以节省绘制开销
 # - 在开发或现场标定时设为 True 便于观察每个网格的采样区域
-DEBUG_DRAW_ROI = True
-
+DEBUG_DRAW_ROI = False
 # ----------------------------------------------------------------------
 # 3. 网格采样与逆透视映射
 # ----------------------------------------------------------------------
@@ -100,89 +99,63 @@ ROWS, COLS = 12, 16
 
 # 场地四角外侧格子的中心点坐标（需根据实际场地微调）
 GRID_CORNERS = {
-    "tl": (13.5, 47.0),  # 左上
-    "tr": (259.6, 39.0), # 右上
-    "bl": (20.0, 219.0), # 左下
-    "br": (260.8, 220.0),# 右下
+    "tl": (18, 31.0),  # 左上
+    "tr": (256, 15.0), # 右上
+    "bl": (19.0, 218.0), # 左下
+    "br": (267.0, 215.0),# 右下
 }
 
-# 2026-07-21 使用 11x16 可见黑点阵拟合；第 12 行底墙不在视野内，
-# 且四周墙体由赛道规则直接填充，不参与图像采样。
-# 输入坐标会先归一化到 u/v = [-1, 1]，再通过该单应矩阵投影到 QVGA。
-GRID_HOMOGRAPHY = (
-    120.556724072, -0.979047012, 131.045091152,
-    -6.262683392, 86.909742355, 150.271296501,
-    -0.032994218, -0.016323230,
-)
-GRID_CALIBRATION_POINTS = 112
-GRID_CALIBRATION_RMS_PX = 0.9257
-GRID_CALIBRATION_MAX_PX = 2.2196
-
-# BEGIN MANUAL_GRID_CALIBRATION
-# 由 pc_grid_calibrator.py 生成；顺序为内部 row 1..10、col 1..14。
-MANUAL_INNER_GRID_POINTS = (
-    (30, 65), (44, 65), (60, 65), (76, 64), (93, 63), (108, 62), (124, 62), (140, 62), (157, 62), (172, 61), (190, 61), (207, 60), (224, 59), (242, 59),  # inner row 1
-    (30, 80), (45, 82), (62, 78), (78, 77), (94, 77), (110, 76), (125, 78), (142, 76), (158, 76), (175, 75), (192, 74), (209, 74), (226, 73), (243, 73),  # inner row 2
-    (30, 93), (45, 96), (62, 94), (78, 93), (94, 93), (110, 93), (126, 93), (142, 93), (157, 93), (176, 91), (192, 91), (209, 90), (226, 90), (243, 90),  # inner row 3
-    (30, 109), (45, 109), (63, 110), (79, 109), (95, 109), (110, 109), (126, 110), (142, 111), (158, 110), (176, 107), (192, 107), (209, 107), (226, 106), (243, 106),  # inner row 4
-    (31, 125), (46, 125), (63, 125), (79, 125), (95, 125), (111, 125), (127, 124), (143, 124), (158, 125), (176, 124), (193, 123), (209, 123), (226, 123), (243, 123),  # inner row 5
-    (30, 142), (46, 141), (64, 141), (80, 141), (95, 141), (111, 141), (126, 142), (144, 140), (158, 140), (176, 140), (193, 140), (210, 139), (226, 139), (243, 139),  # inner row 6
-    (31, 158), (46, 158), (63, 158), (78, 157), (94, 156), (108, 156), (127, 158), (143, 157), (159, 157), (177, 156), (193, 156), (210, 156), (227, 155), (243, 155),  # inner row 7
-    (30, 175), (47, 175), (65, 173), (80, 172), (96, 172), (112, 172), (127, 174), (144, 172), (160, 173), (177, 172), (193, 172), (210, 172), (227, 172), (244, 172),  # inner row 8
-    (31, 190), (47, 191), (65, 188), (81, 188), (97, 188), (113, 188), (128, 189), (145, 188), (159, 187), (177, 188), (194, 188), (210, 188), (227, 188), (244, 188),  # inner row 9
-    (31, 204), (47, 204), (66, 204), (81, 204), (97, 204), (113, 204), (128, 205), (145, 204), (160, 204), (178, 204), (194, 205), (210, 204), (227, 205), (244, 205),  # inner row 10
-)
-MANUAL_INNER_ROI_HALF_SIZES = (
-    (4, 4), (4, 4), (4, 3), (4, 3), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 3), (4, 4), (4, 4), (4, 4),  # inner row 1
-    (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4),  # inner row 2
-    (4, 4), (4, 3), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4),  # inner row 3
-    (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4),  # inner row 4
-    (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4),  # inner row 5
-    (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4),  # inner row 6
-    (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4),  # inner row 7
-    (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4),  # inner row 8
-    (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4),  # inner row 9
-    (4, 4), (4, 3), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4), (4, 4),  # inner row 10
-)
-# END MANUAL_GRID_CALIBRATION
-
-# 当前距离和角度使用上面的单应矩阵。保留人工表只作为历史参考，不参与运行。
-MANUAL_INNER_GRID_POINTS = None
-MANUAL_INNER_ROI_HALF_SIZES = None
-
-INNER_ROWS = ROWS - 2
-INNER_COLS = COLS - 2
-INNER_POINT_COUNT = INNER_ROWS * INNER_COLS
-if (MANUAL_INNER_GRID_POINTS is not None and
-        len(MANUAL_INNER_GRID_POINTS) != INNER_POINT_COUNT):
-    raise ValueError("MANUAL_INNER_GRID_POINTS must contain 140 points")
-if (MANUAL_INNER_ROI_HALF_SIZES is not None and
-        len(MANUAL_INNER_ROI_HALF_SIZES) != INNER_POINT_COUNT):
-    raise ValueError("MANUAL_INNER_ROI_HALF_SIZES must contain 140 sizes")
-
+GRID_K1 = +0.000000
 CALIB_SHOW_CORNERS = True
 CAR_VOTE_FRAMES = 5
 CAR_VOTE_MIN = 2
 car_vote_hist = []
 
 def calc_grid_point(x_idx, y_idx, img_w, img_h):
-    """将逻辑网格格心通过实测单应矩阵投影到 QVGA 像素坐标。"""
-    half_cols = (COLS - 1) * 0.5
-    half_rows = (ROWS - 1) * 0.5
-    u = (x_idx - half_cols) / half_cols
-    v = (y_idx - half_rows) / half_rows
-    h = GRID_HOMOGRAPHY
-    denominator = h[6] * u + h[7] * v + 1.0
-    pixel_x = (h[0] * u + h[1] * v + h[2]) / denominator
-    pixel_y = (h[3] * u + h[4] * v + h[5]) / denominator
-    return int(round(pixel_x)), int(round(pixel_y))
+    """基于四角点进行双线性插值，计算网格真实物理坐标映射到像素的坐标"""
+    u = x_idx / (COLS - 1)
+    v = y_idx / (ROWS - 1)
+    # ========================================================
+    # 【新增】：极速非线性透视/畸变补偿 (抛物线推拉)
+    # 作用：在不影响 0 和 1 这两端边框的前提下，专门对中间的网格进行推拉。
+    # 针对你“中间偏右”的问题，我们给 U 加上一个负的补偿值把它向左拉。
+    # ========================================================
+    COMP_U = -0.06  # 左右补偿系数：负数向左拉，正数向右推 (建议从 -0.02 到 -0.08 之间微调)
+    COMP_V = -0.03   # 上下补偿系数：如果中间行偏上或偏下，同样调这个值
+
+    u = u + COMP_U * u * (1.0 - u)
+    v = v + COMP_V * v * (1.0 - v)
+    # ========================================================
+
+    tl_x, tl_y = GRID_CORNERS["tl"]
+    tr_x, tr_y = GRID_CORNERS["tr"]
+    bl_x, bl_y = GRID_CORNERS["bl"]
+    br_x, br_y = GRID_CORNERS["br"]
+
+    tl_x, tl_y = GRID_CORNERS["tl"]
+    tr_x, tr_y = GRID_CORNERS["tr"]
+    bl_x, bl_y = GRID_CORNERS["bl"]
+    br_x, br_y = GRID_CORNERS["br"]
+
+    top_x = tl_x + (tr_x - tl_x) * u
+    top_y = tl_y + (tr_y - tl_y) * u
+    bot_x = bl_x + (br_x - bl_x) * u
+    bot_y = bl_y + (br_y - bl_y) * u
+
+    raw_x = top_x + (bot_x - top_x) * v
+    raw_y = top_y + (bot_y - top_y) * v
+
+    center_x, center_y = img_w / 2, img_h / 2
+    dx, dy = raw_x - center_x, raw_y - center_y
+    scale = 1 + GRID_K1 * (dx * dx + dy * dy)
+    return int(center_x + dx * scale), int(center_y + dy * scale)
 
 def draw_calibration_overlay(img, img_w, img_h):
-    """只绘制 10x14 内场格心范围；四周墙体不参与取色。"""
-    tl = calc_grid_point(1, 1, img_w, img_h)
-    tr = calc_grid_point(COLS - 2, 1, img_w, img_h)
-    bl = calc_grid_point(1, ROWS - 2, img_w, img_h)
-    br = calc_grid_point(COLS - 2, ROWS - 2, img_w, img_h)
+    """绘制标定框，帮助手动对齐摄像头视角"""
+    tl = calc_grid_point(0, 0, img_w, img_h)
+    tr = calc_grid_point(COLS - 1, 0, img_w, img_h)
+    bl = calc_grid_point(0, ROWS - 1, img_w, img_h)
+    br = calc_grid_point(COLS - 1, ROWS - 1, img_w, img_h)
 
     img.draw_line(tl[0], tl[1], tr[0], tr[1], color=(255, 80, 80), thickness=1)
     img.draw_line(tr[0], tr[1], br[0], br[1], color=(80, 255, 80), thickness=1)
@@ -340,17 +313,19 @@ def classify_symbol_by_features(l_mode, a_mode, b_mode, l_stdev):
 
     return best_sym
 
-def classify_cell(img, x, y, img_w, img_h, half_width=5, half_height=5):
+def classify_cell(img, x, y, img_w, img_h):
     """
     【算力解放入口】：多维统计特征判别器 (O(1) 复杂度)
     彻底废弃 Python 层面的像素遍历！利用底层硬件加速，通过标准差(stdev)和众数(mode)
     实现对“纹理”、“双色”和“纯色”的降维打击分类。
     """
+    radius = 4.5  # 采样半径 5 = 11x11 范围 (共 121 个像素点一起统计)
+
     # 严格的边界防护，防止图像框画到屏幕外面导致死机报错
-    x_min = max(0, int(x - half_width))
-    y_min = max(0, int(y - half_height))
-    x_max = min(img_w - 1, int(x + half_width))
-    y_max = min(img_h - 1, int(y + half_height))
+    x_min = max(0, int(x - radius))
+    y_min = max(0, int(y - radius))
+    x_max = min(img_w - 1, int(x + radius))
+    y_max = min(img_h - 1, int(y + radius))
     w = x_max - x_min + 1
     h = y_max - y_min + 1
 
@@ -444,27 +419,12 @@ while(True):
     # --- 阶段 A：扫描解析赛道 ---
     for y_idx in range(ROWS):
         for x_idx in range(COLS):
-            # 四周按赛道规则固定为墙，不需要手动点击或从墙纹理取色。
-            if (x_idx == 0 or x_idx == COLS - 1 or
-                    y_idx == 0 or y_idx == ROWS - 1):
-                map_list.append("#")
-                continue
-
-            manual_index = (y_idx - 1) * INNER_COLS + (x_idx - 1)
-            if MANUAL_INNER_GRID_POINTS is not None:
-                tx, ty = MANUAL_INNER_GRID_POINTS[manual_index]
-            else:
-                tx, ty = calc_grid_point(x_idx, y_idx, img_w, img_h)
-
-            # 实测相邻格心间距约 15~18 px，9x9 ROI 可避开格子边缘并保持居中。
-            half_width = 4
-            half_height = 4
-            if MANUAL_INNER_ROI_HALF_SIZES is not None:
-                half_width, half_height = MANUAL_INNER_ROI_HALF_SIZES[manual_index]
+            # 获取物理逆透视坐标点
+            tx, ty = calc_grid_point(x_idx, y_idx, img_w, img_h)
 
             if 0 <= tx < img_w and 0 <= ty < img_h:
-                char = classify_cell(img, tx, ty, img_w, img_h,
-                                     half_width, half_height)
+                # 获取该点 11x11 范围的元素分类
+                char = classify_cell(img, tx, ty, img_w, img_h)
                 map_list.append(char)
             else:
                 map_list.append("-")
