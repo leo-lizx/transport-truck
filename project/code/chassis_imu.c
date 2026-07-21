@@ -49,7 +49,7 @@ static inline float imu_yaw_gyro_raw_dps(void)
 /** 全局欧拉角输出（当前控制链只使用 yaw） */
 volatile EulerAngle_t car_angle = {0.0f, 0.0f, 0.0f};
 
-/** Z 轴陀螺仪静态零偏（单位：度/秒） */
+/** 偏航原始轴坐标系下的陀螺仪零偏（单位：度/秒） */
 static float s_gyro_z_bias_dps = 0.0f;
 
 /** Z 轴角速度一阶低通状态（单位：度/秒） - 经死区, 用于 yaw 积分 */
@@ -73,7 +73,6 @@ static uint16 s_still_idx = 0U;
 static uint16 s_still_count = 0U;       /* 已填入的样本数, 上限 = WINDOW_LEN */
 static float  s_still_sum = 0.0f;        /* 窗口内样本和 */
 static float  s_still_sum_sq = 0.0f;     /* 窗口内样本平方和 */
-static uint8  s_imu_is_still = 0U;       /* 最近一次判别结果, 调试可读 */
 
 /* ==========================================================================
  *  § 2. Yaw 卡尔曼滤波 (P0-改进 2026-05-02)
@@ -82,7 +81,7 @@ static uint8  s_imu_is_still = 0U;       /* 最近一次判别结果, 调试可�
  *  Yaw 卡尔曼滤波 (P0-改进 2026-05-02)
  *  状态: x = [angle, bias]ᵀ
  *  - kf_angle  : 当前 yaw 角 (°), 等价于车体 yaw (受 IMU_YAW_SIGN / 轴选择影响)
- *  - kf_bias   : gyro 零偏 (°/s), 在 dps 域, 与 s_gyro_z_bias_dps 物理含义一致
+ *  - kf_bias   : gyro 零偏 (°/s), 已乘 IMU_YAW_SIGN，与 KF 输入同属 yaw 正方向域
  *  - kf_P[2][2]: 状态协方差
  *  KF 在 5ms 节拍下做"预测 + (静止时)ZUPT 观测 + 角度归一化".
  * ---------------------------------------------------------------------- */
@@ -209,13 +208,11 @@ static uint8 still_detect_step(float raw_dps, float *out_mean, float *out_var)
     *out_mean = mean;
     *out_var  = var;
 
-    /* 3) 仅在窗口填满后才出静止结论, 避免开机几十毫秒内误判 */
+    /* 3) 本函数只判断陀螺窗口是否稳定；是否允许 ZUPT 还要结合
+     * 四轮实际反馈和运动命令，避免把真实低速转动吸收到 bias。 */
     if (s_still_count < CHASSIS_IMU_STILL_WINDOW_LEN) { return 0U; }
     return (var < CHASSIS_IMU_STILL_VAR_TH_DPS2) ? 1U : 0U;
 }
-
-/* chassis_imu_is_still() 已删除: 无外部调用者. s_imu_is_still 仍由 update_5ms
- * 内部更新, 保留以便 GDB / Live Watch 观察. */
 
 /* ==========================================================================
  *  § 4. 初始化与静态零偏标定 (启动期唯一调用一次)
@@ -228,21 +225,30 @@ static uint8 still_detect_step(float raw_dps, float *out_mean, float *out_var)
 void chassis_imu_init(void)
 {
     float gyro_z_sum_dps = 0.0f; /* 标定窗口内角速度累计值 */
-    uint16 sample_count = (uint16)CHASSIS_IMU_STILL_WINDOW_LEN;
+    uint16 sample_count = (uint16)CHASSIS_IMU_BIAS_CAL_SAMPLE_COUNT;
+    uint16 warmup_sample_count = (uint16)CHASSIS_IMU_BIAS_WARMUP_SAMPLE_COUNT;
     uint16 i;                    /* 采样循环计数 */
 
     /* 步骤 1: 初始化底层 IMU 设备。 */
     imu660rb_init();
 
-    /* 步骤 2: 按正式 5ms 控制采样周期估计零偏。采样窗口与在线静止检测
-     * 保持一致，避免原 1ms 轮询重复读取尚未更新的 IMU 输出寄存器。 */
+    /* 先丢弃上电预热样本，避免启动瞬态进入零偏平均。 */
+    for (i = 0U; i < warmup_sample_count; ++i)
+    {
+        imu660rb_get_gyro();
+        system_delay_ms(5);
+    }
+
+    /* 步骤 2: 按正式 5ms 控制采样周期估计零偏。约 1s 的独立样本既避免
+     * 1ms 轮询重复读取旧寄存器，也给上电后的陀螺零偏留出稳定时间。 */
     for (i = 0U; i < sample_count; ++i)
     {
         imu660rb_get_gyro();
         /* P0-修复 2026-04-29 IMU 装反: 原代码仅采 Z 轴, 现按轴选择宏切换
          *   gyro_z_sum_dps += imu660rb_gyro_transition(imu660rb_gyro_z);
          */
-        gyro_z_sum_dps += imu_yaw_gyro_raw_dps();
+        /* 启动标定与运行时使用同一缩放域，避免标定后再次放大零偏。 */
+        gyro_z_sum_dps += imu_yaw_gyro_raw_dps() * CHASSIS_IMU_GYRO_SCALE;
         system_delay_ms(5);
     }
 
@@ -261,11 +267,11 @@ void chassis_imu_init(void)
     s_yaw_rate_for_d_dps = 0.0f;
 
 #if (CHASSIS_IMU_USE_KALMAN_YAW != 0)
-    /* 步骤 5: KF 状态初值. bias 直接吃掉刚刚 1000 次平均的零偏估计;
+    /* 步骤 5: KF 状态初值. bias 直接吃掉刚刚约 1s 平均的零偏估计;
      *         angle = 0; P 用 config 的初值 (上面静态初始化已设过, 这里
      *         无条件重置一次, 防热复位时残留). */
     s_kf_angle = 0.0f;
-    s_kf_bias  = s_gyro_z_bias_dps;
+    s_kf_bias  = s_gyro_z_bias_dps * IMU_YAW_SIGN;
     s_kf_P[0][0] = CHASSIS_IMU_KF_P0_ANGLE_DEG2;
     s_kf_P[0][1] = 0.0f;
     s_kf_P[1][0] = 0.0f;
@@ -307,12 +313,13 @@ float chassis_imu_get_yaw_deg(void)
  * @brief  5ms 周期更新航向角
  * @note   处理链路：零偏补偿 -> 死区抑噪 -> 零偏自适应 -> 低通 -> 欧拉积分。
  */
-void chassis_imu_update_5ms(void)
+void chassis_imu_update_5ms(uint8 zupt_allowed)
 {
     float gyro_z_raw_dps;  /* 偏航轴原始角速度（度/秒） - 实际轴由 CHASSIS_IMU_YAW_AXIS 选择 */
     float yaw_rate_dps;    /* 零偏补偿与符号修正后的角速度（度/秒） */
     float still_mean_dps;  /* 滑窗均值 (度/秒)   - 静止时即为最佳 bias 估计 */
     float still_var_dps2;  /* 滑窗方差 (度/秒)^2 - 用于静止判别 */
+    uint8 gyro_is_stable;  /* 1 = 陀螺窗口低方差；无论是否允许 ZUPT 都持续更新 */
     uint8 is_still;        /* 1 = 当前窗口认定静止 */
 
     /* 步骤 1: 采样底层传感器数据。 */
@@ -325,9 +332,13 @@ void chassis_imu_update_5ms(void)
 
     gyro_z_raw_dps *= CHASSIS_IMU_GYRO_SCALE;  /* 陀螺灵敏度标定, 默认 1.0 */
 
-    /* 步骤 2: 滑窗静止检测 -> 通用零偏在线辨识 (P0-改进 2026-04-29) */
-    is_still = still_detect_step(gyro_z_raw_dps, &still_mean_dps, &still_var_dps2);
-    s_imu_is_still = is_still;
+    /* 步骤 2: 陀螺低方差 + 严格的四轮反馈静止授权 -> 在线零偏辨识。
+     * 目标速度不参与门控，避免角度误差产生目标后让 ZUPT 自锁。 */
+    gyro_is_stable = still_detect_step(gyro_z_raw_dps,
+                                       &still_mean_dps,
+                                       &still_var_dps2);
+    is_still = (uint8)((zupt_allowed != 0U) &&
+                       (gyro_is_stable != 0U));
 #if (CHASSIS_IMU_USE_KALMAN_YAW == 0)
     if (is_still)
     {
@@ -344,8 +355,8 @@ void chassis_imu_update_5ms(void)
      * KF 模式下 bias 由 KF 维护, 这里 yaw_rate_dps 仅用于 D 项软死区通道
      * 和兜底慢通道, 不直接进 yaw 积分. */
 #if (CHASSIS_IMU_USE_KALMAN_YAW != 0)
-    /* KF 路径: 用 KF 自身的 bias, 保持 D 通道 / 兜底逻辑物理含义不变 */
-    yaw_rate_dps = (gyro_z_raw_dps - s_kf_bias) * IMU_YAW_SIGN;
+    /* KF 输入和 bias 均在乘过 IMU_YAW_SIGN 的 yaw 正方向域，必须先统一坐标系再相减。 */
+    yaw_rate_dps = gyro_z_raw_dps * IMU_YAW_SIGN - s_kf_bias;
 #else
     yaw_rate_dps = (gyro_z_raw_dps - s_gyro_z_bias_dps) * IMU_YAW_SIGN;
 #endif
@@ -392,8 +403,19 @@ void chassis_imu_update_5ms(void)
         /* 给 KF 喂"已做安装方向修正、未减 bias、未做死区"的 gyro 值,
          * KF 内部用自己的 s_kf_bias 做减法, 才能真正学到 bias. */
         float gyro_signed_dps = gyro_z_raw_dps * IMU_YAW_SIGN;
+        float gyro_predict_dps = gyro_signed_dps;
 
-        kalman_predict(gyro_signed_dps, IMU_DT_S);
+        /* 四轮实际静止且残余角速度很小时，不把量化噪声/温漂继续积进角度。
+         * 这里只冻结本拍预测；KF bias 仍由下面的低方差窗口 ZUPT 更新。 */
+        if ((zupt_allowed != 0U) &&
+            ((is_still != 0U) ||
+             (fabsf(gyro_signed_dps - s_kf_bias) <
+              CHASSIS_IMU_KF_STILL_RATE_DEADZONE_DPS)))
+        {
+            gyro_predict_dps = s_kf_bias;
+        }
+
+        kalman_predict(gyro_predict_dps, IMU_DT_S);
 
         /* 静止时做 ZUPT 观测: 真实角速度=0, 故 z=gyro 是对 bias 的观测.
          * P0-修复 2026-06-30: 用滑窗均值 still_mean_dps 替代瞬时 gyro_signed_dps.
@@ -407,7 +429,8 @@ void chassis_imu_update_5ms(void)
         /* 角度归一化到 [-180,180], 同步写回 car_angle 与外部用的 bias 镜像 */
         s_kf_angle = chassis_normalize_angle_deg(s_kf_angle);
         car_angle.yaw = s_kf_angle;
-        s_gyro_z_bias_dps = s_kf_bias;     /* 让旧的 bias 调试访问仍可用 */
+        /* 镜像回原始轴坐标系，供下一拍静止判定使用；IMU_YAW_SIGN 仅允许 ±1。 */
+        s_gyro_z_bias_dps = s_kf_bias * IMU_YAW_SIGN;
     }
 #else
     car_angle.yaw += s_yaw_rate_lpf_dps * IMU_DT_S;

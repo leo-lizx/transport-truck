@@ -33,9 +33,10 @@ void chassis_imu_init(void);
 
 /**
  * @brief  5ms 周期更新 IMU 航向角
+ * @param  zupt_allowed 1=四轮反馈均静止，允许用低方差窗口校正零偏；0=禁止 ZUPT
  * @note   需在严格 5ms 节拍下调用，保证积分精度。
  */
-void chassis_imu_update_5ms(void);
+void chassis_imu_update_5ms(uint8 zupt_allowed);
 
 /**
  * @brief  读取当前航向角

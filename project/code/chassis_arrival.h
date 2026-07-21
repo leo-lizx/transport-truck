@@ -68,4 +68,28 @@ static inline uint8_t chassis_wheels_idle_stop_ready(
     return 1U;
 }
 
+/* IMU 的静止授权只反映车轮是否真实运动，不能与“目标是否为零”的停轮条件共用。
+ * 否则角度环刚产生非零目标时，即使车轮尚未转动，也会永久禁止零偏校正。 */
+static inline uint8_t chassis_wheels_feedback_stationary(
+    const float *wheel_feedback_mps,
+    uint8_t wheel_count,
+    float feedback_epsilon_mps)
+{
+    uint8_t i;
+
+    if (wheel_count == 0U) {
+        return 0U;
+    }
+
+    for (i = 0U; i < wheel_count; ++i) {
+        float abs_feedback = (wheel_feedback_mps[i] >= 0.0f)
+                           ? wheel_feedback_mps[i] : -wheel_feedback_mps[i];
+        if (abs_feedback >= feedback_epsilon_mps) {
+            return 0U;
+        }
+    }
+
+    return 1U;
+}
+
 #endif /* CHASSIS_ARRIVAL_H */

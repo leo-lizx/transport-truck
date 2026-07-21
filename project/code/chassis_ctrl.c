@@ -46,14 +46,16 @@
 /* Yaw 串级 P-PI 内环: 前馈 + PI 直接输出 PWM, 自动克服静摩擦.
  * 外环(yaw_pi): angle_err → wz_cmd (纯 P)
  * 内环(本段):   wz_cmd - wz_actual → PWM (PI), 取代旧 GAIN×wz 开环 */
-#define CHASSIS_YAW_PWM_GAIN              (80.0f)    /* 已废弃, 由内环 PI 替代 */
+/* 角速度线性 PWM 前馈：按麦轮 yaw 符号叠加到四轮 PID 输出。
+ * 它只补偿随目标角速度变化的基础驱动力，不替代下方静摩擦 breakaway 前馈。 */
+#define CHASSIS_YAW_PWM_GAIN              (80.0f)
 
 /* 保持轴直接 PWM 前馈: 绕过轮速 PID, 把车体速度 (vx,vy) 直接换算成 PWM.
  *   问题同 yaw: 保持轴输出 0.06m/s → 轮速 PID 只给 40×0.06=2.4PWM → 无力纠偏.
  *   新链路: 保持轴 → vx/vy(m/s) → 直接 PWM = GAIN × 麦轮分配系数 × 速度
  *   O 型麦轮: vy 四轮同号, vx 对角同号 (LF=-, RF=+, LB=+, RB=-).
  *   GAIN=1500 时, 保持 0.06m/s→90PWM/轮, 足以对抗 odom 漂移和耦合扰动. */
-#define CHASSIS_HOLD_PWM_GAIN             (40.0f)
+#define CHASSIS_HOLD_PWM_GAIN             (0.0f)
 /* 仅当四轮目标和反馈同时接近 0 才停轮；0.003m/s 不会吞掉正常的小角度修正。 */
 #define WHEEL_STOP_TARGET_EPS_MPS         (0.003f)
 #define WHEEL_STOP_FEEDBACK_EPS_MPS       (0.030f)
@@ -232,19 +234,11 @@ static float s_pos_i       = 0.0f;
 static float s_pos_i_hold  = 0.0f;
 /* yaw 环积分累积量 (°·s): 消除静摩擦稳态残差，仅在误差带内累积 */
 static float s_yaw_i       = 0.0f;
-/* 串级 P-PI 内环积分 (PWM 域): ∫(wz_cmd - wz_actual) → 自动克服静摩擦 */
-static float s_yaw_rate_i  = 0.0f;
-/* ADRC: z1=估计角速度(°/s), z2=估计总扰动(°/s²), u=上拍PWM输出 */
-static float s_yaw_adrc_z1 = 0.0f;
-static float s_yaw_adrc_z2 = 0.0f;
-static float s_yaw_adrc_u  = 0.0f;
 /* 到位驻留计数器: 连续 N 拍满足到位条件 → 判到达, 防止单拍噪声误触 */
 static uint16 s_arrival_dwell_cnt = 0U;
 /* 逐轴到位: X/Y 各自判断 |err|≤EPSILON, 两轴都到位→整体 arrived */
 static uint8 s_axis_x_arrived = 0U;
 static uint8 s_axis_y_arrived = 0U;
-/* Schmitt 触发器: 1 = X 轴已到位, 当前锁定 Y 轴优先; 0 = X 未完成 */
-static uint8 s_axis_y_locked = 0U;
 /* POINT_NAV 起步 yaw 对齐标志: 进入模式时清零, 首次 |yerr|≤INPOS 后置1.
  * 门控仅在未对齐时阻断平移, 对齐后行进中靠 yaw_pi 温柔修正. */
 static uint8_t s_nav_yaw_aligned = 1U;
@@ -266,6 +260,9 @@ static volatile uint8 s_yaw_in_position = 0;
 static volatile float s_fb_vx  = 0.0f;
 static volatile float s_fb_vy  = 0.0f;
 static volatile float s_wheel_fb_lpf[CHASSIS_WHEEL_COUNT] = {0.0f, 0.0f, 0.0f, 0.0f};
+/* 20ms 轮速任务写、5ms IMU 任务读；Cortex-M7 对齐字节读写原子。
+ * 1 表示四轮实际反馈均静止，允许 IMU 用低方差窗口执行 ZUPT。 */
+static volatile uint8 s_imu_zupt_allowed = 1U;
 
 /* P0-诊断: 轮速目标快照, 供串口打印对比期望 vs 实际 */
 volatile float g_chassis_diag_wheel_tgt[CHASSIS_WHEEL_COUNT] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -435,16 +432,13 @@ static void force_stop(void)
     s_pos_i    = 0.0f;
     s_pos_i_hold = 0.0f;
     s_yaw_i      = 0.0f;
-    s_yaw_rate_i = 0.0f;
-    s_yaw_adrc_z1 = 0.0f;
-    s_yaw_adrc_z2 = 0.0f;
-    s_yaw_adrc_u  = 0.0f;
     s_v_along_lpf = 0.0f;
     s_v_cross_lpf = 0.0f;
 
     for (i = 0U; i < (uint8)CHASSIS_WHEEL_COUNT; ++i) {
         stop_wheel_with_pid_reset(i);
         s_wheel_fb_lpf[i] = 0.0f;
+        g_chassis_diag_wheel_tgt[i] = 0.0f;
     }
     s_wheel_fb_lpf_inited = 0U;
 }
@@ -487,21 +481,31 @@ static void apply_speed(chassis_body_speed_cmd_t cmd,
         g_chassis_diag_body_spd_fb_vy  = s_fb_vy;
     }
 
-    /* 零目标时先由 PID 主动制动；四轮都低速后再清状态，防残留 PWM 正反抽动。 */
-    if (chassis_wheels_idle_stop_ready(targets, wheel_fb_mps,
-                                       (uint8)CHASSIS_WHEEL_COUNT,
-                                       WHEEL_STOP_TARGET_EPS_MPS,
-                                       WHEEL_STOP_FEEDBACK_EPS_MPS)) {
+    /* IMU 静止授权只看真实轮速；PID 停轮仍同时要求目标和反馈接近零。 */
+    s_imu_zupt_allowed = chassis_wheels_feedback_stationary(
+        wheel_fb_mps, (uint8)CHASSIS_WHEEL_COUNT,
+        CHASSIS_IMU_WHEEL_STILL_EPS_MPS);
+    if (chassis_wheels_idle_stop_ready(
+            targets, wheel_fb_mps, (uint8)CHASSIS_WHEEL_COUNT,
+            WHEEL_STOP_TARGET_EPS_MPS, WHEEL_STOP_FEEDBACK_EPS_MPS) != 0U) {
         for (i = 0U; i < (uint8)CHASSIS_WHEEL_COUNT; ++i) {
             stop_wheel_with_pid_reset(i);
         }
         return;
     }
 
-    /* 方向检测: X 主导时按正负选 floor, Y 主导时沿用原 floor (不区分正负). */
+    /* 方向检测: X 主导时按正负选 floor, Y 主导时沿用原 floor (不区分正负).
+     * 纯原地小角度旋转使用独立衰减参数：静止时仍能克服静摩擦，轮子一旦
+     * 转动就快速撤掉前馈，防止通用 1.90m/s 衰减范围造成持续推转和反抽。 */
     {
         float abs_vx = fabsf(f.vx_body_mps);
         float abs_vy = fabsf(f.vy_body_mps);
+        float yaw_error_abs_deg = fabsf(chassis_normalize_angle_deg(
+                                            s_tgt_yaw_deg - s_pose.yaw_deg));
+        uint8 small_angle_yaw_ff = (fabsf(f.vx_body_mps) <= WHEEL_STOP_TARGET_EPS_MPS)
+                                && (fabsf(f.vy_body_mps) <= WHEEL_STOP_TARGET_EPS_MPS)
+                                && (fabsf(f.wz_dps) > 1e-3f)
+                                && (yaw_error_abs_deg <= CHASSIS_YAW_SMALL_ANGLE_FF_MAX_ERR_DEG);
         const volatile float *pwm_floor_selected;
         if (abs_vx > abs_vy) {
             pwm_floor_selected = (f.vx_body_mps >= 0.0f)
@@ -521,7 +525,9 @@ static void apply_speed(chassis_body_speed_cmd_t cmd,
 
             /* 静摩擦前馈: 线性衰减 + 方向门控 */
             if (abs_target > g_chassis_tune_params.wheel_breakaway_target_eps_mps[i]) {
-                float fb_eps = g_chassis_tune_params.wheel_breakaway_fb_static_eps_mps[i];
+                float fb_eps = (small_angle_yaw_ff != 0U)
+                             ? CHASSIS_YAW_SMALL_ANGLE_FF_FB_DECAY_MPS
+                             : g_chassis_tune_params.wheel_breakaway_fb_static_eps_mps[i];
                 uint8 same_dir = ((targets[i] >= 0.0f) == (wheel_fb_mps[i] >= 0.0f));
                 uint8 is_stopped = (abs_fb < fb_eps * 0.3f);
                 if (same_dir || is_stopped) {
@@ -534,7 +540,9 @@ static void apply_speed(chassis_body_speed_cmd_t cmd,
                         if (ff_ratio > 1.0f) ff_ratio = 1.0f;
                     }
                     {
-                        float floor_pwm = pwm_floor_selected[i];
+                        float floor_pwm = (small_angle_yaw_ff != 0U)
+                                        ? CHASSIS_YAW_SMALL_ANGLE_FF_PWM_FLOOR
+                                        : pwm_floor_selected[i];
                         float ff_pwm = (targets[i] >= 0.0f) ? floor_pwm : -floor_pwm;
                         pwm_forward_domain += ff_pwm * ff_ratio;
                     }
@@ -603,6 +611,14 @@ static void apply_single_wheel_pid_debug(const float wheel_fb_mps[CHASSIS_WHEEL_
         }
     }
     targets[debug_idx] = s_debug_target_ramp_mps;
+
+    for (i = 0U; i < (uint8)CHASSIS_WHEEL_COUNT; ++i)
+    {
+        g_chassis_diag_wheel_tgt[i] = targets[i];
+    }
+    s_imu_zupt_allowed = chassis_wheels_feedback_stationary(
+        wheel_fb_mps, (uint8)CHASSIS_WHEEL_COUNT,
+        CHASSIS_IMU_WHEEL_STILL_EPS_MPS);
 
     /* 调试模式不输出车体运动指令。 */
     s_last_cmd = (chassis_body_speed_cmd_t){0};
@@ -940,16 +956,11 @@ static void enter_mode(ctrl_mode_t m)
     s_pos_i           = 0.0f;  /* 切换目标时清零位置积分, 防旧路径残留量误推新起点 */
     s_pos_i_hold      = 0.0f;  /* 保持轴积分同步清零 */
     s_yaw_i           = 0.0f;  /* yaw 积分同步清零 */
-    s_yaw_rate_i      = 0.0f;  /* 内环 PI 积分清零 */
-    s_yaw_adrc_z1     = 0.0f;  /* ADRC 状态清零 */
-    s_yaw_adrc_z2     = 0.0f;
-    s_yaw_adrc_u      = 0.0f;
     s_ramp = (chassis_body_speed_cmd_t){0};  /* P0-修复 2026-06-07:
                      * 原漏清 s_ramp: 方向反转时 ramp 保留旧方向速度残值,
                      * 新目标要求反向但 ramp_filter 每拍只能变 dv=0.012,
                      * 从 +0.58→0→-0.60 需 ~100 拍 ≈ 2s, 期间车轮往反方向转,
                      * 车大幅过冲后剧烈反向 → Y 保持轴被甩出震荡. */
-    s_axis_y_locked     = 0U;   /* 切换目标时复位轴锁, 重新从 X 轴开始 */
     s_axis_x_arrived    = 0U;   /* 复位逐轴到达标志 */
     s_axis_y_arrived    = 0U;
     /* P0-修复 2026-07-17: 保持轴锚点初始化为当前位置。
@@ -1041,7 +1052,7 @@ void chassis_ctrl_init(void)
 void chassis_ctrl_task_5ms(void)
 {
     float yaw_now;
-    chassis_imu_update_5ms();
+    chassis_imu_update_5ms(s_imu_zupt_allowed);
     yaw_now = chassis_imu_get_yaw_deg();
     /* P0-3: seq-lock 写 yaw_deg */
     pose_write_begin();
@@ -1165,9 +1176,13 @@ void chassis_ctrl_task_20ms(void)
     /* 4) 模式分支 → 生成车体速度指令 */
     switch (s_mode) {
 
-    case MODE_STOPPED:
+    case MODE_STOPPED: {
         /* chassis_ctrl_stop()/init 已同步清零 PWM；停车期间禁止闭环重新产生命令。 */
+        s_imu_zupt_allowed = chassis_wheels_feedback_stationary(
+            ws_pid, (uint8)CHASSIS_WHEEL_COUNT,
+            CHASSIS_IMU_WHEEL_STILL_EPS_MPS);
         return;
+    }
 
     case MODE_POINT_NAV: {
         float dx   = s_tgt_x_m - s_pose.x_m;
@@ -1218,7 +1233,7 @@ void chassis_ctrl_task_20ms(void)
             chassis_arrival_decision_t arrival_decision;
 
             /* 只在已经进入位置窗口后运行静止航向环，避免正常导航路径重复调用 yaw_pi。
-             * 驻留计数以 Schmitt 锁状态为准：进入 0.6° 后停止微调，漂到 0.8° 外才重启。 */
+             * 当前进入/退出阈值均为 0.7°；阈值以 configChassis.h 的实车配置为准。 */
             if (pos_ok != 0U) {
                 wz_arrival = yaw_pi(yerr_arrival, 1U, 1U);
                 yaw_ok = s_yaw_in_position;
@@ -1282,18 +1297,11 @@ void chassis_ctrl_task_20ms(void)
             s_pos_i         = 0.0f;  /* 清积分, 防止卷绕导致初始速度过大 */
             s_pos_i_hold    = 0.0f;
             s_yaw_i         = 0.0f;  /* yaw 积分同步清零 */
-            s_yaw_rate_i    = 0.0f;  /* 内环 PI 积分清零 */
             s_arrival_dwell_cnt = 0U;  /* 驻留计数器清零: 重新驱动需重新确认 */
             s_ramp.vx_body_mps = 0.0f;  /* 清 ramp, 防旧残值污染新驱动方向 */
             s_ramp.vy_body_mps = 0.0f;
             s_axis_hold_x_m = s_pose.x_m;  /* 更新保持轴锚点到当前位置 */
             s_axis_hold_y_m = s_pose.y_m;
-            /* P0-修复: 重置轴锁, 让状态机从 X 优先重新评估.
-             * 不重置时: Y 阶段被大幅 X 扰动后仍保持 s_axis_y_locked=1,
-             * 层4 进入 Y 相位, X 保持轴只能以 hold_max_speed 修正 X 偏差,
-             * 同时 s_axis_hold_x_m 已被上方更新为扰动 X, X 保持环指向错误目标线,
-             * 导致车永远停在扰动 X 处, dist 长期 > EPSILON, 无法到位. */
-            s_axis_y_locked = 0U;
         }
         s_arrived = 0U;
         /* ================================================================
@@ -1746,6 +1754,7 @@ void chassis_ctrl_attitude_debug_get_state(chassis_attitude_debug_info_t *out)
 
 void chassis_ctrl_attitude_debug_task_5ms(void)
 {
+#if (DEBUG_UART_ENABLE != 0)
     static uint8 div = 0U;
     chassis_pose_t pose_snap;
     float fb_snap[CHASSIS_WHEEL_COUNT];
@@ -1775,6 +1784,7 @@ void chassis_ctrl_attitude_debug_task_5ms(void)
            s_pid[CHASSIS_WHEEL_LB].output, s_pid[CHASSIS_WHEEL_RB].output,
            fb_snap[CHASSIS_WHEEL_LF], fb_snap[CHASSIS_WHEEL_RF],
            fb_snap[CHASSIS_WHEEL_LB], fb_snap[CHASSIS_WHEEL_RB]);
+#endif
 }
 
 /* ==========================================================================

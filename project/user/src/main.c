@@ -128,7 +128,7 @@ static uint32 wait_for_tick(void)
 #define MAIN_RUN_MODE_BOARD_TEST      (11)  /* 新主板测试: 屏幕显示 yaw 和手转车轮的编码器反馈 */
 
 /* ═══════════ 改下面这行切换运行模式 (0~11) ═══════════ */
-#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_SINGLE_WHEEL)
+#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_HARDCODED_MAP)
 /* ═══════════ 改上面这行切换运行模式 (0~11) ═══════════ */
 
 /* OpenART1 地图链路硬件口: 若实测 UART4 走 D0/D1, 只改下面两行宏. */
@@ -2142,7 +2142,7 @@ static void main_openart2_test_render_100ms(void)
 #if (MAIN_RUN_MODE == MAIN_RUN_MODE_SINGLE_WHEEL) && (1 == MAIN_PID_DEBUG_FORCE_PID)
 /*
  * 把 main 内 KP/KI/KD 写进 chassis_tune_params, 仅覆盖被调试的那一个轮子,
- * 其余轮子的 PID 维持 menu/Flash 值不动. 在 chassis_ctrl_init 之后调用.
+ * 其余轮子的 PID 维持编译期初始化值不动. 在 chassis_ctrl_init 之后调用.
  */
 static void main_apply_debug_wheel_pid(void)
 {
@@ -2389,7 +2389,7 @@ int main(void)
                 {   1.0f,  1.0f,  0.0f },  /* 
                 
                 //  { S_NAV_MOVE_M,  7.0f, 10.0f  },
-                // { S_NAV_MOVE_M,  1.0f, 10.0f },  /* ③ 右下角 (14,10) */
+                // { S_NAV_MOVE_M,  1.0f, 10.0f },  ③ 右下角 (14,10) */
                 // { S_NAV_MOVE_M,  9.0f, 10.0f },  /* ④ 左下角 (1,10)  */
                 // { S_NAV_MOVE_M,  9.0f,  4.0f  },  /* ⑤ 中心  (7,5)    */
                 // { S_NAV_MOVE_M,  9.0f,  10.0f  },  /* ⑥ 左上角 (1,1) 再次经过 */

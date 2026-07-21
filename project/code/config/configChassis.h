@@ -18,9 +18,9 @@
  *   PWM     = 原始单位 (0 ~ PWM_DUTY_MAX = 10000)
  *   电流    = ADC 原始量 (如有)
  *
- * 持久化语义: 编译期宏提供默认值；
+ * 上电参数语义: 编译期宏 = 唯一真相源；
  *   运行时 RAM 镜像 (g_chassis_tune_params) 为可调子集，
- *   菜单可从带版本和校验和的 Flash blob 覆盖参数；结构布局变化时必须提升版本号。
+ *   由上述宏初始化并经过安全限幅；菜单不从 Flash 覆盖参数。
  *
  * 分节索引:
  *   §A 调度时序与模式
@@ -128,11 +128,11 @@
 
 /** 内环 P: rate_err(°/s) → wz 修正 (°/s).
  *  0.30 在跟踪精度和噪声放大之间平衡: MPC 输出 100dps 时, KP 贡献 30dps 修正. */
-#define CHASSIS_YAW_RATE_KP                 (0.40f)
+#define CHASSIS_YAW_RATE_KP                 (0.30f)
 
 /** 内环 I 增益: ∫rate_err → wz 修正. 自动克服静摩擦.
  *  0.80 配合 I_LEAK=0.001: 稳态偏航力矩被持续抵消, 1~2°静差不再残留. */
-#define CHASSIS_YAW_RATE_KI                 (0.0020f)
+#define CHASSIS_YAW_RATE_KI                 (0.0010f)
 
 /** 内环 I 上限 (°/s): 积分最多贡献的角速度 */
 #define CHASSIS_YAW_RATE_I_LIMIT            (40.0f)
@@ -149,10 +149,19 @@
 #define CHASSIS_YAW_INPOS_ENTER_DEG         (0.70f)
 
 /** 退出在位锁: |err| > 此值 */
-#define CHASSIS_YAW_INPOS_EXIT_DEG          (0.70f)
+#define CHASSIS_YAW_INPOS_EXIT_DEG          (0.80f)
 
 /** 即位锁需车体稳定: |rate| < 此值 */
-#define CHASSIS_YAW_INPOS_SETTLE_DPS        (8.0f)
+#define CHASSIS_YAW_INPOS_SETTLE_DPS        (10.0f)
+
+/* ---- 小角度原地旋转静摩擦前馈 ----
+ * 通用四轮 breakaway 前馈负责平移和大角度起步；以下参数只在
+ * vx/vy 近零且航向误差不超过 MAX_ERR 时替换它，原有线性 yaw 前馈仍叠加。
+ * 保留足够的静止起步 PWM，同时用真实小轮速快速衰减，避免到位附近持续
+ * 施加 750 PWM，并避免车轮尚未停稳时立刻施加反向大前馈。 */
+#define CHASSIS_YAW_SMALL_ANGLE_FF_MAX_ERR_DEG    (2.0f)
+#define CHASSIS_YAW_SMALL_ANGLE_FF_PWM_FLOOR      (600.0f)
+#define CHASSIS_YAW_SMALL_ANGLE_FF_FB_DECAY_MPS   (0.03f)
 
 /** 角速度加减速限制 (°/s²): 同时用于 yaw sqrt 曲线和下游 ramp */
 #define CHASSIS_CMD_ACCEL_LIMIT_DPS2        (5000.0f)
@@ -202,7 +211,7 @@
 /** 到位驻留确认次数 (20ms/次): 连续 N 次同时满足位置+速度+角度条件才判到达。
  *  单拍 odom 噪声/瞬态过冲可能让 dist 瞬间掉进 EPSILON, 不加驻留会误触到达。
  *  8 次 = 160ms；低速零目标停轮门控负责消除 PID 残留输出。 */
-#define CHASSIS_ARRIVAL_DWELL_COUNT         (10U)
+#define CHASSIS_ARRIVAL_DWELL_COUNT         (7U)
 
 /** 到位后 Schmitt 滞后释放阈值 (米): 1cm 进入、5cm 退出，避免噪声重启位置环。 */
 #define CHASSIS_POS_HOLD_EXIT_M             (0.05f)
@@ -220,12 +229,12 @@
  *  P0-修复 2026-05-11 (拐点停留+走斜线): 10.50→4.50
  *  (KP=10.5 时 linear_dist=accel/KP²≈0.027m → 冲过头) */
 /* P0-修复 2026-07-17: 4.50→5.50, 加快逼近和D项阻尼, 远距不冲近距快停 */
-#define CHASSIS_POS_KP                      (5.50f)
+#define CHASSIS_POS_KP                      (5.0f)
 
 /** Y 方向位置环 Kp — Y 轴机械特性独立，允许与 X 分别调节。 */
-#define CHASSIS_POS_Y_KP                    (4.60f)
+#define CHASSIS_POS_Y_KP                    (4.80f)
 
-/** Runtime safety limit for menu/Flash position-loop Kp; must cover the default. */
+/** Runtime safety limit for position-loop Kp; must cover the compile-time default. */
 #define CHASSIS_TUNE_POS_KP_LIMIT           (10.0f)
 
 /** X 方向位置环积分增益 — 消除静摩擦稳态残差。从 0 起调，+0.05/次 */
@@ -233,7 +242,7 @@
 #define CHASSIS_POS_KI                      (0.80f)
 
 /** Y 方向位置环积分增益 — 初值与 X 相同，后续可独立调节。 */
-#define CHASSIS_POS_Y_KI                    (0.80f)
+#define CHASSIS_POS_Y_KI                    (0.60f)
 
 /** X 方向线速度最大加速度 (m/s²)；保留旧宏名兼容现有调参接口。
  *  P0-调参 2026-05-08: 3.00→5.00，加快爬坡/刹车
@@ -299,10 +308,16 @@
  *  实物转 360° 显示 200° → scale = 200/360 = 0.556
  *  实物转 360° 显示 400° → scale = 400/360 = 1.111
  *  公式: 新值 = 当前值 × (显示角度 / 实际角度) */
-#define CHASSIS_IMU_GYRO_SCALE              (1.01543f)
+#define CHASSIS_IMU_GYRO_SCALE              (1.01058f)
 
 /** Yaw 角速度死区 (°/s) — 抑制静止抖动 */
 #define CHASSIS_IMU_GYRO_DEADZONE_DPS       (0.003f)
+
+/** KF 静止预测死区 (°/s)：仅在四轮反馈静止时抑制残余零偏积分 */
+#define CHASSIS_IMU_KF_STILL_RATE_DEADZONE_DPS (0.15f)
+
+/** IMU 物理静止所用的单轮反馈阈值 (m/s)，独立于电机停轮的 0.03m/s 容差 */
+#define CHASSIS_IMU_WHEEL_STILL_EPS_MPS      (0.003f)
 
 /** Yaw 角速度一阶低通系数 (0,1] — 越小越平滑 */
 #define CHASSIS_IMU_GYRO_LPF_ALPHA          (0.2f)
@@ -314,6 +329,12 @@
 
 /** 滑窗长度 (5ms 一拍，64=320ms) */
 #define CHASSIS_IMU_STILL_WINDOW_LEN        (64U)
+
+/** 上电零偏标定采样数：200 拍 × 5ms ≈ 1s，等待 IMU 启动零偏稳定。 */
+#define CHASSIS_IMU_BIAS_CAL_SAMPLE_COUNT   (200U)
+
+/** 上电标定前丢弃的预热样本：40 拍 × 5ms = 200ms，不计入零偏平均。 */
+#define CHASSIS_IMU_BIAS_WARMUP_SAMPLE_COUNT (40U)
 
 /** 静止判别阈值: 窗口方差上限 (°/s)²
  *  P0-回调 2026-05-02: 0.020→0.050，平台微震动也能识别静止 */
@@ -347,7 +368,7 @@
 #define CHASSIS_ODOM_YAW_FUSION_ENABLE      (1)
 
 /** 编码器 yaw 观测噪声方差 (°²) — 大=几乎不信(仅长期纠偏)，小=信任高(打滑污染) */
-#define CHASSIS_ODOM_YAW_R_DEG2             (200.0f)
+#define CHASSIS_ODOM_YAW_R_DEG2             (400.0f)
 
 /** odom yaw 与 IMU yaw 偏差超过此值视为打滑/重定位，跳过观测 */
 #define CHASSIS_ODOM_YAW_OUTLIER_DEG        (1.20f)
@@ -433,8 +454,8 @@
  *   调参口诀:
  *     起步迟/不动 → 加大 FLOOR
  *     起步猛冲    → 减小 FLOOR
- *     起步一抖一抖 → 加大 FB_STATIC_EPS (ff 保持更久)
- *     小目标也冲   → 降低 TARGET_EPS (更晚触发)
+ *     起步后仍推得猛 → 减小 FB_STATIC_EPS (ff 更快退出)
+ *     小目标也冲   → 提高 TARGET_EPS (更晚触发)
  */
 
 /* 默认值 (各轮初值模板) */
@@ -507,7 +528,7 @@
  * ------------------------------------------------------------ */
 
 /* (1) 执行器输出 MOTOR_*_OUTPUT_DIR: driver 乘命令，使 +命令 → 物理前进
- *     ★ 占位 +1 已按实车标定填写，换接线/换电机线序后必须重新辨识 */
+ *     ★ 下列四轮正负号均为实车标定值，并非统一 +1；换接线/换电机线序后必须重新辨识 */
 #define MOTOR_LF_OUTPUT_DIR                 (+1.0f)
 #define MOTOR_RF_OUTPUT_DIR                 (-1.0f)
 #define MOTOR_LB_OUTPUT_DIR                 (+1.0f)
@@ -708,7 +729,7 @@
 /** Yaw 角度精度权重 (°⁻²): 大→转得猛/停得准, 小→柔和.
  *  H 矩阵中实际贡献 = Q_POS × dt² × (N+QF) = Q_POS × 0.006,
  *  需要 ≥ 0.04 才能与 R_VEL 抗衡. Q_POS=12 时 pos 贡献 ≈ 0.072, 与 R_VEL 持平. */
-#define CHASSIS_MPC_YAW_Q_POS                   (1.80f)
+#define CHASSIS_MPC_YAW_Q_POS                   (1.60f)
 
 /** Yaw 角速度代价 (s²/°²): 大→转速降低, 小→更接近 max_yaw_speed.
  *  Q_POS=12 + R_VEL=0.04 组合: err=5°→320dps, err=2°→140dps, err=0.5°→35dps. */

@@ -117,6 +117,7 @@ void chassis_pid_debug_reset(void)
 
 void chassis_pid_debug_task_5ms(void)
 {
+#if (DEBUG_UART_ENABLE != 0)
     static uint8 div = 0U;
     chassis_pid_debug_snapshot_t snapshot;
     // const char *wheel_name;
@@ -148,4 +149,5 @@ void chassis_pid_debug_task_5ms(void)
            snapshot.actual_value);
     // printf("wfb:%.4f,%.4f,%.4f,%.4f\n",
     //        wheel_fb[0], wheel_fb[1], wheel_fb[2], wheel_fb[3]);
+#endif
 }
