@@ -153,17 +153,6 @@ void LPUART6_IRQHandler(void)
 }
 
 
-void LPUART8_IRQHandler(void)
-{
-    if(kLPUART_RxDataRegFullFlag & LPUART_GetStatusFlags(LPUART8))
-    {
-        debug_interrupr_handler();
-    }
-        
-    LPUART_ClearStatusFlags(LPUART8, kLPUART_RxOverrunFlag);    // 不允许删除
-}
-
-
 void GPIO1_Combined_0_15_IRQHandler(void)
 {
     if(exti_flag_get(B0))

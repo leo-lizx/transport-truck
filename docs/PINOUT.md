@@ -75,14 +75,15 @@
 | C26~C31 | C 口高端空闲 |
 | D0~D1 | 注意: 部分底板用 D0/D1 做 UART Debug |
 | D4~D15 | D 口中段空闲 |
+| D16~D17 | 无线/Debug UART 已关闭，当前未占用 |
 
 ## SDK 管理的外设 (引脚定义在 `libraries/` 中)
 
 | 外设 | 实例 | 备注 |
 |------|------|------|
 | 摄像头 UART | LPUART5 | `camera_uart_handler()`，引脚依底板而定 |
-| 无线模块 UART | LPUART8 | `wireless_module_uart_handler()`，引脚依底板而定 |
-| Debug UART | UART8 | 原在 LPUART1 (B12/B13)，已切换 |
+| 无线模块 UART | LPUART8 | 车上未装载，编译期关闭 |
+| Debug UART | UART8 | `DEBUG_UART_ENABLE=0`，D16/D17 不初始化 |
 | SD 卡 | SDHC | 使用 USDHC 引脚组 |
 | 调试器 SWD | SWCLK/SWDIO | 固定引脚，不可占用 |
 

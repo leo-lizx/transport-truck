@@ -46,6 +46,11 @@
 #include <string.h>
 #include "fsl_rtwdog.h"  /* 非正式比赛模式使用的 2s 硬件看门狗 */
 
+#if (DEBUG_UART_ENABLE == 0)
+/* 无线调试串口拆除后不再格式化日志，避免无输出设备时浪费主循环时间。 */
+#define printf(...) (0)
+#endif
+
 /*==========================================================================
  *  P0-5: 主循环 5ms tick 节拍 (替代 system_delay_ms 阻塞)
  *  - PIT_CH0 ISR 每 5ms 调用 main_loop_on_pit_tick(), 累加 s_main_tick_pending
@@ -2162,7 +2167,9 @@ int main(void)
 #endif
 
     clock_init(BOARD_BOOTCLOCKRUN_CORE_CLOCK);  // 默认528MHz，降低电池冷启动的VDD_SOC需求
+#if DEBUG_UART_ENABLE
     debug_init();                   // 调试端口初始化
+#endif
 
     // ------------------------------------------------------------------
     // 1. 通信外设初始化
