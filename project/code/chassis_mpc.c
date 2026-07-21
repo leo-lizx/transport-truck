@@ -15,15 +15,17 @@
 
 #include "chassis_mpc.h"
 
-#if CHASSIS_MPC_ENABLE
+#if CHASSIS_MPC_ENABLE || CHASSIS_MPC_YAW_ENABLE
 
 #include <math.h>
 
 /* ==================================================================
- *  全局实例 (BSS: 每个 ~620 bytes, 两个 ~1240 bytes)
+ *  全局实例 (N=20 时 BSS 每个约 1.1KB；仅分配已启用的实例)
  * ================================================================== */
 
+#if CHASSIS_MPC_ENABLE
 static mpc_solver_t g_mpc_pos;   /* 位置 MPC (驱动轴纵向) */
+#endif
 #if CHASSIS_MPC_YAW_ENABLE
 static mpc_solver_t g_mpc_yaw;   /* Yaw MPC (原地旋转) */
 #endif
@@ -336,6 +338,8 @@ uint8 mpc_solver_step(mpc_solver_t *s, float dist_to_target,
  *  位置 MPC (向后兼容包装)
  * ================================================================== */
 
+#if CHASSIS_MPC_ENABLE
+
 void chassis_mpc_init(void)
 {
     mpc_solver_init(&g_mpc_pos,
@@ -357,6 +361,8 @@ uint8 chassis_mpc_step(float dist_to_target_m, float *out_velocity_mps)
 {
     return mpc_solver_step(&g_mpc_pos, dist_to_target_m, out_velocity_mps);
 }
+
+#endif /* CHASSIS_MPC_ENABLE */
 
 /* ==================================================================
  *  Yaw MPC
@@ -388,4 +394,4 @@ uint8 chassis_mpc_yaw_step(float angle_err_deg, float *out_rate_dps)
 
 #endif /* CHASSIS_MPC_YAW_ENABLE */
 
-#endif /* CHASSIS_MPC_ENABLE */
+#endif /* CHASSIS_MPC_ENABLE || CHASSIS_MPC_YAW_ENABLE */

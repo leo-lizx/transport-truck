@@ -13,7 +13,7 @@
 #include "zf_common_typedef.h"
 #include "config/configChassis.h"
 
-#if CHASSIS_MPC_ENABLE
+#if CHASSIS_MPC_ENABLE || CHASSIS_MPC_YAW_ENABLE
 
 /* ==================================================================
  *  MPC 维度常量 (由 config 宏推导)
@@ -94,9 +94,11 @@ uint8 mpc_solver_step(mpc_solver_t *s, float dist_to_target,
  *  位置 MPC (向后兼容, 内部使用 g_mpc_pos 实例)
  * ================================================================== */
 
+#if CHASSIS_MPC_ENABLE
 void chassis_mpc_init(void);
 void chassis_mpc_reset(void);
 uint8 chassis_mpc_step(float dist_to_target_m, float *out_velocity_mps);
+#endif /* CHASSIS_MPC_ENABLE */
 
 /* ==================================================================
  *  Yaw MPC (原地旋转航向对齐)
@@ -115,5 +117,5 @@ void chassis_mpc_yaw_reset(void);
 uint8 chassis_mpc_yaw_step(float angle_err_deg, float *out_rate_dps);
 #endif /* CHASSIS_MPC_YAW_ENABLE */
 
-#endif /* CHASSIS_MPC_ENABLE */
+#endif /* CHASSIS_MPC_ENABLE || CHASSIS_MPC_YAW_ENABLE */
 #endif /* CHASSIS_MPC_H */

@@ -6,7 +6,6 @@
 #include "chassis_ctrl.h"
 #include "chassis_imu.h"
 #include "zf_common_headfile.h"
-#include "zf_driver_flash.h"
 #include <string.h>
 
 /*===========================================================================
@@ -23,19 +22,6 @@
  *   - Car grid position overlay.
  *   - Current yaw angle below the map.
  *===========================================================================*/
-
-#define CHASSIS_MENU_FLASH_SECTOR      (127U)
-#define CHASSIS_MENU_FLASH_PAGE        (FLASH_PAGE_7)
-#define CHASSIS_MENU_FLASH_MAGIC       (0x4D4E5455U)
-#define CHASSIS_MENU_FLASH_VERSION     (4U)  /* bumped: per-wheel breakaway fields added to chassis_tune_params_t */
-
-typedef struct
-{
-    uint32 magic;
-    uint32 version;
-    chassis_tune_params_t params;
-    uint32 checksum;
-} chassis_menu_flash_blob_t;
 
 #define MENU_MAP_STALE_MS              (500U)
 #define MENU_MAP_ORIGIN_X              (8U)
@@ -65,7 +51,6 @@ typedef struct
 #define MENU_COLOR_BOMB                MENU_RGB565(255U, 24U, 74U)
 #define MENU_COLOR_CAR                 RGB565_CYAN
 
-static uint8 s_flash_ready = 0U;
 static uint8 s_need_full_refresh = 1U;
 static uint8 s_last_map_ready = 0xFFU;
 static uint32 s_last_car_frame_id = 0U;
@@ -73,48 +58,6 @@ static uint8 s_cached_map[APP_LINK_MAP_ROWS][APP_LINK_MAP_COLS];  /* 缓存上�
 static uint8 s_map_cached = 0U;                                    /* s_cached_map 是否有效 */
 static uint8 s_last_car_x = 0xFFU;                                 /* 上一帧小车格 X (0xFF=无效) */
 static uint8 s_last_car_y = 0xFFU;                                 /* 上一帧小车格 Y */
-
-static uint32 menu_flash_checksum(const uint32 *words, uint16 word_count)
-{
-    uint16 i;
-    uint32 sum = 0U;
-
-    for (i = 0U; i < word_count; ++i)
-    {
-        sum += words[i];
-    }
-    return sum;
-}
-
-static uint8 menu_load_params_from_flash(void)
-{
-    uint32 raw_words[(sizeof(chassis_menu_flash_blob_t) + 3U) / 4U];
-    chassis_menu_flash_blob_t blob;
-    uint32 calc_checksum;
-    uint16 payload_words;
-
-    if (0U == s_flash_ready)
-    {
-        return 0U;
-    }
-
-    flash_read_page(CHASSIS_MENU_FLASH_SECTOR, CHASSIS_MENU_FLASH_PAGE,
-                    raw_words, (uint16)(sizeof(raw_words) / sizeof(raw_words[0])));
-    memcpy(&blob, raw_words, sizeof(blob));
-
-    payload_words = (uint16)((sizeof(chassis_menu_flash_blob_t) - sizeof(uint32)) / 4U);
-    calc_checksum = menu_flash_checksum((const uint32 *)&blob, payload_words);
-
-    if ((blob.magic != CHASSIS_MENU_FLASH_MAGIC) ||
-        (blob.version != CHASSIS_MENU_FLASH_VERSION) ||
-        (blob.checksum != calc_checksum))
-    {
-        return 0U;
-    }
-
-    chassis_ctrl_set_tune_params(&blob.params);
-    return 1U;
-}
 
 static void menu_fill_rect(uint16 x, uint16 y, uint16 w, uint16 h, uint16 color)
 {
@@ -386,9 +329,6 @@ static void menu_draw_dynamic_text(uint8 map_ready, uint32 map_age_ms, const app
 
 void chassis_menu_init(void)
 {
-    s_flash_ready = (0U == flash_init()) ? 1U : 0U;
-    (void)menu_load_params_from_flash();
-
     s_need_full_refresh = 1U;
     s_last_map_ready = 0xFFU;
     s_last_car_frame_id = 0U;

@@ -21,6 +21,7 @@
 #include "chassis_mecanum.h"
 #include "chassis_mpc.h"     /* P0-MPC: 直线行驶 MPC 驱动轴纵向速度规划                   */
 #include "chassis_arrival.h"
+#include "chassis_velocity_handoff.h"
 #include "app_link.h"        /* P0-3: 软限位改用 app_link_get_map_snapshot() 拿一致地图副本   */
 #include "zf_common_headfile.h"  /* P0-3: __DMB() / __disable_irq() 内存屏障与临界区          */
 #include <math.h>
@@ -41,7 +42,7 @@
 /* Yaw 串级 P-PI 内环: 前馈 + PI 直接输出 PWM, 自动克服静摩擦.
  * 外环(yaw_pi): angle_err → wz_cmd (纯 P)
  * 内环(本段):   wz_cmd - wz_actual → PWM (PI), 取代旧 GAIN×wz 开环 */
-#define CHASSIS_YAW_PWM_GAIN              (0.0f)    /* 已废弃, 由内环 PI 替代 */
+#define CHASSIS_YAW_PWM_GAIN              (80.0f)    /* 已废弃, 由内环 PI 替代 */
 
 /* 保持轴直接 PWM 前馈: 绕过轮速 PID, 把车体速度 (vx,vy) 直接换算成 PWM.
  *   问题同 yaw: 保持轴输出 0.06m/s → 轮速 PID 只给 40×0.06=2.4PWM → 无力纠偏.
@@ -49,14 +50,9 @@
  *   O 型麦轮: vy 四轮同号, vx 对角同号 (LF=-, RF=+, LB=+, RB=-).
  *   GAIN=1500 时, 保持 0.06m/s→90PWM/轮, 足以对抗 odom 漂移和耦合扰动. */
 #define CHASSIS_HOLD_PWM_GAIN             (40.0f)
-/* P0-修复 2026-04-29 姿态环“一段一段”真凶:
- * 原阈值 0.015 m/s, 但 yaw 转 1° 需 wheel target ≈ 0.023 m/s, 仅高出 53%,
- * wz 一抖 target 跌破 → stop_wheel_with_pid_reset 把 PWM 拍 0 → 下一拍
- * target 变大又恢复 → PWM 跳变 → 表现为输出“段段起止”。
- * 将阈值调到 0.005 m/s, 让 yaw±1° 场景 (target ≈0.023) 有 4.5x 余量,
- * 小抖动不会再跳变 → PWM 输出连续. */
-#define WHEEL_STOP_TARGET_EPS_MPS         (0.000f)  /* 原 0.015, 调小防小角度阈值跳变 */
-#define WHEEL_STOP_FEEDBACK_EPS_MPS       (2.00f)  /* 原 0.030, 同步调小 */
+/* 仅当四轮目标和反馈同时接近 0 才停轮；0.003m/s 不会吞掉正常的小角度修正。 */
+#define WHEEL_STOP_TARGET_EPS_MPS         (0.003f)
+#define WHEEL_STOP_FEEDBACK_EPS_MPS       (0.030f)
 
 /* 软限位保护参数 / 软限位 helpers / apply_soft_limit_guard()
  * 已于 2026-05-13 迁至 chassis_zone.c (chassis_zone_apply_soft_limit_guard).
@@ -111,9 +107,10 @@ volatile chassis_tune_params_t g_chassis_tune_params = {
         CHASSIS_WHEEL_PID_LB_KD,
         CHASSIS_WHEEL_PID_RB_KD,
     },
-    CHASSIS_POS_KP, CHASSIS_YAW_KP,
+    CHASSIS_POS_KP, CHASSIS_POS_Y_KP, CHASSIS_YAW_KP,
     CHASSIS_MAX_LINEAR_SPEED_MPS, CHASSIS_MAX_YAW_SPEED_DPS,
-    CHASSIS_CMD_ACCEL_LIMIT_MPS2, CHASSIS_CMD_ACCEL_LIMIT_DPS2,
+    CHASSIS_CMD_ACCEL_LIMIT_MPS2, CHASSIS_CMD_ACCEL_LIMIT_Y_MPS2,
+    CHASSIS_CMD_ACCEL_LIMIT_DPS2,
 
     /* 静摩擦前馈 — 每轮独立默认值 */
     {
@@ -336,13 +333,15 @@ static chassis_tune_params_t sanitize(chassis_tune_params_t p)
         p.wheel_breakaway_fb_static_eps_mps[i] = chassis_clamp_f(p.wheel_breakaway_fb_static_eps_mps[i], 0.01f,  5.00f);
     }
 
-    p.pos_kp               = chassis_clamp_f(p.pos_kp,               0.0f,    5.0f);
+    p.pos_kp   = chassis_clamp_f(p.pos_kp,   0.0f, CHASSIS_TUNE_POS_KP_LIMIT);
+    p.pos_kp_y = chassis_clamp_f(p.pos_kp_y, 0.0f, CHASSIS_TUNE_POS_KP_LIMIT);
     p.yaw_kp               = chassis_clamp_f(p.yaw_kp,               0.0f,   10.0f);
     p.max_linear_speed_mps = chassis_clamp_f(p.max_linear_speed_mps, 0.05f,
                                              CHASSIS_TUNE_MAX_LINEAR_SPEED_LIMIT_MPS);
     p.max_yaw_speed_dps   = chassis_clamp_f(p.max_yaw_speed_dps,   10.0f,
                                              CHASSIS_TUNE_MAX_YAW_SPEED_LIMIT_DPS);
     p.cmd_accel_limit_mps2 = chassis_clamp_f(p.cmd_accel_limit_mps2, 0.10f, 5.00f);
+    p.cmd_accel_limit_y_mps2 = chassis_clamp_f(p.cmd_accel_limit_y_mps2, 0.10f, 6.00f);
     p.cmd_accel_limit_dps2 = chassis_clamp_f(p.cmd_accel_limit_dps2, 20.0f, 1000.0f);
     return p;
 }
@@ -366,9 +365,10 @@ static void limit_speed(chassis_body_speed_cmd_t *c)
 }
 
 /** 缓加速斜坡滤波: 每 20ms 周期限制速度变化量，防止轮胎打滑 */
-static chassis_body_speed_cmd_t ramp_filter(chassis_body_speed_cmd_t tgt)
+static chassis_body_speed_cmd_t ramp_filter(chassis_body_speed_cmd_t tgt,
+                                             float accel_limit_mps2)
 {
-    const float dv = g_chassis_tune_params.cmd_accel_limit_mps2 * CHASSIS_TASK_DT_20MS_S;
+    const float dv = accel_limit_mps2 * CHASSIS_TASK_DT_20MS_S;
     const float dw = g_chassis_tune_params.cmd_accel_limit_dps2 * CHASSIS_TASK_DT_20MS_S;
     chassis_body_speed_cmd_t out;
 
@@ -450,13 +450,14 @@ static void force_stop(void)
 
 /** 完整执行链路: 滤波 → 运动学 → PID → 电机 */
 static void apply_speed(chassis_body_speed_cmd_t cmd,
-                        const float wheel_fb_mps[CHASSIS_WHEEL_COUNT])
+                        const float wheel_fb_mps[CHASSIS_WHEEL_COUNT],
+                        float accel_limit_mps2)
 {
     chassis_body_speed_cmd_t f;
     float targets[CHASSIS_WHEEL_COUNT];
     uint8 i;
 
-    f = ramp_filter(cmd);
+    f = ramp_filter(cmd, accel_limit_mps2);
     s_last_cmd = f;
 
     chassis_mecanum_forward(f.vx_body_mps, f.vy_body_mps,
@@ -480,6 +481,17 @@ static void apply_speed(chassis_body_speed_cmd_t cmd,
         g_chassis_diag_body_spd_tgt_vy = f.vy_body_mps;
         g_chassis_diag_body_spd_fb_vx  = s_fb_vx;
         g_chassis_diag_body_spd_fb_vy  = s_fb_vy;
+    }
+
+    /* 零目标时先由 PID 主动制动；四轮都低速后再清状态，防残留 PWM 正反抽动。 */
+    if (chassis_wheels_idle_stop_ready(targets, wheel_fb_mps,
+                                       (uint8)CHASSIS_WHEEL_COUNT,
+                                       WHEEL_STOP_TARGET_EPS_MPS,
+                                       WHEEL_STOP_FEEDBACK_EPS_MPS)) {
+        for (i = 0U; i < (uint8)CHASSIS_WHEEL_COUNT; ++i) {
+            stop_wheel_with_pid_reset(i);
+        }
+        return;
     }
 
     /* 方向检测: X 主导时按正负选 floor, Y 主导时沿用原 floor (不区分正负). */
@@ -697,10 +709,10 @@ static float sqrt_controller(float error, float p, float accel_max)
  *   d_stop = v_max² / (2·accel_limit)
  * brake_dist 必须覆盖 d_stop + EPSILON 才能在到位前刹停, 再留 BRAKE_MARGIN 裕量.
  * 用运行时可调的 max_linear_speed / cmd_accel_limit 计算, 调速度/加速度时自动跟随. */
-static float pos_brake_dist_auto(void)
+static float pos_brake_dist_auto(float accel_limit_mps2)
 {
     float v_max = g_chassis_tune_params.max_linear_speed_mps;
-    float accel = g_chassis_tune_params.cmd_accel_limit_mps2;
+    float accel = accel_limit_mps2;
     float d_stop = (accel > 1e-6f) ? (v_max * v_max / (2.0f * accel)) : 0.0f;
     return d_stop + CHASSIS_TARGET_REACHED_EPSILON_M + CHASSIS_POS_BRAKE_MARGIN_M;
 }
@@ -721,7 +733,7 @@ static float position_axis_velocity_cmd(float axis_error,
      * 此时清零 velocity_cmd 会把积分效果也一起干掉 → KI 调了跟没调一样.
      * position_cmd 与 error 始终同号 (sqrt_controller 保证), 反卷绕仅在超出
      * brake_dist 时做 safety net 缩放, 近端不再触发. */
-    if ((fabsf(axis_error) > pos_brake_dist_auto()) &&
+    if ((fabsf(axis_error) > pos_brake_dist_auto(accel_limit)) &&
         (((axis_error > 0.0f) && (position_cmd < 0.0f)) ||
          ((axis_error < 0.0f) && (position_cmd > 0.0f))))
     {
@@ -750,12 +762,26 @@ static float driving_axis_velocity_cmd(float axis_error,
 #if CHASSIS_MPC_ENABLE
     float mpc_v;
     if (chassis_mpc_step(axis_error, &mpc_v)) {
+        float abs_error = fabsf(axis_error);
+
+        if (abs_error < CHASSIS_MPC_BLEND_START_DIST_M) {
+            float pid_v = position_axis_velocity_cmd(axis_error,
+                                                     axis_velocity_lpf,
+                                                     position_gain,
+                                                     damping_gain,
+                                                     accel_limit,
+                                                     integral_term);
+            /* 融合区按 PID 路径积累 I 项，让接管前后的指令保持连续。 */
+            *out_mpc_active = 0U;
+            return chassis_velocity_handoff_blend(
+                abs_error,
+                CHASSIS_MPC_BLEND_START_DIST_M,
+                CHASSIS_MPC_MIN_DIST_M,
+                mpc_v,
+                pid_v);
+        }
+
         *out_mpc_active = 1U;
-        (void)axis_velocity_lpf;
-        (void)position_gain;
-        (void)damping_gain;
-        (void)accel_limit;
-        (void)integral_term;
         return mpc_v;
     }
 #endif
@@ -936,9 +962,9 @@ static void enter_mode(ctrl_mode_t m)
     }
 #if CHASSIS_MPC_ENABLE
     chassis_mpc_reset();  /* P0-MPC: 切换目标时清热启动, 旧解不污染新方向 */
+#endif
 #if CHASSIS_MPC_YAW_ENABLE
     chassis_mpc_yaw_reset();  /* Yaw MPC: 同步清热启动 */
-#endif
 #endif
     s_mode              = m;
 }
@@ -994,9 +1020,9 @@ void chassis_ctrl_init(void)
 
 #if CHASSIS_MPC_ENABLE
     chassis_mpc_init();     /* P0-MPC: 构建 H 矩阵, 预计算 FISTA 步长 */
+#endif
 #if CHASSIS_MPC_YAW_ENABLE
     chassis_mpc_yaw_init(); /* Yaw MPC: 构建 H 矩阵, 预计算 FISTA 步长 */
-#endif
 #endif
 
     force_stop();
@@ -1026,6 +1052,8 @@ void chassis_ctrl_task_20ms(void)
     float vx_raw, vy_raw;
     float yaw_rad, cy, sy;
     chassis_body_speed_cmd_t cmd = {0};
+    /* POINT_NAV 按全局 X/Y 逐轴驱动；下游虽处理车体系速度，斜坡上限仍应跟随当前全局驱动轴。 */
+    float linear_accel_limit_mps2 = g_chassis_tune_params.cmd_accel_limit_mps2;
     uint8 i;
 
     /* 1) 编码器采样 */
@@ -1141,6 +1169,8 @@ void chassis_ctrl_task_20ms(void)
         float dx   = s_tgt_x_m - s_pose.x_m;
         float dy   = s_tgt_y_m - s_pose.y_m;
         float dist = sqrtf(dx * dx + dy * dy);
+        float accel_x = g_chassis_tune_params.cmd_accel_limit_mps2;
+        float accel_y = g_chassis_tune_params.cmd_accel_limit_y_mps2;
         float vxg, vyg, norm;
         float yerr;
 
@@ -1184,7 +1214,7 @@ void chassis_ctrl_task_20ms(void)
             chassis_arrival_decision_t arrival_decision;
 
             /* 只在已经进入位置窗口后运行静止航向环，避免正常导航路径重复调用 yaw_pi。
-             * 驻留计数以 Schmitt 锁状态为准：进入 0.3° 后停止微调，漂到 0.7° 外才重启。 */
+             * 驻留计数以 Schmitt 锁状态为准：进入 0.6° 后停止微调，漂到 0.8° 外才重启。 */
             if (pos_ok != 0U) {
                 wz_arrival = yaw_pi(yerr_arrival, 1U, 1U);
                 yaw_ok = s_yaw_in_position;
@@ -1290,16 +1320,21 @@ void chassis_ctrl_task_20ms(void)
             s_v_cross_lpf = (1.0f - CHASSIS_POS_D_LPF_ALPHA) * s_v_cross_lpf
                           + CHASSIS_POS_D_LPF_ALPHA * vyg_meas;  /* 借用 cross 槽存 vyg LPF */
 
-            /* KP 保持不变 (不再 gain scheduling), KD/保持轴阻尼由 KP 自动推导. */
-            float kp_eff  = g_chassis_tune_params.pos_kp;
-            float kd_eff  = kp_eff * CHASSIS_POS_KD_RATIO;       /* 主轴速度阻尼 */
-            float kd_hold = kp_eff * CHASSIS_POS_HOLD_KD_RATIO;  /* 保持轴轻阻尼 */
+            /* X/Y 位置环分别取参；D 项和保持阻尼由对应轴 Kp 独立推导。 */
+            float kp_x = g_chassis_tune_params.pos_kp;
+            float kp_y = g_chassis_tune_params.pos_kp_y;
+            float kd_x = kp_x * CHASSIS_POS_KD_RATIO;
+            float kd_y = kp_y * CHASSIS_POS_Y_KD_RATIO;
+            float kd_hold_x = kp_x * CHASSIS_POS_HOLD_KD_RATIO;
+            float kd_hold_y = kp_y * CHASSIS_POS_HOLD_KD_RATIO;
 
             /* 自动推导的积分/切轴参数 (替代旧 I_LIMIT / I_BAND / SWITCH_TOL 常量) */
-            float brake_dist = pos_brake_dist_auto();
+            float brake_dist_x = pos_brake_dist_auto(accel_x);
+            float brake_dist_y = pos_brake_dist_auto(accel_y);
             float i_limit    = g_chassis_tune_params.max_linear_speed_mps
                              * CHASSIS_POS_I_LIMIT_RATIO;
-            float i_band     = brake_dist * CHASSIS_POS_I_BAND_RATIO;
+            float i_band_x   = brake_dist_x * CHASSIS_POS_I_BAND_RATIO;
+            float i_band_y   = brake_dist_y * CHASSIS_POS_I_BAND_RATIO;
 
             /* 曼哈顿: 选主轴驱动, 非主轴命令 = 0 且立即清零其 ramp.
              *
@@ -1320,6 +1355,10 @@ void chassis_ctrl_task_20ms(void)
             {
                 uint8 drive_y = ((s_axis_x_arrived != 0U) && (s_axis_y_arrived == 0U)) ? 1U : 0U;
 
+                if (drive_y != 0U) {
+                    linear_accel_limit_mps2 = accel_y;
+                }
+
                 if (!drive_y) {
                     /* ── X 驱动, Y 保持 ── */
                     if (fabsf(dx) <= CHASSIS_TARGET_REACHED_EPSILON_M
@@ -1336,18 +1375,18 @@ void chassis_ctrl_task_20ms(void)
                         float y_hold_err = s_axis_hold_y_m - s_pose.y_m;
                         uint8 mpc_active;
                         vxg = driving_axis_velocity_cmd(dx, s_v_along_lpf,
-                            kp_eff, kd_eff,
-                            g_chassis_tune_params.cmd_accel_limit_mps2,
+                            kp_x, kd_x,
+                            accel_x,
                             s_pos_i, &mpc_active);
-                        if (!mpc_active && CHASSIS_POS_KI > 1e-6f && dist < i_band) {
+                        if (!mpc_active && CHASSIS_POS_KI > 1e-6f && dist < i_band_x) {
                             s_pos_i += CHASSIS_POS_KI * dx * CHASSIS_TASK_DT_20MS_S;
                             if      (s_pos_i >  i_limit) s_pos_i =  i_limit;
                             else if (s_pos_i < -i_limit) s_pos_i = -i_limit;
                             if (dx * s_pos_i < 0.0f) s_pos_i = 0.0f;
                         }
                         if (fabsf(y_hold_err) > CHASSIS_POS_HOLD_DEAD_ZONE_M) {
-                            if (CHASSIS_POS_KI > 1e-6f) {
-                                s_pos_i_hold += CHASSIS_POS_KI * y_hold_err * CHASSIS_TASK_DT_20MS_S;
+                            if (CHASSIS_POS_Y_KI > 1e-6f) {
+                                s_pos_i_hold += CHASSIS_POS_Y_KI * y_hold_err * CHASSIS_TASK_DT_20MS_S;
                                 float hlim = i_limit * 0.5f;
                                 if      (s_pos_i_hold >  hlim) s_pos_i_hold =  hlim;
                                 else if (s_pos_i_hold < -hlim) s_pos_i_hold = -hlim;
@@ -1355,8 +1394,8 @@ void chassis_ctrl_task_20ms(void)
                             }
                         } else { s_pos_i_hold = 0.0f; }
                         vyg = axis_hold_velocity_cmd(y_hold_err, s_v_cross_lpf,
-                            kp_eff, kd_hold,
-                            g_chassis_tune_params.cmd_accel_limit_mps2,
+                            kp_y, kd_hold_y,
+                            accel_y,
                             s_pos_i_hold);
                     }
                 } else {
@@ -1384,11 +1423,11 @@ void chassis_ctrl_task_20ms(void)
                             vyg = 0.0f;
                         } else {
                             vyg = driving_axis_velocity_cmd(dy, s_v_cross_lpf,
-                                kp_eff, kd_eff,
-                                g_chassis_tune_params.cmd_accel_limit_mps2,
+                                kp_y, kd_y,
+                                accel_y,
                                 s_pos_i, &mpc_active);
-                            if (!mpc_active && CHASSIS_POS_KI > 1e-6f && dist < i_band) {
-                                s_pos_i += CHASSIS_POS_KI * dy * CHASSIS_TASK_DT_20MS_S;
+                            if (!mpc_active && CHASSIS_POS_Y_KI > 1e-6f && dist < i_band_y) {
+                                s_pos_i += CHASSIS_POS_Y_KI * dy * CHASSIS_TASK_DT_20MS_S;
                                 if      (s_pos_i >  i_limit) s_pos_i =  i_limit;
                                 else if (s_pos_i < -i_limit) s_pos_i = -i_limit;
                                 if (dy * s_pos_i < 0.0f) s_pos_i = 0.0f;
@@ -1403,8 +1442,8 @@ void chassis_ctrl_task_20ms(void)
                                 }
                             } else { s_pos_i_hold = 0.0f; }
                             vxg = axis_hold_velocity_cmd(x_hold_err, s_v_along_lpf,
-                                kp_eff, kd_hold,
-                                g_chassis_tune_params.cmd_accel_limit_mps2,
+                                kp_x, kd_hold_x,
+                                accel_x,
                                 s_pos_i_hold);
                         }
                     }
@@ -1418,10 +1457,11 @@ void chassis_ctrl_task_20ms(void)
          *   dist 仍大 → 刹车不触发 → X 全速冲过头 → 保持环拉回 → 到点慢.
          *   修复: X 驱动时用 |dx|, Y 驱动时用 |dy| 独立算刹车. */
         {
-            float brake_dist = pos_brake_dist_auto();
+            float brake_dist_x = pos_brake_dist_auto(accel_x);
+            float brake_dist_y = pos_brake_dist_auto(accel_y);
             /* 入口也改用逐轴距离: 任一轴进刹车区就对该轴限速, 不再被另一轴拖累 */
-            if (brake_dist > 1e-6f
-                && (fabsf(dx) < brake_dist || fabsf(dy) < brake_dist)) {
+            if ((brake_dist_x > 1e-6f || brake_dist_y > 1e-6f)
+                && (fabsf(dx) < brake_dist_x || fabsf(dy) < brake_dist_y)) {
                 float v_max_brake;
 
                 /* 根据逐轴到位状态, 用驱动轴的误差独立算刹车速度 */
@@ -1430,7 +1470,7 @@ void chassis_ctrl_task_20ms(void)
                     if (brake_err < 0.0f) brake_err = 0.0f;
                     v_max_brake = sqrt_controller(brake_err,
                         g_chassis_tune_params.pos_kp,
-                        g_chassis_tune_params.cmd_accel_limit_mps2);
+                        accel_x);
                     if (v_max_brake < CHASSIS_POS_BRAKE_FLOOR_MPS)
                         v_max_brake = CHASSIS_POS_BRAKE_FLOOR_MPS;
                     if (fabsf(vxg) > v_max_brake)
@@ -1439,8 +1479,8 @@ void chassis_ctrl_task_20ms(void)
                     float brake_err = fabsf(dy) - CHASSIS_TARGET_REACHED_EPSILON_M;
                     if (brake_err < 0.0f) brake_err = 0.0f;
                     v_max_brake = sqrt_controller(brake_err,
-                        g_chassis_tune_params.pos_kp,
-                        g_chassis_tune_params.cmd_accel_limit_mps2);
+                        g_chassis_tune_params.pos_kp_y,
+                        accel_y);
                     if (v_max_brake < CHASSIS_POS_BRAKE_FLOOR_MPS)
                         v_max_brake = CHASSIS_POS_BRAKE_FLOOR_MPS;
                     if (fabsf(vyg) > v_max_brake)
@@ -1452,7 +1492,7 @@ void chassis_ctrl_task_20ms(void)
                     if (brake_err < 0.0f) brake_err = 0.0f;
                     v_max_brake = sqrt_controller(brake_err,
                         g_chassis_tune_params.pos_kp,
-                        g_chassis_tune_params.cmd_accel_limit_mps2);
+                        accel_x);
                     if (v_max_brake < CHASSIS_POS_BRAKE_FLOOR_MPS)
                         v_max_brake = CHASSIS_POS_BRAKE_FLOOR_MPS;
                     norm_2d = sqrtf(vxg * vxg + vyg * vyg);
@@ -1542,7 +1582,7 @@ void chassis_ctrl_task_20ms(void)
         chassis_zone_apply_soft_limit_guard(&cmd);
     }
 
-    apply_speed(cmd, ws_pid);
+    apply_speed(cmd, ws_pid, linear_accel_limit_mps2);
 }
 
 /* ==========================================================================

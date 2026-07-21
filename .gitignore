@@ -7,7 +7,9 @@ Release/
 *.pbd
 *.pbw
 *.o
+*.r79
 *.out
+*.exe
 *.map
 *.hex
 *.bin
@@ -80,3 +82,9 @@ __pycache__/
 /project/code/tests/test_chassis_arrival.c
 /project/code/tests/test_chassis_arrival_config.py
 /project/code/tests/test_clock_profile.py
+/project/code/tests/test_chassis_tune_config.py
+/project/code/tests/test_chassis_velocity_handoff.c
+/project/code/tests/test_chassis_mpc_feature_guards.py
+
+# PC-only configuration source regression; not part of IAR firmware/full-course execution
+/project/code/tests/test_chassis_config_source.py
