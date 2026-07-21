@@ -7,7 +7,12 @@
 
 #include "chassis_pid.h"
 #include "chassis_ctrl.h"
+#include "zf_common_debug.h"
 #include <stdio.h>
+
+#if (DEBUG_UART_ENABLE == 0)
+#define printf(...) (0)
+#endif
 
 /* ---------------------- 单轮 PID 调试缓存 ---------------------- */
 static volatile uint8 s_pid_debug_wheel_index = (uint8)CHASSIS_WHEEL_RF; /* 当前选中的调试轮子 */

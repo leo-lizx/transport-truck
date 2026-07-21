@@ -26,6 +26,10 @@
 #include "zf_common_headfile.h"  /* P0-3: __DMB() / __disable_irq() 内存屏障与临界区          */
 #include <math.h>
 
+#if (DEBUG_UART_ENABLE == 0)
+#define printf(...) (0)
+#endif
+
 /* 软限位依赖：P0-3 解耦 g_game_map 直访, 改为运行时 seq-lock 快照 (apply_soft_limit_guard 内部拷贝) */
 
 /* 航向闭环参数集中在 chassis_config.h 顶部“用户常调参数区”。 */
