@@ -75,13 +75,15 @@ typedef struct
     float wheel_pid_ki[CHASSIS_CTRL_TUNE_WHEEL_COUNT];
     float wheel_pid_kd[CHASSIS_CTRL_TUNE_WHEEL_COUNT];
 
-    float pos_kp;
+    float pos_kp;       /**< X 方向位置环 Kp；保留字段名兼容现有调用方 */
+    float pos_kp_y;     /**< Y 方向位置环 Kp */
     float yaw_kp;
 
     float max_linear_speed_mps;
     float max_yaw_speed_dps;
 
-    float cmd_accel_limit_mps2;
+    float cmd_accel_limit_mps2;    /**< 全局 X 方向加速度上限；保留字段名兼容现有调用方 */
+    float cmd_accel_limit_y_mps2;  /**< 全局 Y 方向加速度上限 */
     float cmd_accel_limit_dps2;
 
     /* 静摩擦前馈 — 每轮独立 (LF/RF/LB/RB) */

@@ -27,7 +27,7 @@
 #define CHASSIS_MENU_FLASH_SECTOR      (127U)
 #define CHASSIS_MENU_FLASH_PAGE        (FLASH_PAGE_7)
 #define CHASSIS_MENU_FLASH_MAGIC       (0x4D4E5455U)
-#define CHASSIS_MENU_FLASH_VERSION     (4U)  /* bumped: per-wheel breakaway fields added to chassis_tune_params_t */
+#define CHASSIS_MENU_FLASH_VERSION     (5U)  /* X/Y 独立位置参数改变了 chassis_tune_params_t 布局 */
 
 typedef struct
 {
