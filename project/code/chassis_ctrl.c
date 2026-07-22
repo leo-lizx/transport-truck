@@ -35,9 +35,9 @@
 /* 航向闭环参数集中在 chassis_config.h 顶部“用户常调参数区”。 */
 
 /* 单轮 PID 调试起步补偿参数（用于克服静摩擦） */
-#define WHEEL_DEBUG_START_SPEED_EPS_MPS   (0.03f)   /* 低于此反馈速度视为静止 */
-#define WHEEL_DEBUG_START_TARGET_EPS_MPS  (0.05f)   /* 低于此目标速度不启用补偿 */
-#define WHEEL_DEBUG_START_PWM_MIN         (800.0f)  /* 起步最小 PWM 幅值 */
+#define WHEEL_DEBUG_START_SPEED_EPS_MPS   (1.3f)   /* 低于此反馈速度视为静止 */
+#define WHEEL_DEBUG_START_TARGET_EPS_MPS  (0.001f)   /* 低于此目标速度不启用补偿 */
+#define WHEEL_DEBUG_START_PWM_MIN         (750.0f)  /* 起步最小 PWM 幅值 */
 #define WHEEL_DEBUG_TARGET_RAMP_MPS_PER_TICK (0.8f) /* 20ms 每拍目标最多变化量 */
 
 /* 轮速闭环抗抖参数（抑制低速量化噪声和来回翻向） */
@@ -48,14 +48,14 @@
  * 内环(本段):   wz_cmd - wz_actual → PWM (PI), 取代旧 GAIN×wz 开环 */
 /* 角速度线性 PWM 前馈：按麦轮 yaw 符号叠加到四轮 PID 输出。
  * 它只补偿随目标角速度变化的基础驱动力，不替代下方静摩擦 breakaway 前馈。 */
-#define CHASSIS_YAW_PWM_GAIN              (80.0f)
+#define CHASSIS_YAW_PWM_GAIN              (200.0f)
 
 /* 保持轴直接 PWM 前馈: 绕过轮速 PID, 把车体速度 (vx,vy) 直接换算成 PWM.
  *   问题同 yaw: 保持轴输出 0.06m/s → 轮速 PID 只给 40×0.06=2.4PWM → 无力纠偏.
  *   新链路: 保持轴 → vx/vy(m/s) → 直接 PWM = GAIN × 麦轮分配系数 × 速度
  *   O 型麦轮: vy 四轮同号, vx 对角同号 (LF=-, RF=+, LB=+, RB=-).
  *   GAIN=1500 时, 保持 0.06m/s→90PWM/轮, 足以对抗 odom 漂移和耦合扰动. */
-#define CHASSIS_HOLD_PWM_GAIN             (0.0f)
+#define CHASSIS_HOLD_PWM_GAIN             (20.0f)
 /* 仅当四轮目标和反馈同时接近 0 才停轮；0.003m/s 不会吞掉正常的小角度修正。 */
 #define WHEEL_STOP_TARGET_EPS_MPS         (0.003f)
 #define WHEEL_STOP_FEEDBACK_EPS_MPS       (0.030f)
@@ -421,6 +421,21 @@ static float axis_hold_velocity_cmd(float hold_error,
                                        integral_term));
 }
 
+/** 移动航向保护的平移比例: 小误差不降速，中误差线性降速，大误差停走对正。 */
+static float yaw_move_translation_scale(float abs_yaw_error_deg)
+{
+    const float slow_start_deg = CHASSIS_YAW_INPOS_ENTER_DEG;
+    const float realign_deg = CHASSIS_YAW_MOVE_REALIGN_DEG;
+
+    if (abs_yaw_error_deg <= slow_start_deg) {
+        return 1.0f;
+    }
+    if ((abs_yaw_error_deg >= realign_deg) || (realign_deg <= slow_start_deg)) {
+        return 0.0f;
+    }
+    return (realign_deg - abs_yaw_error_deg) / (realign_deg - slow_start_deg);
+}
+
 /** 紧急停机: 清零滤波器、PID、PWM */
 
 static void force_stop(void)
@@ -520,11 +535,15 @@ static void apply_speed(chassis_body_speed_cmd_t cmd,
             float pwm_motor_domain;
             const float abs_target = fabsf(targets[i]);
             const float abs_fb     = fabsf(wheel_fb_mps[i]);
+            const float breakaway_target_eps_mps = (small_angle_yaw_ff != 0U)
+                                                   ? CHASSIS_YAW_SMALL_ANGLE_FF_TARGET_EPS_MPS
+                                                   : g_chassis_tune_params.wheel_breakaway_target_eps_mps[i];
 
             pwm_forward_domain = chassis_pid_step(&s_pid[i], targets[i], wheel_fb_mps[i]);
 
-            /* 静摩擦前馈: 线性衰减 + 方向门控 */
-            if (abs_target > g_chassis_tune_params.wheel_breakaway_target_eps_mps[i]) {
+            /* 小角度纯旋转的单轮目标常低于通用 0.02m/s，必须用独立门槛，
+             * 否则航向误差刚好卡在到位带外时只能等待轮速 PID 缓慢累积。 */
+            if (abs_target > breakaway_target_eps_mps) {
                 float fb_eps = (small_angle_yaw_ff != 0U)
                              ? CHASSIS_YAW_SMALL_ANGLE_FF_FB_DECAY_MPS
                              : g_chassis_tune_params.wheel_breakaway_fb_static_eps_mps[i];
@@ -1192,6 +1211,7 @@ void chassis_ctrl_task_20ms(void)
         float accel_y = g_chassis_tune_params.cmd_accel_limit_y_mps2;
         float vxg, vyg, norm;
         float yerr;
+        float yaw_move_scale;
 
         /* ================================================================
          * 【层1~4】位置驱动
@@ -1233,10 +1253,20 @@ void chassis_ctrl_task_20ms(void)
             chassis_arrival_decision_t arrival_decision;
 
             /* 只在已经进入位置窗口后运行静止航向环，避免正常导航路径重复调用 yaw_pi。
-             * 当前进入/退出阈值均为 0.7°；阈值以 configChassis.h 的实车配置为准。 */
+             * 到达前必须逐拍检查实时误差；带滞回的在位锁只留给到达后的抗抖保持。 */
             if (pos_ok != 0U) {
-                wz_arrival = yaw_pi(yerr_arrival, 1U, 1U);
-                yaw_ok = s_yaw_in_position;
+                yaw_ok = chassis_yaw_arrival_realtime_ok(
+                    yerr_arrival,
+                    chassis_imu_get_yaw_rate_dps(),
+                    CHASSIS_YAW_INPOS_ENTER_DEG,
+                    CHASSIS_YAW_INPOS_SETTLE_DPS);
+                if (yaw_ok != 0U) {
+                    s_yaw_in_position = 1U;
+                    s_yaw_i = 0.0f;
+                } else {
+                    /* 漂出实时容忍带立即解除锁定并恢复纯旋转纠正。 */
+                    wz_arrival = yaw_pi(yerr_arrival, 1U, 0U);
+                }
             }
 
             arrival_decision = chassis_arrival_dwell_update(
@@ -1560,6 +1590,23 @@ void chassis_ctrl_task_20ms(void)
         /* 全局 → 车体坐标变换 (车体→全局矩阵的转置, 见 task_20ms 步骤 3 注释) */
         cmd.vx_body_mps =  cy * vxg - sy * vyg;
         cmd.vy_body_mps =  sy * vxg + cy * vyg;
+
+        /* 移动中航向误差保护:
+         *   <= ENTER: 不牺牲平移速度；ENTER~REALIGN: 线性降速给角度环留余量；
+         *   >= REALIGN: 立即清平移 ramp，重新进入“先对正再走”的起步门控。
+         * 不能只把 cmd 置零，否则 ramp_filter 会继续输出旧平移速度。 */
+        yaw_move_scale = yaw_move_translation_scale(fabsf(yerr));
+        if (yaw_move_scale <= 0.0f) {
+            s_nav_yaw_aligned = 0U;
+            s_ramp.vx_body_mps = 0.0f;
+            s_ramp.vy_body_mps = 0.0f;
+            cmd.vx_body_mps = 0.0f;
+            cmd.vy_body_mps = 0.0f;
+            cmd.wz_dps = yaw_pi(yerr, 0U, 1U);
+            break;
+        }
+        cmd.vx_body_mps *= yaw_move_scale;
+        cmd.vy_body_mps *= yaw_move_scale;
         /* 平移时开内环 PI: 微小误差走增益调度消抖, 不小角度硬锁 */
         cmd.wz_dps = yaw_pi(yerr, 1U, 0U);
         break;

@@ -90,3 +90,6 @@ __pycache__/
 
 # PC-only configuration source regression; not part of IAR firmware/full-course execution
 /project/code/tests/test_chassis_config_source.py
+
+# 测试文件目录（仅电脑端验证用，不参与固件编译）
+/project/code/tests/

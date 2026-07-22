@@ -1841,8 +1841,8 @@ static void main_mode5_render_100ms(void)
 /*  ⬇⬇⬇ 姿态闭环调试阶段这里全部被 #if 屏蔽, 不会被编译, 不要删 ⬇⬇⬇          */
 /* ========================================================================== */
 #if (MAIN_RUN_MODE == MAIN_RUN_MODE_SINGLE_WHEEL)
-#define MAIN_PID_DEBUG_WHEEL_INDEX    (CHASSIS_WHEEL_LF)  /* 0=LF, 1=RF, 2=LB, 3=RB */
-#define MAIN_PID_DEBUG_TARGET_MPS     (2.0f)             /* target wheel speed, m/s */
+#define MAIN_PID_DEBUG_WHEEL_INDEX    (CHASSIS_WHEEL_LB)  /* 0=LF, 1=RF, 2=LB, 3=RB */
+#define MAIN_PID_DEBUG_TARGET_MPS     (0.10f)             /* target wheel speed, m/s */
 #define MAIN_PID_DEBUG_FORCE_PID      (1)                 /* 1=use KP/KI/KD below */
 #define MAIN_PID_DEBUG_KP             (200.0f)
 #define MAIN_PID_DEBUG_KI             (50.0f)

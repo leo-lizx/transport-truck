@@ -132,7 +132,7 @@
 
 /** 内环 I 增益: ∫rate_err → wz 修正. 自动克服静摩擦.
  *  0.80 配合 I_LEAK=0.001: 稳态偏航力矩被持续抵消, 1~2°静差不再残留. */
-#define CHASSIS_YAW_RATE_KI                 (0.0010f)
+#define CHASSIS_YAW_RATE_KI                 (0.10f)
 
 /** 内环 I 上限 (°/s): 积分最多贡献的角速度 */
 #define CHASSIS_YAW_RATE_I_LIMIT            (40.0f)
@@ -146,10 +146,14 @@
 /* ---- 到位锁 ---- */
 
 /** 进入在位锁: |err| < 此值 */
-#define CHASSIS_YAW_INPOS_ENTER_DEG         (0.70f)
+#define CHASSIS_YAW_INPOS_ENTER_DEG         (0.60f)
 
 /** 退出在位锁: |err| > 此值 */
 #define CHASSIS_YAW_INPOS_EXIT_DEG          (0.80f)
+
+/** 移动中重新对正阈值: |err| 达到此值时立即停止平移并原地校正。
+ *  ENTER~REALIGN 之间按误差线性降低平移速度，兼顾速度与航向保持。 */
+#define CHASSIS_YAW_MOVE_REALIGN_DEG         (2.0f)
 
 /** 即位锁需车体稳定: |rate| < 此值 */
 #define CHASSIS_YAW_INPOS_SETTLE_DPS        (10.0f)
@@ -158,9 +162,10 @@
  * 通用四轮 breakaway 前馈负责平移和大角度起步；以下参数只在
  * vx/vy 近零且航向误差不超过 MAX_ERR 时替换它，原有线性 yaw 前馈仍叠加。
  * 保留足够的静止起步 PWM，同时用真实小轮速快速衰减，避免到位附近持续
- * 施加 750 PWM，并避免车轮尚未停稳时立刻施加反向大前馈。 */
-#define CHASSIS_YAW_SMALL_ANGLE_FF_MAX_ERR_DEG    (2.0f)
-#define CHASSIS_YAW_SMALL_ANGLE_FF_PWM_FLOOR      (600.0f)
+ * 施加较大 PWM，并避免车轮尚未停稳时立刻施加反向大前馈。 */
+#define CHASSIS_YAW_SMALL_ANGLE_FF_MAX_ERR_DEG    (5.0f)
+#define CHASSIS_YAW_SMALL_ANGLE_FF_TARGET_EPS_MPS (0.005f)
+#define CHASSIS_YAW_SMALL_ANGLE_FF_PWM_FLOOR      (800.0f)
 #define CHASSIS_YAW_SMALL_ANGLE_FF_FB_DECAY_MPS   (0.03f)
 
 /** 角速度加减速限制 (°/s²): 同时用于 yaw sqrt 曲线和下游 ramp */
@@ -229,10 +234,10 @@
  *  P0-修复 2026-05-11 (拐点停留+走斜线): 10.50→4.50
  *  (KP=10.5 时 linear_dist=accel/KP²≈0.027m → 冲过头) */
 /* P0-修复 2026-07-17: 4.50→5.50, 加快逼近和D项阻尼, 远距不冲近距快停 */
-#define CHASSIS_POS_KP                      (5.0f)
+#define CHASSIS_POS_KP                      (6.0f)
 
 /** Y 方向位置环 Kp — Y 轴机械特性独立，允许与 X 分别调节。 */
-#define CHASSIS_POS_Y_KP                    (4.80f)
+#define CHASSIS_POS_Y_KP                    (5.0f)
 
 /** Runtime safety limit for position-loop Kp; must cover the compile-time default. */
 #define CHASSIS_TUNE_POS_KP_LIMIT           (10.0f)
@@ -265,7 +270,7 @@
  *  P0-修复 2026-07-17: 逐轴刹车已独立用|dx|/|dy|防冲头, D 项只做轻量速度阻尼. */
 /* kd=KP×0.30=1.65, 适中阻尼: 远距高速有制动力不冲, 近距不拖死 */
 /* kd=5.50×0.40=2.20, 强阻尼拽住车速, 配合低FLOOR刹进EPSILON */
-#define CHASSIS_POS_KD_RATIO                (0.12f)  /* X: Kd = X_Kp × 此比例 */
+#define CHASSIS_POS_KD_RATIO                (0.15f)  /* X: Kd = X_Kp × 此比例 */
 #define CHASSIS_POS_Y_KD_RATIO              (0.10f)  /* Y: Kd = Y_Kp × 此比例 */
 #define CHASSIS_POS_HOLD_KD_RATIO           (0.50f)
 /* 0.50→0.05: 刹车区从55cm缩到~10cm, 太大会让车过早限速, 不影响防冲 */
@@ -368,7 +373,7 @@
 #define CHASSIS_ODOM_YAW_FUSION_ENABLE      (1)
 
 /** 编码器 yaw 观测噪声方差 (°²) — 大=几乎不信(仅长期纠偏)，小=信任高(打滑污染) */
-#define CHASSIS_ODOM_YAW_R_DEG2             (400.0f)
+#define CHASSIS_ODOM_YAW_R_DEG2             (8000.0f)
 
 /** odom yaw 与 IMU yaw 偏差超过此值视为打滑/重定位，跳过观测 */
 #define CHASSIS_ODOM_YAW_OUTLIER_DEG        (1.20f)
@@ -472,31 +477,31 @@
 
 /* RF (Wheel 1) */
 #define CHASSIS_WHEEL_BREAKAWAY_RF_TARGET_EPS_MPS          (0.02f)
-#define CHASSIS_WHEEL_BREAKAWAY_RF_PWM_FLOOR               (750.0f)
+#define CHASSIS_WHEEL_BREAKAWAY_RF_PWM_FLOOR               (850.0f)
 #define CHASSIS_WHEEL_BREAKAWAY_RF_FB_STATIC_EPS_MPS       (1.90f)
 
 /* LB (Wheel 2) */
 #define CHASSIS_WHEEL_BREAKAWAY_LB_TARGET_EPS_MPS          (0.02f)
-#define CHASSIS_WHEEL_BREAKAWAY_LB_PWM_FLOOR               (750.0f)
+#define CHASSIS_WHEEL_BREAKAWAY_LB_PWM_FLOOR               (800.0f)
 #define CHASSIS_WHEEL_BREAKAWAY_LB_FB_STATIC_EPS_MPS       (1.90f)
 
 /* RB (Wheel 3) */
 #define CHASSIS_WHEEL_BREAKAWAY_RB_TARGET_EPS_MPS          (0.02f)
-#define CHASSIS_WHEEL_BREAKAWAY_RB_PWM_FLOOR               (750.0f)
+#define CHASSIS_WHEEL_BREAKAWAY_RB_PWM_FLOOR               (800.0f)
 #define CHASSIS_WHEEL_BREAKAWAY_RB_FB_STATIC_EPS_MPS       (1.90f)
 
 /* 正/负向不对称前馈 (XP=正X移动 / XN=负X移动)
  * P0-修复 2026-06-07: 原 XN 不对称(LB=1200独大)→ -X 偏航力矩→yaw 耦合震荡；
  * 改为对称互换，两侧推力均衡后 yaw 力矩抵消 */
-#define CHASSIS_WHEEL_BREAKAWAY_LF_PWM_FLOOR_XP            (700.0f)
-#define CHASSIS_WHEEL_BREAKAWAY_RF_PWM_FLOOR_XP            (700.0f)
-#define CHASSIS_WHEEL_BREAKAWAY_LB_PWM_FLOOR_XP            (700.0f)
-#define CHASSIS_WHEEL_BREAKAWAY_RB_PWM_FLOOR_XP            (700.0f)
+#define CHASSIS_WHEEL_BREAKAWAY_LF_PWM_FLOOR_XP            (750.0f)
+#define CHASSIS_WHEEL_BREAKAWAY_RF_PWM_FLOOR_XP            (850.0f)
+#define CHASSIS_WHEEL_BREAKAWAY_LB_PWM_FLOOR_XP            (800.0f)
+#define CHASSIS_WHEEL_BREAKAWAY_RB_PWM_FLOOR_XP            (800.0f)
 
-#define CHASSIS_WHEEL_BREAKAWAY_LF_PWM_FLOOR_XN            (700.0f)
-#define CHASSIS_WHEEL_BREAKAWAY_RF_PWM_FLOOR_XN            (700.0f)
-#define CHASSIS_WHEEL_BREAKAWAY_LB_PWM_FLOOR_XN            (700.0f)
-#define CHASSIS_WHEEL_BREAKAWAY_RB_PWM_FLOOR_XN            (700.0f)
+#define CHASSIS_WHEEL_BREAKAWAY_LF_PWM_FLOOR_XN            (750.0f)
+#define CHASSIS_WHEEL_BREAKAWAY_RF_PWM_FLOOR_XN            (850.0f)
+#define CHASSIS_WHEEL_BREAKAWAY_LB_PWM_FLOOR_XN            (800.0f)
+#define CHASSIS_WHEEL_BREAKAWAY_RB_PWM_FLOOR_XN            (800.0f)
 
 /* 兼容宏 (旧名称) */
 // #define CHASSIS_WHEEL_BREAKAWAY_TARGET_EPS_MPS    CHASSIS_WHEEL_BREAKAWAY_DEFAULT_TARGET_EPS_MPS
