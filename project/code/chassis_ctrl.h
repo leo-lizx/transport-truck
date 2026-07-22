@@ -57,6 +57,13 @@ typedef struct chassis_body_speed_cmd_s
     float wz_dps;        /**< 转向角速度（°/s），逆时针为正 */
 } chassis_body_speed_cmd_t;
 
+/** 定点导航路径策略；普通航点默认逐轴，最终返航可显式选择两点直线。 */
+typedef enum
+{
+    CHASSIS_POINT_NAV_AXIS_BY_AXIS = 0,
+    CHASSIS_POINT_NAV_DIRECT_LINE
+} chassis_point_nav_mode_t;
+
 /** 航向闭环调试信息（用于 0 度航向保持调试打印） */
 typedef struct
 {
@@ -144,6 +151,13 @@ void chassis_ctrl_move_to_grid(uint8 target_x_grid, uint8 target_y_grid);
  * @param  hold_yaw_deg 全程保持的航向角（度）
  */
 void chassis_ctrl_move_to_m(float x_m, float y_m, float hold_yaw_deg);
+
+/**
+ * @brief  从命令下发时的当前位置沿固定直线移动到目标，保持下发瞬间航向
+ * @param  x_m 目标 X 坐标（米）
+ * @param  y_m 目标 Y 坐标（米）
+ */
+void chassis_ctrl_move_to_m_direct(float x_m, float y_m);
 
 /**
  * @brief  切换到航向保持模式：停止位置移动，仅保持指定航向角

@@ -486,10 +486,9 @@ static void main_run_level1_test_5ms(void)
                     /* 全部箱子推完 → 回发车区 */
                     printf("L1_ALL_BOXES_DONE, returning home\n");
                     s_l1_phase = L1_PHASE_RETURN_HOME;
-                    chassis_ctrl_move_to_m(
+                    chassis_ctrl_move_to_m_direct(
                         MAIN_POS_GRID_TO_M_X(MAIN_POS_HCM_HOME_X_GRID),
-                        MAIN_POS_GRID_TO_M_Y(MAIN_POS_HCM_HOME_Y_GRID),
-                        0.0f);
+                        MAIN_POS_GRID_TO_M_Y(MAIN_POS_HCM_HOME_Y_GRID));
                     s_l1_navigating = 1U;
                     return;
                 }
@@ -880,10 +879,9 @@ static void main_run_level2_test_5ms(void)
                 {
                     printf("L2_ALL_BOXES_DONE, returning home\n");
                     s_l2_phase = L2_PHASE_RETURN_HOME;
-                    chassis_ctrl_move_to_m(
+                    chassis_ctrl_move_to_m_direct(
                         MAIN_POS_GRID_TO_M_X(MAIN_POS_HCM_HOME_X_GRID),
-                        MAIN_POS_GRID_TO_M_Y(MAIN_POS_HCM_HOME_Y_GRID),
-                        0.0f);
+                        MAIN_POS_GRID_TO_M_Y(MAIN_POS_HCM_HOME_Y_GRID));
                     s_l2_navigating = 1U;
                     return;
                 }
@@ -1121,10 +1119,9 @@ static void main_run_hardcoded_map_5ms(void)
                     /* 全部箱子推完 → 回发车区 */
                     printf("HCM_ALL_BOXES_DONE, returning home\n");
                     s_hcm_phase = HCM_PHASE_RETURN_HOME;
-                    chassis_ctrl_move_to_m(
+                    chassis_ctrl_move_to_m_direct(
                         MAIN_POS_GRID_TO_M_X(MAIN_POS_HCM_HOME_X_GRID),
-                        MAIN_POS_GRID_TO_M_Y(MAIN_POS_HCM_HOME_Y_GRID),
-                        0.0f);
+                        MAIN_POS_GRID_TO_M_Y(MAIN_POS_HCM_HOME_Y_GRID));
                     s_hcm_navigating = 1U;
                     return;
                 }

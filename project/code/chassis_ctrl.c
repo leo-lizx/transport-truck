@@ -21,6 +21,7 @@
 #include "chassis_mecanum.h"
 #include "chassis_mpc.h"     /* P0-MPC: 直线行驶 MPC 驱动轴纵向速度规划                   */
 #include "chassis_arrival.h"
+#include "chassis_direct_line.h"
 #include "chassis_velocity_handoff.h"
 #include "app_link.h"        /* P0-3: 软限位改用 app_link_get_map_snapshot() 拿一致地图副本   */
 #include "zf_common_headfile.h"  /* P0-3: __DMB() / __disable_irq() 内存屏障与临界区          */
@@ -72,6 +73,15 @@ typedef enum {
     MODE_POINT_NAV,         /* 网格点位导航                               */
     MODE_SINGLE_WHEEL_PID_DEBUG /* 单轮 PID 调试（仅一个轮子给目标）        */
 } ctrl_mode_t;
+
+/** 两点直线导航子状态；不恢复已废弃的独立重对正状态。 */
+typedef enum
+{
+    DIRECT_INACTIVE = 0,
+    DIRECT_TRACK,
+    DIRECT_SETTLE,
+    DIRECT_HOLD
+} direct_nav_state_t;
 
 /* ====================== 硬件实例 ====================== */
 
@@ -224,6 +234,10 @@ static volatile float s_tgt_yaw_deg   = 0.0f;
 /* 1 = chassis_ctrl_move_to_m() 主动锁定航向, 禁止任务层用 atan2 覆盖.
  * 曼哈顿轴模式下 move_to_grid() 也会保持起步航向, 不边走轴边转头. */
 static volatile uint8 s_nav_lock_yaw  = 0U;
+static volatile chassis_point_nav_mode_t s_point_nav_mode =
+    CHASSIS_POINT_NAV_AXIS_BY_AXIS;
+static volatile direct_nav_state_t s_direct_state = DIRECT_INACTIVE;
+static chassis_direct_line_t s_direct_line;
 
 /* D 项低通状态 (一阶 IIR, 消除 odom 高频噪声对 KD 的放大) */
 static float s_v_along_lpf = 0.0f;
@@ -449,6 +463,8 @@ static void force_stop(void)
     s_yaw_i      = 0.0f;
     s_v_along_lpf = 0.0f;
     s_v_cross_lpf = 0.0f;
+    s_point_nav_mode = CHASSIS_POINT_NAV_AXIS_BY_AXIS;
+    s_direct_state = DIRECT_INACTIVE;
 
     for (i = 0U; i < (uint8)CHASSIS_WHEEL_COUNT; ++i) {
         stop_wheel_with_pid_reset(i);
@@ -988,6 +1004,8 @@ static void enter_mode(ctrl_mode_t m)
     s_axis_hold_y_m     = s_pose.y_m;
     s_nav_yaw_aligned   = 0U;   /* 起步 yaw 门控: 每个新目标都重新对齐一次 */
     s_arrival_dwell_cnt = 0U;   /* 到位驻留计数器清零: 新目标重新累计 */
+    s_point_nav_mode     = CHASSIS_POINT_NAV_AXIS_BY_AXIS;
+    s_direct_state       = DIRECT_INACTIVE;
     {
         uint8 pid_i;
         for (pid_i = 0U; pid_i < (uint8)CHASSIS_WHEEL_COUNT; ++pid_i) {
@@ -1209,7 +1227,9 @@ void chassis_ctrl_task_20ms(void)
         float dist = sqrtf(dx * dx + dy * dy);
         float accel_x = g_chassis_tune_params.cmd_accel_limit_mps2;
         float accel_y = g_chassis_tune_params.cmd_accel_limit_y_mps2;
-        float vxg, vyg, norm;
+        float vxg = 0.0f;
+        float vyg = 0.0f;
+        float norm;
         float yerr;
         float yaw_move_scale;
 
@@ -1277,6 +1297,9 @@ void chassis_ctrl_task_20ms(void)
                 CHASSIS_ARRIVAL_DWELL_COUNT);
 
             if (arrival_decision.hold_translation != 0U) {
+                if (s_point_nav_mode == CHASSIS_POINT_NAV_DIRECT_LINE) {
+                    s_direct_state = DIRECT_SETTLE;
+                }
                 s_ramp.vx_body_mps = 0.0f;
                 s_ramp.vy_body_mps = 0.0f;
                 s_pos_i = 0.0f;
@@ -1288,6 +1311,9 @@ void chassis_ctrl_task_20ms(void)
                 if (arrival_decision.arrived != 0U) {
                     s_arrived = 1U;
                     g_chassis_arrival_count++;
+                    if (s_point_nav_mode == CHASSIS_POINT_NAV_DIRECT_LINE) {
+                        s_direct_state = DIRECT_HOLD;
+                    }
                     s_axis_x_arrived  = 0U;
                     s_axis_y_arrived  = 0U;
                     cmd.wz_dps        = 0.0f;
@@ -1302,6 +1328,10 @@ void chassis_ctrl_task_20ms(void)
             }
             if (fabsf(dy) > CHASSIS_TARGET_REACHED_EPSILON_M) {
                 s_axis_y_arrived = 0U;
+            }
+            if ((s_point_nav_mode == CHASSIS_POINT_NAV_DIRECT_LINE) &&
+                (s_direct_state == DIRECT_SETTLE)) {
+                s_direct_state = DIRECT_TRACK;
             }
         }
         if (s_arrived && (dist <= CHASSIS_POS_HOLD_EXIT_M)) {
@@ -1332,6 +1362,10 @@ void chassis_ctrl_task_20ms(void)
             s_ramp.vy_body_mps = 0.0f;
             s_axis_hold_x_m = s_pose.x_m;  /* 更新保持轴锚点到当前位置 */
             s_axis_hold_y_m = s_pose.y_m;
+            if (s_point_nav_mode == CHASSIS_POINT_NAV_DIRECT_LINE) {
+                /* 沿用当前公共保持圈策略；恢复后仍跟踪原起终点固定直线。 */
+                s_direct_state = DIRECT_TRACK;
+            }
         }
         s_arrived = 0U;
         /* ================================================================
@@ -1352,6 +1386,118 @@ void chassis_ctrl_task_20ms(void)
          *              保持轴 kd_hold = pos_kp × HOLD_KD_RATIO (轻阻尼).
          * D 项始终用全局速度 (vxg_meas, vyg_meas) 直接做 PD, 与 axis 独立. */
         {
+            if (s_point_nav_mode == CHASSIS_POINT_NAV_DIRECT_LINE) {
+                float vxg_meas = cy * s_fb_vx + sy * s_fb_vy;
+                float vyg_meas = -sy * s_fb_vx + cy * s_fb_vy;
+                float along_error_m;
+                float cross_error_m;
+                float along_velocity_mps;
+                float cross_velocity_mps;
+                float kp_along;
+                float kp_cross;
+                float kd_along;
+                float accel_along;
+                float accel_cross;
+                float along_cmd = 0.0f;
+                float cross_cmd = 0.0f;
+                float i_limit = g_chassis_tune_params.max_linear_speed_mps
+                              * CHASSIS_POS_I_LIMIT_RATIO;
+
+                chassis_direct_line_error(
+                    &s_direct_line,
+                    s_pose.x_m,
+                    s_pose.y_m,
+                    s_tgt_x_m,
+                    s_tgt_y_m,
+                    &along_error_m,
+                    &cross_error_m);
+                chassis_direct_line_project_velocity(
+                    &s_direct_line,
+                    vxg_meas,
+                    vyg_meas,
+                    &along_velocity_mps,
+                    &cross_velocity_mps);
+
+                s_v_along_lpf = (1.0f - CHASSIS_POS_D_LPF_ALPHA) * s_v_along_lpf
+                              + CHASSIS_POS_D_LPF_ALPHA * along_velocity_mps;
+                s_v_cross_lpf = (1.0f - CHASSIS_POS_D_LPF_ALPHA) * s_v_cross_lpf
+                              + CHASSIS_POS_D_LPF_ALPHA * cross_velocity_mps;
+
+                kp_along = chassis_direct_line_weighted_param(
+                    &s_direct_line,
+                    g_chassis_tune_params.pos_kp,
+                    g_chassis_tune_params.pos_kp_y);
+                kp_cross = chassis_direct_line_weighted_param(
+                    &s_direct_line,
+                    g_chassis_tune_params.pos_kp_y,
+                    g_chassis_tune_params.pos_kp);
+                kd_along = chassis_direct_line_weighted_param(
+                    &s_direct_line,
+                    g_chassis_tune_params.pos_kp * CHASSIS_POS_KD_RATIO,
+                    g_chassis_tune_params.pos_kp_y * CHASSIS_POS_Y_KD_RATIO);
+                accel_along = chassis_direct_line_weighted_param(
+                    &s_direct_line, accel_x, accel_y);
+                accel_cross = chassis_direct_line_weighted_param(
+                    &s_direct_line, accel_y, accel_x);
+                linear_accel_limit_mps2 = accel_along;
+
+                if (s_direct_state == DIRECT_TRACK) {
+                    uint8 mpc_active;
+                    float i_band = pos_brake_dist_auto(accel_along)
+                                 * CHASSIS_POS_I_BAND_RATIO;
+                    float ki_along = chassis_direct_line_weighted_param(
+                        &s_direct_line, CHASSIS_POS_KI, CHASSIS_POS_Y_KI);
+                    float ki_cross = chassis_direct_line_weighted_param(
+                        &s_direct_line, CHASSIS_POS_Y_KI, CHASSIS_POS_KI);
+
+                    along_cmd = driving_axis_velocity_cmd(along_error_m,
+                        s_v_along_lpf,
+                        kp_along,
+                        kd_along,
+                        accel_along,
+                        s_pos_i,
+                        &mpc_active);
+                    cross_cmd = axis_hold_velocity_cmd(
+                        cross_error_m,
+                        s_v_cross_lpf,
+                        kp_cross,
+                        kp_cross * CHASSIS_POS_HOLD_KD_RATIO,
+                        accel_cross,
+                        s_pos_i_hold);
+
+                    if ((mpc_active == 0U) && (ki_along > 1e-6f) &&
+                        (fabsf(along_error_m) < i_band)) {
+                        s_pos_i += ki_along * along_error_m
+                                 * CHASSIS_TASK_DT_20MS_S;
+                        if (s_pos_i > i_limit) s_pos_i = i_limit;
+                        else if (s_pos_i < -i_limit) s_pos_i = -i_limit;
+                        if (along_error_m * s_pos_i < 0.0f) s_pos_i = 0.0f;
+                    }
+                    if ((ki_cross > 1e-6f) &&
+                        (fabsf(cross_error_m) < i_band)) {
+                        float cross_i_limit = i_limit * 0.5f;
+                        s_pos_i_hold += ki_cross * cross_error_m
+                                      * CHASSIS_TASK_DT_20MS_S;
+                        if (s_pos_i_hold > cross_i_limit) {
+                            s_pos_i_hold = cross_i_limit;
+                        } else if (s_pos_i_hold < -cross_i_limit) {
+                            s_pos_i_hold = -cross_i_limit;
+                        }
+                        if (cross_error_m * s_pos_i_hold < 0.0f) {
+                            s_pos_i_hold = 0.0f;
+                        }
+                    }
+
+                    vxg = s_direct_line.ux * along_cmd
+                        + s_direct_line.nx * cross_cmd;
+                    vyg = s_direct_line.uy * along_cmd
+                        + s_direct_line.ny * cross_cmd;
+                } else {
+                    /* SETTLE/HOLD 已由到位层处理，不再生成平移命令。 */
+                    vxg = 0.0f;
+                    vyg = 0.0f;
+                }
+            } else if (s_point_nav_mode == CHASSIS_POINT_NAV_AXIS_BY_AXIS) {
             /* P0-修复 2026-07-08: 与里程计积分同一套车体→全局变换 (见 task_20ms 步骤 3 注释) */
             float vxg_meas      =  cy * s_fb_vx + sy * s_fb_vy;  /* 全局速度 X */
             float vyg_meas      = -sy * s_fb_vx + cy * s_fb_vy;  /* 全局速度 Y */
@@ -1491,6 +1637,7 @@ void chassis_ctrl_task_20ms(void)
                     }
                 }
             }
+            }
         }
         norm = sqrtf(vxg * vxg + vyg * vyg);
 
@@ -1499,6 +1646,42 @@ void chassis_ctrl_task_20ms(void)
          *   dist 仍大 → 刹车不触发 → X 全速冲过头 → 保持环拉回 → 到点慢.
          *   修复: X 驱动时用 |dx|, Y 驱动时用 |dy| 独立算刹车. */
         {
+            if (s_point_nav_mode == CHASSIS_POINT_NAV_DIRECT_LINE) {
+                float along_error_m = dx * s_direct_line.ux
+                                    + dy * s_direct_line.uy;
+                float accel_along = chassis_direct_line_weighted_param(
+                    &s_direct_line, accel_x, accel_y);
+                float kp_along = chassis_direct_line_weighted_param(
+                    &s_direct_line,
+                    g_chassis_tune_params.pos_kp,
+                    g_chassis_tune_params.pos_kp_y);
+                float brake_dist = pos_brake_dist_auto(accel_along);
+
+                if ((brake_dist > 1e-6f) &&
+                    (fabsf(along_error_m) < brake_dist)) {
+                    float brake_err = fabsf(along_error_m)
+                                    - CHASSIS_TARGET_REACHED_EPSILON_M;
+                    float v_max_brake;
+                    float along_velocity_cmd;
+                    float limited_along_cmd;
+
+                    if (brake_err < 0.0f) brake_err = 0.0f;
+                    v_max_brake = sqrt_controller(
+                        brake_err, kp_along, accel_along);
+                    if (v_max_brake < CHASSIS_POS_BRAKE_FLOOR_MPS) {
+                        v_max_brake = CHASSIS_POS_BRAKE_FLOOR_MPS;
+                    }
+
+                    along_velocity_cmd = vxg * s_direct_line.ux
+                                       + vyg * s_direct_line.uy;
+                    limited_along_cmd = chassis_clamp_f(
+                        along_velocity_cmd, -v_max_brake, v_max_brake);
+                    vxg += s_direct_line.ux
+                         * (limited_along_cmd - along_velocity_cmd);
+                    vyg += s_direct_line.uy
+                         * (limited_along_cmd - along_velocity_cmd);
+                }
+            } else {
             float brake_dist_x = pos_brake_dist_auto(accel_x);
             float brake_dist_y = pos_brake_dist_auto(accel_y);
             /* 入口也改用逐轴距离: 任一轴进刹车区就对该轴限速, 不再被另一轴拖累 */
@@ -1544,6 +1727,7 @@ void chassis_ctrl_task_20ms(void)
                         vyg *= sc;
                     }
                 }
+            }
             }
         }
         norm = sqrtf(vxg * vxg + vyg * vyg);  /* 刹车后重算, 供全局限速使用 */
@@ -1680,6 +1864,7 @@ void chassis_ctrl_move_to_grid(uint8 target_x_grid, uint8 target_y_grid)
         s_tgt_yaw_deg  = chassis_normalize_angle_deg(yaw_snap);
     }
     enter_mode(MODE_POINT_NAV);
+    s_point_nav_mode = CHASSIS_POINT_NAV_AXIS_BY_AXIS;
     s_arrived = 0U;
     __enable_irq();
 }
@@ -1703,7 +1888,33 @@ void chassis_ctrl_move_to_m(float x_m, float y_m, float hold_yaw_deg)
     s_axis_hold_x_m = pose_snap.x_m;
     s_axis_hold_y_m = pose_snap.y_m;
     enter_mode(MODE_POINT_NAV);  /* 先 enter_mode 重置标志, 再打开锁定, 顺序不能反 */
+    s_point_nav_mode = CHASSIS_POINT_NAV_AXIS_BY_AXIS;
     s_nav_lock_yaw = 1U;         /* 锁住姿态, 任务层不再用 atan2 覆盖 */
+    s_arrived = 0U;
+    __enable_irq();
+}
+
+void chassis_ctrl_move_to_m_direct(float x_m, float y_m)
+{
+    chassis_pose_t pose_snap;
+
+    pose_read_snapshot(&pose_snap);
+
+    __disable_irq();
+    s_tgt_x_m = x_m;
+    s_tgt_y_m = y_m;
+    /* 不预旋转：保存下发瞬间的真实航向，并在直线平移全程保持。 */
+    s_tgt_yaw_deg = pose_snap.yaw_deg;
+    enter_mode(MODE_POINT_NAV);
+    s_point_nav_mode = CHASSIS_POINT_NAV_DIRECT_LINE;
+    s_nav_lock_yaw = 1U;
+    s_nav_yaw_aligned = 1U;
+    s_direct_state = (chassis_direct_line_init(
+        &s_direct_line,
+        pose_snap.x_m,
+        pose_snap.y_m,
+        x_m,
+        y_m) != 0U) ? DIRECT_TRACK : DIRECT_SETTLE;
     s_arrived = 0U;
     __enable_irq();
 }

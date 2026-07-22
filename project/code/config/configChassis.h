@@ -165,7 +165,7 @@
  * 施加较大 PWM，并避免车轮尚未停稳时立刻施加反向大前馈。 */
 #define CHASSIS_YAW_SMALL_ANGLE_FF_MAX_ERR_DEG    (5.0f)
 #define CHASSIS_YAW_SMALL_ANGLE_FF_TARGET_EPS_MPS (0.005f)
-#define CHASSIS_YAW_SMALL_ANGLE_FF_PWM_FLOOR      (800.0f)
+#define CHASSIS_YAW_SMALL_ANGLE_FF_PWM_FLOOR      (700.0f)
 #define CHASSIS_YAW_SMALL_ANGLE_FF_FB_DECAY_MPS   (0.03f)
 
 /** 角速度加减速限制 (°/s²): 同时用于 yaw sqrt 曲线和下游 ramp */
@@ -272,7 +272,7 @@
 /* kd=5.50×0.40=2.20, 强阻尼拽住车速, 配合低FLOOR刹进EPSILON */
 #define CHASSIS_POS_KD_RATIO                (0.15f)  /* X: Kd = X_Kp × 此比例 */
 #define CHASSIS_POS_Y_KD_RATIO              (0.10f)  /* Y: Kd = Y_Kp × 此比例 */
-#define CHASSIS_POS_HOLD_KD_RATIO           (0.50f)
+#define CHASSIS_POS_HOLD_KD_RATIO           (0.70f)
 /* 0.50→0.05: 刹车区从55cm缩到~10cm, 太大会让车过早限速, 不影响防冲 */
 #define CHASSIS_POS_BRAKE_MARGIN_M          (0.20f)
 #define CHASSIS_POS_I_LIMIT_RATIO           (0.40f)
@@ -282,11 +282,11 @@
 
 /** 保持轴死区 (m) — 滤除编码器量化噪声 (~2~5mm)，远小于 EPSILON
  *  P0-修复 2026-06-07: 原无死区，噪声被 sqrt_ctrl 放大 → Y 方向持续微幅震荡 */
-#define CHASSIS_POS_HOLD_DEAD_ZONE_M        (0.00006f)
+#define CHASSIS_POS_HOLD_DEAD_ZONE_M        (0.01f)
 
 /** D 项低通滤波系数 α (一阶 IIR) — 截止 ≈ α/(2π·dt)
  *  0.10 @ 20ms → 截止≈0.8Hz，衰减 odom 高频噪声 */
-#define CHASSIS_POS_D_LPF_ALPHA             (0.20f)
+#define CHASSIS_POS_D_LPF_ALPHA             (0.40f)
 
 /** brake_cap 末段最小有效速度 (m/s) — 克服静摩擦，确保推进到 EPSILON 内
  *  P0-修复 2026-06-30: 0.65→0.15。0.65 刹车距离 7cm > EPSILON 2.5cm → 必定过冲。
@@ -295,7 +295,7 @@
 /* P0-修复 2026-07-17: 0.15→0.06, 刹车区末段最低速减半, 配合 KD 翻倍平滑停入 EPSILON. */
 /* 0.06→0.10: 略高以克服静摩擦, 配合 KD=1.65 刹得住不过冲 */
 /* 降到 0.02: 仅克服静摩擦的最低推力, 不强制推车冲过 EPSILON */
-#define CHASSIS_POS_BRAKE_FLOOR_MPS         (0.400f)
+#define CHASSIS_POS_BRAKE_FLOOR_MPS         (0.200f)
 
 /* ============================================================
  * §D IMU / 卡尔曼滤波 / 编码器融合
@@ -316,13 +316,13 @@
 #define CHASSIS_IMU_GYRO_SCALE              (1.01058f)
 
 /** Yaw 角速度死区 (°/s) — 抑制静止抖动 */
-#define CHASSIS_IMU_GYRO_DEADZONE_DPS       (0.003f)
+#define CHASSIS_IMU_GYRO_DEADZONE_DPS       (0.004f)
 
 /** KF 静止预测死区 (°/s)：仅在四轮反馈静止时抑制残余零偏积分 */
-#define CHASSIS_IMU_KF_STILL_RATE_DEADZONE_DPS (0.15f)
+#define CHASSIS_IMU_KF_STILL_RATE_DEADZONE_DPS (0.10f)
 
 /** IMU 物理静止所用的单轮反馈阈值 (m/s)，独立于电机停轮的 0.03m/s 容差 */
-#define CHASSIS_IMU_WHEEL_STILL_EPS_MPS      (0.003f)
+#define CHASSIS_IMU_WHEEL_STILL_EPS_MPS      (0.010f)
 
 /** Yaw 角速度一阶低通系数 (0,1] — 越小越平滑 */
 #define CHASSIS_IMU_GYRO_LPF_ALPHA          (0.2f)
@@ -358,10 +358,10 @@
 
 /** 过程噪声: bias (°²/s²/s) — 反映 bias 随机游走速度
  *  P0-回调 2026-05-02: 8e-6→5e-5，车跑 5min 温升 0.05°/s/min，K 增益翻几倍 */
-#define CHASSIS_IMU_KF_Q_BIAS_DPS2_PER_S    (0.0009f)
+#define CHASSIS_IMU_KF_Q_BIAS_DPS2_PER_S    (0.001f)
 
 /** 观测噪声: ZUPT 时陀螺噪声方差 (°²/s²) */
-#define CHASSIS_IMU_KF_R_ZUPT_DPS2          (0.000010f)
+#define CHASSIS_IMU_KF_R_ZUPT_DPS2          (0.010f)
 
 /** 状态协方差初值 */
 #define CHASSIS_IMU_KF_P0_ANGLE_DEG2        (1.0f)
@@ -373,7 +373,7 @@
 #define CHASSIS_ODOM_YAW_FUSION_ENABLE      (1)
 
 /** 编码器 yaw 观测噪声方差 (°²) — 大=几乎不信(仅长期纠偏)，小=信任高(打滑污染) */
-#define CHASSIS_ODOM_YAW_R_DEG2             (8000.0f)
+#define CHASSIS_ODOM_YAW_R_DEG2             (80000.0f)
 
 /** odom yaw 与 IMU yaw 偏差超过此值视为打滑/重定位，跳过观测 */
 #define CHASSIS_ODOM_YAW_OUTLIER_DEG        (1.20f)
@@ -415,7 +415,7 @@
 /** 车体平移最大合成线速度 (m/s)
  *  P0-修复 2026-05-19 (轮子停转): 1.20→0.70 (TB6612 过流关断)
  *  0.70: d_stop=0.117m, BRAKE_DIST=0.25m 有裕量 */
-#define CHASSIS_MAX_LINEAR_SPEED_MPS        (2.0f)
+#define CHASSIS_MAX_LINEAR_SPEED_MPS        (1.50f)
 
 /** 正常控制路径的单轮速度兑底上限 (m/s) — 等比例缩放保方向 */
 #define CHASSIS_WHEEL_SPEED_CAP_MPS         (4.0f)
