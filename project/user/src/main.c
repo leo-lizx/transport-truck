@@ -102,7 +102,7 @@ static uint32 wait_for_tick(void)
  *  编号  宏                                 轮子?  地图来源        功能一句话
  *  ────────────────────────────────────────────────────────────────
  *   0   MAIN_RUN_MODE_GAME                  ✅    OpenART 串口    正式比赛: 摄像头识图→解算→推箱→回库
- *   1   MAIN_RUN_MODE_YAW_HOLD              ❌    无               航向保持调试: 车不动, IMU 锁死目标角度调 wz 环
+ *   1   MAIN_RUN_MODE_YAW_HOLD              ✅    无               航向保持调试: 手动扰动车体, 松手后自动回到 0°
  *   2   MAIN_RUN_MODE_SINGLE_WHEEL          单轮   无               单轮 PID 调试: 只让一个轮子转, 调速度环 Kp/Ki/Kd
  *   3   MAIN_RUN_MODE_POINT_NAV             ✅    无               定点导航: 按预设 9 个航点依次跑四角→回起点
  *   4   MAIN_RUN_MODE_SOKO_SELFTEST         ❌    摄像头 UART4     推箱求解自测: 接收摄像头地图帧→屏幕彩色方块显示
@@ -115,7 +115,7 @@ static uint32 wait_for_tick(void)
  *   11  MAIN_RUN_MODE_BOARD_TEST            ❌    无               新主板自测: 屏幕显示 yaw、活动编码器轮号和轮速
  *=========================================================================*/
 #define MAIN_RUN_MODE_GAME            (0)   /* 正式比赛: 完整视觉+推箱+底盘闭环 */
-#define MAIN_RUN_MODE_YAW_HOLD        (1)   /* 航向保持: 车不动, IMU 锁角度调 yaw PID */
+#define MAIN_RUN_MODE_YAW_HOLD        (1)   /* 航向保持: 不平移, 手动扰动后回到原航向 */
 #define MAIN_RUN_MODE_SINGLE_WHEEL    (2)   /* 单轮调试: 一个轮子转, 调速度环参数 */
 #define MAIN_RUN_MODE_POINT_NAV       (3)   /* 定点导航: 预设航点四角遍历, 测里程计精度 */
 #define MAIN_RUN_MODE_SOKO_SELFTEST   (4)   /* 推箱自测: 收摄像头地图→屏幕色块, 车不动 */
@@ -128,7 +128,7 @@ static uint32 wait_for_tick(void)
 #define MAIN_RUN_MODE_BOARD_TEST      (11)  /* 新主板测试: 屏幕显示 yaw 和手转车轮的编码器反馈 */
 
 /* ═══════════ 改下面这行切换运行模式 (0~11) ═══════════ */
-#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_SINGLE_WHEEL)
+#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_GAME)
 /* ═══════════ 改上面这行切换运行模式 (0~11) ═══════════ */
 
 /* OpenART1 地图链路硬件口: 若实测 UART4 走 D0/D1, 只改下面两行宏. */
@@ -595,6 +595,7 @@ static uint8               s_l2_recog_started = 0U;
 static uint16              s_l2_warmup_ticks = 0U;
 static uint16              s_l2_nav_ticks    = 0U;
 static uint32              s_l2_map_recv_ms  = 0U;
+static float               s_l2_nav_heading_deg = 0.0f;
 
 static Point_t main_l2_current_grid(void)
 {
@@ -689,6 +690,7 @@ static void main_l2_wait_map_5ms(void)
         }
         memset(s_l2_box_to_target, 0, sizeof(s_l2_box_to_target));
         App_Recognize_Reset();
+        s_l2_nav_heading_deg = 0.0f;
         s_l2_recog_started = 0U;
         s_l2_phase = L2_PHASE_WARMUP;
         s_l2_warmup_ticks = 0U;
@@ -723,7 +725,8 @@ static void main_l2_recognize_5ms(void)
     }
 
     r = App_Recognize_Tick(s_l2_map, cur, main_l2_map_has_bomb(),
-                           2U, s_l2_box_to_target);
+                           2U, &s_l2_nav_heading_deg,
+                           s_l2_box_to_target);
     if ((r == APP_RECOG_DONE_OK) || (r == APP_RECOG_DONE_NO_NEED))
     {
         uint8 i, box_count = main_l2_box_count();
@@ -899,7 +902,9 @@ static void main_run_level2_test_5ms(void)
             }
             {
                 Point_t next = s_l2_waypoints.points[s_l2_wp_idx];
-                chassis_ctrl_move_to_grid((uint8)next.x, (uint8)next.y);
+                chassis_ctrl_move_to_m(chassis_grid_x_to_m((uint8)next.x),
+                                       chassis_grid_y_to_m((uint8)next.y),
+                                       s_l2_nav_heading_deg);
                 s_l2_navigating = 1U;
             }
             return;
@@ -1812,7 +1817,7 @@ static void main_mode5_render_100ms(void)
 #define MAIN_POS_NAV_TARGET_Y_GRID    (10)     /* 整数 0..10, 10 = 下边界 */
 /* <<<<<<<<<<<< 改这两行换目标格 >>>>>>>>>>>> */
 
-#define MAIN_POS_NAV_HOLD_YAW_DEG     (180.0f)   /* 全程锁住 0° 航向 */
+#define MAIN_YAW_HOLD_TARGET_DEG      (0.0f)     /* 模式1: 上电建立 0° 基准并持续保持 */
 
 /*
  * 上电暖机等待时长 (5ms tick 数). 200 × 5ms = 1s.
@@ -2160,11 +2165,27 @@ static void main_apply_debug_wheel_pid(void)
 /*  ⬆⬆⬆ 单轮 PID 调试辅助函数结束 ⬆⬆⬆                                          */
 /* ========================================================================== */
 
+#if (MAIN_RUN_MODE == MAIN_RUN_MODE_YAW_HOLD)
+/* 模式1必须使用本次源码中的航向参数，避免菜单在初始化后加载的旧 Flash 值
+ * 覆盖 yaw Kp、最大角速度或角加速度，导致同一固件测试结果不可复现。 */
+static void main_apply_yaw_hold_test_params(void)
+{
+    chassis_tune_params_t tune_params;
+
+    chassis_ctrl_get_tune_params(&tune_params);
+    tune_params.yaw_kp = CHASSIS_YAW_KP;
+    tune_params.max_yaw_speed_dps = CHASSIS_MAX_YAW_SPEED_DPS;
+    tune_params.cmd_accel_limit_dps2 = CHASSIS_CMD_ACCEL_LIMIT_DPS2;
+    chassis_ctrl_set_tune_params(&tune_params);
+}
+#endif
+
 int main(void)
 {
 #if (CHASSIS_MENU_ENABLE != 0)
-    uint8 menu_render_div = 0U;
+    uint16 menu_render_div = 0U;
 #endif
+    uint32 elapsed_ticks;
 
     clock_init(BOARD_BOOTCLOCKRUN_CORE_CLOCK);  // 默认528MHz，降低电池冷启动的VDD_SOC需求
 #if DEBUG_UART_ENABLE
@@ -2258,8 +2279,10 @@ int main(void)
            MAIN_PID_DEBUG_KI,
            MAIN_PID_DEBUG_KD);
 #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_YAW_HOLD)
-    /* ✅ 姿态闭环调试走这里: 只设一次目标角, 后续 PIT_CH1 20ms 中断中持续闭环. */
-    chassis_ctrl_hold_yaw(MAIN_POS_NAV_HOLD_YAW_DEG);
+    /* 姿态闭环扰动测试: 使用源码基线覆盖旧 Flash 参数，只设一次 0° 目标；
+     * 后续 PIT_CH1 20ms 中断持续保持，人工扭转车体并松手即可观察恢复响应。 */
+    main_apply_yaw_hold_test_params();
+    chassis_ctrl_hold_yaw(MAIN_YAW_HOLD_TARGET_DEG);
 #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_POINT_NAV)
     /* 车头朝上=yaw0°, 暖机期间保持当前航向不动. */
     chassis_ctrl_hold_yaw(0.0f);
@@ -2303,9 +2326,9 @@ int main(void)
     chassis_ctrl_hold_yaw(0.0f);
     main_hcm_solve();   /* 同步解算, 结果写入 s_hcm_solve_ok */
 #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_GAME)
-    /* 游戏模式: 锁定 0° 发车航向基准，等待编码器/陀螺仪发车状态机调度。 */
+    /* 游戏模式: 初始化后保持电机关闭，PIT 启动并完成稳定等待后再发车。
+     * 暖机阶段不能进入 YAW_HOLD，否则 IMU 微小噪声会提前驱动车轮。 */
     Game_Logic_Init();
-    chassis_ctrl_hold_yaw(APP_GAME_LAUNCH_FACE_YAW_DEG);
 #else
     /* 游戏模式: 设置初始航向基准, 等待状态机调度. */
     chassis_ctrl_hold_yaw(0.0f);
@@ -2338,7 +2361,7 @@ int main(void)
 
     while (1)
     {
-        (void)wait_for_tick();
+        elapsed_ticks = wait_for_tick();
 #if (MAIN_RUN_MODE != MAIN_RUN_MODE_GAME)
         RTWDOG_Refresh(RTWDOG);  /* 喂狗: 主循环活着就每 5ms 刷新 */
 #endif
@@ -2555,12 +2578,23 @@ int main(void)
         main_run_hardcoded_map_5ms();
         main_run_hardcoded_map_log_50ms();
     #else
-        Game_Logic_Task_Run();          /* 推箱子状态机 (非阻塞) */
+        /* 补跑上一轮积压的逻辑 tick，保证超时、采样窗和分时规划预算不丢拍。 */
+        for (uint32 tick = 0U; tick < elapsed_ticks; ++tick)
+        {
+            Game_Logic_Task_Run();
+        }
     #endif
 
 #if (CHASSIS_MENU_ENABLE != 0)
         /* 菜单渲染放到主循环，避免在 PIT 中断内刷屏造成控制节拍抖动。 */
-        menu_render_div++;
+        if (elapsed_ticks >= (uint32)(MAIN_MENU_RENDER_DIV - menu_render_div))
+        {
+            menu_render_div = MAIN_MENU_RENDER_DIV;
+        }
+        else
+        {
+            menu_render_div = (uint16)(menu_render_div + elapsed_ticks);
+        }
         if (menu_render_div >= MAIN_MENU_RENDER_DIV)
         {
             menu_render_div = 0U;
@@ -2570,7 +2604,24 @@ int main(void)
             main_board_test_render_100ms();
 #else
 #if (MAIN_RUN_MODE != MAIN_RUN_MODE_POINT_NAV)
+#if (MAIN_RUN_MODE == MAIN_RUN_MODE_GAME)
+            {
+                GameRuntimeStatus_t game_status;
+                Game_Get_Runtime_Status(&game_status);
+                /* 比赛计时中的识别、规划和运动阶段不刷 SPI 屏；仅在等待、
+                 * 异常或结束时保留状态画面，避免显示传输拉长主循环。 */
+                if (game_status.stage == STAGE_WAIT_MAP_REFRESH ||
+                    game_status.stage == STAGE_WAIT_RECOVERY_MAP ||
+                    game_status.stage == STAGE_DEADLOCK_RESET ||
+                    game_status.stage == STAGE_PAUSE_ON_LINK_LOSS ||
+                    game_status.stage == STAGE_DONE)
+                {
+                    chassis_menu_render_100ms();
+                }
+            }
+#else
             chassis_menu_render_100ms();
+#endif
 #endif
 #if (MAIN_RUN_MODE == MAIN_RUN_MODE_STATIC_VERIFY)
             main_mode6_render_100ms();

@@ -77,6 +77,17 @@ typedef enum {
     STAGE_WAIT_RECOVERY_MAP         // 断链恢复：停车等待新鲜稳定地图后重规划
 } GameStage_e;
 
+/* Race-flow diagnostics for the IPS status line. */
+typedef struct
+{
+    GameStage_e stage;
+    uint8 map_accepted;       /* A valid post-departure map entered game logic. */
+    uint8 solve_succeeded;    /* A push-box/bomb solution is ready to execute. */
+    uint8 waypoint_issued;    /* The current execution waypoint was sent. */
+    uint16 waypoint_index;    /* Zero-based index in the current waypoint segment. */
+    uint16 waypoint_count;
+} GameRuntimeStatus_t;
+
 // 地图全局变量 (由副镜头串口解析后写入此数组)
 extern uint8 g_game_map[MAP_ROWS][MAP_COLS];
 
@@ -89,13 +100,18 @@ void Game_Logic_Init(void);
 /* ==================================================================
  * 【P0-2】链路状态查询接口
  * Game_Link_Is_Alive():
- *   1: 当前阶段所需视觉链路在线
- *      - 普通阶段: OpenART1 MAP/heartbeat 在线
+ *   1: 当前所监控的视觉链路在线
+ *      - 地图链路: OpenART1 MAP/heartbeat 在线
  *      - 识别阶段: 需要分类时 OpenART1 + OpenART2 均在线
- *   0: 所需链路已超时, 状态机已进入 STAGE_PAUSE_ON_LINK_LOSS
+ *   0: 所需链路已超时
+ *      - 收图/识别阶段进入 STAGE_PAUSE_ON_LINK_LOSS
+ *      - 规划/执行阶段只记录离线，不中断已有航点
  * 用途: 菜单 / IPS 显示、调试上位机查询。
  * ================================================================== */
 uint8 Game_Link_Is_Alive(void);
+
+/* Read-only race-flow status used by the differential IPS refresh. */
+void Game_Get_Runtime_Status(GameRuntimeStatus_t *out);
 
 /* ==================================================================
  * 【B17】识别 tour 进度查询接口 (转发自 App_Recognize_Get_Debug)

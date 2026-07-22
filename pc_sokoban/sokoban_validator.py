@@ -164,6 +164,90 @@ def nav_bfs(the_map: list, start: tuple, end: tuple) -> Optional[list]:
     return None
 
 
+NAV_TIME_MOVE_UNITS = 1
+NAV_TIME_TURN_UNITS = 4
+
+
+def _nav_time_search(the_map: list, start: tuple,
+                     initial_direction: Optional[int] = None) -> tuple:
+    """方向状态最短路，镜像固件 Algo_Nav_Time_*（代价单位 100ms）。"""
+    if not is_inner(*start) or not is_free(the_map, *start):
+        return {}, {}
+
+    costs: Dict[tuple, int] = {}
+    parent: Dict[tuple, Optional[tuple]] = {}
+    queue = []
+    for direction in range(4):
+        pos = (start[0] + DR[direction], start[1] + DC[direction])
+        if not is_free(the_map, *pos):
+            continue
+        state = (pos[0], pos[1], direction)
+        cost = NAV_TIME_MOVE_UNITS
+        if initial_direction is None or initial_direction != direction:
+            cost += NAV_TIME_TURN_UNITS
+        if cost < costs.get(state, 10 ** 18):
+            costs[state] = cost
+            parent[state] = None
+            heapq.heappush(queue, (cost, state))
+
+    while queue:
+        cost, state = heapq.heappop(queue)
+        if cost != costs.get(state):
+            continue
+        r, c, previous_direction = state
+        for direction in range(4):
+            pos = (r + DR[direction], c + DC[direction])
+            if not is_free(the_map, *pos):
+                continue
+            next_state = (pos[0], pos[1], direction)
+            next_cost = cost + NAV_TIME_MOVE_UNITS
+            if direction != previous_direction:
+                next_cost += NAV_TIME_TURN_UNITS
+            if next_cost >= costs.get(next_state, 10 ** 18):
+                continue
+            costs[next_state] = next_cost
+            parent[next_state] = state
+            heapq.heappush(queue, (next_cost, next_state))
+    return costs, parent
+
+
+def nav_time_distance_flood(the_map: list, start: tuple,
+                            initial_direction: Optional[int] = None) -> Dict[tuple, int]:
+    costs, _ = _nav_time_search(the_map, start, initial_direction)
+    result = {start: 0} if is_inner(*start) and is_free(the_map, *start) else {}
+    for (r, c, _), cost in costs.items():
+        pos = (r, c)
+        if cost < result.get(pos, 10 ** 18):
+            result[pos] = cost
+    return result
+
+
+def nav_time_path(the_map: list, start: tuple, end: tuple,
+                  initial_direction: Optional[int] = None
+                  ) -> Optional[Tuple[list, int, Optional[int]]]:
+    if not (is_inner(*start) and is_inner(*end)):
+        return None
+    if not (is_free(the_map, *start) and is_free(the_map, *end)):
+        return None
+    if start == end:
+        return [start], 0, initial_direction
+
+    costs, parent = _nav_time_search(the_map, start, initial_direction)
+    end_states = [(cost, state) for state, cost in costs.items()
+                  if state[:2] == end]
+    if not end_states:
+        return None
+    cost, state = min(end_states)
+    end_direction = state[2]
+    path = []
+    while state is not None:
+        path.append(state[:2])
+        state = parent[state]
+    path.append(start)
+    path.reverse()
+    return path, cost, end_direction
+
+
 def nav_bfs_distance_flood(the_map: list, start: tuple) -> Dict[tuple, int]:
     """从 start 一次 BFS 扩散，返回各可达坐标的最短步数。"""
     if not is_inner(*start) or not is_free(the_map, *start):
@@ -421,6 +505,7 @@ def plan_scout_phase(the_map: list, player_start: tuple,
 #           箱-目一一对应 (相同 class_id 互推).
 # ============================================================
 EXACT_SCOUT_ITEM_LIMIT = 6
+SCOUT_QUARTER_TURN_COST = 4
 
 
 def static_push_distances(the_map: list, target: tuple,
@@ -457,7 +542,8 @@ def static_push_distances(the_map: list, target: tuple,
 
 def plan_scout_phase_v2(the_map: list, player_start: tuple,
                          box_classes: Optional[list] = None,
-                         target_classes: Optional[list] = None) -> dict:
+                         target_classes: Optional[list] = None,
+                         initial_heading_quarters: int = 0) -> dict:
     """
     侦查规划 — 逐个实地访问每个箱子和目标点.
 
@@ -465,6 +551,9 @@ def plan_scout_phase_v2(the_map: list, player_start: tuple,
         box_classes / target_classes:
             视觉端"真值": 第 i 个箱子/目标的 class_id (1..N).
             模拟时由地图生成器或外部分配. 若为 None, 默认按 extract 顺序赋 1..N.
+        initial_heading_quarters:
+            初始四向航向，0/1/2/3 分别对应 0/90/180/-90 度。精确 Tour
+            使用平移格数与观察转角的组合代价，并保留实际选中的观察格。
 
     返回:
         scout_actions, scout_waypoints, visits, player_after_scout,
@@ -508,6 +597,17 @@ def plan_scout_phase_v2(the_map: list, player_start: tuple,
                 return d
         return None
 
+    def face_heading_quarters(observe: tuple, target: tuple) -> Optional[int]:
+        face_dir = face_dir_from_observe(observe, target)
+        if face_dir is None:
+            return None
+        # Direction U/D/L/R maps to fixed yaw 180/0/-90/90 degrees.
+        return (2, 0, 3, 1)[face_dir]
+
+    def quarter_turns(from_heading: int, to_heading: int) -> int:
+        diff = abs((from_heading & 3) - (to_heading & 3))
+        return min(diff, 4 - diff)
+
     def all_resolved() -> bool:
         return all(it['ok'] for it in items)
 
@@ -519,22 +619,32 @@ def plan_scout_phase_v2(the_map: list, player_start: tuple,
                 opts.append(obs)
         return opts
 
-    def shortest_observe_path(start: tuple, target: tuple) -> Tuple[Optional[int], Optional[tuple], Optional[list]]:
+    def shortest_observe_path(start: tuple, target: tuple,
+                              start_heading: int) -> Tuple[Optional[int], Optional[tuple], Optional[list]]:
         best_cost = None
         best_obs = None
         best_path = None
         for obs in observe_options(target):
-            path = nav_bfs(the_map, start, obs)
-            if path is None:
+            route = nav_time_path(the_map, start, obs)
+            if route is None:
                 continue
-            cost = len(path) - 1
+            path, move_cost, _ = route
+            heading = face_heading_quarters(obs, target)
+            if heading is None:
+                continue
+            cost = (move_cost +
+                    quarter_turns(start_heading, heading) *
+                    SCOUT_QUARTER_TURN_COST)
             if best_cost is None or cost < best_cost:
                 best_cost = cost
                 best_obs = obs
                 best_path = path
         return best_cost, best_obs, best_path
 
-    def choose_exact_tour_first(start: tuple, cand: list) -> Optional[dict]:
+    tour_cache = []
+
+    def choose_exact_tour_first(start: tuple, cand: list,
+                                start_heading: int) -> Optional[tuple]:
         if not cand or len(cand) > EXACT_SCOUT_ITEM_LIMIT:
             return None
 
@@ -544,38 +654,49 @@ def plan_scout_phase_v2(the_map: list, player_start: tuple,
             if not opts:
                 return None
             for obs in opts:
-                obs_nodes.append((local_idx, obs))
+                heading = face_heading_quarters(obs, it['pos'])
+                if heading is None:
+                    return None
+                obs_nodes.append((local_idx, obs, heading))
         if not obs_nodes:
             return None
 
         start_cost = []
-        for _, obs in obs_nodes:
-            path = nav_bfs(the_map, start, obs)
-            start_cost.append(None if path is None else len(path) - 1)
+        for _, obs, heading in obs_nodes:
+            route = nav_time_path(the_map, start, obs)
+            start_cost.append(None if route is None else
+                              route[1] +
+                              quarter_turns(start_heading, heading) *
+                              SCOUT_QUARTER_TURN_COST)
 
         edge_cost = [[None] * len(obs_nodes) for _ in obs_nodes]
-        for i, (_, from_obs) in enumerate(obs_nodes):
-            for j, (_, to_obs) in enumerate(obs_nodes):
-                path = nav_bfs(the_map, from_obs, to_obs)
-                edge_cost[i][j] = None if path is None else len(path) - 1
+        for i, (_, from_obs, from_heading) in enumerate(obs_nodes):
+            for j, (_, to_obs, to_heading) in enumerate(obs_nodes):
+                route = nav_time_path(the_map, from_obs, to_obs)
+                edge_cost[i][j] = None if route is None else (
+                    route[1] +
+                    quarter_turns(from_heading, to_heading) *
+                    SCOUT_QUARTER_TURN_COST)
 
         full_mask = (1 << len(cand)) - 1
         dp = {}
-        for node_idx, (local_idx, _) in enumerate(obs_nodes):
+        parent = {}
+        for node_idx, (local_idx, _, _) in enumerate(obs_nodes):
             if start_cost[node_idx] is None:
                 continue
             mask = 1 << local_idx
             key = (mask, node_idx)
             old = dp.get(key)
-            value = (start_cost[node_idx], local_idx)
+            value = (start_cost[node_idx], node_idx)
             if old is None or value[0] < old[0]:
                 dp[key] = value
+                parent[key] = None
 
         for mask in range(1, full_mask + 1):
             states = [(node_idx, val) for (state_mask, node_idx), val in dp.items()
                       if state_mask == mask]
             for node_idx, (base_cost, first_idx) in states:
-                for next_node, (next_local, _) in enumerate(obs_nodes):
+                for next_node, (next_local, _, _) in enumerate(obs_nodes):
                     if mask & (1 << next_local):
                         continue
                     step = edge_cost[node_idx][next_node]
@@ -587,51 +708,84 @@ def plan_scout_phase_v2(the_map: list, player_start: tuple,
                     old = dp.get(key)
                     if old is None or value[0] < old[0]:
                         dp[key] = value
+                        parent[key] = (mask, node_idx)
 
         best = None
-        for (mask, _), value in dp.items():
+        best_key = None
+        for (mask, node_idx), value in dp.items():
             if mask != full_mask:
                 continue
-            if best is None or value[0] < best[0]:
-                best = value
+            terminal_cost = min(
+                (edge_cost[node_idx][to_idx]
+                 for to_idx, (local_idx, _, _) in enumerate(obs_nodes)
+                 if cand[local_idx]['kind'] == 'box' and
+                 edge_cost[node_idx][to_idx] is not None),
+                default=0)
+            total_cost = value[0] + terminal_cost
+            if best is None or total_cost < best[0]:
+                best = (total_cost, value[1])
+                best_key = (mask, node_idx)
         if best is None:
             return None
-        return cand[best[1]]
 
-    def choose_next_item(start: tuple, cand: list) -> Tuple[Optional[dict], Optional[tuple]]:
-        exact = choose_exact_tour_first(start, cand)
+        order = []
+        key = best_key
+        while key is not None:
+            _, node_idx = key
+            local_idx, observe, _ = obs_nodes[node_idx]
+            order.append((cand[local_idx], observe))
+            key = parent[key]
+        order.reverse()
+        tour_cache[:] = order[1:]
+        return order[0]
+
+    def choose_next_item(start: tuple, cand: list,
+                         start_heading: int) -> Tuple[Optional[dict], Optional[tuple]]:
+        while tour_cache:
+            cached_item, cached_observe = tour_cache.pop(0)
+            if not cached_item['visited'] and cached_observe in observe_options(cached_item['pos']):
+                return cached_item, cached_observe
+        exact = choose_exact_tour_first(start, cand, start_heading)
         if exact is not None:
-            _, obs, _ = shortest_observe_path(start, exact['pos'])
-            if obs is not None:
-                return exact, obs
+            return exact
 
         best_it = None
         best_obs = None
         best_cost = None
         for it in cand:
-            cost, obs, _ = shortest_observe_path(start, it['pos'])
+            cost, obs, _ = shortest_observe_path(start, it['pos'], start_heading)
             if cost is None:
                 continue
-            if best_cost is None or cost < best_cost:
-                best_cost = cost
+            heading = face_heading_quarters(obs, it['pos'])
+            next_cost = min(
+                (value for other in cand if other is not it
+                 for value, _, _ in
+                 [shortest_observe_path(obs, other['pos'], heading)]
+                 if value is not None),
+                default=0)
+            score = cost + next_cost
+            if best_cost is None or score < best_cost:
+                best_cost = score
                 best_it = it
                 best_obs = obs
         return best_it, best_obs
 
+    current_heading = initial_heading_quarters & 3
     while not all_resolved():
         cand = [it for it in items if not it['visited'] and not it['ok']]
         if not cand:
             break
 
-        best_it, best_obs = choose_next_item(cur, cand)
+        best_it, best_obs = choose_next_item(cur, cand, current_heading)
 
         if best_it is None or best_obs is None:
             break
 
-        path = nav_bfs(the_map, cur, best_obs)
-        if path is None:
+        route = nav_time_path(the_map, cur, best_obs)
+        if route is None:
             best_it['visited'] = True
             continue
+        path = route[0]
 
         acts = path_to_actions(path)
         scout_actions.extend(acts)
@@ -642,15 +796,19 @@ def plan_scout_phase_v2(the_map: list, player_start: tuple,
         best_it['ok'] = (cls > 0)
         best_it['visited'] = True
 
+        face_dir = face_dir_from_observe(best_obs, best_it['pos'])
         visits.append({
             'kind':         best_it['kind'],
             'item_idx':     best_it['item_idx'],
             'pos':          best_it['pos'],
             'observe':      best_obs,
-            'face_dir':     face_dir_from_observe(best_obs, best_it['pos']),
+            'face_dir':     face_dir,
             'class_id':     cls,
             'path_actions': list(acts),
         })
+        next_heading = face_heading_quarters(best_obs, best_it['pos'])
+        if next_heading is not None:
+            current_heading = next_heading
         cur = best_obs
 
     out_box_classes    = [0] * n_box
@@ -744,7 +902,9 @@ def plan_scout_phase_v2(the_map: list, player_start: tuple,
 
 SOKO_COST_MOVE_MS = 100
 SOKO_COST_WAYPOINT_MS = 400
-SOKO_COST_SNAP_MS = 200
+# Firmware configChassis.h currently disables arrival Snap; keep the mirror's
+# objective identical instead of charging a non-existent 200ms operation.
+SOKO_COST_SNAP_MS = 0
 
 
 def _action_from_points(src: tuple, dst: tuple) -> Optional[int]:
@@ -755,8 +915,9 @@ def _action_from_points(src: tuple, dst: tuple) -> Optional[int]:
 
 
 def _macro_edge(sub_map: list, player: tuple, box: tuple, target: tuple,
-                push_dir: int, previous_push_dir: Optional[int],
-                block_other_targets: bool) -> Optional[tuple]:
+                 push_dir: int, previous_push_dir: Optional[int],
+                 block_other_targets: bool,
+                 walk_costs: Optional[Dict[tuple, int]] = None) -> Optional[tuple]:
     stand = (box[0] - DR[push_dir], box[1] - DC[push_dir])
     next_box = (box[0] + DR[push_dir], box[1] + DC[push_dir])
     if not (is_free(sub_map, *stand) and is_free(sub_map, *next_box)):
@@ -765,27 +926,28 @@ def _macro_edge(sub_map: list, player: tuple, box: tuple, target: tuple,
             and next_box != target):
         return None
 
-    walk_map = [row[:] for row in sub_map]
-    walk_map[box[0]][box[1]] = WALL
-    walk_path = nav_bfs(walk_map, player, stand)
-    if walk_path is None:
-        return None
-
-    cost = 0
-    last_dir = previous_push_dir
-    for src, dst in zip(walk_path, walk_path[1:]):
-        d = _action_from_points(src, dst)
-        if d is None:
+    if walk_costs is None:
+        walk_map = [row[:] for row in sub_map]
+        walk_map[box[0]][box[1]] = WALL
+        route = nav_time_path(walk_map, player, stand, previous_push_dir)
+        if route is None:
             return None
-        cost += SOKO_COST_MOVE_MS
-        if last_dir is None or d != last_dir:
-            cost += SOKO_COST_WAYPOINT_MS
-        last_dir = d
+        walk_path, walk_cost_units, last_dir = route
+    else:
+        arrivals = [(cost, state[2]) for state, cost in walk_costs.items()
+                    if state[:2] == stand]
+        if not arrivals:
+            if stand != player:
+                return None
+            walk_cost_units, last_dir = 0, previous_push_dir
+        else:
+            walk_cost_units, last_dir = min(arrivals)
+        walk_path = None
 
-    cost += SOKO_COST_MOVE_MS
+    cost = walk_cost_units * SOKO_COST_MOVE_MS + SOKO_COST_MOVE_MS
     if last_dir is None or push_dir != last_dir:
         cost += SOKO_COST_WAYPOINT_MS
-    if len(walk_path) > 1 or previous_push_dir is None or push_dir != previous_push_dir:
+    if stand != player or previous_push_dir is None or push_dir != previous_push_dir:
         cost += SOKO_COST_SNAP_MS
     return next_box, walk_path, cost
 
@@ -809,9 +971,12 @@ def sokoban_bfs_single(sub_map: list, player: tuple, box: tuple,
     parent: Dict[tuple, Optional[tuple]] = {}
     queue = []
 
+    initial_walk_map = [row[:] for row in work_map]
+    initial_walk_map[box[0]][box[1]] = WALL
+    initial_walk_costs, _ = _nav_time_search(initial_walk_map, player, None)
     for d in range(4):
         edge = _macro_edge(work_map, player, box, target, d, None,
-                           block_other_targets)
+                           block_other_targets, initial_walk_costs)
         if edge is None:
             continue
         next_box, _, edge_cost = edge
@@ -837,9 +1002,14 @@ def sokoban_bfs_single(sub_map: list, player: tuple, box: tuple,
             goal_state = state
             break
 
+        state_walk_map = [row[:] for row in work_map]
+        state_walk_map[cur_box[0]][cur_box[1]] = WALL
+        state_walk_costs, _ = _nav_time_search(
+            state_walk_map, cur_player, previous_dir)
         for d in range(4):
             edge = _macro_edge(work_map, cur_player, cur_box, target, d,
-                               previous_dir, block_other_targets)
+                               previous_dir, block_other_targets,
+                               state_walk_costs)
             if edge is None:
                 continue
             next_box, _, edge_cost = edge
@@ -870,9 +1040,11 @@ def sokoban_bfs_single(sub_map: list, player: tuple, box: tuple,
         stand = (cur_box[0] - DR[push_dir], cur_box[1] - DC[push_dir])
         walk_map = [row[:] for row in work_map]
         walk_map[cur_box[0]][cur_box[1]] = WALL
-        walk_path = nav_bfs(walk_map, cur_player, stand)
-        if walk_path is None:
+        route = nav_time_path(walk_map, cur_player, stand,
+                              actions[-1] if actions else None)
+        if route is None:
             return None
+        walk_path = route[0]
         for src, dst in zip(walk_path, walk_path[1:]):
             d = _action_from_points(src, dst)
             if d is None:
@@ -1094,14 +1266,7 @@ def _solve_stage2_greedy(the_map: list, player_pos: tuple,
 
 OPT_EXACT_BOX_LIMIT = 3
 OPT_BRANCH_BOX_LIMIT = 5
-OPT_STAGE1_NODE_LIMIT_5 = 1024
 STAGE1_PAIR_LIMIT = 256
-
-
-def _solution_cost(sol: Optional[dict]) -> int:
-    if not sol:
-        return 10 ** 9
-    return int(sol.get('total_steps', 10 ** 9))
 
 
 def _mapping_valid(mapping: list, box_n: int, target_n: int) -> bool:
@@ -1113,104 +1278,6 @@ def _mapping_valid(mapping: list, box_n: int, target_n: int) -> bool:
             return False
         used.add(ti)
     return True
-
-
-def _pair_heuristic(player: tuple, box: tuple, target: tuple) -> int:
-    return (abs(box[0] - player[0]) + abs(box[1] - player[1])
-            + abs(target[0] - box[0]) + abs(target[1] - box[1]))
-
-
-def _solve_stage_opt(the_map: list, player_pos: tuple,
-                     box_to_target_idx: Optional[list],
-                     fallback: Optional[dict]) -> Optional[dict]:
-    boxes = extract_elements(the_map, BOX)
-    targets = extract_elements(the_map, TARGET)
-    n = len(boxes)
-    fixed_mapping = box_to_target_idx is not None
-
-    if n == 0 or n != len(targets):
-        return fallback
-    if n > OPT_BRANCH_BOX_LIMIT:
-        return fallback
-    if fixed_mapping and not _mapping_valid(box_to_target_idx, n, len(targets)):
-        return None
-
-    best = fallback
-    best_cost = _solution_cost(fallback)
-    cur_solutions: list = []
-    node_limit = 0 if (fixed_mapping or n <= OPT_EXACT_BOX_LIMIT) else OPT_STAGE1_NODE_LIMIT_5
-    node_count = 0
-    hit_limit = False
-
-    def dfs(solved_mask: int, used_target_mask: int,
-            cur_player: tuple, cost: int) -> None:
-        nonlocal best, best_cost, node_count, hit_limit
-
-        depth = len(cur_solutions)
-        if cost >= best_cost:
-            return
-        if hit_limit:
-            return
-        if depth >= n:
-            best = {
-                'sub_solutions': [dict(s) for s in cur_solutions],
-                'boxes':         boxes,
-                'targets':       targets,
-                'total_steps':   cost,
-            }
-            best_cost = cost
-            return
-
-        candidates = []
-        for bi in range(n):
-            if solved_mask & (1 << bi):
-                continue
-            if fixed_mapping:
-                ti = box_to_target_idx[bi]
-                candidates.append((bi, ti, _pair_heuristic(cur_player, boxes[bi], targets[ti])))
-            else:
-                for ti in range(n):
-                    if used_target_mask & (1 << ti):
-                        continue
-                    candidates.append((bi, ti, _pair_heuristic(cur_player, boxes[bi], targets[ti])))
-        candidates.sort(key=lambda x: x[2])
-
-        solved = [False] * n
-        target_used = [False] * n
-        for i in range(n):
-            solved[i] = bool(solved_mask & (1 << i))
-            target_used[i] = bool(used_target_mask & (1 << i))
-
-        for bi, ti, _ in candidates:
-            if node_limit:
-                if node_count >= node_limit:
-                    hit_limit = True
-                    return
-                node_count += 1
-            sub = build_sub_map(the_map, boxes, targets, solved, target_used, bi, ti)
-            sol = sokoban_bfs_single(sub, cur_player, boxes[bi], targets[ti])
-            if sol is None:
-                continue
-            next_cost = cost + len(sol)
-            if next_cost >= best_cost:
-                continue
-            next_player, _ = simulate_actions(sol, cur_player, boxes[bi])
-            cur_solutions.append({
-                'actions':    sol,
-                'box_idx':    bi,
-                'target_idx': ti,
-                'player_end': next_player,
-            })
-            dfs(solved_mask | (1 << bi),
-                used_target_mask | (1 << ti),
-                next_player,
-                next_cost)
-            cur_solutions.pop()
-            if hit_limit:
-                return
-
-    dfs(0, 0, player_pos, 0)
-    return best
 
 
 def _push_flags(actions: list, player: tuple, box: tuple) -> list:
@@ -1254,14 +1321,14 @@ def _path_to_actions(path: list) -> list:
 
 def build_return_path(the_map: list, player_pos: tuple,
                       home_pos: tuple = (5, 1)) -> Optional[dict]:
-    """镜像固件：通关后忽略虚拟障碍，只下发一个直达库位航点。"""
+    """镜像固件：返库单命令由底盘依次执行 X/Y 轴，按曼哈顿行程计时。"""
     del the_map
     if not is_inner(*home_pos):
         return None
-    distance_cells = math.hypot(home_pos[0] - player_pos[0],
-                                home_pos[1] - player_pos[1])
-    move_cost = int(distance_cells * SOKO_COST_MOVE_MS + 0.5)
-    waypoint_cost = SOKO_COST_WAYPOINT_MS if distance_cells > 0.0 else 0
+    distance_cells = (abs(home_pos[0] - player_pos[0]) +
+                      abs(home_pos[1] - player_pos[1]))
+    move_cost = distance_cells * SOKO_COST_MOVE_MS
+    waypoint_cost = SOKO_COST_WAYPOINT_MS if distance_cells > 0 else 0
     return {
         'actions': [],
         'waypoints': [(home_pos, 'critical')],
@@ -1271,17 +1338,23 @@ def build_return_path(the_map: list, player_pos: tuple,
 
 
 def _solve_stage1_time_opt(the_map: list, player_pos: tuple,
-                           home_pos: tuple) -> Optional[dict]:
+                           home_pos: tuple,
+                           fixed_mapping: Optional[list] = None) -> Optional[dict]:
     boxes = extract_elements(the_map, BOX)
     targets = extract_elements(the_map, TARGET)
     n = len(boxes)
     if n == 0 or n != len(targets) or n > MAX_BOXES:
         return None
+    if fixed_mapping is not None and not _mapping_valid(fixed_mapping, n, n):
+        return None
 
     best = None
     best_cost = 10 ** 18
     cur_solutions = []
-    node_limit = 0 if n <= OPT_EXACT_BOX_LIMIT else STAGE1_PAIR_LIMIT
+    if fixed_mapping is not None:
+        node_limit = 0 if n <= OPT_BRANCH_BOX_LIMIT else 512
+    else:
+        node_limit = 0 if n <= OPT_EXACT_BOX_LIMIT else STAGE1_PAIR_LIMIT
     node_count = 0
     hit_limit = False
 
@@ -1321,7 +1394,9 @@ def _solve_stage1_time_opt(the_map: list, player_pos: tuple,
             box_distance = _box_nav_distance(distance, boxes[bi])
             if box_distance >= 10 ** 9:
                 continue
-            for ti in range(n):
+            target_indices = ([fixed_mapping[bi]] if fixed_mapping is not None
+                              else range(n))
+            for ti in target_indices:
                 if target_mask & (1 << ti):
                     continue
                 target_distance = (abs(targets[ti][0] - boxes[bi][0])
@@ -1363,7 +1438,9 @@ def _solve_stage1_time_opt(the_map: list, player_pos: tuple,
         return best
 
     # 镜像正式固件：仅在多箱搜索预算耗尽且尚无完整叶子时，用已有贪心解保底。
-    fallback = _solve_stage1_greedy(the_map, player_pos)
+    fallback = (_solve_stage2_greedy(the_map, player_pos, fixed_mapping)
+                if fixed_mapping is not None
+                else _solve_stage1_greedy(the_map, player_pos))
     if fallback is None:
         return None
     fallback_cost = 0
@@ -1391,13 +1468,16 @@ def solve_stage1(the_map: list, player_pos: tuple,
 
 
 def solve_stage2(the_map: list, player_pos: tuple,
-                 box_to_target_idx: list) -> Optional[dict]:
+                 box_to_target_idx: list,
+                 home_pos: Optional[tuple] = None) -> Optional[dict]:
     box_n = len(extract_elements(the_map, BOX))
     target_n = len(extract_elements(the_map, TARGET))
     if not _mapping_valid(box_to_target_idx, box_n, target_n):
         return None
-    fallback = _solve_stage2_greedy(the_map, player_pos, box_to_target_idx)
-    return _solve_stage_opt(the_map, player_pos, box_to_target_idx, fallback)
+    return _solve_stage1_time_opt(
+        the_map, player_pos,
+        player_pos if home_pos is None else home_pos,
+        box_to_target_idx)
 
 
 def is_blocker(the_map: list, r: int, c: int) -> bool:
@@ -1540,8 +1620,9 @@ def plan_bomb(the_map: list, player_pos: tuple,
     """
     多炸弹联合 (炸弹, 墙体) 规划。对应 C 代码 Sokoban_Plan_Bomb()。
 
-    与 find_bomb_wall 的区别: 墙体打分阶段即把"该墙能否被某颗炸弹推到"作为硬约束,
-    并在多颗炸弹中按到墙曼哈顿距离由近到远挑选第一颗可推的。
+    与 find_bomb_wall 的区别: 对全部 (炸弹, 墙体) 组合实际求解，并按
+    “不可达目标罚时 + 推炸弹执行时间 + 爆破后关键目标导航时间”选择总耗时最小者；
+    清墙数量只作为同成本时的次级判据。
 
     blocked_target:
         给定时作为破局门控 (该墙必须恢复其可达性);
@@ -1553,8 +1634,10 @@ def plan_bomb(the_map: list, player_pos: tuple,
     if not bombs:
         return None
 
-    best_score = float('-inf')
+    best_rank = 10 ** 18
+    best_cleared = -1
     best_plan: Optional[Tuple[tuple, tuple, list]] = None
+    target_count = len(extract_elements(the_map, TARGET))
 
     for r in range(1, MAP_ROWS - 1):
         for c in range(1, MAP_COLS - 1):
@@ -1584,12 +1667,12 @@ def plan_bomb(the_map: list, player_pos: tuple,
             if blocked_target is not None:
                 if not is_reachable(reachable_cells, blocked_target):
                     continue
-                path = nav_bfs(tmp, player_pos, blocked_target)
-                if path is None:
+                route = nav_time_path(tmp, player_pos, blocked_target)
+                if route is None:
                     continue
-                blocked_len = len(path)
+                blocked_cost_ms = route[1] * SOKO_COST_MOVE_MS
             else:
-                blocked_len = 0
+                blocked_cost_ms = 0
 
             reachable = sum(
                 1 for tr in range(INNER_R_MIN, INNER_R_MAX + 1)
@@ -1598,17 +1681,9 @@ def plan_bomb(the_map: list, player_pos: tuple,
                 is_reachable(reachable_cells, (tr, tc))
             )
 
-            score = reachable * 200 + cleared * 20 - (blocked_len * blocked_len) // 50
-
-            # 仅当有望刷新最优时, 才付出可行性 BFS 代价
-            if best_plan is not None and score <= best_score:
-                continue
-
-            # 在多颗炸弹中按到墙曼哈顿距离由近到远, 取第一颗可推到 wall 的
+            # 固件分时搜索仍按距离顺序验证，但会比较同一墙体的全部可行炸弹。
             order = sorted(range(len(bombs)),
                            key=lambda i: abs(bombs[i][0] - r) + abs(bombs[i][1] - c))
-            chosen = None
-            chosen_actions = None
             for bi in order:
                 sub = [row[:] for row in the_map]
                 sub[bombs[bi][0]][bombs[bi][1]] = EMPTY
@@ -1616,15 +1691,14 @@ def plan_bomb(the_map: list, player_pos: tuple,
                 acts = sokoban_bfs_single(sub, player_pos, bombs[bi], wall,
                                           block_other_targets=False)
                 if acts is not None:
-                    chosen = bombs[bi]
-                    chosen_actions = acts
-                    break
-
-            if chosen is None:
-                continue
-
-            best_score = score
-            best_plan = (chosen, wall, chosen_actions)
+                    flags = _push_flags(acts, player_pos, bombs[bi])
+                    rank = ((target_count - reachable) * 60000 +
+                            sequence_time_cost(acts, flags) + blocked_cost_ms)
+                    if (rank < best_rank or
+                            (rank == best_rank and cleared > best_cleared)):
+                        best_rank = rank
+                        best_cleared = cleared
+                        best_plan = (bombs[bi], wall, acts)
 
     return best_plan
 

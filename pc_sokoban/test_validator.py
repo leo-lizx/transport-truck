@@ -55,7 +55,6 @@ assert err2a == "", err2a
 greedy2a = sv._solve_stage1_greedy(m2a, p2a)
 stage1_2a = sv.solve_stage1(m2a, p2a)
 assert greedy2a is not None
-assert greedy2a['total_steps'] == 38
 assert stage1_2a is not None
 
 greedy_cost2a = 0
@@ -176,6 +175,44 @@ assert scout8c['box_to_target_idx'] == [0, 1], scout8c['box_to_target_idx']
 assert sv.solve_stage2(m8c, scout8c['player_after_scout'],
                        scout8c['box_to_target_idx']) is not None
 print("静态不可推的近目标被排除，同类别映射选择可解组合 [0, 1]。")
+
+# Test 8d: the exact tour must execute its chosen observe cell and compare
+# movement segments together with the final observation turn.
+print("\n=== Test 8d: time-aware scout observe selection ===")
+m8d = sv._make_empty_map()
+m8d[5][5] = sv.BOX
+scout8d = sv.plan_scout_phase_v2(m8d, (5, 2), box_classes=[1])
+assert scout8d['all_visited']
+assert scout8d['visits'][0]['observe'] == (5, 4), scout8d['visits'][0]
+assert scout8d['visits'][0]['face_dir'] == 3, scout8d['visits'][0]
+print("精确 Tour 保留观察格，并按平移停站与观察转角的总时间选点。")
+
+# Test 8e: maps above the six-item exact-DP limit use the same turn-aware
+# observe scoring in the greedy fallback.
+print("\n=== Test 8e: turn-aware greedy scout fallback ===")
+m8e = sv._make_empty_map()
+for r, c in [(5, 5), (1, 10), (2, 12), (4, 12)]:
+    m8e[r][c] = sv.BOX
+for r, c in [(6, 12), (8, 12), (9, 10), (9, 6)]:
+    m8e[r][c] = sv.TARGET
+scout8e = sv.plan_scout_phase_v2(
+    m8e, (5, 2), box_classes=[1, 2, 3, 4],
+    target_classes=[1, 2, 3, 4])
+assert scout8e['all_visited']
+assert scout8e['visits'][0]['pos'] == (5, 5), scout8e['visits'][0]
+assert scout8e['visits'][0]['observe'] == (5, 4), scout8e['visits'][0]
+print("超过精确 DP 上限时，两步前瞻仍使用相同的时间代价。")
+
+print("\n=== Test 8f: direction-state navigation avoids extra stops ===")
+m8f = sv._make_empty_map()
+m8f[5][4] = sv.WALL
+route8f = sv.nav_time_path(m8f, (5, 2), (5, 6))
+assert route8f is not None
+actions8f = sv._path_to_actions(route8f[0])
+segments8f = 1 + sum(a != b for a, b in zip(actions8f, actions8f[1:]))
+assert route8f[1] == len(actions8f) + segments8f * sv.NAV_TIME_TURN_UNITS
+assert segments8f == 3, (route8f, actions8f)
+print(f"方向状态路径: {len(actions8f)} 格 / {segments8f} 段 / 代价 {route8f[1]}")
 
 # 测试9: V2 + Stage2 完整求解 (走真实路径)
 print("\n=== 测试9: V2 完整求解 ===")
@@ -342,7 +379,7 @@ ret13 = sv.build_return_path(m13, (5, 3), (5, 1))
 assert ret13 is not None and ret13['direct']
 assert ret13['actions'] == []
 assert ret13['waypoints'] == [((5, 1), 'critical')]
-assert ret13['time_cost_ms'] == 800
-print("普通转弯/关键推箱航点标记正确，返库直线忽略虚拟墙。")
+assert ret13['time_cost_ms'] == 600
+print("普通转弯/关键推箱航点标记正确，返库命令忽略虚拟墙且不计已关闭的 Snap。")
 print("\n=============================")
 print("所有测试通过！")

@@ -19,7 +19,7 @@
  * The old two-level tuning menu has been collapsed into one race-facing
  * screen:
  *   - 16 x 12 map grid.
- *   - Color blocks for map cells, only while fresh MAP frames are arriving.
+ *   - Changed map cells while fresh MAP frames are arriving; retain last frame when stale.
  *   - Car grid position overlay.
  *   - Current yaw angle below the map.
  *===========================================================================*/
@@ -45,7 +45,6 @@ typedef struct
 #define MENU_MAP_W                     (APP_LINK_MAP_COLS * MENU_CELL_SIZE)
 #define MENU_MAP_H                     (APP_LINK_MAP_ROWS * MENU_CELL_SIZE)
 #define MENU_SIDE_X                    (216U)
-#define MENU_SIDE_W                    (104U)
 #define MENU_RECOG_Y                   (152U)
 
 #define MENU_RGB565(r, g, b)           (uint16)((((uint16)(r) & 0xF8U) << 8) | \
@@ -69,6 +68,20 @@ static uint8 s_need_full_refresh = 1U;
 static uint8 s_last_map_ready = 0xFFU;
 static uint8 s_cached_map[APP_LINK_MAP_ROWS][APP_LINK_MAP_COLS];  /* 缓存上一帧地图, 用于变化检测 */
 static uint8 s_map_cached = 0U;                                    /* s_cached_map 是否有效 */
+static uint8 s_dynamic_cached = 0U;
+static uint32 s_last_map_age_ms = 0U;
+static int32 s_last_pose_yaw_key = 0;
+static int32 s_last_pose_x_key = 0;
+static int32 s_last_pose_y_key = 0;
+static int32 s_last_imu_yaw_key = 0;
+static uint8 s_recog_cached = 0U;
+static uint8 s_last_recog_valid = 0U;
+static uint8 s_last_recog_idx = 0U;
+static uint8 s_last_recog_total = 0U;
+static uint8 s_last_recog_kind = 0U;
+static uint8 s_last_recog_class = 0U;
+static uint8 s_game_status_cached = 0U;
+static GameRuntimeStatus_t s_last_game_status;
 
 static uint32 menu_flash_checksum(const uint32 *words, uint16 word_count)
 {
@@ -117,53 +130,109 @@ static void menu_fill_rect(uint16 x, uint16 y, uint16 w, uint16 h, uint16 color)
     ips200_show_rgb565_image(x, y, &color, 1U, 1U, w, h, 0U);
 }
 
-static void menu_clear_text_line(uint16 y)
+static int32 menu_float_display_key(float value, uint8 point_digits)
 {
-    ips200_set_color(MENU_COLOR_TEXT, MENU_COLOR_BG);
-    ips200_show_string(0U, y, "                                        ");
+    float scale = (point_digits == 1U) ? 10.0f : 100.0f;
+    int32 key = (int32)(value * scale);
+
+    /* ips200_show_float 会显示 -0.0/-0.00, 这里保留零附近的符号差异。 */
+    if ((value < 0.0f) && (key == 0))
+    {
+        key = (int32)0x80000000UL;
+    }
+    return key;
 }
 
-static void menu_draw_recognize_object(void)
+static void menu_update_recognize_object(void)
 {
     AppRecognizeDebug_t recog;
-    const char *kind = "--";
+    const char *kind_text;
+    uint8 recog_valid;
+    uint8 display_idx;
+    uint8 display_total;
+    uint8 display_kind;
+    uint8 display_class;
 
     Game_Get_Recognize_Debug(&recog);
+    recog_valid = (uint8)((recog.total_targets != 0U) &&
+                          (recog.current_idx < recog.total_targets));
+    display_idx = (0U != recog_valid) ? (uint8)(recog.current_idx + 1U) : 0U;
+    display_total = (0U != recog_valid) ? recog.total_targets : 0U;
+    display_kind = (0U != recog_valid) ? recog.current_kind : 0U;
+    display_class = (0U != recog_valid) ? recog.current_class_id : 0U;
 
-    menu_fill_rect(MENU_SIDE_X, MENU_RECOG_Y, MENU_SIDE_W, 32U, MENU_COLOR_BG);
     ips200_set_color(MENU_COLOR_TEXT, MENU_COLOR_BG);
 
-    if ((recog.total_targets == 0U) || (recog.current_idx >= recog.total_targets))
+    if ((0U == s_recog_cached) ||
+        (recog_valid != s_last_recog_valid) ||
+        (display_kind != s_last_recog_kind))
     {
-        ips200_show_string(MENU_SIDE_X, MENU_RECOG_Y, "OBJ: --");
-        ips200_show_string(MENU_SIDE_X, MENU_RECOG_Y + 16U, "I:--/-- C:--");
-        return;
+        if (display_kind == APP_LINK_OBJ_KIND_BOX)
+        {
+            kind_text = "BOX   ";
+        }
+        else if (display_kind == APP_LINK_OBJ_KIND_TARGET)
+        {
+            kind_text = "TARGET";
+        }
+        else
+        {
+            kind_text = "--    ";
+        }
+        ips200_show_string(MENU_SIDE_X + 40U, MENU_RECOG_Y, kind_text);
     }
 
-    if (recog.current_kind == APP_LINK_OBJ_KIND_BOX)
+    if ((0U == s_recog_cached) ||
+        (recog_valid != s_last_recog_valid) ||
+        (display_idx != s_last_recog_idx))
     {
-        kind = "BOX";
-    }
-    else if (recog.current_kind == APP_LINK_OBJ_KIND_TARGET)
-    {
-        kind = "TARGET";
+        if (0U != recog_valid)
+        {
+            ips200_show_uint(MENU_SIDE_X + 16U, MENU_RECOG_Y + 16U,
+                             (uint32)display_idx, 2U);
+        }
+        else
+        {
+            ips200_show_string(MENU_SIDE_X + 16U, MENU_RECOG_Y + 16U, "--");
+        }
     }
 
-    ips200_show_string(MENU_SIDE_X, MENU_RECOG_Y, "OBJ: ");
-    ips200_show_string(MENU_SIDE_X + 40U, MENU_RECOG_Y, kind);
-    ips200_show_string(MENU_SIDE_X, MENU_RECOG_Y + 16U, "I:");
-    ips200_show_uint(MENU_SIDE_X + 16U, MENU_RECOG_Y + 16U, (uint32)(recog.current_idx + 1U), 2U);
-    ips200_show_string(MENU_SIDE_X + 34U, MENU_RECOG_Y + 16U, "/");
-    ips200_show_uint(MENU_SIDE_X + 42U, MENU_RECOG_Y + 16U, (uint32)recog.total_targets, 2U);
-    ips200_show_string(MENU_SIDE_X + 64U, MENU_RECOG_Y + 16U, "C:");
-    if (recog.current_class_id == 0U)
+    if ((0U == s_recog_cached) ||
+        (recog_valid != s_last_recog_valid) ||
+        (display_total != s_last_recog_total))
     {
-        ips200_show_string(MENU_SIDE_X + 80U, MENU_RECOG_Y + 16U, "--");
+        if (0U != recog_valid)
+        {
+            ips200_show_uint(MENU_SIDE_X + 42U, MENU_RECOG_Y + 16U,
+                             (uint32)display_total, 2U);
+        }
+        else
+        {
+            ips200_show_string(MENU_SIDE_X + 42U, MENU_RECOG_Y + 16U, "--");
+        }
     }
-    else
+
+    if ((0U == s_recog_cached) ||
+        (recog_valid != s_last_recog_valid) ||
+        (display_class != s_last_recog_class))
     {
-        ips200_show_uint(MENU_SIDE_X + 80U, MENU_RECOG_Y + 16U, (uint32)recog.current_class_id, 2U);
+        if ((0U != recog_valid) && (display_class != 0U))
+        {
+            ips200_show_uint(MENU_SIDE_X + 80U, MENU_RECOG_Y + 16U,
+                             (uint32)display_class, 2U);
+        }
+        else
+        {
+            ips200_show_string(MENU_SIDE_X + 80U, MENU_RECOG_Y + 16U, "--");
+        }
     }
+
+    s_last_recog_valid = recog_valid;
+    s_last_recog_idx = display_idx;
+    s_last_recog_total = display_total;
+    s_last_recog_kind = display_kind;
+    s_last_recog_class = display_class;
+    s_recog_cached = 1U;
 }
 
 static uint8 menu_map_frame_is_fresh(uint32 *age_ms_out)
@@ -215,7 +284,7 @@ static void menu_draw_grid_lines(void)
     }
 }
 
-static void menu_draw_static_layout(uint8 map_ready)
+static void menu_draw_static_layout(void)
 {
     ips200_full(MENU_COLOR_BG);
 
@@ -234,76 +303,211 @@ static void menu_draw_static_layout(uint8 map_ready)
     menu_fill_rect(216U, 92U, 12U, 12U, MENU_COLOR_TARGET);
     menu_fill_rect(216U, 112U, 12U, 12U, MENU_COLOR_BOMB);
 
-    ips200_show_string(MENU_SIDE_X, MENU_RECOG_Y, "OBJ: --");
-    ips200_show_string(MENU_SIDE_X, MENU_RECOG_Y + 16U, "I:--/-- C:--");
+    ips200_show_string(MENU_SIDE_X, MENU_RECOG_Y, "OBJ:");
+    ips200_show_string(MENU_SIDE_X, MENU_RECOG_Y + 16U, "I:  /   C:");
 
     menu_fill_rect(MENU_MAP_ORIGIN_X, MENU_MAP_ORIGIN_Y, MENU_MAP_W, MENU_MAP_H, MENU_COLOR_BG);
     menu_draw_grid_lines();
 
     ips200_set_color(MENU_COLOR_TEXT, MENU_COLOR_BG);
-    ips200_show_string(0U, 188U, "YAW:        deg");
-    ips200_show_string(0U, 206U, "POSE X:      Y:      IMU:");
-
-    ips200_set_color(map_ready ? MENU_COLOR_OK : MENU_COLOR_WAIT, MENU_COLOR_BG);
-    ips200_show_string(0U, 16U, map_ready ? "MAP: RX    AGE:      ms" : "MAP: LOADING GRID ONLY");
+    ips200_show_string(0U, 188U, "YAW:");
+    ips200_show_string(112U, 188U, "deg");
+    ips200_show_string(0U, 206U, "POSE X:");
+    ips200_show_string(120U, 206U, "Y:");
+    ips200_show_string(200U, 206U, "IMU:");
+    ips200_show_string(0U, 224U, "M:WAIT S:WAIT W:---/--- ST:00 WAIT_START");
 }
 
-static void menu_draw_map_cells(const uint8 map[APP_LINK_MAP_ROWS][APP_LINK_MAP_COLS])
+static void menu_draw_map_cell(uint8 row, uint8 col, uint8 cell)
+{
+    uint16 x = (uint16)(MENU_MAP_ORIGIN_X + (uint16)col * MENU_CELL_SIZE + MENU_CELL_GAP);
+    uint16 y = (uint16)(MENU_MAP_ORIGIN_Y + (uint16)row * MENU_CELL_SIZE + MENU_CELL_GAP);
+
+    menu_fill_rect(x, y,
+                   (uint16)(MENU_CELL_SIZE - MENU_CELL_GAP),
+                   (uint16)(MENU_CELL_SIZE - MENU_CELL_GAP),
+                   menu_cell_color(cell));
+}
+
+static void menu_update_map_cells(const uint8 map[APP_LINK_MAP_ROWS][APP_LINK_MAP_COLS])
 {
     uint8 r;
     uint8 c;
-    uint16 x;
-    uint16 y;
-    uint16 color;
 
     for (r = 0U; r < APP_LINK_MAP_ROWS; ++r)
     {
         for (c = 0U; c < APP_LINK_MAP_COLS; ++c)
         {
-            x = (uint16)(MENU_MAP_ORIGIN_X + (uint16)c * MENU_CELL_SIZE + MENU_CELL_GAP);
-            y = (uint16)(MENU_MAP_ORIGIN_Y + (uint16)r * MENU_CELL_SIZE + MENU_CELL_GAP);
-            color = menu_cell_color(map[r][c]);
-            menu_fill_rect(x, y,
-                           (uint16)(MENU_CELL_SIZE - MENU_CELL_GAP),
-                           (uint16)(MENU_CELL_SIZE - MENU_CELL_GAP),
-                           color);
+            if ((0U == s_map_cached) || (map[r][c] != s_cached_map[r][c]))
+            {
+                menu_draw_map_cell(r, c, map[r][c]);
+                s_cached_map[r][c] = map[r][c];
+            }
         }
+    }
+    s_map_cached = 1U;
+}
+
+static void menu_update_map_status(uint8 map_ready, uint32 map_age_ms)
+{
+    if ((0xFFU == s_last_map_ready) || (map_ready != s_last_map_ready))
+    {
+        ips200_set_color(map_ready ? MENU_COLOR_OK : MENU_COLOR_WAIT, MENU_COLOR_BG);
+        if (0U != map_ready)
+        {
+            ips200_show_string(0U, 16U, "MAP: RX    AGE:      ms ");
+        }
+        else
+        {
+            ips200_show_string(0U, 16U, "MAP: LOADING GRID ONLY  ");
+        }
+    }
+
+    if ((0U != map_ready) &&
+        ((0U == s_dynamic_cached) || (map_age_ms != s_last_map_age_ms) ||
+         (map_ready != s_last_map_ready)))
+    {
+        ips200_set_color(MENU_COLOR_OK, MENU_COLOR_BG);
+        ips200_show_uint(120U, 16U, map_age_ms, 5U);
+    }
+
+    s_last_map_age_ms = map_age_ms;
+    s_last_map_ready = map_ready;
+}
+
+static const char *menu_stage_text(GameStage_e stage)
+{
+    switch (stage)
+    {
+        case STAGE_WAIT_START:          return "00 WAIT_START";
+        case STAGE_LAUNCH_EXIT:         return "01 LAUNCH    ";
+        case STAGE_WAIT_MAP_REFRESH:    return "02 WAIT_MAP  ";
+        case STAGE_RECOGNIZE_MAP:       return "03 RECOGNIZE ";
+        case STAGE_PLAN_PATH:           return "04 PLAN      ";
+        case STAGE_EXECUTE_ACTION:      return "05 EXECUTE   ";
+        case STAGE_LEVEL_JUDGE:         return "06 LVL_JUDGE ";
+        case STAGE_DEADLOCK_RESET:      return "07 DEADLOCK  ";
+        case STAGE_DONE:                return "08 DONE      ";
+        case STAGE_PAUSE_ON_LINK_LOSS:  return "09 LINK_LOSS ";
+        case STAGE_WAIT_RECOVERY_MAP:   return "10 RECOVERY  ";
+        default:                        return "?? UNKNOWN   ";
     }
 }
 
-static void menu_draw_dynamic_text(uint8 map_ready, uint32 map_age_ms)
+static void menu_update_game_status(void)
 {
-    chassis_pose_t pose = chassis_ctrl_get_pose();
-    float imu_yaw_deg = chassis_imu_get_yaw_deg();
+    GameRuntimeStatus_t status;
+    const char *solve_text;
+    uint16 waypoint_index;
+    uint16 waypoint_count;
 
-    if (map_ready)
+    Game_Get_Runtime_Status(&status);
+
+    if ((0U == s_game_status_cached) ||
+        (status.map_accepted != s_last_game_status.map_accepted))
     {
-        ips200_set_color(MENU_COLOR_OK, MENU_COLOR_BG);
-        ips200_show_string(0U, 16U, "MAP: RX    AGE:      ms");
-        ips200_show_uint(112U, 16U, map_age_ms, 5U);
+        ips200_set_color(status.map_accepted ? MENU_COLOR_OK : MENU_COLOR_WAIT,
+                         MENU_COLOR_BG);
+        ips200_show_string(16U, 224U, status.map_accepted ? "OK  " : "WAIT");
+    }
+
+    if (status.stage == STAGE_DEADLOCK_RESET)
+    {
+        solve_text = "FAIL";
+    }
+    else if (status.solve_succeeded != 0U)
+    {
+        solve_text = "OK  ";
+    }
+    else if (status.stage == STAGE_PLAN_PATH)
+    {
+        solve_text = "RUN ";
     }
     else
     {
-        ips200_set_color(MENU_COLOR_WAIT, MENU_COLOR_BG);
-        ips200_show_string(0U, 16U, "MAP: LOADING GRID ONLY     ");
+        solve_text = "WAIT";
     }
 
-    menu_clear_text_line(188U);
-    ips200_set_color(MENU_COLOR_TEXT, MENU_COLOR_BG);
-    ips200_show_string(0U, 188U, "YAW:");
-    ips200_show_float(40U, 188U, pose.yaw_deg, 5U, 1U);
-    ips200_show_string(96U, 188U, "deg");
+    if ((0U == s_game_status_cached) ||
+        (status.stage != s_last_game_status.stage) ||
+        (status.solve_succeeded != s_last_game_status.solve_succeeded))
+    {
+        ips200_set_color((status.solve_succeeded != 0U) ? MENU_COLOR_OK : MENU_COLOR_WAIT,
+                         MENU_COLOR_BG);
+        ips200_show_string(72U, 224U, solve_text);
+    }
 
-    menu_clear_text_line(206U);
-    ips200_set_color(MENU_COLOR_TEXT, MENU_COLOR_BG);
-    ips200_show_string(0U, 206U, "POSE X:");
-    ips200_show_float(64U, 206U, pose.x_m, 3U, 2U);
-    ips200_show_string(120U, 206U, "Y:");
-    ips200_show_float(144U, 206U, pose.y_m, 3U, 2U);
-    ips200_show_string(200U, 206U, "IMU:");
-    ips200_show_float(240U, 206U, imu_yaw_deg, 5U, 1U);
+    if ((0U == s_game_status_cached) ||
+        (status.waypoint_issued != s_last_game_status.waypoint_issued) ||
+        (status.waypoint_index != s_last_game_status.waypoint_index) ||
+        (status.waypoint_count != s_last_game_status.waypoint_count))
+    {
+        ips200_set_color((status.waypoint_issued != 0U) ? MENU_COLOR_OK : MENU_COLOR_WAIT,
+                         MENU_COLOR_BG);
+        if ((status.waypoint_issued != 0U) && (status.waypoint_count != 0U))
+        {
+            waypoint_index = (uint16)(status.waypoint_index + 1U);
+            waypoint_count = status.waypoint_count;
+            if (waypoint_index > 999U) waypoint_index = 999U;
+            if (waypoint_count > 999U) waypoint_count = 999U;
+            ips200_show_uint(128U, 224U, (uint32)waypoint_index, 3U);
+            ips200_show_uint(160U, 224U, (uint32)waypoint_count, 3U);
+        }
+        else
+        {
+            ips200_show_string(128U, 224U, "---");
+            ips200_show_string(160U, 224U, "---");
+        }
+    }
 
-    menu_draw_recognize_object();
+    if ((0U == s_game_status_cached) ||
+        (status.stage != s_last_game_status.stage))
+    {
+        ips200_set_color((status.stage == STAGE_DEADLOCK_RESET) ? MENU_COLOR_WAIT : MENU_COLOR_TEXT,
+                         MENU_COLOR_BG);
+        ips200_show_string(216U, 224U, menu_stage_text(status.stage));
+    }
+
+    s_last_game_status = status;
+    s_game_status_cached = 1U;
+}
+
+static void menu_update_dynamic_text(uint8 map_ready, uint32 map_age_ms)
+{
+    chassis_pose_t pose = chassis_ctrl_get_pose();
+    float imu_yaw_deg = chassis_imu_get_yaw_deg();
+    int32 pose_yaw_key = menu_float_display_key(pose.yaw_deg, 1U);
+    int32 pose_x_key = menu_float_display_key(pose.x_m, 2U);
+    int32 pose_y_key = menu_float_display_key(pose.y_m, 2U);
+    int32 imu_yaw_key = menu_float_display_key(imu_yaw_deg, 1U);
+
+    menu_update_map_status(map_ready, map_age_ms);
+    ips200_set_color(MENU_COLOR_TEXT, MENU_COLOR_BG);
+    if ((0U == s_dynamic_cached) || (pose_yaw_key != s_last_pose_yaw_key))
+    {
+        ips200_show_float(40U, 188U, pose.yaw_deg, 5U, 1U);
+    }
+    if ((0U == s_dynamic_cached) || (pose_x_key != s_last_pose_x_key))
+    {
+        ips200_show_float(64U, 206U, pose.x_m, 3U, 2U);
+    }
+    if ((0U == s_dynamic_cached) || (pose_y_key != s_last_pose_y_key))
+    {
+        ips200_show_float(144U, 206U, pose.y_m, 3U, 2U);
+    }
+    if ((0U == s_dynamic_cached) || (imu_yaw_key != s_last_imu_yaw_key))
+    {
+        ips200_show_float(240U, 206U, imu_yaw_deg, 5U, 1U);
+    }
+
+    s_last_pose_yaw_key = pose_yaw_key;
+    s_last_pose_x_key = pose_x_key;
+    s_last_pose_y_key = pose_y_key;
+    s_last_imu_yaw_key = imu_yaw_key;
+    s_dynamic_cached = 1U;
+
+    menu_update_recognize_object();
+    menu_update_game_status();
 }
 
 void chassis_menu_init(void)
@@ -313,6 +517,10 @@ void chassis_menu_init(void)
 
     s_need_full_refresh = 1U;
     s_last_map_ready = 0xFFU;
+    s_map_cached = 0U;
+    s_dynamic_cached = 0U;
+    s_recog_cached = 0U;
+    s_game_status_cached = 0U;
 }
 
 void chassis_menu_task_10ms(void)
@@ -329,63 +537,27 @@ void chassis_menu_render_100ms(void)
     uint8 map[APP_LINK_MAP_ROWS][APP_LINK_MAP_COLS];
     uint32 map_age_ms = 0U;
     uint8 map_ready;
-    uint8 full_refresh;
 
     map_ready = menu_map_frame_is_fresh(&map_age_ms);
 
-    /*
-     * 全屏刷新仅在以下情况触发:
-     *   1. 首次上电 (s_need_full_refresh==1)
-     *   2. 地图就绪状态切换 (有图 ↔ 无图)
-     * 其余情况只做局部更新, 避免 100ms 周期重绘导致屏幕闪烁。
-     */
-    full_refresh = (uint8)((0U != s_need_full_refresh) || (map_ready != s_last_map_ready));
-    if (0U != full_refresh)
+    /* 静态布局只在首次进入菜单时绘制一次。 */
+    if (0U != s_need_full_refresh)
     {
-        menu_draw_static_layout(map_ready);
+        menu_draw_static_layout();
         s_need_full_refresh = 0U;
-        s_last_map_ready = map_ready;
-        s_map_cached = 0U;          /* 全屏刷新后缓存失效, 下次强制重绘地图 */
+        s_last_map_ready = 0xFFU;
+        s_map_cached = 0U;
+        s_dynamic_cached = 0U;
+        s_recog_cached = 0U;
+        s_game_status_cached = 0U;
     }
 
     if (map_ready)
     {
-        uint8 map_changed = 0U;
-
         app_link_get_map_snapshot(map);
-
-        /* 比对地图内容是否变化 */
-        if ((0U == s_map_cached) ||
-            (0 != memcmp(map, s_cached_map, sizeof(s_cached_map))))
-        {
-            map_changed = 1U;
-        }
-
-        if (0U != map_changed)
-        {
-            /* 地图内容变了 → 全量重绘格子。 */
-            menu_draw_map_cells(map);
-            memcpy(s_cached_map, map, sizeof(s_cached_map));
-            s_map_cached = 1U;
-        }
-        /* else: 地图没变 → 不碰地图区域, 屏幕保持静止 */
-    }
-    else
-    {
-        /* 地图过期: 仅在状态切换时清空地图区一次 */
-        if (0U != full_refresh)
-        {
-            menu_fill_rect(MENU_MAP_ORIGIN_X, MENU_MAP_ORIGIN_Y,
-                           MENU_MAP_W, MENU_MAP_H, MENU_COLOR_BG);
-            menu_draw_grid_lines();
-            s_map_cached = 0U;
-        }
+        menu_update_map_cells(map);
     }
 
-    /*
-     * 动态文字行每 100ms 必刷新:
-     *   - AGE 数值持续更新 → 用户看到数字在跳就知道摄像头还在工作
-     *   - 陀螺仪/里程计航向与位姿也同步刷新
-     */
-    menu_draw_dynamic_text(map_ready, map_age_ms);
+    /* 地图过期时保留最后一帧；状态栏、数字和识别字段按显示值变化局部更新。 */
+    menu_update_dynamic_text(map_ready, map_age_ms);
 }

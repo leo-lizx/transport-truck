@@ -82,7 +82,7 @@ static uint8  s_imu_is_still = 0U;       /* 最近一次判别结果, 调试可�
  *  Yaw 卡尔曼滤波 (P0-改进 2026-05-02)
  *  状态: x = [angle, bias]ᵀ
  *  - kf_angle  : 当前 yaw 角 (°), 等价于车体 yaw (受 IMU_YAW_SIGN / 轴选择影响)
- *  - kf_bias   : gyro 零偏 (°/s), 在 dps 域, 与 s_gyro_z_bias_dps 物理含义一致
+ *  - kf_bias   : 已做 IMU_YAW_SIGN 修正的 gyro 零偏 (°/s)，与 KF 输入同一符号域
  *  - kf_P[2][2]: 状态协方差
  *  KF 在 5ms 节拍下做"预测 + (静止时)ZUPT 观测 + 角度归一化".
  * ---------------------------------------------------------------------- */
@@ -261,11 +261,12 @@ void chassis_imu_init(void)
     s_yaw_rate_for_d_dps = 0.0f;
 
 #if (CHASSIS_IMU_USE_KALMAN_YAW != 0)
-    /* 步骤 5: KF 状态初值. bias 直接吃掉刚刚 1000 次平均的零偏估计;
+    /* 步骤 5: KF 状态初值. bias 吃掉刚刚 1000 次平均的零偏估计，并转换到
+     *         与 gyro_signed_dps 相同的安装方向修正域;
      *         angle = 0; P 用 config 的初值 (上面静态初始化已设过, 这里
      *         无条件重置一次, 防热复位时残留). */
     s_kf_angle = 0.0f;
-    s_kf_bias  = s_gyro_z_bias_dps;
+    s_kf_bias  = s_gyro_z_bias_dps * IMU_YAW_SIGN;
     s_kf_P[0][0] = CHASSIS_IMU_KF_P0_ANGLE_DEG2;
     s_kf_P[0][1] = 0.0f;
     s_kf_P[1][0] = 0.0f;
@@ -344,8 +345,8 @@ void chassis_imu_update_5ms(void)
      * KF 模式下 bias 由 KF 维护, 这里 yaw_rate_dps 仅用于 D 项软死区通道
      * 和兜底慢通道, 不直接进 yaw 积分. */
 #if (CHASSIS_IMU_USE_KALMAN_YAW != 0)
-    /* KF 路径: 用 KF 自身的 bias, 保持 D 通道 / 兜底逻辑物理含义不变 */
-    yaw_rate_dps = (gyro_z_raw_dps - s_kf_bias) * IMU_YAW_SIGN;
+    /* KF 路径: 原始 gyro 与 bias 必须先统一到安装方向修正域再做减法。 */
+    yaw_rate_dps = gyro_z_raw_dps * IMU_YAW_SIGN - s_kf_bias;
 #else
     yaw_rate_dps = (gyro_z_raw_dps - s_gyro_z_bias_dps) * IMU_YAW_SIGN;
 #endif
@@ -407,7 +408,8 @@ void chassis_imu_update_5ms(void)
         /* 角度归一化到 [-180,180], 同步写回 car_angle 与外部用的 bias 镜像 */
         s_kf_angle = chassis_normalize_angle_deg(s_kf_angle);
         car_angle.yaw = s_kf_angle;
-        s_gyro_z_bias_dps = s_kf_bias;     /* 让旧的 bias 调试访问仍可用 */
+        /* 旧调试镜像保持原始传感器轴符号，避免同一变量运行中改变符号域。 */
+        s_gyro_z_bias_dps = s_kf_bias * IMU_YAW_SIGN;
     }
 #else
     car_angle.yaw += s_yaw_rate_lpf_dps * IMU_DT_S;

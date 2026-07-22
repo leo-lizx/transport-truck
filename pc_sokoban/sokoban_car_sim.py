@@ -38,6 +38,7 @@ from sokoban_validator import (
     plan_scout_phase_v2,
     solve_full,
     solve_level,
+    solve_stage2,
     build_return_path,
     check_deadlock,
     apply_bomb_explosion,
@@ -371,8 +372,11 @@ def _gen_open_map(level: int, box_count: int, wall_density: float,
         if level == 1:
             ok = solve_level(1, m, exit_c) is not None
         else:
-            ok = solve_level(2, m, exit_c, require_scout=True,
-                             box_classes=bc, target_classes=tc) is not None
+            scout = plan_scout_phase_v2(
+                m, exit_c, box_classes=bc, target_classes=tc)
+            mapping = scout.get('box_to_target_idx')
+            ok = bool(scout.get('all_visited') and mapping and
+                      solve_stage2(m, scout['player_after_scout'], mapping))
         if not ok:
             continue
 
@@ -714,6 +718,10 @@ class CarSim:
     def plan_and_execute(self):
         self._snap('PLAN', '规划推箱/炸弹路径 (推宏 A* + 时间成本搜索)')
         fm = self.full_map()
+        if self.level >= 2 and self.mapping is None:
+            self._snap('DEADLOCK', '分类映射不完整，禁止降级为任意配对')
+            self.log.append('[DEADLOCK_RESET] 分类映射失败')
+            return False
         res = solve_full(fm, self.player, self.mapping, home_pos=self.start)
         if res is None or not res['is_solved']:
             self._snap('DEADLOCK', '无解 → 回发车区静止 3s 复位')

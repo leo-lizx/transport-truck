@@ -5,9 +5,10 @@
  * 用途:
  *   游戏主状态机 STAGE_RECOGNIZE_MAP 的真正内容由本模块承担:
  *     1) 提取地图中所有 BOX 与 TARGET 坐标
- *     2) 小规模精确 tour / BFS 最近观察点计算访问顺序 (与 PC 验证器 plan_scout_phase_v2 对齐)
+ *     2) 小规模按“平移格数 + 四向转角”的精确 tour / BFS 最近观察点计算访问顺序
+ *        (与 PC 验证器 plan_scout_phase_v2 对齐)
  *     3) 对每个待识别物体:
- *          - 移动到侧面观察点 (BFS 选最近的可立足格)
+ *          - 移动到 Tour 选定的侧面观察点（兼顾路程和四向转角）
  *          - 仅依赖编码器里程计与陀螺仪确认到达观察点
  *          - 原地旋转车头朝向物体
  *          - 等待视觉端 BOX_CLASS 帧持续广播, 多数票稳定后采样
@@ -103,6 +104,9 @@ void App_Recognize_Reset(void);
  * @param player_pos    当前车体网格坐标
  * @param has_bomb      地图是否含炸弹 (= map_has_bomb 结果)
  * @param level         当前关卡 (1=Stage1 跳过识别, ≥2 = 必走识别)
+ * @param nav_heading_deg_io [in,out] 当前逻辑导航航向；输入和输出均限定为
+ *        0/90/180/-90 度。观察转向完成后写回该物体对应的正交航向，
+ *        后续平移直接保持此值，不根据 IMU 实测角重新选择航向。
  * @param box_to_target_out  [out] 长度 SOKOBAN_MAX_BOXES, DONE_OK 时被填充
  *
  * @return AppRecognizeStatus_e
@@ -111,6 +115,7 @@ AppRecognizeStatus_e App_Recognize_Tick(uint8 map[MAP_ROWS][MAP_COLS],
                                         Point_t player_pos,
                                         uint8 has_bomb,
                                         uint8 level,
+                                        float *nav_heading_deg_io,
                                         uint8 box_to_target_out[SOKOBAN_MAX_BOXES]);
 
 /**

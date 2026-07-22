@@ -71,6 +71,7 @@ typedef struct {
 #define SOKOBAN_MAX_WAYPOINTS   200     // 路点数组上限
 #define SOKOBAN_PUSH_BITMAP_BYTES ((SOKOBAN_MAX_ACTIONS + 7U) / 8U)
 #define ALGO_NAV_DISTANCE_UNREACHABLE (0xFFU)
+#define ALGO_NAV_TIME_COST_UNREACHABLE (0xFFFFU)
 
 /* ======================================================================
  *  数据类型
@@ -158,6 +159,30 @@ uint8 Algo_Nav_BFS_Flood(const uint8 map[MAP_ROWS][MAP_COLS],
                          uint8 reach[MAP_ROWS][MAP_COLS],
                          uint8 distance_steps[MAP_ROWS][MAP_COLS]);
 
+/**
+ * @brief 以“移动格数 + 方向段停站”为代价的方向状态寻路。
+ *
+ * 状态为 (网格, 上一步平移方向)，代价单位为 100ms：每移动一格 1，
+ * 每开始一个新方向段额外 4。initial_direction 可传 SOKO_ACT_NONE，表示
+ * 从停车状态开始；result_path / end_direction / cost_units 均允许传 NULL。
+ *
+ * 与普通导航 BFS、单箱求解共享文件级 scratch，不可重入。
+ */
+uint8 Algo_Nav_Time_Path(const uint8 map[MAP_ROWS][MAP_COLS],
+                         Point_t start,
+                         Point_t end,
+                         SokoAction_e initial_direction,
+                         NavPath_t *result_path,
+                         uint16 *cost_units,
+                         SokoAction_e *end_direction);
+
+/** 一次方向状态扩散，返回到每个网格的最小时间代价及对应到达方向。 */
+uint8 Algo_Nav_Time_Flood(const uint8 map[MAP_ROWS][MAP_COLS],
+                          Point_t start,
+                          SokoAction_e initial_direction,
+                          uint16 cost_units[MAP_ROWS][MAP_COLS],
+                          uint8 arrival_direction[MAP_ROWS][MAP_COLS]);
+
 /** 基于 Algo_Nav_BFS_Flood 结果查询单点是否可达 */
 uint8 Algo_Nav_Is_Reachable(const uint8 reach[MAP_ROWS][MAP_COLS],
                             Point_t target);
@@ -188,19 +213,30 @@ typedef enum {
 /**
  * @brief 启动第一关分时全局搜索。
  *
- * 搜索目标为“动作时间 + 航点停站/Snap + 完成后直线到 home_pos 的返库时间”。
+ * 搜索目标为“动作时间 + 航点停站/Snap + 完成后按底盘 X/Y 轴执行的返库时间”。
  * 本模块不可重入；Begin 后只能由同一主循环周期调用 Step，直至终态或 Cancel。
  */
 uint8 Sokoban_Stage1_Search_Begin(const uint8 map[MAP_ROWS][MAP_COLS],
                                  Point_t player_pos,
                                  Point_t home_pos);
 
-/** 每次最多评估 max_pair_evals 个箱-目标候选，适合拆到 5ms tick 中运行。 */
-SokoSearchStatus_e Sokoban_Stage1_Search_Step(uint8 max_pair_evals,
+/** 每次最多推进 max_work_units 个内部工作单元，适合拆到 5ms tick 中运行。 */
+SokoSearchStatus_e Sokoban_Stage1_Search_Step(uint8 max_work_units,
                                               SokoFullSolution_t *result);
 
 /** 取消尚未结束的第一关分时搜索并释放上下文。 */
 void Sokoban_Stage1_Search_Cancel(void);
+
+/** 启动第二/三关固定映射的分时搜索，目标同样包含完成后的返库时间。 */
+uint8 Sokoban_Stage2_Search_Begin(const uint8 map[MAP_ROWS][MAP_COLS],
+                                 Point_t player_pos,
+                                 const uint8 box_to_target_idx[],
+                                 uint8 box_count,
+                                 Point_t home_pos);
+
+/** 第二/三关分时搜索；每拍最多推进 max_work_units 个内部工作单元。 */
+SokoSearchStatus_e Sokoban_Stage2_Search_Step(uint8 max_work_units,
+                                              SokoFullSolution_t *result);
 
 /**
  * @brief  第二阶段求解 — 指定箱→目标映射（分类模式）
@@ -272,10 +308,10 @@ uint16 Sokoban_Seq_To_Waypoints(const SokoActionSeq_t *seq,
                                 SokoWaypointPath_t *wp_path);
 
 /**
- * @brief 关卡完成后的直线返库航点。
+ * @brief 关卡完成后的单命令返库航点。
  *
  * 通关后不再按虚拟墙和炸弹绕行，只生成一个指向车库的关键航点，供底盘
- * POINT_NAV 直接走直线，并在到达后执行视觉 Snap/航向校准。
+ * POINT_NAV 在同一命令内依次完成 X/Y 轴运动；到达后的视觉 Snap 由底盘配置决定。
  */
 uint8 Sokoban_Build_Return_Waypoints(const uint8 map[MAP_ROWS][MAP_COLS],
                                      Point_t player_pos,
@@ -316,10 +352,10 @@ uint8 Sokoban_Solve_Push_Bomb(const uint8 map[MAP_ROWS][MAP_COLS],
  *
  * 本函数做联合搜索, 一次性给出可直接执行的完整炸弹计划:
  *   1. 提取全部炸弹;
- *   2. 遍历每一面内部墙体 W, 模拟 3×3 爆破后用 Algo_Nav_BFS 评估破局收益;
- *   3. 仅对"有望刷新最优分"的墙体, 按到 W 的曼哈顿距离从近到远遍历炸弹 B,
- *      用 Sokoban_Solve_Push_Bomb 验证 B 能否真正被推到 W;
- *   4. 取得分最高且"存在可推炸弹"的 (B, W), 输出推炸弹动作序列。
+ *   2. 遍历每一面内部墙体 W，模拟 3×3 爆破并检查目标可达性;
+ *   3. 对每个 (B, W) 组合实际求解推炸弹动作，不以曼哈顿距离替代可行性;
+ *   4. 按“不可达目标罚时 + 推炸弹执行时间 + 爆破后关键目标导航时间”取最小值，
+ *      清墙数量仅作为同成本时的次级判据。
  *
  * 其余炸弹在求解 B→W 时仍视为障碍 (符合"一次只引爆一颗"的物理), 多颗炸弹
  * 由上层在每次爆炸后重新规划 (STAGE_EXECUTE → STAGE_PLAN_PATH) 逐颗消化。
@@ -339,6 +375,16 @@ uint8 Sokoban_Plan_Bomb(const uint8 map[MAP_ROWS][MAP_COLS],
                         Point_t *out_bomb_pos,
                         Point_t *out_wall_pos,
                         SokoActionSeq_t *out_seq);
+
+/** 启动/推进炸弹联合搜索；Step 每拍最多推进 max_work_units 个内部工作单元。 */
+uint8 Sokoban_Bomb_Search_Begin(const uint8 map[MAP_ROWS][MAP_COLS],
+                                Point_t player_pos,
+                                Point_t blocked_target);
+SokoSearchStatus_e Sokoban_Bomb_Search_Step(uint8 max_work_units,
+                                            Point_t *out_bomb_pos,
+                                            Point_t *out_wall_pos,
+                                            SokoActionSeq_t *out_seq);
+void Sokoban_Bomb_Search_Cancel(void);
 
 /* ======================================================================
  *  顶层迭代求解（推箱 + 多炸弹一气呵成）

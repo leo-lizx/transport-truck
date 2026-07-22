@@ -7,11 +7,11 @@
  *--------------------------------------------------------------------------------------------------------------------
  * 算法概述:
  *   1. 从地图提取所有 BOX 和 TARGET 坐标 (Stage1 跳过本流程)
- *   2. 6 个以内物体用精确 tour 选首项；更多物体退化为 BFS 最近观察点
+ *   2. 6 个以内物体按“平移格数 + 四向转角”精确规划 tour；更多物体退化为 BFS 最近观察点
  *   3. 对每个物体:
- *        - 找观察点: 与物体 4-邻接的可立足空地, BFS 求最近
- *        - 以最近的 90° 基准航向移动到观察点，仅依赖里程计到位
- *        - 旋转车头朝物体 (chassis_ctrl_rotate_to_deg + chassis_ctrl_is_arrived)
+ *        - 在与物体 4-邻接的可立足格中，由 Tour 选择兼顾路程和转角的观察点
+ *        - 保持状态机记录的 90° 基准航向移动到观察点，仅依赖里程计到位
+ *        - 按“物体格-观察格”旋转到 0/90/180/-90° 朝向物体
  *        - 等多数票稳定: 在 SAMPLE_WINDOW_MS 内统计 BOX_CLASS 帧, 占比 ≥ MAJORITY_THRESH 即确认
  *        - 保持采样后的车头角, 直接继续下一个物体
  *   4. 所有 box → class_id, target → class_id 收齐后, 按相同 class_id 与静态推送可达性配对生成
@@ -27,12 +27,7 @@
 #include "app_link.h"
 #include "chassis_ctrl.h"
 #include "chassis_config.h"
-#include <math.h>
 #include <string.h>
-
-#ifndef PI_F
-#define PI_F (3.14159265358979323846f)
-#endif
 
 /*===================================================================================================================
  * 调参 (集中, 后续可挪到 chassis_config.h)
@@ -46,6 +41,9 @@
 
 /** 最少采样次数 — 不到这个数即使比例够也再等等 */
 #define RECOG_MIN_SAMPLES              (8U)
+
+/** 连续三张新鲜同类帧即可快速确认；不满足时仍保留 8 帧多数票兜底。 */
+#define RECOG_FAST_CONSEC_SAMPLES      (3U)
 
 /** 视觉端无识别 (class_id=0) 容忍上限: B16 — 改为"连续 N 帧 None"判据.
  *  视觉端 BOX_CLASS 帧约 50~100ms/帧, 连续 30 帧 ≈ 1.5~3s 持续无识别才失败.
@@ -80,6 +78,11 @@
 #define RECOG_TOUR_MASK_COUNT          (1U << RECOG_EXACT_TOUR_ITEM_LIMIT)
 #define RECOG_TOUR_MAX_CANDIDATES      (RECOG_EXACT_TOUR_ITEM_LIMIT * 4U)
 #define RECOG_ROUTE_COST_INF           (0xFFFFU)
+
+/** 90° 观察转向的等效路程代价（格）。当前 120°/s 角速度下，单次 90°
+ *  转向连同加减速和到位稳定明显慢于单格平移；取 4 格用于优先减少大角度
+ *  转向，同时仍允许绕行代价较大时选择更近的观察格。 */
+#define RECOG_TOUR_QUARTER_TURN_COST   (4U)
 
 /*===================================================================================================================
  * 内部数据结构
@@ -119,16 +122,25 @@ static uint8   s_nav_replay_map[MAP_ROWS][MAP_COLS];
 static uint16 s_sample_ticks    = 0U;
 static uint16 s_sample_total    = 0U;
 static uint16 s_sample_consec_none = 0U;     /* B16: 连续 None 计数, 任一有效帧清零 */
+static uint8  s_sample_last_class = 0U;
+static uint8  s_sample_consec_class = 0U;
 static uint16 s_class_hist[RECOG_CLASS_ID_MAX + 1U] = {0};
 static uint32 s_last_seen_frame_id = 0U;     /* 已采样过的最大 frame_id, 防重复计票 */
 
-/* 识别 tour 选点 scratch: 小规模 DP 约 5.5KB BSS, 低于单次新增 10KB 约束。 */
+/* 识别 tour 选点 scratch: 小规模 DP、父节点和时间距离约 8KB BSS。 */
 static uint8  s_pick_distance[MAP_ROWS][MAP_COLS];
-static uint8  s_tour_start_cost[RECOG_TOUR_MAX_CANDIDATES];
-static uint8  s_tour_edge_cost[RECOG_TOUR_MAX_CANDIDATES][RECOG_TOUR_MAX_CANDIDATES];
+static uint16 s_pick_time_cost[MAP_ROWS][MAP_COLS];
+static uint16 s_tour_start_cost[RECOG_TOUR_MAX_CANDIDATES];
+static uint16 s_tour_edge_cost[RECOG_TOUR_MAX_CANDIDATES][RECOG_TOUR_MAX_CANDIDATES];
 static uint16 s_tour_dp[RECOG_TOUR_MASK_COUNT][RECOG_TOUR_MAX_CANDIDATES];
 static uint8  s_tour_first[RECOG_TOUR_MASK_COUNT][RECOG_TOUR_MAX_CANDIDATES];
+static uint8  s_tour_parent[RECOG_TOUR_MASK_COUNT][RECOG_TOUR_MAX_CANDIDATES];
+static uint8  s_tour_cached_item[RECOG_EXACT_TOUR_ITEM_LIMIT];
+static Point_t s_tour_cached_observe[RECOG_EXACT_TOUR_ITEM_LIMIT];
+static uint8  s_tour_cached_count;
+static uint8  s_tour_cached_next;
 static AppRecogClearPlan_t s_pick_clear_plan;
+static NavPath_t s_pick_nav_path;
 /* 重复类别匹配 scratch：反向推箱 BFS 共用一张距离图和一个 12×16 队列，约 0.6KB BSS。 */
 static Point_t s_match_queue[MAP_ROWS * MAP_COLS];
 static uint16  s_match_cost[SOKOBAN_MAX_BOXES][SOKOBAN_MAX_BOXES];
@@ -138,44 +150,71 @@ static uint16  s_match_cost[SOKOBAN_MAX_BOXES][SOKOBAN_MAX_BOXES];
  *=================================================================================================================*/
 
 /**
- * 计算"车头朝物体"的目标 yaw (度). 约定见文件头.
+ * 根据相邻网格关系计算"车头朝物体"的四正交目标 yaw (度).
  *  - 车体 +Y 为前进方向, +X 为右
- *  - yaw 是车体相对全局坐标系 +X 的角度 (CCW 正)
- *  - 朝物体 = 车体 +Y 指向物体 → 解得 yaw = atan2(Δx, Δy)
+ *  - 地图 +X 向右、+Y 向下
+ *  - 观察点必须与物体 4-邻接；不使用里程计浮点位置，避免位置漂移
+ *    被 atan2 放大成任意观察角。
  */
-static float recog_calc_face_yaw_deg(Point_t observe, Point_t target)
+static uint8 recog_face_heading_index(Point_t observe, Point_t target,
+                                      uint8 *heading_index_out)
 {
-    /* B7: observe 不用格中心, 用底盘 odom 真实位姿 (车不一定停在格正中心,
-     * 5cm 偏差 + 14cm 邻接距离 → 格中心算的 yaw 最多偏 20°, 够把物体甩出视场). */
-    chassis_pose_t pose = chassis_ctrl_get_pose();
-    float ox_m = pose.x_m;
-    float oy_m = pose.y_m;
-    float tx_m = chassis_grid_x_to_m((uint8)target.x);
-    float ty_m = chassis_grid_y_to_m((uint8)target.y);
-    float dx   = tx_m - ox_m;
-    float dy   = ty_m - oy_m;
-    float yaw_rad;
+    int16 dx;
+    int16 dy;
 
-    (void)observe;     /* 仅供调试观测保留, 不再参与计算 */
+    if (heading_index_out == NULL) { return 0U; }
 
-    /* 退化情形: 重合 (理论上不会发生, 观察点必与物体相邻); 留前向 0° 兜底 */
-    if ((dx == 0.0f) && (dy == 0.0f))
-    {
-        return 0.0f;
-    }
-    yaw_rad = atan2f(dx, dy);
-    return yaw_rad * (180.0f / PI_F);
+    dx = (int16)target.x - (int16)observe.x;
+    dy = (int16)target.y - (int16)observe.y;
+
+    if ((dx == 0) && (dy == 1))  { *heading_index_out = 0U; return 1U; }
+    if ((dx == 1) && (dy == 0))  { *heading_index_out = 1U; return 1U; }
+    if ((dx == 0) && (dy == -1)) { *heading_index_out = 2U; return 1U; }
+    if ((dx == -1) && (dy == 0)) { *heading_index_out = 3U; return 1U; }
+
+    return 0U;
 }
 
-static void recog_move_to_grid_keep_current_yaw(Point_t target)
+static uint8 recog_nav_heading_index(float yaw_deg)
 {
-    chassis_pose_t pose = chassis_ctrl_get_pose();
+    float snapped = chassis_snap_yaw_to_cardinal_deg(yaw_deg);
 
-    /* snap 到最近 90° 倍数: 面向物体采样后 yaw 是任意角, 直接保持会让
-     * 轴对齐平移控制器两轴耦合 → 走斜线/限速失真, 故先吸附再派发 */
+    if (snapped > 45.0f && snapped < 135.0f) { return 1U; }
+    if (snapped >= 135.0f || snapped <= -135.0f) { return 2U; }
+    if (snapped < -45.0f) { return 3U; }
+    return 0U;
+}
+
+static uint8 recog_quarter_turns(uint8 from_heading, uint8 to_heading)
+{
+    uint8 diff = (from_heading > to_heading)
+               ? (uint8)(from_heading - to_heading)
+               : (uint8)(to_heading - from_heading);
+    return (diff > 2U) ? (uint8)(4U - diff) : diff;
+}
+
+static uint8 recog_calc_face_yaw_deg(Point_t observe, Point_t target,
+                                     float *yaw_deg_out)
+{
+    static const float yaw_deg[4] = {0.0f, 90.0f, 180.0f, -90.0f};
+    uint8 heading_index;
+
+    if (yaw_deg_out == NULL ||
+        !recog_face_heading_index(observe, target, &heading_index))
+    {
+        return 0U;
+    }
+    *yaw_deg_out = yaw_deg[heading_index];
+    return 1U;
+}
+
+static void recog_move_to_grid_keep_nav_heading(Point_t target,
+                                                float nav_heading_deg)
+{
+    /* 航向由上层状态机显式维护；不读取当前 IMU 后重新选择最近基准角。 */
     chassis_ctrl_move_to_m(chassis_grid_x_to_m((uint8)target.x),
                            chassis_grid_y_to_m((uint8)target.y),
-                           chassis_snap_yaw_to_cardinal_deg(pose.yaw_deg));
+                           nav_heading_deg);
 }
 
 /* 识别巡航的中间点与最终观察点均只使用编码器和陀螺仪到位。 */
@@ -195,6 +234,8 @@ static void sample_state_reset(void)
     s_sample_ticks       = 0U;
     s_sample_total       = 0U;
     s_sample_consec_none = 0U;
+    s_sample_last_class  = 0U;
+    s_sample_consec_class = 0U;
     /* 丢弃转向完成前已经落地的最后一帧，只统计进入 SAMPLE 后的新帧。 */
     app_link_get_box_class_snapshot(&snap);
     s_last_seen_frame_id = (snap.valid != 0U) ? snap.frame_id : 0U;
@@ -211,6 +252,7 @@ static int16 sample_majority_step(uint8 expect_kind)
 {
     app_link_box_class_snapshot_t snap;
     uint32 now_ms;
+    uint8 histogram_changed = 0U;
     app_link_get_box_class_snapshot(&snap);
     now_ms = app_link_get_ms();
 
@@ -236,17 +278,35 @@ static int16 sample_majority_step(uint8 expect_kind)
         else if (snap.class_id == 0U)
         {
             s_sample_consec_none++;            /* B16: 连续 None */
+            s_sample_last_class = 0U;
+            s_sample_consec_class = 0U;
         }
         else if (snap.class_id <= (uint8)RECOG_CLASS_ID_MAX)
         {
             s_class_hist[snap.class_id]++;
             s_sample_total++;
             s_sample_consec_none = 0U;          /* B16: 收到有效帧 → 清零 */
+            histogram_changed = 1U;
+            if (s_sample_last_class == snap.class_id)
+            {
+                if (s_sample_consec_class < 255U) { s_sample_consec_class++; }
+            }
+            else
+            {
+                s_sample_last_class = snap.class_id;
+                s_sample_consec_class = 1U;
+            }
+            if (s_sample_consec_class >= (uint8)RECOG_FAST_CONSEC_SAMPLES)
+            {
+                return (int16)snap.class_id;
+            }
         }
         else
         {
             /* 越界视为 None */
             s_sample_consec_none++;
+            s_sample_last_class = 0U;
+            s_sample_consec_class = 0U;
         }
     }
 
@@ -257,7 +317,8 @@ static int16 sample_majority_step(uint8 expect_kind)
     }
 
     /* 满足最少采样数后, 看最高票占比 */
-    if (s_sample_total >= (uint16)RECOG_MIN_SAMPLES)
+    if (histogram_changed != 0U &&
+        s_sample_total >= (uint16)RECOG_MIN_SAMPLES)
     {
         uint8  best_cls = 0U;
         uint16 best_cnt = 0U;
@@ -368,9 +429,11 @@ static uint8 recog_is_observe_standable(const uint8 map[MAP_ROWS][MAP_COLS],
     return (uint8)(map[y][x] == MAP_EMPTY || map[y][x] == MAP_TARGET);
 }
 
-static uint16 observe_distance_from_flood(const uint8 map[MAP_ROWS][MAP_COLS],
-                                          const uint8 distance_steps[MAP_ROWS][MAP_COLS],
-                                          Point_t object)
+static uint16 observe_route_cost_from_flood(const uint8 map[MAP_ROWS][MAP_COLS],
+                                            const uint16 time_cost[MAP_ROWS][MAP_COLS],
+                                            Point_t object,
+                                            uint8 start_heading,
+                                            Point_t *best_observe)
 {
     static const int8 dr[4] = {-1, 1, 0, 0};
     static const int8 dc[4] = {0, 0, -1, 1};
@@ -380,11 +443,23 @@ static uint16 observe_distance_from_flood(const uint8 map[MAP_ROWS][MAP_COLS],
     {
         int8 y = (int8)(object.y + dr[d]);
         int8 x = (int8)(object.x + dc[d]);
+        Point_t candidate;
+        uint8 heading;
+        uint16 cost;
+
         if (!recog_is_observe_standable(map, y, x)) { continue; }
-        if (distance_steps[y][x] < (uint8)ALGO_NAV_DISTANCE_UNREACHABLE &&
-            (uint16)distance_steps[y][x] < best)
+        if (time_cost[y][x] >= (uint16)ALGO_NAV_TIME_COST_UNREACHABLE) { continue; }
+
+        candidate.x = x;
+        candidate.y = y;
+        if (!recog_face_heading_index(candidate, object, &heading)) { continue; }
+        cost = time_cost[y][x] +
+               (uint16)recog_quarter_turns(start_heading, heading) *
+               (uint16)RECOG_TOUR_QUARTER_TURN_COST;
+        if (cost < best)
         {
-            best = (uint16)distance_steps[y][x];
+            best = cost;
+            if (best_observe != NULL) { *best_observe = candidate; }
         }
     }
     return best;
@@ -393,23 +468,29 @@ static uint16 observe_distance_from_flood(const uint8 map[MAP_ROWS][MAP_COLS],
 /**
  * 小规模精确 tour:
  *   - 节点是每个未访问物体的所有可站观察格;
- *   - DP 状态为 (已访问物体集合, 当前观察格), 求覆盖全部物体的最短总步数;
- *   - 只输出当前应访问的首个物体, 真实导航仍由 prepare_nav_plan() 重新规划。
+ *   - DP 状态为 (已访问物体集合, 当前观察格), 求平移与四向转角的最小总代价;
+ *   - 同时输出首个物体和观察格，执行阶段不得丢弃 Tour 选定的观察方向。
  */
 static uint8 pick_exact_direct_tour(const uint8 map[MAP_ROWS][MAP_COLS],
                                     Point_t cur,
-                                    uint8 *out_idx)
+                                    float nav_heading_deg,
+                                    uint8 *out_idx,
+                                    Point_t *out_observe)
 {
     static const int8 dr[4] = {-1, 1, 0, 0};
     static const int8 dc[4] = {0, 0, -1, 1};
     uint8 item_idx[RECOG_EXACT_TOUR_ITEM_LIMIT];
     uint8 cand_item[RECOG_TOUR_MAX_CANDIDATES];
+    uint8 cand_heading[RECOG_TOUR_MAX_CANDIDATES];
     Point_t cand_pos[RECOG_TOUR_MAX_CANDIDATES];
     uint8 item_count = 0U;
     uint8 cand_count = 0U;
     uint8 full_mask;
     uint16 best_total = RECOG_ROUTE_COST_INF;
-    uint8 best_first = 0xFFU;
+    uint8 best_end_candidate = 0xFFU;
+    uint8 start_heading = recog_nav_heading_index(nav_heading_deg);
+
+    if (out_idx == NULL || out_observe == NULL) { return 0U; }
 
     for (uint8 i = 0U; i < s_item_count; ++i)
     {
@@ -432,6 +513,11 @@ static uint8 pick_exact_direct_tour(const uint8 map[MAP_ROWS][MAP_COLS],
             cand_pos[cand_count].x = x;
             cand_pos[cand_count].y = y;
             cand_item[cand_count] = local;
+            if (!recog_face_heading_index(cand_pos[cand_count], object,
+                                          &cand_heading[cand_count]))
+            {
+                return 0U;
+            }
             cand_count++;
             has_candidate = 1U;
         }
@@ -441,30 +527,38 @@ static uint8 pick_exact_direct_tour(const uint8 map[MAP_ROWS][MAP_COLS],
 
     memset(s_tour_dp, 0xFF, sizeof(s_tour_dp));
     memset(s_tour_first, 0xFF, sizeof(s_tour_first));
-    memset(s_tour_start_cost, ALGO_NAV_DISTANCE_UNREACHABLE, sizeof(s_tour_start_cost));
-    memset(s_tour_edge_cost, ALGO_NAV_DISTANCE_UNREACHABLE, sizeof(s_tour_edge_cost));
+    memset(s_tour_parent, 0xFF, sizeof(s_tour_parent));
+    memset(s_tour_start_cost, 0xFF, sizeof(s_tour_start_cost));
+    memset(s_tour_edge_cost, 0xFF, sizeof(s_tour_edge_cost));
 
-    if (!Algo_Nav_BFS_Flood(map, cur, NULL, s_pick_distance)) { return 0U; }
+    if (!Algo_Nav_Time_Flood(map, cur, SOKO_ACT_NONE,
+                             s_pick_time_cost, NULL)) { return 0U; }
     for (uint8 c = 0U; c < cand_count; ++c)
     {
-        s_tour_start_cost[c] = s_pick_distance[cand_pos[c].y][cand_pos[c].x];
+        s_tour_start_cost[c] = s_pick_time_cost[cand_pos[c].y][cand_pos[c].x];
     }
 
     for (uint8 from = 0U; from < cand_count; ++from)
     {
-        if (!Algo_Nav_BFS_Flood(map, cand_pos[from], NULL, s_pick_distance)) { continue; }
+        if (!Algo_Nav_Time_Flood(map, cand_pos[from], SOKO_ACT_NONE,
+                                 s_pick_time_cost, NULL)) { continue; }
         for (uint8 to = 0U; to < cand_count; ++to)
         {
-            s_tour_edge_cost[from][to] = s_pick_distance[cand_pos[to].y][cand_pos[to].x];
+            s_tour_edge_cost[from][to] =
+                s_pick_time_cost[cand_pos[to].y][cand_pos[to].x];
         }
     }
 
     for (uint8 c = 0U; c < cand_count; ++c)
     {
         uint8 item_bit = (uint8)(1U << cand_item[c]);
-        if (s_tour_start_cost[c] >= (uint8)ALGO_NAV_DISTANCE_UNREACHABLE) { continue; }
-        s_tour_dp[item_bit][c] = (uint16)s_tour_start_cost[c];
-        s_tour_first[item_bit][c] = cand_item[c];
+        if (s_tour_start_cost[c] >= (uint16)ALGO_NAV_TIME_COST_UNREACHABLE) { continue; }
+        s_tour_dp[item_bit][c] = (uint16)s_tour_start_cost[c] +
+            (uint16)recog_quarter_turns(start_heading, cand_heading[c]) *
+            (uint16)RECOG_TOUR_QUARTER_TURN_COST;
+        /* 必须保留首个候选观察格，而不只是物体索引；否则执行阶段重新
+         * 选择最近观察格，会破坏 DP 已计算出的全局 Tour。 */
+        s_tour_first[item_bit][c] = c;
     }
 
     full_mask = (uint8)((1U << item_count) - 1U);
@@ -482,14 +576,19 @@ static uint8 pick_exact_direct_tour(const uint8 map[MAP_ROWS][MAP_COLS],
                 uint16 next_cost;
 
                 if ((mask & to_bit) != 0U) { continue; }
-                if (s_tour_edge_cost[from][to] >= (uint8)ALGO_NAV_DISTANCE_UNREACHABLE) { continue; }
+                if (s_tour_edge_cost[from][to] >=
+                    (uint16)ALGO_NAV_TIME_COST_UNREACHABLE) { continue; }
 
                 next_mask = (uint8)(mask | to_bit);
-                next_cost = (uint16)(base_cost + (uint16)s_tour_edge_cost[from][to]);
+                next_cost = (uint16)(base_cost +
+                    (uint16)s_tour_edge_cost[from][to] +
+                    (uint16)recog_quarter_turns(cand_heading[from], cand_heading[to]) *
+                    (uint16)RECOG_TOUR_QUARTER_TURN_COST);
                 if (next_cost < s_tour_dp[next_mask][to])
                 {
                     s_tour_dp[next_mask][to] = next_cost;
                     s_tour_first[next_mask][to] = s_tour_first[mask][from];
+                    s_tour_parent[next_mask][to] = from;
                 }
             }
         }
@@ -497,34 +596,115 @@ static uint8 pick_exact_direct_tour(const uint8 map[MAP_ROWS][MAP_COLS],
 
     for (uint8 c = 0U; c < cand_count; ++c)
     {
-        if (s_tour_dp[full_mask][c] < best_total)
+        uint16 terminal_cost = RECOG_ROUTE_COST_INF;
+        uint16 total_cost;
+        if (s_tour_dp[full_mask][c] >= RECOG_ROUTE_COST_INF) { continue; }
+
+        /* 识别结束后立即进入推箱；把最后观察点到任一箱子观察侧的时间
+         * 作为终端下界，避免 Tour 为省最后一步而停在远离全部箱子的目标旁。 */
+        for (uint8 to = 0U; to < cand_count; ++to)
         {
-            best_total = s_tour_dp[full_mask][c];
-            best_first = s_tour_first[full_mask][c];
+            uint8 global_item = item_idx[cand_item[to]];
+            if (s_items[global_item].kind != APP_LINK_OBJ_KIND_BOX) { continue; }
+            if (s_tour_edge_cost[c][to] < terminal_cost)
+            {
+                terminal_cost = s_tour_edge_cost[c][to];
+            }
+        }
+        if (terminal_cost >= RECOG_ROUTE_COST_INF) { terminal_cost = 0U; }
+        total_cost = (uint16)(s_tour_dp[full_mask][c] + terminal_cost);
+        if (total_cost < best_total)
+        {
+            best_total = total_cost;
+            best_end_candidate = c;
         }
     }
 
-    if (best_first == 0xFFU) { return 0U; }
-    *out_idx = item_idx[best_first];
+    if (best_end_candidate == 0xFFU) { return 0U; }
+
+    /* 一次回溯保存完整 Tour；后续物体直接消费缓存，避免每次采样后重复
+     * 运行 1+候选数 次方向状态扩散。地图发生清障时 Reset 会废弃缓存。 */
+    {
+        uint8 mask = full_mask;
+        uint8 node = best_end_candidate;
+        uint8 write = item_count;
+        while (write > 0U && node != 0xFFU)
+        {
+            uint8 bit = (uint8)(1U << cand_item[node]);
+            uint8 previous = s_tour_parent[mask][node];
+            --write;
+            s_tour_cached_item[write] = item_idx[cand_item[node]];
+            s_tour_cached_observe[write] = cand_pos[node];
+            mask = (uint8)(mask & (uint8)~bit);
+            node = previous;
+        }
+        if (write != 0U) { return 0U; }
+        s_tour_cached_count = item_count;
+        s_tour_cached_next = 1U;
+    }
+
+    *out_idx = s_tour_cached_item[0];
+    *out_observe = s_tour_cached_observe[0];
     return 1U;
 }
 
 static uint8 pick_nearest_direct_item(const uint8 map[MAP_ROWS][MAP_COLS],
-                                      Point_t cur)
+                                      Point_t cur,
+                                      float nav_heading_deg,
+                                      Point_t *out_observe)
 {
+    Point_t first_observe[2U * RECOG_MAX_TARGETS];
+    uint16 first_cost[2U * RECOG_MAX_TARGETS];
     uint8 best = 0xFFU;
+    uint8 start_heading = recog_nav_heading_index(nav_heading_deg);
     uint16 best_cost = RECOG_ROUTE_COST_INF;
 
-    if (!Algo_Nav_BFS_Flood(map, cur, NULL, s_pick_distance)) { return 0xFFU; }
+    if (out_observe == NULL) { return 0xFFU; }
+
+    if (!Algo_Nav_Time_Flood(map, cur, SOKO_ACT_NONE,
+                             s_pick_time_cost, NULL)) { return 0xFFU; }
     for (uint8 i = 0U; i < s_item_count; ++i)
     {
-        uint16 cost;
-        if (s_items[i].visited) { continue; }
-        cost = observe_distance_from_flood(map, s_pick_distance, s_items[i].pos);
-        if (cost < best_cost)
+        first_cost[i] = RECOG_ROUTE_COST_INF;
+        if (!s_items[i].visited)
         {
-            best_cost = cost;
+            first_cost[i] = observe_route_cost_from_flood(
+                map, s_pick_time_cost, s_items[i].pos, start_heading,
+                &first_observe[i]);
+        }
+    }
+
+    /* 超出精确 DP 上限时使用两步前瞻：比较“本次访问 + 下一物体最小代价”，
+     * 避免纯最近邻在大地图上反复横穿。每个候选只额外做一次方向状态扩散。 */
+    for (uint8 i = 0U; i < s_item_count; ++i)
+    {
+        uint16 score;
+        uint16 next_best = RECOG_ROUTE_COST_INF;
+        uint8 face_heading;
+        if (first_cost[i] >= RECOG_ROUTE_COST_INF ||
+            !recog_face_heading_index(first_observe[i], s_items[i].pos,
+                                      &face_heading)) {
+            continue;
+        }
+        if (Algo_Nav_Time_Flood(map, first_observe[i], SOKO_ACT_NONE,
+                                s_pick_time_cost, NULL))
+        {
+            for (uint8 j = 0U; j < s_item_count; ++j)
+            {
+                uint16 next_cost;
+                if (j == i || s_items[j].visited) continue;
+                next_cost = observe_route_cost_from_flood(
+                    map, s_pick_time_cost, s_items[j].pos, face_heading, NULL);
+                if (next_cost < next_best) next_best = next_cost;
+            }
+        }
+        if (next_best >= RECOG_ROUTE_COST_INF) next_best = 0U;
+        score = (uint16)(first_cost[i] + next_best);
+        if (score < best_cost)
+        {
+            best_cost = score;
             best = i;
+            *out_observe = first_observe[i];
         }
     }
     return best;
@@ -555,14 +735,21 @@ static uint8 pick_clearable_item(const uint8 map[MAP_ROWS][MAP_COLS],
 
 /**
  * 选下一个未访问的物体。
- * 6 个以内物体先用精确 tour 找全局最短首项；更大规模使用一次 BFS flood 的最近观察点。
+ * 6 个以内物体先用转角感知的精确 tour 找全局最优首项和观察格；
+ * 更大规模使用一次 BFS flood 的最近观察点。
  * 仅当没有直接可达观察点时才按清障规划成本兜底，避免过早移动其它箱子。
  */
 static uint8 pick_next_item(const uint8 map[MAP_ROWS][MAP_COLS],
-                            Point_t cur)
+                            Point_t cur,
+                            float nav_heading_deg,
+                            Point_t *preferred_observe,
+                            uint8 *has_preferred_observe)
 {
     uint8 remaining = 0U;
     uint8 best = 0xFFU;
+
+    if (preferred_observe == NULL || has_preferred_observe == NULL) { return 0xFFU; }
+    *has_preferred_observe = 0U;
 
     for (uint8 i = 0U; i < s_item_count; ++i)
     {
@@ -570,14 +757,37 @@ static uint8 pick_next_item(const uint8 map[MAP_ROWS][MAP_COLS],
     }
     if (remaining == 0U) { return 0xFFU; }
 
-    if (remaining <= (uint8)RECOG_EXACT_TOUR_ITEM_LIMIT &&
-        pick_exact_direct_tour(map, cur, &best))
+    while (s_tour_cached_next < s_tour_cached_count)
     {
+        uint8 cached_item = s_tour_cached_item[s_tour_cached_next];
+        Point_t cached_observe = s_tour_cached_observe[s_tour_cached_next];
+        s_tour_cached_next++;
+        if (cached_item < s_item_count && !s_items[cached_item].visited &&
+            recog_is_observe_standable(map, cached_observe.y, cached_observe.x))
+        {
+            *preferred_observe = cached_observe;
+            *has_preferred_observe = 1U;
+            return cached_item;
+        }
+    }
+    s_tour_cached_count = 0U;
+    s_tour_cached_next = 0U;
+
+    if (remaining <= (uint8)RECOG_EXACT_TOUR_ITEM_LIMIT &&
+        pick_exact_direct_tour(map, cur, nav_heading_deg,
+                               &best, preferred_observe))
+    {
+        *has_preferred_observe = 1U;
         return best;
     }
 
-    best = pick_nearest_direct_item(map, cur);
-    if (best != 0xFFU) { return best; }
+    best = pick_nearest_direct_item(map, cur, nav_heading_deg,
+                                    preferred_observe);
+    if (best != 0xFFU)
+    {
+        *has_preferred_observe = 1U;
+        return best;
+    }
 
     return pick_clearable_item(map, cur);
 }
@@ -836,14 +1046,56 @@ static uint8 build_box_to_target_mapping(const uint8 map[MAP_ROWS][MAP_COLS],
     return 1U;
 }
 
+static uint8 prepare_direct_nav_plan(const uint8 map[MAP_ROWS][MAP_COLS],
+                                     Point_t player_pos,
+                                     Point_t observe)
+{
+    Point_t previous = player_pos;
+    uint16 i;
+
+    if (!Algo_Nav_Time_Path(map, player_pos, observe, SOKO_ACT_NONE,
+                            &s_pick_nav_path, NULL, NULL)) { return 0U; }
+
+    memset(&s_nav_plan, 0, sizeof(s_nav_plan));
+    for (i = 0U; i < s_pick_nav_path.step_count; ++i)
+    {
+        Point_t next = s_pick_nav_path.path[i];
+        int8 dx = (int8)(next.x - previous.x);
+        int8 dy = (int8)(next.y - previous.y);
+        SokoAction_e action;
+
+        if      (dx ==  0 && dy == -1) action = SOKO_ACT_UP;
+        else if (dx ==  0 && dy ==  1) action = SOKO_ACT_DOWN;
+        else if (dx == -1 && dy ==  0) action = SOKO_ACT_LEFT;
+        else if (dx ==  1 && dy ==  0) action = SOKO_ACT_RIGHT;
+        else return 0U;
+
+        if (s_nav_plan.actions.count >= (uint16)SOKOBAN_MAX_ACTIONS) { return 0U; }
+        s_nav_plan.actions.actions[s_nav_plan.actions.count++] = action;
+        previous = next;
+    }
+    s_nav_plan.observe = observe;
+    s_nav_plan.player_end = observe;
+    s_nav_plan.push_count = 0U;
+    return 1U;
+}
+
 static uint8 prepare_nav_plan(const uint8 map[MAP_ROWS][MAP_COLS],
-                              Point_t player_pos)
+                              Point_t player_pos,
+                              const Point_t *preferred_observe)
 {
     uint16 i;
     Point_t player;
 
-    if (!App_Recog_Clear_Plan(map, player_pos, s_items[s_cur_idx].pos,
-                              &s_nav_plan))
+    /* 精确 Tour 已经选定观察格时必须执行该结果；只有候选路径失效或进入
+     * 清障兜底时，才允许清障规划器重新选择观察格。 */
+    if (preferred_observe != NULL &&
+        prepare_direct_nav_plan(map, player_pos, *preferred_observe))
+    {
+        /* s_nav_plan 已就绪 */
+    }
+    else if (!App_Recog_Clear_Plan(map, player_pos, s_items[s_cur_idx].pos,
+                                   &s_nav_plan))
     {
         return 0U;
     }
@@ -1021,6 +1273,8 @@ void App_Recognize_Reset(void)
     s_nav_wp_idx   = 0U;
     s_nav_actions_applied = 0U;
     s_map_changed  = 0U;
+    s_tour_cached_count = 0U;
+    s_tour_cached_next = 0U;
     s_subphase_ticks = 0U;        /* B3a */
     s_nav_timeout_limit = RECOG_NAV_TIMEOUT_TICKS;
     sample_state_reset();
@@ -1033,12 +1287,26 @@ AppRecognizeStatus_e App_Recognize_Tick(uint8 map[MAP_ROWS][MAP_COLS],
                                         Point_t player_pos,
                                         uint8 has_bomb,
                                         uint8 level,
+                                        float *nav_heading_deg_io,
                                         uint8 box_to_target_out[SOKOBAN_MAX_BOXES])
 {
+    if (nav_heading_deg_io == NULL)
+    {
+        chassis_ctrl_stop();
+        s_sub_state = RECOG_SUB_FAIL;
+        return APP_RECOG_FAIL;
+    }
+
+    /* API 边界兜底：只规范调用方保存的逻辑值，不从 IMU 实测角推断。 */
+    *nav_heading_deg_io = chassis_snap_yaw_to_cardinal_deg(*nav_heading_deg_io);
+
     switch (s_sub_state)
     {
         case RECOG_SUB_INIT:
         {
+            Point_t preferred_observe;
+            uint8 has_preferred_observe;
+
             /* 第一关无数字配对要求，跳过整圈分类 Tour，缩短连续计时总时长。 */
             if (level <= 1U)
             {
@@ -1057,14 +1325,17 @@ AppRecognizeStatus_e App_Recognize_Tick(uint8 map[MAP_ROWS][MAP_COLS],
                 s_sub_state = RECOG_SUB_FAIL;
                 return APP_RECOG_FAIL;
             }
-            s_cur_idx = pick_next_item(map, player_pos);
+            s_cur_idx = pick_next_item(map, player_pos, *nav_heading_deg_io,
+                                       &preferred_observe,
+                                       &has_preferred_observe);
             if (s_cur_idx == 0xFFU)
             {
                 /* 不应发生 (s_item_count > 0) */
                 s_sub_state = RECOG_SUB_DONE;
                 return APP_RECOG_RUNNING;
             }
-            if (!prepare_nav_plan(map, player_pos))
+            if (!prepare_nav_plan(map, player_pos,
+                                  has_preferred_observe ? &preferred_observe : NULL))
             {
                 s_items[s_cur_idx].visited = 1U;
                 s_items[s_cur_idx].ok      = 0U;
@@ -1084,7 +1355,7 @@ AppRecognizeStatus_e App_Recognize_Tick(uint8 map[MAP_ROWS][MAP_COLS],
                 if (!s_nav_started)
                 {
                     Point_t wp = s_nav_waypoints.points[s_nav_wp_idx];
-                    recog_move_to_grid_keep_current_yaw(wp);
+                    recog_move_to_grid_keep_nav_heading(wp, *nav_heading_deg_io);
                     s_nav_timeout_limit = nav_timeout_limit_for_waypoint(wp);
                     s_nav_started = 1U;
                     s_subphase_ticks = 0U;
@@ -1139,8 +1410,18 @@ AppRecognizeStatus_e App_Recognize_Tick(uint8 map[MAP_ROWS][MAP_COLS],
             s_subphase_ticks++;            /* B3a: FACE 超时计时 */
             if (!s_face_started)
             {
-                float yaw_target = recog_calc_face_yaw_deg(s_items[s_cur_idx].observe,
-                                                           s_items[s_cur_idx].pos);
+                float yaw_target;
+                if (!recog_calc_face_yaw_deg(s_items[s_cur_idx].observe,
+                                             s_items[s_cur_idx].pos,
+                                             &yaw_target))
+                {
+                    chassis_ctrl_stop();
+                    s_items[s_cur_idx].visited = 1U;
+                    s_items[s_cur_idx].ok = 0U;
+                    enter_sub_next();
+                    return APP_RECOG_RUNNING;
+                }
+                *nav_heading_deg_io = yaw_target;
                 chassis_ctrl_rotate_to_deg(yaw_target);
                 s_face_started = 1U;
                 return APP_RECOG_RUNNING;
@@ -1192,6 +1473,9 @@ AppRecognizeStatus_e App_Recognize_Tick(uint8 map[MAP_ROWS][MAP_COLS],
 
         case RECOG_SUB_NEXT:
         {
+            Point_t preferred_observe;
+            uint8 has_preferred_observe;
+
             /* 已全部识别完 → 配对 */
             if (all_resolved())
             {
@@ -1204,11 +1488,14 @@ AppRecognizeStatus_e App_Recognize_Tick(uint8 map[MAP_ROWS][MAP_COLS],
                 return APP_RECOG_FAIL;
             }
 
-            uint8 next = pick_next_item(map, player_pos);
+            uint8 next = pick_next_item(map, player_pos, *nav_heading_deg_io,
+                                        &preferred_observe,
+                                        &has_preferred_observe);
             if (next != 0xFFU)
             {
                 s_cur_idx = next;
-                if (!prepare_nav_plan(map, player_pos))
+                if (!prepare_nav_plan(map, player_pos,
+                                      has_preferred_observe ? &preferred_observe : NULL))
                 {
                     s_items[s_cur_idx].visited = 1U;
                     s_items[s_cur_idx].ok      = 0U;

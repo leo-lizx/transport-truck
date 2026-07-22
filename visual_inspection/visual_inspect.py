@@ -45,6 +45,20 @@ uart = UART(12, 115200, timeout_char=1000)
 sensor.reset()
 sensor.set_pixformat(sensor.RGB565)
 sensor.set_framesize(sensor.QVGA) # 保持 320x240 取景
+
+# 识别框坐标（QVGA 320x240，画面左上角为 (0, 0)）。
+# 只需修改下面 4 个数：左上角 (ROI_X1, ROI_Y1)，右下角 (ROI_X2, ROI_Y2)。
+# 右上角为 (ROI_X2, ROI_Y1)，左下角为 (ROI_X1, ROI_Y2)。
+ROI_X1 = 42
+ROI_Y1 = 0
+ROI_X2 = 320
+ROI_Y2 = 199
+
+if not (0 <= ROI_X1 < ROI_X2 <= 320 and 0 <= ROI_Y1 < ROI_Y2 <= 240):
+    raise ValueError("ROI 坐标必须在 320x240 画面内，且右下角必须在左上角的右下方")
+
+RECOGNITION_ROI = (ROI_X1, ROI_Y1, ROI_X2 - ROI_X1, ROI_Y2 - ROI_Y1)
+
 sensor.set_brightness(2000)
 sensor.skip_frames(time = 20)
 # 保留逐飞历程中防止画面泛白的设置，这对强光环境有一定帮助
@@ -110,7 +124,7 @@ except:
 while(True):
     clock.tick()
     img = sensor.snapshot()
-    
+
     # 【新增功能】：定期发送心跳帧 (TYPE=0x10)
     # 依据 MD 文档第 8 点，每 100ms 发送一次心跳，证明视觉端在线
     current_time = time.ticks_ms()
@@ -120,9 +134,8 @@ while(True):
         heartbeat_seq = (heartbeat_seq + 1) % 256 # 0-255 循环
         last_heartbeat_time = current_time
 
-    # 直接将整张图像喂给模型进行分类，不加任何滑动窗口参数！
-    # 这时 tf.classify 只会返回一个包含全图分类结果的 obj
-    for obj in tf.classify(net, img):
+    # 模型只对矩形框内的图像进行分类。
+    for obj in tf.classify(net, img, roi=RECOGNITION_ROI):
 
         # 获取所有类别的预测概率列表
         predictions = obj.output()
@@ -135,13 +148,16 @@ while(True):
         # 在终端打印，方便连着电脑时肉眼调试
         print("FPS: %5.1f | 识别结果: %s | 置信度: %.2f" % (clock.fps(), best_label, max_confidence))
 
-        # 在屏幕左上角打印结果，方便看 LCD 屏调试（因为不画框了，所以把字写大点）
+        # 画框放在分类之后，避免绿色边框影响模型输入。
+        img.draw_rectangle(RECOGNITION_ROI, color=(0,255,0), thickness=2)
+
+        # 在屏幕左上角打印结果，方便看 LCD 屏调试
         img.draw_string(10, 10, "%s: %.2f" % (best_label, max_confidence), color=(255,0,0), scale=2)
 
         # ==========================================
         # 4. 串口通信：发送决策数据给主板 (已全面重构以适配新协议)
         # ==========================================
-        
+
         # 【极其关键：重新逻辑映射】
         # MD 文档旧版写过 class_id 1..8；当前主控已按 OpenART2 映射扩展到 1..10。
         # 我们利用 obj_kind 字段进行扩容分离：
@@ -149,7 +165,7 @@ while(True):
         # obj_kind = 1 (目标点) 代表后 10 个数字
         mapped_obj_kind = 0
         mapped_class_id = 0 # 默认 0 表示未识别/背景
-        
+
         # 只有当置信度大于 70% 且不是背景时，才进行有效映射
         if max_confidence > 0.70 and best_label != "background":
             if 0 <= max_index <= 9:
@@ -169,10 +185,10 @@ while(True):
         # 依据 MD 文档第 9 点，TYPE=0x02，LEN=3
         # PAYLOAD = [obj_kind, class_id, vision_seq]
         data_packet = bytes([mapped_obj_kind, mapped_class_id, vision_seq])
-        
+
         # 使用 pack_frame 打包并发送 (会自动加上 AA 55、TYPE、LEN、CRC)
         uart.write(pack_frame(0x02, data_packet))
-        
+
         # 更新视觉帧序号 (0-255 循环)，告诉主控这是一帧新的数据
         vision_seq = (vision_seq + 1) % 256
 
@@ -180,7 +196,7 @@ while(True):
         # 因为你们是停车识别，延时 100-200ms 完全没问题
         # 【新增批注】：MD 文档建议分类摄像头 50ms 一帧 (20Hz)。
         # 因此这里的延时修改为 50ms，以满足主控 1.5s 采样窗口内收集足够票数的需求。
-        time.sleep_ms(50) 
+        time.sleep_ms(50)
 
     # 极限内存回收，防止长期运行死机
     gc.collect()
