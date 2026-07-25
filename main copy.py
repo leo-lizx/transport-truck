@@ -99,10 +99,10 @@ ROWS, COLS = 12, 16
 
 # 场地四角外侧格子的中心点坐标（需根据实际场地微调）
 GRID_CORNERS = {
-    "tl": (19, 47.0),  # 左上
-    "tr": (260, 30.0), # 右上
-    "bl": (27.0, 227.0), # 左下
-    "br": (265.0, 227.0),# 右下
+    "tl": (18, 37.0),  # 左上
+    "tr": (260, 23.0), # 右上
+    "bl": (25.0, 218.0), # 左下
+    "br": (261.0, 221.0),# 右下
 }
 
 GRID_K1 = +0.000000
@@ -110,6 +110,14 @@ CALIB_SHOW_CORNERS = True
 CAR_VOTE_FRAMES = 5
 CAR_VOTE_MIN = 2
 car_vote_hist = []
+
+# ========================================================
+# 【新增】：数据传输与全局地图投票配置
+# ========================================================
+TX_VOTE_FRAMES = 5       # 设定多帧累积次数，5帧进行一次全局投票并发送（降低传输频率）
+tx_vote_buffer_map = []  # 暂存多帧的 192 网格地图数据
+tx_vote_buffer_car = []  # 暂存多帧的车辆坐标数据
+# ========================================================
 
 def calc_grid_point(x_idx, y_idx, img_w, img_h):
     """基于四角点进行双线性插值，计算网格真实物理坐标映射到像素的坐标"""
@@ -126,11 +134,6 @@ def calc_grid_point(x_idx, y_idx, img_w, img_h):
     u = u + COMP_U * u * (1.0 - u)
     v = v + COMP_V * v * (1.0 - v)
     # ========================================================
-
-    tl_x, tl_y = GRID_CORNERS["tl"]
-    tr_x, tr_y = GRID_CORNERS["tr"]
-    bl_x, bl_y = GRID_CORNERS["bl"]
-    br_x, br_y = GRID_CORNERS["br"]
 
     tl_x, tl_y = GRID_CORNERS["tl"]
     tr_x, tr_y = GRID_CORNERS["tr"]
@@ -405,6 +408,10 @@ def build_map_with_single_car(map_list, car_found, car_x, car_y):
 # ======================================================================
 # 6. 系统主循环 (正常运行)
 # ======================================================================
+# 【新增】：定义用于在 IDE 终端保持打印的最近一次已发送优选结果
+last_map_list_out = ["-"] * (ROWS * COLS)
+last_car_x, last_car_y = 225, 225
+
 while(True):
     clock.tick()
     img = sensor.snapshot()
@@ -440,22 +447,58 @@ while(True):
     if CALIB_SHOW_CORNERS:
         tl_pt, tr_pt, bl_pt, br_pt = draw_calibration_overlay(img, img_w, img_h)
 
-    # 车辆坐标防抖滤波
-    car_x, car_y = vote_car_position(car_found, car_x, car_y)
+    # 车辆坐标防抖滤波 (由于下方已启用全局多帧投票机制，此行原逻辑注释保留以防遗失，转由全局投票代理)
+    # car_x, car_y = vote_car_position(car_found, car_x, car_y)
 
-    # 组装最终给主控的单@字符地图
-    map_list_out = build_map_with_single_car(map_list, car_found, car_x, car_y)
+    # ======================================================================
+    # 【核心修改区】：将当前帧解析数据送入缓冲，累计多帧执行全局投票
+    # ======================================================================
+    tx_vote_buffer_map.append(map_list)
+    tx_vote_buffer_car.append((car_found, car_x, car_y))
 
-    # --- 阶段 C：串口打包发送 (194 字节全场通讯) ---
-    try:
-        map_bytes = "".join(map_list_out).encode("ascii")
-        payload = map_bytes + bytes([car_x, car_y])
-        if len(payload) == 194:
-            uart.write(pack_frame(PROTO_TYPE_MAP, payload))
-    except Exception as e:
-        print("UART TX Error:", e)
+    # 判断是否达到指定的判定帧数 (例如积累了 5 帧)
+    if len(tx_vote_buffer_map) >= TX_VOTE_FRAMES:
+        final_map_list = []
 
-    # 发送系统心跳
+        # 1. 赛道网格投票：分别提取 192 个格子在过去 5 帧的识别结果
+        for i in range(ROWS * COLS):
+            cell_votes = [frame_map[i] for frame_map in tx_vote_buffer_map]
+            # 统计并取众数作为该格子最终传输结果 (利用集合去重和count特性)
+            best_char = max(set(cell_votes), key=cell_votes.count)
+            final_map_list.append(best_char)
+
+        # 2. 小车坐标投票：提取过去 5 帧内成功识别到小车的坐标
+        valid_car_votes = [(cx, cy) for fnd, cx, cy in tx_vote_buffer_car if fnd]
+        if len(valid_car_votes) > 0:
+            final_car_pos = max(set(valid_car_votes), key=valid_car_votes.count)
+            final_car_found = True
+            final_car_x, final_car_y = final_car_pos
+        else:
+            final_car_found = False
+            final_car_x, final_car_y = 225, 225 # 无效坐标
+
+        # 组装最终给主控的单@字符地图 (此时使用的是多帧投票后的最优结果)
+        map_list_out = build_map_with_single_car(final_map_list, final_car_found, final_car_x, final_car_y)
+
+        # 记录本次打包的数据以供 IDE 监控随时打印
+        last_map_list_out = map_list_out
+        last_car_x, last_car_y = final_car_x, final_car_y
+
+        # --- 阶段 C：串口打包发送 (194 字节全场通讯) ---
+        # 此时传输频率降低为原先的 1/TX_VOTE_FRAMES，且准确率通过多帧投票获得大幅提升
+        try:
+            map_bytes = "".join(map_list_out).encode("ascii")
+            payload = map_bytes + bytes([final_car_x, final_car_y])
+            if len(payload) == 194:
+                uart.write(pack_frame(PROTO_TYPE_MAP, payload))
+        except Exception as e:
+            print("UART TX Error:", e)
+
+        # 清空缓冲区，开始下一次判定累积周期
+        tx_vote_buffer_map = []
+        tx_vote_buffer_car = []
+
+    # 发送系统心跳 (不受地图降频约束，必须独立维持高频发送防止主控掉线)
     send_heartbeat_if_due()
 
     # --- 阶段 D：终端监控防阻塞 (极度重要) ---
@@ -463,10 +506,11 @@ while(True):
     # 绝对禁止每帧打印！I/O 阻塞会直接卡死摄像头进程导致帧率断崖下跌。
     if frame_cnt % 10 == 0:
         print("\033[H", end="") # 清屏
-        print("FPS: %0.1f | 小车坐标: (%d, %d)" % (clock.fps(), car_x, car_y))
+        # 打印使用最新投票决出的最后结果
+        print("FPS: %0.1f | 小车坐标: (%d, %d)" % (clock.fps(), last_car_x, last_car_y))
         if CALIB_SHOW_CORNERS and tl_pt is not None:
             print("基准: TL=%s TR=%s BL=%s BR=%s" % (tl_pt, tr_pt, bl_pt, br_pt))
 
         # 打印字符地图阵列
         for r in range(ROWS):
-            print("".join(map_list_out[r*COLS : (r+1)*COLS]))
+            print("".join(last_map_list_out[r*COLS : (r+1)*COLS]))
