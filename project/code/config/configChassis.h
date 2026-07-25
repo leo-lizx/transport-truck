@@ -153,7 +153,7 @@
 
 /** 移动中重新对正阈值: |err| 达到此值时立即停止平移并原地校正。
  *  ENTER~REALIGN 之间按误差线性降低平移速度，兼顾速度与航向保持。 */
-#define CHASSIS_YAW_MOVE_REALIGN_DEG         (2.0f)
+#define CHASSIS_YAW_MOVE_REALIGN_DEG         (5.0f)
 
 /** 即位锁需车体稳定: |rate| < 此值 */
 #define CHASSIS_YAW_INPOS_SETTLE_DPS        (10.0f)
@@ -237,7 +237,7 @@
 #define CHASSIS_POS_KP                      (6.0f)
 
 /** Y 方向位置环 Kp — Y 轴机械特性独立，允许与 X 分别调节。 */
-#define CHASSIS_POS_Y_KP                    (5.0f)
+#define CHASSIS_POS_Y_KP                    (4.20f)
 
 /** Runtime safety limit for position-loop Kp; must cover the compile-time default. */
 #define CHASSIS_TUNE_POS_KP_LIMIT           (10.0f)
@@ -415,7 +415,7 @@
 /** 车体平移最大合成线速度 (m/s)
  *  P0-修复 2026-05-19 (轮子停转): 1.20→0.70 (TB6612 过流关断)
  *  0.70: d_stop=0.117m, BRAKE_DIST=0.25m 有裕量 */
-#define CHASSIS_MAX_LINEAR_SPEED_MPS        (1.50f)
+#define CHASSIS_MAX_LINEAR_SPEED_MPS        (1.80f)
 
 /** 正常控制路径的单轮速度兑底上限 (m/s) — 等比例缩放保方向 */
 #define CHASSIS_WHEEL_SPEED_CAP_MPS         (4.0f)
