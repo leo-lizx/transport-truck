@@ -91,7 +91,7 @@ def send_heartbeat_if_due():
 # 调试开关：控制是否绘制采样 ROI 的矩形边框用于视觉调试
 # - 在比赛或正式运行时建议设为 False 以节省绘制开销
 # - 在开发或现场标定时设为 True 便于观察每个网格的采样区域
-DEBUG_DRAW_ROI = False
+DEBUG_DRAW_ROI = True
 # ----------------------------------------------------------------------
 # 3. 网格采样与逆透视映射
 # ----------------------------------------------------------------------
@@ -100,7 +100,7 @@ ROWS, COLS = 12, 16
 # 场地四角外侧格子的中心点坐标（需根据实际场地微调）
 GRID_CORNERS = {
     "tl": (18, 37.0),  # 左上
-    "tr": (260, 23.0), # 右上
+    "tr": (260, 25.0), # 右上
     "bl": (25.0, 218.0), # 左下
     "br": (261.0, 223.0),# 右下
 }
@@ -194,7 +194,7 @@ CAR_HEAD_BRIGHT_RGB = (30, 255, 255)
 CAR_TAIL_DARK_RGB = (0, 152, 195)     # 车尾（T）
 CAR_TAIL_BRIGHT_RGB = (58, 247, 16)
 WALL_DARK_RGB = (41, 61, 80)          # 墙壁（#）
-WALL_BRIGHT_RGB = (107, 170, 255)
+WALL_BRIGHT_RGB = (107, 180, 255)
 FLOOR_DARK_RGB = (33, 12, 255)        # 空地（-）
 FLOOR_BRIGHT_RGB = (49, 97, 255)
 GOAL_DARK_RGB = (173, 0, 255)         # 终点（.）
@@ -208,9 +208,9 @@ BOMB_BRIGHT_RGB = (255, 40, 82)
 COLOR_UNKNOWN_MAX_DIST = 100.0
 BOMB_MAX_MATCH_DIST = 48.0
 BOMB_MIN_LEAD_DIST = 18.0
-WALL_TEXTURE_L_STDEV = 8.5
-WALL_TEXTURE_MAX_DIST = 70.0
-WALL_TEXTURE_BONUS_DIST = 15.0
+WALL_TEXTURE_L_STDEV = 6.5
+WALL_TEXTURE_MAX_DIST = 85.0
+WALL_TEXTURE_BONUS_DIST = 25.0
 
 # 【架构保留】：依然保留所有靶点字典，作为纯色匹配和特征检测失败时的安全垫 (Fallback)
 SYMBOL_MAP_RGB = {
