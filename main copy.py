@@ -91,7 +91,7 @@ def send_heartbeat_if_due():
 # 调试开关：控制是否绘制采样 ROI 的矩形边框用于视觉调试
 # - 在比赛或正式运行时建议设为 False 以节省绘制开销
 # - 在开发或现场标定时设为 True 便于观察每个网格的采样区域
-DEBUG_DRAW_ROI = True
+DEBUG_DRAW_ROI = False
 # ----------------------------------------------------------------------
 # 3. 网格采样与逆透视映射
 # ----------------------------------------------------------------------
@@ -102,7 +102,7 @@ GRID_CORNERS = {
     "tl": (18, 37.0),  # 左上
     "tr": (260, 23.0), # 右上
     "bl": (25.0, 218.0), # 左下
-    "br": (261.0, 221.0),# 右下
+    "br": (261.0, 223.0),# 右下
 }
 
 GRID_K1 = +0.000000
@@ -193,7 +193,7 @@ CAR_HEAD_DARK_RGB = (25, 152, 0)      # 车头（H）
 CAR_HEAD_BRIGHT_RGB = (30, 255, 255)
 CAR_TAIL_DARK_RGB = (0, 152, 195)     # 车尾（T）
 CAR_TAIL_BRIGHT_RGB = (58, 247, 16)
-WALL_DARK_RGB = (41, 61, 66)          # 墙壁（#）
+WALL_DARK_RGB = (41, 61, 80)          # 墙壁（#）
 WALL_BRIGHT_RGB = (107, 170, 255)
 FLOOR_DARK_RGB = (33, 12, 255)        # 空地（-）
 FLOOR_BRIGHT_RGB = (49, 97, 255)
@@ -201,14 +201,14 @@ GOAL_DARK_RGB = (173, 0, 255)         # 终点（.）
 GOAL_BRIGHT_RGB = (255, 32, 255)
 BOX_DARK_RGB = (99, 138, 0)           # 箱子（$）
 BOX_BRIGHT_RGB = (247, 255, 66)
-BOMB_DARK_RGB = (181, 28, 58)         # 炸弹（*）
+BOMB_DARK_RGB = (110, 36, 50)         # 炸弹（*）
 BOMB_BRIGHT_RGB = (255, 40, 82)
 
 # 颜色匹配的置信度限制：保留现有实测色值，只阻止“仅仅相对更像炸弹”的格子被强制判为炸弹。
 COLOR_UNKNOWN_MAX_DIST = 100.0
-BOMB_MAX_MATCH_DIST = 45.0
-BOMB_MIN_LEAD_DIST = 15.0
-WALL_TEXTURE_L_STDEV = 15.0
+BOMB_MAX_MATCH_DIST = 48.0
+BOMB_MIN_LEAD_DIST = 18.0
+WALL_TEXTURE_L_STDEV = 8.5
 WALL_TEXTURE_MAX_DIST = 70.0
 WALL_TEXTURE_BONUS_DIST = 15.0
 
@@ -266,11 +266,12 @@ def classify_symbol_by_features(l_mode, a_mode, b_mode, l_stdev):
     wall_dist = 999999.0
     bomb_dist = 999999.0
 
+    # 遍历计算与所有模板色的 LAB 空间距离
     for sym, lab_targets in SYMBOL_MAP_LABTarget.items():
         for target in lab_targets:
             tl, ta, tb = target
             # 计算加权欧氏距离（L降权处理，抵抗光斑）
-            dist = math.sqrt(0.2 * (l_mode - tl)**2 + (a_mode - ta)**2 + (b_mode - tb)**2)
+            dist = math.sqrt(0.3 * (l_mode - tl)**2 + (a_mode - ta)**2 + (b_mode - tb)**2)
 
             if dist < min_dist:
                 min_dist = dist
@@ -292,23 +293,34 @@ def classify_symbol_by_features(l_mode, a_mode, b_mode, l_stdev):
     if min_dist > COLOR_UNKNOWN_MAX_DIST:
         return "-"
 
+    # ==========================================
+    # === 升级版判定逻辑 (防御“跷跷板效应”) ===
+    # ==========================================
+
+    # 1. 先计算各自的置信度条件
     bomb_is_confident = (
         bomb_dist <= BOMB_MAX_MATCH_DIST and
         bomb_dist + BOMB_MIN_LEAD_DIST <= best_non_bomb_dist
     )
-    if bomb_is_confident:
-        return "*"
 
-    # 亮度离散是墙的辅助证据，只允许它在颜色距离接近时纠正结果。
     wall_has_texture = l_stdev > WALL_TEXTURE_L_STDEV
     wall_color_is_plausible = (
         wall_dist <= WALL_TEXTURE_MAX_DIST and
         wall_dist <= best_non_wall_dist + WALL_TEXTURE_BONUS_DIST
     )
+
+    # 2. 墙壁绝对防御机制：如果它拥有墙的纹理，且颜色勉强符合墙，优先判定为墙
     if wall_has_texture and wall_color_is_plausible:
+        # 唯一的例外：除非炸弹匹配度极其完美（距离小于25），才允许炸弹抢占
+        if bomb_is_confident and bomb_dist < 25.0:
+            return "*"
         return "#"
 
-    # 炸弹没有通过严格门槛时，不再因“相对最近”而输出炸弹。
+    # 3. 如果没有墙的纹理，再看是不是炸弹
+    if bomb_is_confident:
+        return "*"
+
+    # 4. 兜底保护：如果最接近炸弹，但没通过严格门槛，退回非炸弹类别
     if best_sym == "*":
         if best_non_bomb_dist <= COLOR_UNKNOWN_MAX_DIST:
             return best_non_bomb_sym
