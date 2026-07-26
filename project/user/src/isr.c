@@ -41,7 +41,6 @@
 
 /* P0-5: 主循环 5ms 节拍唤醒钩子, 实现位于 user/src/main.c */
 extern void main_loop_on_pit_tick(void);
-extern volatile uint8 g_main_uart1_raw_echo_enabled;
 
 
 void CSI_IRQHandler(void)
@@ -90,14 +89,7 @@ void LPUART1_IRQHandler(void)
     if(kLPUART_RxDataRegFullFlag & LPUART_GetStatusFlags(LPUART1))
     {
         uint8 rx_byte = uart_read_byte(UART_1);
-        if (g_main_uart1_raw_echo_enabled != 0U)
-        {
-            uart_write_byte(UART_1, rx_byte);
-        }
-        else
-        {
-            app_link_isr_feed_class_byte(rx_byte);
-        }
+        app_link_isr_feed_class_byte(rx_byte);
     }
 
 

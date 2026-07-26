@@ -91,7 +91,7 @@ def send_heartbeat_if_due():
 # 调试开关：控制是否绘制采样 ROI 的矩形边框用于视觉调试
 # - 在比赛或正式运行时建议设为 False 以节省绘制开销
 # - 在开发或现场标定时设为 True 便于观察每个网格的采样区域
-DEBUG_DRAW_ROI = False
+DEBUG_DRAW_ROI = True
 # ----------------------------------------------------------------------
 # 3. 网格采样与逆透视映射
 # ----------------------------------------------------------------------
@@ -99,10 +99,10 @@ ROWS, COLS = 12, 16
 
 # 场地四角外侧格子的中心点坐标（需根据实际场地微调）
 GRID_CORNERS = {
-    "tl": (18, 31.0),  # 左上
-    "tr": (256, 15.0), # 右上
-    "bl": (19.0, 218.0), # 左下
-    "br": (267.0, 215.0),# 右下
+    "tl": (18, 37.0),  # 左上
+    "tr": (260, 25.0), # 右上
+    "bl": (25.0, 220.0), # 左下
+    "br": (261.0, 223.0),# 右下
 }
 
 GRID_K1 = +0.000000
@@ -110,6 +110,19 @@ CALIB_SHOW_CORNERS = True
 CAR_VOTE_FRAMES = 5
 CAR_VOTE_MIN = 2
 car_vote_hist = []
+
+# ========================================================
+# 【修改更新】：基于时间的动态数据传输与全局地图投票配置
+# ========================================================
+# 【深度优化】：废弃原先写死的 TX_VOTE_FRAMES = 5 机制，改为时间轴驱动
+# 这样能够完美适配硬件-软件通讯架构，防止底层传输阻塞，同时利用闲置算力
+TX_INTERVAL_MS = 300     # 【核心参数】：设定每次数据传输的间隔时长（毫秒）。
+                         # 该参数可任意更改。间隔内累积的帧数越多，投票越精准，
+                         # 系统会根据实际帧率，动态计算在此间隔内的判定次数。
+_last_tx_ms = time.ticks_ms() # 用于记录上一次成功打包下发数据的时间戳
+tx_vote_buffer_map = []  # 动态长度：暂存多帧的 192 网格地图数据缓冲池
+tx_vote_buffer_car = []  # 动态长度：暂存多帧的车辆坐标数据缓冲池
+# ========================================================
 
 def calc_grid_point(x_idx, y_idx, img_w, img_h):
     """基于四角点进行双线性插值，计算网格真实物理坐标映射到像素的坐标"""
@@ -121,16 +134,11 @@ def calc_grid_point(x_idx, y_idx, img_w, img_h):
     # 针对你“中间偏右”的问题，我们给 U 加上一个负的补偿值把它向左拉。
     # ========================================================
     COMP_U = -0.06  # 左右补偿系数：负数向左拉，正数向右推 (建议从 -0.02 到 -0.08 之间微调)
-    COMP_V = -0.03   # 上下补偿系数：如果中间行偏上或偏下，同样调这个值
+    COMP_V = +0.1   # 上下补偿系数：如果中间行偏上或偏下，同样调这个值
 
     u = u + COMP_U * u * (1.0 - u)
     v = v + COMP_V * v * (1.0 - v)
     # ========================================================
-
-    tl_x, tl_y = GRID_CORNERS["tl"]
-    tr_x, tr_y = GRID_CORNERS["tr"]
-    bl_x, bl_y = GRID_CORNERS["bl"]
-    br_x, br_y = GRID_CORNERS["br"]
 
     tl_x, tl_y = GRID_CORNERS["tl"]
     tr_x, tr_y = GRID_CORNERS["tr"]
@@ -190,28 +198,29 @@ CAR_HEAD_DARK_RGB = (25, 152, 0)      # 车头（H）
 CAR_HEAD_BRIGHT_RGB = (30, 255, 255)
 CAR_TAIL_DARK_RGB = (0, 152, 195)     # 车尾（T）
 CAR_TAIL_BRIGHT_RGB = (58, 247, 16)
-WALL_DARK_RGB = (41, 61, 66)          # 墙壁（#）
-WALL_BRIGHT_RGB = (107, 170, 255)
+WALL_DARK_RGB = (41, 61, 80)          # 墙壁（#）
+WALL_BRIGHT_RGB = (107, 180, 255)
+WALL_GLARE_RGB = (132, 170, 255)      # 墙壁高光白名单
 FLOOR_DARK_RGB = (33, 12, 255)        # 空地（-）
 FLOOR_BRIGHT_RGB = (49, 97, 255)
 GOAL_DARK_RGB = (173, 0, 255)         # 终点（.）
 GOAL_BRIGHT_RGB = (255, 32, 255)
 BOX_DARK_RGB = (99, 138, 0)           # 箱子（$）
 BOX_BRIGHT_RGB = (247, 255, 66)
-BOMB_DARK_RGB = (181, 28, 58)         # 炸弹（*）
+BOMB_DARK_RGB = (110, 36, 50)         # 炸弹（*）
 BOMB_BRIGHT_RGB = (255, 40, 82)
 
 # 颜色匹配的置信度限制：保留现有实测色值，只阻止“仅仅相对更像炸弹”的格子被强制判为炸弹。
 COLOR_UNKNOWN_MAX_DIST = 100.0
-BOMB_MAX_MATCH_DIST = 45.0
-BOMB_MIN_LEAD_DIST = 15.0
-WALL_TEXTURE_L_STDEV = 15.0
-WALL_TEXTURE_MAX_DIST = 70.0
-WALL_TEXTURE_BONUS_DIST = 15.0
+BOMB_MAX_MATCH_DIST = 48.0
+BOMB_MIN_LEAD_DIST = 18.0
+WALL_TEXTURE_L_STDEV = 6.5
+WALL_TEXTURE_MAX_DIST = 85.0
+WALL_TEXTURE_BONUS_DIST = 25.0
 
 # 【架构保留】：依然保留所有靶点字典，作为纯色匹配和特征检测失败时的安全垫 (Fallback)
 SYMBOL_MAP_RGB = {
-    "#": (WALL_DARK_RGB, WALL_BRIGHT_RGB),
+    "#": (WALL_DARK_RGB, WALL_BRIGHT_RGB, WALL_GLARE_RGB),
     "-": (FLOOR_DARK_RGB, FLOOR_BRIGHT_RGB),
     ".": (GOAL_DARK_RGB, GOAL_BRIGHT_RGB),
     "$": (BOX_DARK_RGB, BOX_BRIGHT_RGB),
@@ -263,11 +272,12 @@ def classify_symbol_by_features(l_mode, a_mode, b_mode, l_stdev):
     wall_dist = 999999.0
     bomb_dist = 999999.0
 
+    # 遍历计算与所有模板色的 LAB 空间距离
     for sym, lab_targets in SYMBOL_MAP_LABTarget.items():
         for target in lab_targets:
             tl, ta, tb = target
             # 计算加权欧氏距离（L降权处理，抵抗光斑）
-            dist = math.sqrt(0.2 * (l_mode - tl)**2 + (a_mode - ta)**2 + (b_mode - tb)**2)
+            dist = math.sqrt(0.3 * (l_mode - tl)**2 + (a_mode - ta)**2 + (b_mode - tb)**2)
 
             if dist < min_dist:
                 min_dist = dist
@@ -289,23 +299,34 @@ def classify_symbol_by_features(l_mode, a_mode, b_mode, l_stdev):
     if min_dist > COLOR_UNKNOWN_MAX_DIST:
         return "-"
 
+    # ==========================================
+    # === 升级版判定逻辑 (防御“跷跷板效应”) ===
+    # ==========================================
+
+    # 1. 先计算各自的置信度条件
     bomb_is_confident = (
         bomb_dist <= BOMB_MAX_MATCH_DIST and
         bomb_dist + BOMB_MIN_LEAD_DIST <= best_non_bomb_dist
     )
-    if bomb_is_confident:
-        return "*"
 
-    # 亮度离散是墙的辅助证据，只允许它在颜色距离接近时纠正结果。
     wall_has_texture = l_stdev > WALL_TEXTURE_L_STDEV
     wall_color_is_plausible = (
         wall_dist <= WALL_TEXTURE_MAX_DIST and
         wall_dist <= best_non_wall_dist + WALL_TEXTURE_BONUS_DIST
     )
+
+    # 2. 墙壁绝对防御机制：如果它拥有墙的纹理，且颜色勉强符合墙，优先判定为墙
     if wall_has_texture and wall_color_is_plausible:
+        # 唯一的例外：除非炸弹匹配度极其完美（距离小于25），才允许炸弹抢占
+        if bomb_is_confident and bomb_dist < 25.0:
+            return "*"
         return "#"
 
-    # 炸弹没有通过严格门槛时，不再因“相对最近”而输出炸弹。
+    # 3. 如果没有墙的纹理，再看是不是炸弹
+    if bomb_is_confident:
+        return "*"
+
+    # 4. 兜底保护：如果最接近炸弹，但没通过严格门槛，退回非炸弹类别
     if best_sym == "*":
         if best_non_bomb_dist <= COLOR_UNKNOWN_MAX_DIST:
             return best_non_bomb_sym
@@ -405,6 +426,10 @@ def build_map_with_single_car(map_list, car_found, car_x, car_y):
 # ======================================================================
 # 6. 系统主循环 (正常运行)
 # ======================================================================
+# 【新增】：定义用于在 IDE 终端保持打印的最近一次已发送优选结果
+last_map_list_out = ["-"] * (ROWS * COLS)
+last_car_x, last_car_y = 225, 225
+
 while(True):
     clock.tick()
     img = sensor.snapshot()
@@ -440,22 +465,73 @@ while(True):
     if CALIB_SHOW_CORNERS:
         tl_pt, tr_pt, bl_pt, br_pt = draw_calibration_overlay(img, img_w, img_h)
 
-    # 车辆坐标防抖滤波
-    car_x, car_y = vote_car_position(car_found, car_x, car_y)
+    # 车辆坐标防抖滤波 (由于下方已启用全局多帧投票机制，此行原逻辑注释保留以防遗失，转由全局投票代理)
+    # car_x, car_y = vote_car_position(car_found, car_x, car_y)
 
-    # 组装最终给主控的单@字符地图
-    map_list_out = build_map_with_single_car(map_list, car_found, car_x, car_y)
+    # ======================================================================
+    # 【核心修改区】：基于时间的动态缓冲，累计时间内的所有帧执行全局投票
+    # ======================================================================
+    # 不论间隔多长，摄像头只要抓到一帧就算出一次特征，无脑压入缓冲池
+    tx_vote_buffer_map.append(map_list)
+    tx_vote_buffer_car.append((car_found, car_x, car_y))
 
-    # --- 阶段 C：串口打包发送 (194 字节全场通讯) ---
-    try:
-        map_bytes = "".join(map_list_out).encode("ascii")
-        payload = map_bytes + bytes([car_x, car_y])
-        if len(payload) == 194:
-            uart.write(pack_frame(PROTO_TYPE_MAP, payload))
-    except Exception as e:
-        print("UART TX Error:", e)
+    current_ms = time.ticks_ms()
 
-    # 发送系统心跳
+    # 【关键触发器】：判断当前时间与上一次下发时间的时间差，是否已经满足设定的 TX_INTERVAL_MS
+    # 此逻辑完美解决了系统帧率波动时传输频率不稳定的问题，并释放了 CPU 开销。
+    if time.ticks_diff(current_ms, _last_tx_ms) >= TX_INTERVAL_MS:
+
+        # 动态判定次数的体现：在上述间隔时间内，系统实际跑了多少帧，就在此处判定多少次。
+        # 比如如果设间隔 100ms 且帧率是 60帧/秒，此处 dynamic_vote_count 大约就是 6 次判定。
+        # 如果你后续把 TX_INTERVAL_MS 调整成 500ms，判定次数就会自动飙升到 30 次！
+        dynamic_vote_count = len(tx_vote_buffer_map)
+
+        # 边界防护：确保确实积累了数据帧才进行统计，防止出现空指针或除零
+        if dynamic_vote_count > 0:
+            final_map_list = []
+
+            # 1. 赛道网格投票：分别提取 192 个格子在过去这一个时间周期内的动态次识别结果
+            for i in range(ROWS * COLS):
+                cell_votes = [frame_map[i] for frame_map in tx_vote_buffer_map]
+                # 统计并取众数作为该格子最终传输结果 (利用集合去重和count特性，算法复杂度低)
+                best_char = max(set(cell_votes), key=cell_votes.count)
+                final_map_list.append(best_char)
+
+            # 2. 小车坐标投票：提取该时间周期内，成功识别到小车的有效坐标集合
+            valid_car_votes = [(cx, cy) for fnd, cx, cy in tx_vote_buffer_car if fnd]
+            if len(valid_car_votes) > 0:
+                # 基于这个动态时间池中占比最大的坐标点，敲定最后基准以抗击突发光斑或抖动
+                final_car_pos = max(set(valid_car_votes), key=valid_car_votes.count)
+                final_car_found = True
+                final_car_x, final_car_y = final_car_pos
+            else:
+                final_car_found = False
+                final_car_x, final_car_y = 225, 225 # 无效坐标
+
+            # 组装最终给主控的单@字符地图 (此时使用的是基于动态时间的全局最优解)
+            map_list_out = build_map_with_single_car(final_map_list, final_car_found, final_car_x, final_car_y)
+
+            # 记录本次打包的数据以供 IDE 监控随时打印
+            last_map_list_out = map_list_out
+            last_car_x, last_car_y = final_car_x, final_car_y
+
+            # --- 阶段 C：串口打包发送 (194 字节全场通讯) ---
+            # 此时传输完全被 TX_INTERVAL_MS 严格卡位，彻底杜绝了高频硬发导致的 MCU 死机或溢出
+            try:
+                map_bytes = "".join(map_list_out).encode("ascii")
+                payload = map_bytes + bytes([final_car_x, final_car_y])
+                if len(payload) == 194:
+                    uart.write(pack_frame(PROTO_TYPE_MAP, payload))
+            except Exception as e:
+                print("UART TX Error:", e)
+
+        # 【极其重要】：无论刚才是否发生了异常断联，只要时间周期走完了，
+        # 都必须彻底清空多帧缓冲区，并同步重置计时器，让系统迎接下一次干净的动态累加周期。
+        tx_vote_buffer_map = []
+        tx_vote_buffer_car = []
+        _last_tx_ms = current_ms
+
+    # 发送系统心跳 (不受地图降频约束，必须独立维持高频发送防止主控掉线)
     send_heartbeat_if_due()
 
     # --- 阶段 D：终端监控防阻塞 (极度重要) ---
@@ -463,10 +539,11 @@ while(True):
     # 绝对禁止每帧打印！I/O 阻塞会直接卡死摄像头进程导致帧率断崖下跌。
     if frame_cnt % 10 == 0:
         print("\033[H", end="") # 清屏
-        print("FPS: %0.1f | 小车坐标: (%d, %d)" % (clock.fps(), car_x, car_y))
+        # 打印使用最新投票决出的最后结果
+        print("FPS: %0.1f | 小车坐标: (%d, %d)" % (clock.fps(), last_car_x, last_car_y))
         if CALIB_SHOW_CORNERS and tl_pt is not None:
             print("基准: TL=%s TR=%s BL=%s BR=%s" % (tl_pt, tr_pt, bl_pt, br_pt))
 
         # 打印字符地图阵列
         for r in range(ROWS):
-            print("".join(map_list_out[r*COLS : (r+1)*COLS]))
+            print("".join(last_map_list_out[r*COLS : (r+1)*COLS]))
