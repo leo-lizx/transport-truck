@@ -12,7 +12,7 @@
  *        - 在与物体 4-邻接的可立足格中，由 Tour 选择兼顾路程和转角的观察点
  *        - 保持状态机记录的 90° 基准航向移动到观察点，仅依赖里程计到位
  *        - 按“物体格-观察格”旋转到 0/90/180/-90° 朝向物体
- *        - 等多数票稳定: 在 SAMPLE_WINDOW_MS 内统计 BOX_CLASS 帧, 占比 ≥ MAJORITY_THRESH 即确认
+ *        - 主控指定 BOX/TARGET 与 request_id；连续三帧同编号、同类别后立即确认
  *        - 保持采样后的车头角, 直接继续下一个物体
  *   4. 所有 box → class_id, target → class_id 收齐后, 按相同 class_id 与静态推送可达性配对生成
  *      g_box_to_target[]，避免仅按直线距离把贴边箱分给无法起推的目标
@@ -33,27 +33,19 @@
  * 调参 (集中, 后续可挪到 chassis_config.h)
  *=================================================================================================================*/
 
-/** 单次采样窗口最长时长 (ms) — 超时仍未稳定则按当前最高票输出 */
-#define RECOG_SAMPLE_WINDOW_MS         (1500U)
+/** 连续收到三张同 request_id、同类型、同 class_id 的有效帧即确认。 */
+#define RECOG_CONFIRM_CONSEC_SAMPLES   (3U)
 
-/** 多数票确认阈值: 同一 class_id 出现次数 / 总采样 ≥ 该比 → 立即确认 (0..100) */
-#define RECOG_MAJORITY_THRESH_PCT      (60U)
+/** 无法得到三帧一致结果时的故障上限；它不参与成功判定，也不会延迟已确认结果。 */
+#define RECOG_SAMPLE_TIMEOUT_MS        (1500U)
 
-/** 最少采样次数 — 不到这个数即使比例够也再等等 */
-#define RECOG_MIN_SAMPLES              (8U)
-
-/** 连续三张新鲜同类帧即可快速确认；不满足时仍保留 8 帧多数票兜底。 */
-#define RECOG_FAST_CONSEC_SAMPLES      (3U)
-
-/** 视觉端无识别 (class_id=0) 容忍上限: B16 — 改为"连续 N 帧 None"判据.
- *  视觉端 BOX_CLASS 帧约 50~100ms/帧, 连续 30 帧 ≈ 1.5~3s 持续无识别才失败.
- *  允许偶发掉帧不影响整体识别. */
-#define RECOG_MAX_CONSEC_NONE          (30U)
+/** SAMPLE 中定期重发同一请求，覆盖 OpenART2 重启或请求帧偶发损坏。 */
+#define RECOG_REQUEST_RETRY_MS         (200U)
 
 /** 5ms 周期 */
 #define RECOG_TICK_MS                  (5U)
 
-/** 单个分类帧最大年龄；超过该值不得计入当前观察点的多数票。 */
+/** 单个分类帧最大年龄；超过该值不得计入当前观察点的连续确认。 */
 #define RECOG_CLASS_FRAME_MAX_AGE_MS   (250U)
 
 /** B3a: 单点 NAV 最短时限 5s，长直线按每格 1.5s 线性放宽。 */
@@ -64,7 +56,8 @@
 #define RECOG_FACE_TIMEOUT_TICKS       (600U)
 
 /** 单次 SAMPLE 阶段最大 tick 数 */
-#define RECOG_SAMPLE_MAX_TICKS         (RECOG_SAMPLE_WINDOW_MS / RECOG_TICK_MS)
+#define RECOG_SAMPLE_MAX_TICKS         (RECOG_SAMPLE_TIMEOUT_MS / RECOG_TICK_MS)
+#define RECOG_REQUEST_RETRY_TICKS      (RECOG_REQUEST_RETRY_MS / RECOG_TICK_MS)
 
 /** 从 SOKOBAN_MAX_BOXES 借用的目标列表上限 (理论上 boxes==targets) */
 #define RECOG_MAX_TARGETS              (SOKOBAN_MAX_BOXES)
@@ -93,7 +86,7 @@ typedef struct
     Point_t pos;            /* 物体网格坐标                          */
     Point_t observe;        /* 观察点 (与 pos 4-邻接的可立足格)      */
     uint8   kind;           /* APP_LINK_OBJ_KIND_BOX / TARGET        */
-    uint8   class_id;       /* 多数票输出的类别; 0 = 未识别          */
+    uint8   class_id;       /* 连续确认输出的类别; 0 = 未识别        */
     uint8   visited;        /* 1 = 本轮已尝试访问, 不再选              */
     uint8   ok;             /* 1 = class_id 已确定 (≠0)              */
 } RecogItem_t;
@@ -118,14 +111,15 @@ static Point_t s_nav_apply_player;
 static uint8   s_map_changed     = 0U;
 static uint8   s_nav_replay_map[MAP_ROWS][MAP_COLS];
 
-/* 多数票统计 */
+/* 当前识别请求与连续确认统计 */
 static uint16 s_sample_ticks    = 0U;
 static uint16 s_sample_total    = 0U;
-static uint16 s_sample_consec_none = 0U;     /* B16: 连续 None 计数, 任一有效帧清零 */
 static uint8  s_sample_last_class = 0U;
 static uint8  s_sample_consec_class = 0U;
-static uint16 s_class_hist[RECOG_CLASS_ID_MAX + 1U] = {0};
 static uint32 s_last_seen_frame_id = 0U;     /* 已采样过的最大 frame_id, 防重复计票 */
+static uint8  s_active_request_id = 0U;
+static uint8  s_request_sequence = 0U;       /* 不随单轮 Reset 清零，避免迟到帧重新命中 */
+static uint16 s_request_retry_ticks = 0U;
 
 /* 识别 tour 选点 scratch: 小规模 DP、父节点和时间距离约 8KB BSS。 */
 static uint8  s_pick_distance[MAP_ROWS][MAP_COLS];
@@ -224,69 +218,62 @@ static uint8 recog_nav_arrived(void)
 }
 
 /*===================================================================================================================
- * 多数票 — 采样统计与判定
+ * 指定类型请求 — 连续一致结果判定
  *=================================================================================================================*/
 
 static void sample_state_reset(void)
 {
     app_link_box_class_snapshot_t snap;
 
-    s_sample_ticks       = 0U;
-    s_sample_total       = 0U;
-    s_sample_consec_none = 0U;
-    s_sample_last_class  = 0U;
+    s_sample_ticks = 0U;
+    s_sample_total = 0U;
+    s_sample_last_class = 0U;
     s_sample_consec_class = 0U;
+    s_request_retry_ticks = 0U;
     /* 丢弃转向完成前已经落地的最后一帧，只统计进入 SAMPLE 后的新帧。 */
     app_link_get_box_class_snapshot(&snap);
     s_last_seen_frame_id = (snap.valid != 0U) ? snap.frame_id : 0U;
-    memset(s_class_hist, 0, sizeof(s_class_hist));
 }
 
 /**
  * @return  >0 = 已确认的 class_id;
  *           0 = 还在采样;
- *          -1 = 视觉持续无识别 (class_id=0 累计过多), 判失败
- *          -2 = 时间窗到了仍无明确多数, 取最高票兜底
+ *          -2 = 故障上限内仍未取得三帧一致结果
  */
-static int16 sample_majority_step(uint8 expect_kind)
+static int16 sample_confirm_step(uint8 expect_kind)
 {
     app_link_box_class_snapshot_t snap;
     uint32 now_ms;
-    uint8 histogram_changed = 0U;
+
     app_link_get_box_class_snapshot(&snap);
     now_ms = app_link_get_ms();
-
     s_sample_ticks++;
+    s_request_retry_ticks++;
 
-    /* 仅当新一帧到达时计票 */
+    /* 仅统计当前请求产生的新鲜帧，旧观察点或其他类型的结果不会污染连续确认。 */
     if ((snap.valid != 0U) && (snap.frame_id != s_last_seen_frame_id))
     {
         s_last_seen_frame_id = snap.frame_id;
 
-        /* frame_id 只保证“没重复”，stamp_ms 再保证它确属当前实时观察窗口。 */
         if ((uint32)(now_ms - snap.stamp_ms) > RECOG_CLASS_FRAME_MAX_AGE_MS)
         {
             return 0;
         }
 
-        /* B11: 物体类型不匹配 (主控想看 BOX, 视觉端却给 TARGET): 静默忽略,
-         * 不计入 None 也不计入 total. 否则相邻 box/target 会把 None 拉满判失败. */
-        if (snap.obj_kind != expect_kind)
+        if ((snap.obj_kind != expect_kind) ||
+            (snap.request_id != s_active_request_id))
         {
-            /* skip — 既不计 None 也不计 total */
+            /* 迟到帧：忽略且不打断当前请求已经取得的连续结果。 */
         }
-        else if (snap.class_id == 0U)
+        else if ((snap.class_id == 0U) ||
+                 (snap.class_id > (uint8)RECOG_CLASS_ID_MAX))
         {
-            s_sample_consec_none++;            /* B16: 连续 None */
             s_sample_last_class = 0U;
             s_sample_consec_class = 0U;
         }
-        else if (snap.class_id <= (uint8)RECOG_CLASS_ID_MAX)
+        else
         {
-            s_class_hist[snap.class_id]++;
             s_sample_total++;
-            s_sample_consec_none = 0U;          /* B16: 收到有效帧 → 清零 */
-            histogram_changed = 1U;
             if (s_sample_last_class == snap.class_id)
             {
                 if (s_sample_consec_class < 255U) { s_sample_consec_class++; }
@@ -296,68 +283,26 @@ static int16 sample_majority_step(uint8 expect_kind)
                 s_sample_last_class = snap.class_id;
                 s_sample_consec_class = 1U;
             }
-            if (s_sample_consec_class >= (uint8)RECOG_FAST_CONSEC_SAMPLES)
+            if (s_sample_consec_class >= (uint8)RECOG_CONFIRM_CONSEC_SAMPLES)
             {
                 return (int16)snap.class_id;
             }
         }
-        else
-        {
-            /* 越界视为 None */
-            s_sample_consec_none++;
-            s_sample_last_class = 0U;
-            s_sample_consec_class = 0U;
-        }
     }
 
-    /* B16: 视觉端连续无识别 → 失败 (允许偶发掉帧) */
-    if (s_sample_consec_none >= (uint16)RECOG_MAX_CONSEC_NONE)
+    if (s_request_retry_ticks >= (uint16)RECOG_REQUEST_RETRY_TICKS)
     {
-        return -1;
+        app_link_send_recog_request(expect_kind, s_active_request_id);
+        s_request_retry_ticks = 0U;
     }
 
-    /* 满足最少采样数后, 看最高票占比 */
-    if (histogram_changed != 0U &&
-        s_sample_total >= (uint16)RECOG_MIN_SAMPLES)
-    {
-        uint8  best_cls = 0U;
-        uint16 best_cnt = 0U;
-        for (uint8 i = 1U; i <= (uint8)RECOG_CLASS_ID_MAX; ++i)
-        {
-            if (s_class_hist[i] > best_cnt)
-            {
-                best_cnt = s_class_hist[i];
-                best_cls = i;
-            }
-        }
-        /* 占比达标 → 立即确认 */
-        if ((uint32)best_cnt * 100U >= (uint32)s_sample_total * (uint32)RECOG_MAJORITY_THRESH_PCT)
-        {
-            return (int16)best_cls;
-        }
-    }
-
-    /* 时间窗到了 → 兜底返回最高票 (即便比例不够, 只要 >0) */
+    /* 只把它作为故障退出上限；绝不拿不足三帧的最高票兜底。 */
     if (s_sample_ticks >= (uint16)RECOG_SAMPLE_MAX_TICKS)
     {
-        uint8  best_cls = 0U;
-        uint16 best_cnt = 0U;
-        for (uint8 i = 1U; i <= (uint8)RECOG_CLASS_ID_MAX; ++i)
-        {
-            if (s_class_hist[i] > best_cnt)
-            {
-                best_cnt = s_class_hist[i];
-                best_cls = i;
-            }
-        }
-        if (best_cnt > 0U)
-        {
-            return (int16)best_cls;
-        }
-        return -2;     /* 兜底失败 */
+        return -2;
     }
 
-    return 0;          /* 继续采样 */
+    return 0;
 }
 
 /*===================================================================================================================
@@ -1250,6 +1195,10 @@ static void enter_sub_sample(void)
 {
     s_sub_state = RECOG_SUB_SAMPLE;
     sample_state_reset();
+    s_request_sequence++;
+    if (s_request_sequence == 0U) { s_request_sequence = 1U; }
+    s_active_request_id = s_request_sequence;
+    app_link_send_recog_request(s_items[s_cur_idx].kind, s_active_request_id);
 }
 
 static void enter_sub_next(void)
@@ -1277,6 +1226,7 @@ void App_Recognize_Reset(void)
     s_tour_cached_next = 0U;
     s_subphase_ticks = 0U;        /* B3a */
     s_nav_timeout_limit = RECOG_NAV_TIMEOUT_TICKS;
+    s_active_request_id = 0U;
     sample_state_reset();
     memset(s_items, 0, sizeof(s_items));
     memset(&s_nav_plan, 0, sizeof(s_nav_plan));
@@ -1445,7 +1395,7 @@ AppRecognizeStatus_e App_Recognize_Tick(uint8 map[MAP_ROWS][MAP_COLS],
 
         case RECOG_SUB_SAMPLE:
         {
-            int16 r = sample_majority_step(s_items[s_cur_idx].kind);
+            int16 r = sample_confirm_step(s_items[s_cur_idx].kind);
             if (r > 0)
             {
                 s_items[s_cur_idx].class_id = (uint8)r;
@@ -1453,7 +1403,7 @@ AppRecognizeStatus_e App_Recognize_Tick(uint8 map[MAP_ROWS][MAP_COLS],
                 s_items[s_cur_idx].ok       = 1U;
                 enter_sub_next();
             }
-            else if (r == -1 || r == -2)
+            else if (r < 0)
             {
                 /* 当前物体识别失败 — 不立即整体失败, 给后续物体机会;
                  * 最终在 NEXT/DONE 阶段统一判断映射是否完整 */
@@ -1530,7 +1480,13 @@ AppRecognizeStatus_e App_Recognize_Tick(uint8 map[MAP_ROWS][MAP_COLS],
 
 void App_Recognize_Get_Debug(AppRecognizeDebug_t *out)
 {
+    uint8 box_idx = 0U;
+    uint8 target_idx = 0U;
+
     if (out == NULL) { return; }
+
+    memset(out->box_class_ids, 0, sizeof(out->box_class_ids));
+    memset(out->target_class_ids, 0, sizeof(out->target_class_ids));
 
     out->sub_state         = s_sub_state;
     out->total_targets     = s_item_count;
@@ -1552,15 +1508,31 @@ void App_Recognize_Get_Debug(AppRecognizeDebug_t *out)
     for (uint8 i = 0U; i < s_item_count; ++i)
     {
         if (s_items[i].visited) { ++visited; }
-        if (s_items[i].ok)
+        if (s_items[i].kind == APP_LINK_OBJ_KIND_BOX)
         {
-            if (s_items[i].kind == APP_LINK_OBJ_KIND_BOX) { ++rb; } else { ++rt; }
+            if (box_idx < (uint8)SOKOBAN_MAX_BOXES)
+            {
+                out->box_class_ids[box_idx] = s_items[i].ok ? s_items[i].class_id : 0U;
+                ++box_idx;
+            }
+            if (s_items[i].ok) { ++rb; }
+        }
+        else if (s_items[i].kind == APP_LINK_OBJ_KIND_TARGET)
+        {
+            if (target_idx < (uint8)SOKOBAN_MAX_BOXES)
+            {
+                out->target_class_ids[target_idx] = s_items[i].ok ? s_items[i].class_id : 0U;
+                ++target_idx;
+            }
+            if (s_items[i].ok) { ++rt; }
         }
     }
     out->visited_count   = visited;
     out->inferred_count  = 0U;
     out->resolved_box    = rb;
     out->resolved_target = rt;
+    out->box_count       = box_idx;
+    out->target_count    = target_idx;
 }
 
 uint8 App_Recognize_Map_Changed(void)

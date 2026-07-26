@@ -21,7 +21,7 @@
  *   - 16 x 12 map grid.
  *   - Normal modes show fresh MAP frames; race mode shows accepted frozen maps only.
  *   - Car grid position overlay.
- *   - Current yaw angle below the map.
+ *   - Normal mode shows pose data; race mode shows all recognized BOX/TARGET class IDs.
  *===========================================================================*/
 
 #define CHASSIS_MENU_FLASH_SECTOR      (127U)
@@ -46,6 +46,9 @@ typedef struct
 #define MENU_MAP_H                     (APP_LINK_MAP_ROWS * MENU_CELL_SIZE)
 #define MENU_SIDE_X                    (216U)
 #define MENU_RECOG_Y                   (152U)
+#define MENU_TEXT_COLS                 (40U)
+#define MENU_RECOG_BOX_Y               (188U)
+#define MENU_RECOG_TARGET_Y            (206U)
 
 #define MENU_RGB565(r, g, b)           (uint16)((((uint16)(r) & 0xF8U) << 8) | \
                                                 (((uint16)(g) & 0xF8U) << 3) | \
@@ -81,6 +84,9 @@ static uint8 s_last_recog_idx = 0U;
 static uint8 s_last_recog_total = 0U;
 static uint8 s_last_recog_kind = 0U;
 static uint8 s_last_recog_class = 0U;
+static uint8 s_recog_lists_cached = 0U;
+static char s_last_box_line[MENU_TEXT_COLS + 1U];
+static char s_last_target_line[MENU_TEXT_COLS + 1U];
 static uint8 s_game_status_cached = 0U;
 static GameRuntimeStatus_t s_last_game_status;
 
@@ -144,9 +150,8 @@ static int32 menu_float_display_key(float value, uint8 point_digits)
     return key;
 }
 
-static void menu_update_recognize_object(void)
+static void menu_update_recognize_object(const AppRecognizeDebug_t *recog)
 {
-    AppRecognizeDebug_t recog;
     const char *kind_text;
     uint8 recog_valid;
     uint8 display_idx;
@@ -154,13 +159,12 @@ static void menu_update_recognize_object(void)
     uint8 display_kind;
     uint8 display_class;
 
-    Game_Get_Recognize_Debug(&recog);
-    recog_valid = (uint8)((recog.total_targets != 0U) &&
-                          (recog.current_idx < recog.total_targets));
-    display_idx = (0U != recog_valid) ? (uint8)(recog.current_idx + 1U) : 0U;
-    display_total = (0U != recog_valid) ? recog.total_targets : 0U;
-    display_kind = (0U != recog_valid) ? recog.current_kind : 0U;
-    display_class = (0U != recog_valid) ? recog.current_class_id : 0U;
+    recog_valid = (uint8)((recog->total_targets != 0U) &&
+                          (recog->current_idx < recog->total_targets));
+    display_idx = (0U != recog_valid) ? (uint8)(recog->current_idx + 1U) : 0U;
+    display_total = (0U != recog_valid) ? recog->total_targets : 0U;
+    display_kind = (0U != recog_valid) ? recog->current_kind : 0U;
+    display_class = (0U != recog_valid) ? recog->current_class_id : 0U;
 
     ips200_set_color(MENU_COLOR_TEXT, MENU_COLOR_BG);
 
@@ -234,6 +238,84 @@ static void menu_update_recognize_object(void)
     s_last_recog_kind = display_kind;
     s_last_recog_class = display_class;
     s_recog_cached = 1U;
+}
+
+static void menu_build_class_line(char line[MENU_TEXT_COLS + 1U],
+                                  const char *prefix,
+                                  const uint8 class_ids[SOKOBAN_MAX_BOXES],
+                                  uint8 count)
+{
+    uint8 cursor = 0U;
+    uint8 i;
+
+    while ((*prefix != '\0') && (cursor < (uint8)MENU_TEXT_COLS))
+    {
+        line[cursor++] = *prefix++;
+    }
+
+    if (count > (uint8)SOKOBAN_MAX_BOXES) { count = (uint8)SOKOBAN_MAX_BOXES; }
+    for (i = 0U; i < count; ++i)
+    {
+        uint8 class_id = class_ids[i];
+
+        if ((uint8)(cursor + 3U) > (uint8)MENU_TEXT_COLS) { break; }
+        line[cursor++] = ' ';
+        if (class_id == 0U)
+        {
+            line[cursor++] = '-';
+            line[cursor++] = '-';
+        }
+        else if (class_id <= 99U)
+        {
+            line[cursor++] = (char)('0' + (class_id / 10U));
+            line[cursor++] = (char)('0' + (class_id % 10U));
+        }
+        else
+        {
+            line[cursor++] = '?';
+            line[cursor++] = '?';
+        }
+    }
+
+    while (cursor < (uint8)MENU_TEXT_COLS) { line[cursor++] = ' '; }
+    line[MENU_TEXT_COLS] = '\0';
+}
+
+static void menu_update_recognize_lists(const AppRecognizeDebug_t *recog)
+{
+    char box_line[MENU_TEXT_COLS + 1U];
+    char target_line[MENU_TEXT_COLS + 1U];
+
+    menu_build_class_line(box_line, "BOX:", recog->box_class_ids, recog->box_count);
+    menu_build_class_line(target_line, "TARGET:",
+                          recog->target_class_ids, recog->target_count);
+
+    ips200_set_color(MENU_COLOR_TEXT, MENU_COLOR_BG);
+    if ((s_recog_lists_cached == 0U) ||
+        (memcmp(box_line, s_last_box_line, sizeof(box_line)) != 0))
+    {
+        ips200_show_string(0U, MENU_RECOG_BOX_Y, box_line);
+        memcpy(s_last_box_line, box_line, sizeof(box_line));
+    }
+    if ((s_recog_lists_cached == 0U) ||
+        (memcmp(target_line, s_last_target_line, sizeof(target_line)) != 0))
+    {
+        ips200_show_string(0U, MENU_RECOG_TARGET_Y, target_line);
+        memcpy(s_last_target_line, target_line, sizeof(target_line));
+    }
+    s_recog_lists_cached = 1U;
+}
+
+static void menu_update_recognize_display(uint8 show_class_lists)
+{
+    AppRecognizeDebug_t recog;
+
+    Game_Get_Recognize_Debug(&recog);
+    menu_update_recognize_object(&recog);
+    if (show_class_lists != 0U)
+    {
+        menu_update_recognize_lists(&recog);
+    }
 }
 
 static uint8 menu_map_frame_is_fresh(uint32 *age_ms_out)
@@ -331,6 +413,7 @@ static void menu_prepare_layout_once(void)
     s_map_cached = 0U;
     s_dynamic_cached = 0U;
     s_recog_cached = 0U;
+    s_recog_lists_cached = 0U;
     s_game_status_cached = 0U;
 }
 
@@ -522,7 +605,7 @@ static void menu_update_dynamic_text(uint8 map_ready, uint32 map_age_ms)
     s_last_imu_yaw_key = imu_yaw_key;
     s_dynamic_cached = 1U;
 
-    menu_update_recognize_object();
+    menu_update_recognize_display(0U);
     menu_update_game_status();
 }
 
@@ -536,6 +619,7 @@ void chassis_menu_init(void)
     s_map_cached = 0U;
     s_dynamic_cached = 0U;
     s_recog_cached = 0U;
+    s_recog_lists_cached = 0U;
     s_game_status_cached = 0U;
     s_last_frozen_map_generation = 0U;
 }
@@ -576,6 +660,11 @@ void chassis_menu_render_game_frozen_100ms(void)
     uint32 generation = 0U;
 
     menu_prepare_layout_once();
+
+    /* Race mode keeps the frozen map unchanged, but refreshes recognition
+     * diagnostics and stage text when their values change. */
+    menu_update_recognize_display(1U);
+    menu_update_game_status();
 
     /* The grid is already black after drawing the layout. Treat it as an
      * empty cached map so the first freeze only transfers non-empty cells. */

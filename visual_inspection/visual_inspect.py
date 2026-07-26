@@ -6,16 +6,20 @@ import os, tf, gc
 # 新增：CRC8 校验函数 (依据逐飞协议标准多项式 0x07)
 # 这是主控判定数据包是否损坏的唯一标准，必须计算！
 # ==========================================
+def crc8_update(crc, byte):
+    crc ^= byte
+    for _ in range(8):
+        if crc & 0x80:
+            crc = (crc << 1) ^ 0x07
+        else:
+            crc <<= 1
+        crc &= 0xFF
+    return crc
+
 def crc8(data):
     crc = 0x00
     for byte in data:
-        crc ^= byte
-        for _ in range(8):
-            if crc & 0x80:
-                crc = (crc << 1) ^ 0x07
-            else:
-                crc <<= 1
-            crc &= 0xFF
+        crc = crc8_update(crc, byte)
     return crc
 
 # ==========================================
@@ -41,6 +45,71 @@ def pack_frame(type_byte, payload):
 # 【新增批注】：MD文档中写明主控侧接口为 UART1_RX_B13，这里 UART(12) 是 OpenART 端的串口号，
 # 只要物理引脚（TX连主控RX，RX连主控TX，GND连GND）接对即可。
 uart = UART(12, 115200, timeout_char=1000)
+
+TYPE_RECOG_REQUEST = 0x11
+OBJ_KIND_BOX = 0
+OBJ_KIND_TARGET = 1
+REQUEST_PAYLOAD_LEN = 2
+
+# 主控请求帧接收状态机。只有收到合法的 [obj_kind][request_id] 后才发送分类结果。
+request_rx_state = 0
+request_rx_type = 0
+request_rx_len = 0
+request_rx_index = 0
+request_rx_crc = 0
+request_rx_payload = bytearray(REQUEST_PAYLOAD_LEN)
+active_request_kind = OBJ_KIND_BOX
+active_request_id = 0
+
+def feed_request_byte(byte):
+    global request_rx_state, request_rx_type, request_rx_len
+    global request_rx_index, request_rx_crc
+    global active_request_kind, active_request_id
+
+    if request_rx_state == 0:
+        if byte == 0xAA:
+            request_rx_state = 1
+    elif request_rx_state == 1:
+        if byte == 0x55:
+            request_rx_state = 2
+        elif byte != 0xAA:
+            request_rx_state = 0
+    elif request_rx_state == 2:
+        request_rx_type = byte
+        request_rx_crc = crc8_update(0x00, byte)
+        request_rx_state = 3
+    elif request_rx_state == 3:
+        request_rx_len = byte
+        request_rx_crc = crc8_update(request_rx_crc, byte)
+        request_rx_index = 0
+        if request_rx_len == REQUEST_PAYLOAD_LEN:
+            request_rx_state = 4
+        else:
+            request_rx_state = 0
+    elif request_rx_state == 4:
+        request_rx_payload[request_rx_index] = byte
+        request_rx_crc = crc8_update(request_rx_crc, byte)
+        request_rx_index += 1
+        if request_rx_index >= request_rx_len:
+            request_rx_state = 5
+    else:
+        if (byte == request_rx_crc and
+            request_rx_type == TYPE_RECOG_REQUEST and
+            request_rx_payload[0] in (OBJ_KIND_BOX, OBJ_KIND_TARGET) and
+            request_rx_payload[1] != 0):
+            active_request_kind = request_rx_payload[0]
+            active_request_id = request_rx_payload[1]
+        request_rx_state = 0
+
+def poll_recognition_request():
+    available = uart.any()
+    while available > 0:
+        chunk = uart.read(available)
+        if not chunk:
+            return
+        for byte in chunk:
+            feed_request_byte(byte)
+        available = uart.any()
 
 sensor.reset()
 sensor.set_pixformat(sensor.RGB565)
@@ -122,6 +191,7 @@ except:
 # 3. 主循环：停车打点识别
 # ==========================================
 while(True):
+    poll_recognition_request()
     clock.tick()
     img = sensor.snapshot()
 
@@ -134,14 +204,30 @@ while(True):
         heartbeat_seq = (heartbeat_seq + 1) % 256 # 0-255 循环
         last_heartbeat_time = current_time
 
+    # 没有主控请求时只维持取景和心跳，不广播无归属的分类结果。
+    if active_request_id == 0:
+        img.draw_rectangle(RECOGNITION_ROI, color=(255,255,0), thickness=2)
+        gc.collect()
+        continue
+
     # 模型只对矩形框内的图像进行分类。
     for obj in tf.classify(net, img, roi=RECOGNITION_ROI):
 
         # 获取所有类别的预测概率列表
         predictions = obj.output()
 
-        # 找到概率最大的那个类别的索引
-        max_index = predictions.index(max(predictions))
+        # 只在主控指定的类别集合中找最大值；另一种物体不会参与本次结果竞争。
+        if active_request_kind == OBJ_KIND_BOX:
+            candidate_start = 0
+            candidate_end = 10
+        else:
+            candidate_start = 11
+            candidate_end = 21
+
+        max_index = candidate_start
+        for index in range(candidate_start + 1, candidate_end):
+            if predictions[index] > predictions[max_index]:
+                max_index = index
         max_confidence = predictions[max_index]
         best_label = labels[max_index]
 
@@ -158,45 +244,26 @@ while(True):
         # 4. 串口通信：发送决策数据给主板 (已全面重构以适配新协议)
         # ==========================================
 
-        # 【极其关键：重新逻辑映射】
-        # MD 文档旧版写过 class_id 1..8；当前主控已按 OpenART2 映射扩展到 1..10。
-        # 我们利用 obj_kind 字段进行扩容分离：
-        # obj_kind = 0 (箱子) 代表前 10 个卡通人物
-        # obj_kind = 1 (目标点) 代表后 10 个数字
-        mapped_obj_kind = 0
+        mapped_obj_kind = active_request_kind
         mapped_class_id = 0 # 默认 0 表示未识别/背景
 
-        # 只有当置信度大于 70% 且不是背景时，才进行有效映射
-        if max_confidence > 0.70 and best_label != "background":
-            if 0 <= max_index <= 9:
-                # 识别到卡通人物 (0-9)
-                mapped_obj_kind = 0 # 归类为“箱子”
-                mapped_class_id = max_index + 1 # 映射为编号 1 到 10
-            elif 11 <= max_index <= 20:
-                # 识别到数字 (11-20)
-                mapped_obj_kind = 1 # 归类为“目标点”
-                mapped_class_id = (max_index - 11) + 1 # 同样映射为编号 1 到 10
-        else:
-            # 置信度不足或识别为背景
-            mapped_obj_kind = 0
-            mapped_class_id = 0 # class_id=0 主控会判定为 None (未识别)
+        # 指定集合的最佳结果必须同时超过 70% 且强于背景，才算确切识别。
+        if max_confidence > 0.70 and max_confidence > predictions[10]:
+            if active_request_kind == OBJ_KIND_BOX:
+                mapped_class_id = max_index + 1
+            else:
+                mapped_class_id = (max_index - 11) + 1
 
         # 【构造 BOX_CLASS 帧】
-        # 依据 MD 文档第 9 点，TYPE=0x02，LEN=3
-        # PAYLOAD = [obj_kind, class_id, vision_seq]
-        data_packet = bytes([mapped_obj_kind, mapped_class_id, vision_seq])
+        # TYPE=0x02，PAYLOAD 回传本次主控 request_id。
+        # PAYLOAD = [obj_kind, class_id, vision_seq, request_id]
+        data_packet = bytes([mapped_obj_kind, mapped_class_id, vision_seq, active_request_id])
 
         # 使用 pack_frame 打包并发送 (会自动加上 AA 55、TYPE、LEN、CRC)
         uart.write(pack_frame(0x02, data_packet))
 
         # 更新视觉帧序号 (0-255 循环)，告诉主控这是一帧新的数据
         vision_seq = (vision_seq + 1) % 256
-
-        # 比赛防抖小技巧：发送完后强制延时一小会儿，防止连续疯狂发包导致主板串口中断卡死
-        # 因为你们是停车识别，延时 100-200ms 完全没问题
-        # 【新增批注】：MD 文档建议分类摄像头 50ms 一帧 (20Hz)。
-        # 因此这里的延时修改为 50ms，以满足主控 1.5s 采样窗口内收集足够票数的需求。
-        time.sleep_ms(50)
 
     # 极限内存回收，防止长期运行死机
     gc.collect()

@@ -848,7 +848,7 @@ static void stage_recognize_handler(void)
     /* ============================================================
      * 识别 tour 子状态机驱动 (app_recognize.c):
      *   - Stage1 无数字配对要求（有无炸弹均同）→ DONE_NO_NEED 直接放行
-     *   - Stage2/3: 遍历每个箱子和目标的观察点, 多数票投出 class_id,
+     *   - Stage2/3: 遍历每个箱子和目标的观察点, 三帧一致后确认 class_id,
      *               配对成 box→target 映射写入 g_box_to_target[]
      *   - 不可达或视觉持续无识别 → 停车等待人工处理
      * ============================================================ */
@@ -1137,7 +1137,7 @@ uint8 Game_Get_Frozen_Map(uint8 out[MAP_ROWS][MAP_COLS], uint32 *generation)
 
 /* ==================================================================
  * 【B17】对外查询: 识别 tour 进度 (转发自 App_Recognize_Get_Debug)
- * 用途: 菜单 / IPS / 上位机显示当前识别到第几个物体, 多数票占比等.
+ * 用途: 菜单 / IPS / 上位机显示当前识别到第几个物体和有效采样数等.
  * ================================================================== */
 void Game_Get_Recognize_Debug(AppRecognizeDebug_t *out)
 {

@@ -116,6 +116,7 @@ static volatile uint32 s_box_cls_seq      = 0U;
 static volatile uint8  s_box_cls_kind     = 0U;
 static volatile uint8  s_box_cls_id       = 0U;
 static volatile uint8  s_box_cls_vseq     = 0U;
+static volatile uint8  s_box_cls_request_id = 0U;
 static volatile uint32 s_box_cls_ms       = 0U;
 static volatile uint32 s_box_cls_frame_id = 0U;
 static volatile uint8  s_box_cls_valid    = 0U;
@@ -172,7 +173,8 @@ void app_link_get_car_snapshot(app_link_car_snapshot_t *out)
 /*-------------------------------------------------------------------------------------------------------------------
  * BOX_CLASS 帧 - ISR 写入 (载荷已经过 LEN/CRC 校验)
  *-----------------------------------------------------------------------------------------------------------------*/
-static void commit_box_class_frame(uint8 obj_kind, uint8 class_id, uint8 vision_seq)
+static void commit_box_class_frame(uint8 obj_kind, uint8 class_id,
+                                   uint8 vision_seq, uint8 request_id)
 {
     if ((s_box_cls_vseq_seen != 0U) &&
         (vision_seq != (uint8)(s_box_cls_last_vseq + 1U)))
@@ -187,6 +189,7 @@ static void commit_box_class_frame(uint8 obj_kind, uint8 class_id, uint8 vision_
     s_box_cls_kind     = obj_kind;
     s_box_cls_id       = class_id;
     s_box_cls_vseq     = vision_seq;
+    s_box_cls_request_id = request_id;
     s_box_cls_ms       = s_ms_now;
     s_box_cls_frame_id++;
     s_box_cls_valid    = 1U;
@@ -210,6 +213,7 @@ void app_link_get_box_class_snapshot(app_link_box_class_snapshot_t *out)
         out->obj_kind   = s_box_cls_kind;
         out->class_id   = s_box_cls_id;
         out->vision_seq = s_box_cls_vseq;
+        out->request_id = s_box_cls_request_id;
         out->stamp_ms   = s_box_cls_ms;
         out->frame_id   = s_box_cls_frame_id;
         out->valid      = s_box_cls_valid;
@@ -294,6 +298,27 @@ uint32 app_link_get_ms(void)
 {
     /* 32 位字段读取在 Cortex-M7 上原子, 无需临界区                                  */
     return s_ms_now;
+}
+
+void app_link_send_recog_request(uint8 obj_kind, uint8 request_id)
+{
+    uint8 frame[7U];
+
+    if (((obj_kind != APP_LINK_OBJ_KIND_BOX) &&
+         (obj_kind != APP_LINK_OBJ_KIND_TARGET)) ||
+        (request_id == 0U))
+    {
+        return;
+    }
+
+    frame[0] = (uint8)APP_LINK_SOF1;
+    frame[1] = (uint8)APP_LINK_SOF2;
+    frame[2] = (uint8)APP_LINK_TYPE_RECOG_REQUEST;
+    frame[3] = (uint8)APP_LINK_RECOG_REQUEST_PAYLOAD_LEN;
+    frame[4] = obj_kind;
+    frame[5] = request_id;
+    frame[6] = app_link_compute_crc8(&frame[2], 4U);
+    uart_write_buffer(UART_1, frame, (uint32)sizeof(frame));
 }
 
 static inline app_link_stats_t *port_stats(app_link_port_e port)
@@ -591,6 +616,7 @@ static void dispatch_frame(app_link_port_e port, const app_link_parser_t *parser
             uint8 obj_kind;
             uint8 class_id;
             uint8 vision_seq;
+            uint8 request_id;
 
             if (port != APP_LINK_PORT_CLASS)
             {
@@ -605,13 +631,15 @@ static void dispatch_frame(app_link_port_e port, const app_link_parser_t *parser
             obj_kind   = parser->rx_payload[0];
             class_id   = parser->rx_payload[1];
             vision_seq = parser->rx_payload[2];
+            request_id = parser->rx_payload[3];
             if ((obj_kind != APP_LINK_OBJ_KIND_BOX) &&
-                (obj_kind != APP_LINK_OBJ_KIND_TARGET))
+                (obj_kind != APP_LINK_OBJ_KIND_TARGET) ||
+                (request_id == 0U))
             {
                 stats_inc_len_err(port);
                 break;
             }
-            commit_box_class_frame(obj_kind, class_id, vision_seq);
+            commit_box_class_frame(obj_kind, class_id, vision_seq, request_id);
             stats_inc_ok(port);
             g_link_last_box_class_ms  = s_ms_now;
             g_link_last_class_link_ms = s_ms_now;
@@ -681,6 +709,7 @@ void app_link_init(void)
     s_box_cls_kind     = 0U;
     s_box_cls_id       = 0U;
     s_box_cls_vseq     = 0U;
+    s_box_cls_request_id = 0U;
     s_box_cls_ms       = 0U;
     s_box_cls_frame_id = 0U;
     s_box_cls_valid    = 0U;

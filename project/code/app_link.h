@@ -18,6 +18,7 @@
  * 当前任务实现:
  *   - TYPE=0x01 MAP        : 兼容 192B ASCII 地图; 推荐 194B = 192B 地图 + car_x + car_y
  *   - TYPE=0x10 HEARTBEAT  : 1 字节自增 seq, 用于链路保活与丢包率统计
+ *   - TYPE=0x11 RECOG_REQUEST: 主控指定本次只识别 BOX 或 TARGET，并携带请求编号
  *
  * 不在本任务范围 (留给 P0-2 / P1):
  *   - 链路超时回退状态机 (本文件只更新时间戳与心跳计数, 不做回退)
@@ -49,17 +50,20 @@ typedef enum
 {
     APP_LINK_TYPE_MAP        = 0x01,    /* 视觉 → 主控: 全局地图        */
     APP_LINK_TYPE_BOX_CLASS  = 0x02,    /* 视觉 → 主控: 物体分类 (识别 tour) */
-    APP_LINK_TYPE_POSE_HINT  = 0x03,    /* 主控 → 视觉: 位姿回灌 (后续) */
-    APP_LINK_TYPE_HEARTBEAT  = 0x10     /* 视觉 → 主控: 心跳, 载荷 1B seq */
+    APP_LINK_TYPE_POSE_HINT    = 0x03,  /* 主控 → 视觉: 位姿回灌 (后续) */
+    APP_LINK_TYPE_HEARTBEAT    = 0x10,  /* 视觉 → 主控: 心跳, 载荷 1B seq */
+    APP_LINK_TYPE_RECOG_REQUEST = 0x11  /* 主控 → 视觉: 指定识别类型和请求编号 */
 } app_link_type_e;
 
 /*-- BOX_CLASS 帧载荷常量 (识别 tour) -----------------------------------------------------------------------------
- * Payload 3 字节: [obj_kind][class_id][seq]
+ * Payload 4 字节: [obj_kind][class_id][seq][request_id]
  *   obj_kind : 0=BOX(图片箱子)  1=TARGET(数字目标)
  *   class_id : 1..N 有效类别;  0 = 无识别 / 背景
  *   seq      : 视觉端自增 seq, 用于丢包/防重统计 (主控不据此切流)
+ *   request_id: 原样回传主控请求编号；主控只采纳当前请求的结果
  *--------------------------------------------------------------------------------------------------------------*/
-#define APP_LINK_BOX_CLASS_PAYLOAD_LEN  (3U)
+#define APP_LINK_BOX_CLASS_PAYLOAD_LEN  (4U)
+#define APP_LINK_RECOG_REQUEST_PAYLOAD_LEN (2U)
 #define APP_LINK_OBJ_KIND_BOX           (0U)
 #define APP_LINK_OBJ_KIND_TARGET        (1U)
 #define APP_LINK_CLASS_ID_NONE          (0U)
@@ -174,6 +178,13 @@ uint8 app_link_compute_crc8(const uint8 *data, uint32 len);
 uint32 app_link_get_ms(void);
 
 /*-------------------------------------------------------------------------------------------------------------------
+ * 函数: app_link_send_recog_request
+ * 功能: 通过 OpenART2/UART1 发送识别请求，载荷为 [obj_kind][request_id]
+ * 备注: request_id=0 保留为“尚无请求”；非法参数不会发送。
+ *-----------------------------------------------------------------------------------------------------------------*/
+void app_link_send_recog_request(uint8 obj_kind, uint8 request_id);
+
+/*-------------------------------------------------------------------------------------------------------------------
  * 函数: app_link_get_map_snapshot
  * 功能: 【P0-3】把视觉端最新一帧合法地图以 seq-lock 方式拷贝到调用方提供的缓冲区
  * 参数: dst —— 12×16 目标缓冲区 (单元格枚举值, 与 MAP_EMPTY/WALL/TARGET/BOX/BOMB 一致)
@@ -210,7 +221,7 @@ void app_link_get_car_snapshot(app_link_car_snapshot_t *out);
 
 /*===================================================================================================================
  * BOX_CLASS 帧 — 识别 tour 阶段视觉端持续广播的"当前视野中央物体类别"
- *  - 主控按 1ms tick 维护一个 seq-lock 快照, 业务层 (app_recognize.c) 多数票投出最终类别
+ *  - 主控按 1ms tick 维护一个 seq-lock 快照, 业务层按 request_id 连续确认最终类别
  *  - 上电至首帧到达前, 快照内容 valid=0; 业务层据此决定是否进入 SAMPLE 阶段
  *=================================================================================================================*/
 typedef struct
@@ -218,6 +229,7 @@ typedef struct
     uint8  obj_kind;    /* APP_LINK_OBJ_KIND_BOX / TARGET                       */
     uint8  class_id;    /* 1..N (0 = 无识别)                                     */
     uint8  vision_seq;  /* 视觉端自增 seq, 透传                                  */
+    uint8  request_id;  /* 视觉端回传的主控识别请求编号                           */
     uint32 stamp_ms;    /* 落地时间, 与 app_link_get_ms() 同源                   */
     uint32 frame_id;    /* 主控侧帧号, 每收到一帧自增                            */
     uint8  valid;       /* 至少收到过一帧合法 BOX_CLASS                          */
@@ -225,7 +237,7 @@ typedef struct
 
 /*-------------------------------------------------------------------------------------------------------------------
  * 函数: app_link_get_box_class_snapshot
- * 功能: seq-lock 拷贝最近一帧 BOX_CLASS 解析结果, 供 app_recognize 多数票采样
+ * 功能: seq-lock 拷贝最近一帧 BOX_CLASS 解析结果, 供 app_recognize 连续确认采样
  * 参数: out —— 输出, 可为 NULL (直接忽略)
  * 备注: 业务层应配合 frame_id 变化和 stamp_ms 抗陈旧来判定 "新一帧已到"
  *-----------------------------------------------------------------------------------------------------------------*/

@@ -11,7 +11,7 @@
  *          - 移动到 Tour 选定的侧面观察点（兼顾路程和四向转角）
  *          - 仅依赖编码器里程计与陀螺仪确认到达观察点
  *          - 原地旋转车头朝向物体
- *          - 等待视觉端 BOX_CLASS 帧持续广播, 多数票稳定后采样
+ *          - 主控请求指定 BOX/TARGET；连续三帧同请求、同类别后立即确认
  *     4) 全部物体识别完成后, 按类别与静态推送可达性把 (boxIdx -> targetIdx) 映射写入
  *        g_box_to_target[]
  *        游戏主状态机据此进入 STAGE_PLAN_PATH (Sokoban_Solve_Stage2)
@@ -62,7 +62,7 @@ typedef enum
     RECOG_SUB_INIT     = 0,   /* 初始化 / 提取物体列表 / 决定是否需要识别 */
     RECOG_SUB_NAV,            /* 移动到当前物体观察点                     */
     RECOG_SUB_FACE,            /* 原地旋转车头朝向物体                     */
-    RECOG_SUB_SAMPLE,          /* 多数票采样视觉分类结果                   */
+    RECOG_SUB_SAMPLE,          /* 按 request_id 连续确认视觉分类结果       */
     RECOG_SUB_RETURN_YAW,      /* 旧调试枚举: 采样后保持当前 yaw, 不再回正 */
     RECOG_SUB_NEXT,            /* 当前物体完成, 切下一个                   */
     RECOG_SUB_DONE,            /* 全部完成 (对外输出 DONE_OK 一帧后归 INIT)*/
@@ -78,12 +78,16 @@ typedef struct
     uint8  total_targets;       /* 本轮待识别物体总数 (boxes + targets) */
     uint8  current_idx;         /* 当前正在识别第几个                    */
     uint8  current_kind;        /* APP_LINK_OBJ_KIND_BOX / TARGET        */
-    uint8  current_class_id;    /* 当前多数票得到的 class_id (0=未确定)  */
+    uint8  current_class_id;    /* 当前连续确认的 class_id (0=未确定)    */
     uint16 sample_count;        /* 已采样次数 (调试用)                   */
     uint8  visited_count;       /* 已实测访问识别完成数 (含跳过失败)     */
     uint8  inferred_count;      /* 保留字段, 恒为 0                        */
     uint8  resolved_box;        /* 已确定 class_id 的箱子数              */
     uint8  resolved_target;     /* 已确定 class_id 的目标点数            */
+    uint8  box_count;           /* 箱子槽位数（按地图从上到下、从左到右） */
+    uint8  target_count;        /* 目标点槽位数（按地图从上到下、从左到右）*/
+    uint8  box_class_ids[SOKOBAN_MAX_BOXES];
+    uint8  target_class_ids[SOKOBAN_MAX_BOXES];
 } AppRecognizeDebug_t;
 
 /*===================================================================================================================

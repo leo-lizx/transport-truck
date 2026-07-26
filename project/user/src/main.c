@@ -61,6 +61,7 @@
 static volatile uint32 s_main_tick_pending = 0U;   /* PIT_CH0 累加, 主循环消费 */
 static volatile uint32 s_main_tick_overrun = 0U;   /* 一次消费 >1 的累计差值 */
 static volatile uint32 s_main_tick_total   = 0U;   /* 主循环已消费的 tick 总数 */
+volatile uint8 g_main_uart1_raw_echo_enabled = 0U; /* 模式11由UART1 ISR原样回发摄像头字节 */
 
 /* 由 isr.c 中 PIT_CH0 分支调用; 用 extern 声明对外可见, 实现见本文件末 */
 void main_loop_on_pit_tick(void)
@@ -116,7 +117,7 @@ static uint32 wait_for_tick(void)
  *   8   MAIN_RUN_MODE_HARDCODED_MAP         ✅    代码内置          固定发车: 上电解算→Y轴平移发车→推箱→回库
  *   9   MAIN_RUN_MODE_OPENART2_TEST         ❌    OpenART2 UART1   分类链路自测: 只显示 BOX_CLASS, 车不动
  *   10  MAIN_RUN_MODE_LEVEL2_TEST           ✅    OpenART1+2       第二关单测: 收图→发车→分类→Stage2推箱→回库
- *   11  MAIN_RUN_MODE_BOARD_TEST            ❌    无               新主板自测: 屏幕显示 yaw、活动编码器轮号和轮速
+ *   11  MAIN_RUN_MODE_BOARD_TEST            ❌    UART1            新主板自测: 显示传感器数据并原样回发摄像头字节
  *=========================================================================*/
 #define MAIN_RUN_MODE_GAME            (0)   /* 正式比赛: 完整视觉+推箱+底盘闭环 */
 #define MAIN_RUN_MODE_YAW_HOLD        (1)   /* 航向保持: 不平移, 手动扰动后回到原航向 */
@@ -129,7 +130,7 @@ static uint32 wait_for_tick(void)
 #define MAIN_RUN_MODE_HARDCODED_MAP   (8)   /* 硬编码地图: 上电解算→Y轴平移发车→跑→回发车点 */
 #define MAIN_RUN_MODE_OPENART2_TEST   (9)   /* OpenART2 分类链路测试: 屏幕显示 BOX/TARGET/NONE, 车不动 */
 #define MAIN_RUN_MODE_LEVEL2_TEST     (10)  /* 第二关测试: 收图→固定发车→分类识别→Stage2推箱→回库 */
-#define MAIN_RUN_MODE_BOARD_TEST      (11)  /* 新主板测试: 屏幕显示 yaw 和手转车轮的编码器反馈 */
+#define MAIN_RUN_MODE_BOARD_TEST      (11)  /* 新主板测试: 传感器显示 + UART1 摄像头原始数据回显 */
 
 /* ═══════════ 改下面这行切换运行模式 (0~11) ═══════════ */
 #define MAIN_RUN_MODE                 (MAIN_RUN_MODE_GAME)
@@ -1932,6 +1933,8 @@ static void main_board_test_render_100ms(void)
 
 #if (MAIN_RUN_MODE == MAIN_RUN_MODE_OPENART2_TEST)
 #define OA2_TEST_STALE_MS             (500U)
+#define OA2_TEST_REQUEST_KIND          (APP_LINK_OBJ_KIND_TARGET)
+#define OA2_TEST_REQUEST_ID            (1U)
 
 typedef enum
 {
@@ -1948,6 +1951,7 @@ static uint32 s_oa2_last_frame_id = 0U;
 static uint32 s_oa2_box_count = 0U;
 static uint32 s_oa2_target_count = 0U;
 static uint32 s_oa2_none_count = 0U;
+static uint8 s_oa2_request_sent = 0U;
 
 static const char *main_oa2_phase_name(oa2_test_phase_e phase)
 {
@@ -1996,10 +2000,24 @@ static void main_run_openart2_test_5ms(void)
     }
     if ((now_ms - link_ms) > OA2_TEST_STALE_MS)
     {
+        s_oa2_request_sent = 0U;
         s_oa2_phase = OA2_PHASE_STALE;
         return;
     }
+    if (s_oa2_request_sent == 0U)
+    {
+        app_link_send_recog_request((uint8)OA2_TEST_REQUEST_KIND,
+                                    (uint8)OA2_TEST_REQUEST_ID);
+        s_oa2_request_sent = 1U;
+        s_oa2_phase = OA2_PHASE_WAIT_FRAME;
+        return;
+    }
     if (snap.valid == 0U)
+    {
+        s_oa2_phase = OA2_PHASE_WAIT_FRAME;
+        return;
+    }
+    if (snap.request_id != (uint8)OA2_TEST_REQUEST_ID)
     {
         s_oa2_phase = OA2_PHASE_WAIT_FRAME;
         return;
@@ -2206,8 +2224,11 @@ int main(void)
 #endif
 
     // OpenART2: 分类识别模块, 通过 UART1 上报 BOX_CLASS/HEARTBEAT 帧.
-#if ((MAIN_RUN_MODE == MAIN_RUN_MODE_GAME) || (MAIN_RUN_MODE == MAIN_RUN_MODE_OPENART2_TEST) || (MAIN_RUN_MODE == MAIN_RUN_MODE_LEVEL2_TEST))
+#if ((MAIN_RUN_MODE == MAIN_RUN_MODE_GAME) || (MAIN_RUN_MODE == MAIN_RUN_MODE_OPENART2_TEST) || (MAIN_RUN_MODE == MAIN_RUN_MODE_LEVEL2_TEST) || (MAIN_RUN_MODE == MAIN_RUN_MODE_BOARD_TEST))
     uart_init(MAIN_OPENART2_UART, 115200, MAIN_OPENART2_UART_TX, MAIN_OPENART2_UART_RX);
+#if (MAIN_RUN_MODE == MAIN_RUN_MODE_BOARD_TEST)
+    g_main_uart1_raw_echo_enabled = 1U;
+#endif
     uart_rx_interrupt(MAIN_OPENART2_UART, 1);
 #endif
 
@@ -2305,10 +2326,10 @@ int main(void)
     printf("M6_BOOT static map solver screen verify...\n");
     chassis_ctrl_stop();
 #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_OPENART2_TEST)
-    printf("OA2_BOOT wait BOX_CLASS from OpenART2 (UART1)...\n");
+    printf("OA2_BOOT request TARGET_CLASS from OpenART2 (UART1)...\n");
     chassis_ctrl_stop();
 #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_BOARD_TEST)
-    /* 新主板测试只采集 IMU/编码器，保持四路电机 PWM 关闭。 */
+    /* 新主板测试采集 IMU/编码器并回显 UART1 原始字节，保持四路电机 PWM 关闭。 */
     chassis_ctrl_stop();
   #if (CHASSIS_MENU_ENABLE != 0)
     main_board_test_render_100ms();
@@ -2609,8 +2630,8 @@ int main(void)
 #else
 #if (MAIN_RUN_MODE != MAIN_RUN_MODE_POINT_NAV)
 #if (MAIN_RUN_MODE == MAIN_RUN_MODE_GAME)
-            /* 比赛屏幕不再读取实时 UART 地图。该函数只有在五帧门产生新的
-             * 冻结快照时才写 SPI，其余调用立即返回。 */
+            /* 比赛屏幕不再读取实时 UART 地图。冻结地图只在五帧门产生新快照时更新；
+             * 识别编号与比赛状态仅在内容变化时局部写 SPI。 */
             chassis_menu_render_game_frozen_100ms();
 #else
             chassis_menu_render_100ms();
