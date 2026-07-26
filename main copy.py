@@ -200,6 +200,7 @@ CAR_TAIL_DARK_RGB = (0, 152, 195)     # 车尾（T）
 CAR_TAIL_BRIGHT_RGB = (58, 247, 16)
 WALL_DARK_RGB = (41, 61, 80)          # 墙壁（#）
 WALL_BRIGHT_RGB = (107, 180, 255)
+WALL_GLARE_RGB = (132, 170, 255)      # 墙壁高光白名单
 FLOOR_DARK_RGB = (33, 12, 255)        # 空地（-）
 FLOOR_BRIGHT_RGB = (49, 97, 255)
 GOAL_DARK_RGB = (173, 0, 255)         # 终点（.）
@@ -219,7 +220,7 @@ WALL_TEXTURE_BONUS_DIST = 25.0
 
 # 【架构保留】：依然保留所有靶点字典，作为纯色匹配和特征检测失败时的安全垫 (Fallback)
 SYMBOL_MAP_RGB = {
-    "#": (WALL_DARK_RGB, WALL_BRIGHT_RGB),
+    "#": (WALL_DARK_RGB, WALL_BRIGHT_RGB, WALL_GLARE_RGB),
     "-": (FLOOR_DARK_RGB, FLOOR_BRIGHT_RGB),
     ".": (GOAL_DARK_RGB, GOAL_BRIGHT_RGB),
     "$": (BOX_DARK_RGB, BOX_BRIGHT_RGB),
@@ -475,16 +476,16 @@ while(True):
     tx_vote_buffer_car.append((car_found, car_x, car_y))
 
     current_ms = time.ticks_ms()
-    
+
     # 【关键触发器】：判断当前时间与上一次下发时间的时间差，是否已经满足设定的 TX_INTERVAL_MS
     # 此逻辑完美解决了系统帧率波动时传输频率不稳定的问题，并释放了 CPU 开销。
     if time.ticks_diff(current_ms, _last_tx_ms) >= TX_INTERVAL_MS:
-        
+
         # 动态判定次数的体现：在上述间隔时间内，系统实际跑了多少帧，就在此处判定多少次。
         # 比如如果设间隔 100ms 且帧率是 60帧/秒，此处 dynamic_vote_count 大约就是 6 次判定。
         # 如果你后续把 TX_INTERVAL_MS 调整成 500ms，判定次数就会自动飙升到 30 次！
         dynamic_vote_count = len(tx_vote_buffer_map)
-        
+
         # 边界防护：确保确实积累了数据帧才进行统计，防止出现空指针或除零
         if dynamic_vote_count > 0:
             final_map_list = []
