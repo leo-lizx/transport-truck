@@ -108,15 +108,19 @@ vr = sv.verify_run_script(m2, (5, 7), script, stage=1)
 assert vr['ok'], vr['message']
 print(vr['message'])
 
-# 测试8: V2 侦查 — 必须实地访问全部箱子/目标
-print("\n=== 测试8: V2 侦查 (全量实地访问) ===")
+# 测试8: V2 侦查 — 两类物体统一规划，全部实地观察（排除法推断已移除）
+print("\n=== 测试8: V2 侦查 (混合 Tour + 全部实地观察) ===")
 m8, p8 = sv.generate_map(stage=2, box_count=3, seed=11)
 scout8 = sv.plan_scout_phase_v2(m8, p8)
 total_items = 6  # 3 box + 3 target
-print(f"  访问数: {scout8['visited_count']}/{total_items} (期望 6/6)")
-assert scout8['visited_count'] == total_items, "应实地访问全部物体"
+print(f"  实地访问: {scout8['visited_count']} / {total_items}")
+assert scout8['visited_count'] == total_items
+assert scout8['inferred_count'] == 0
 assert scout8['all_visited'], "应全部 resolved"
 assert scout8['box_to_target_idx'] is not None
+kinds8 = [v['kind'] for v in scout8['visits']]
+assert kinds8.count('box') == 3 and kinds8.count('target') == 3
+assert any(kind == 'box' for kind in kinds8[kinds8.index('target') + 1:]), kinds8
 for v in scout8['visits']:
     fd = v.get('face_dir')
     assert fd is not None, "每个实地观察项都应有面向物体的 face_dir"
@@ -126,13 +130,14 @@ for v in scout8['visits']:
 print(f"  box_classes={scout8['box_classes']} target_classes={scout8['target_classes']}")
 print(f"  box→target 映射: {scout8['box_to_target_idx']}")
 
-# 测试8a: 小规模侦查应使用全局 tour，而不是当前最近点贪心
-print("\n=== 测试8a: V2 侦查全局顺序 ===")
+# 测试8a: 小规模侦查把箱子和目标放进同一个全局 tour
+print("\n=== 测试8a: V2 混合全局侦查顺序 ===")
 m8a, p8a = sv.generate_map(stage=2, box_count=2, seed=4)
 scout8a = sv.plan_scout_phase_v2(m8a, p8a)
 order8a = [(v['kind'], v['item_idx']) for v in scout8a['visits']]
 assert order8a == [('target', 1), ('target', 0), ('box', 0), ('box', 1)], order8a
 assert len(scout8a['scout_actions']) == 12, len(scout8a['scout_actions'])
+assert scout8a['inferred_count'] == 0
 print(f"  顺序: {order8a}  侦查步数: {len(scout8a['scout_actions'])}")
 
 # 测试8b: 同图案多箱/多目标时按组内最少静态推数匹配
@@ -148,6 +153,7 @@ scout8b = sv.plan_scout_phase_v2(
     target_classes=[1, 1],
 )
 assert scout8b['all_visited']
+assert scout8b['inferred_count'] == 0
 assert scout8b['box_to_target_idx'] == [1, 0], scout8b['box_to_target_idx']
 print(f"  重复 class=1 映射: {scout8b['box_to_target_idx']} (期望 [1, 0])")
 
@@ -171,6 +177,7 @@ m8c, p8c, err8c = sv.parse_map_text("""
 assert err8c == "", err8c
 scout8c = sv.plan_scout_phase_v2(m8c, p8c, [1, 1], [1, 1])
 assert scout8c['all_visited']
+assert scout8c['inferred_count'] == 0
 assert scout8c['box_to_target_idx'] == [0, 1], scout8c['box_to_target_idx']
 assert sv.solve_stage2(m8c, scout8c['player_after_scout'],
                        scout8c['box_to_target_idx']) is not None
@@ -180,8 +187,10 @@ print("静态不可推的近目标被排除，同类别映射选择可解组合 
 # movement segments together with the final observation turn.
 print("\n=== Test 8d: time-aware scout observe selection ===")
 m8d = sv._make_empty_map()
-m8d[5][5] = sv.BOX
-scout8d = sv.plan_scout_phase_v2(m8d, (5, 2), box_classes=[1])
+m8d[5][5] = sv.TARGET
+m8d[8][12] = sv.BOX
+scout8d = sv.plan_scout_phase_v2(
+    m8d, (5, 2), box_classes=[1], target_classes=[1])
 assert scout8d['all_visited']
 assert scout8d['visits'][0]['observe'] == (5, 4), scout8d['visits'][0]
 assert scout8d['visits'][0]['face_dir'] == 3, scout8d['visits'][0]
@@ -191,19 +200,38 @@ print("精确 Tour 保留观察格，并按平移停站与观察转角的总时�
 # observe scoring in the greedy fallback.
 print("\n=== Test 8e: turn-aware greedy scout fallback ===")
 m8e = sv._make_empty_map()
-for r, c in [(5, 5), (1, 10), (2, 12), (4, 12)]:
+for r, c in [(5, 5), (1, 10), (2, 12), (4, 12),
+             (6, 12), (8, 12), (9, 10)]:
     m8e[r][c] = sv.BOX
-for r, c in [(6, 12), (8, 12), (9, 10), (9, 6)]:
+for r, c in [(1, 2), (2, 4), (3, 6), (7, 4),
+             (8, 6), (9, 6), (9, 8)]:
     m8e[r][c] = sv.TARGET
 scout8e = sv.plan_scout_phase_v2(
-    m8e, (5, 2), box_classes=[1, 2, 3, 4],
-    target_classes=[1, 2, 3, 4])
+    m8e, (5, 2), box_classes=[1, 2, 3, 4, 5, 6, 7],
+    target_classes=[1, 2, 3, 4, 5, 6, 7])
 assert scout8e['all_visited']
+assert scout8e['visited_count'] == 14
+assert scout8e['inferred_count'] == 0
 assert scout8e['visits'][0]['pos'] == (5, 5), scout8e['visits'][0]
 assert scout8e['visits'][0]['observe'] == (5, 4), scout8e['visits'][0]
 print("超过精确 DP 上限时，两步前瞻仍使用相同的时间代价。")
 
-print("\n=== Test 8f: direction-state navigation avoids extra stops ===")
+print("\n=== Test 8f: duplicate classes are fully observed on site ===")
+m8f_infer = sv._make_empty_map()
+for pos in [(2, 2), (5, 5), (8, 8)]:
+    m8f_infer[pos[0]][pos[1]] = sv.BOX
+for pos in [(2, 10), (5, 10), (8, 10)]:
+    m8f_infer[pos[0]][pos[1]] = sv.TARGET
+scout8f_infer = sv.plan_scout_phase_v2(
+    m8f_infer, (9, 2), box_classes=[1, 1, 3],
+    target_classes=[3, 1, 1])
+assert scout8f_infer['all_visited']
+assert scout8f_infer['visited_count'] == 6
+assert scout8f_infer['inferred_count'] == 0
+assert sorted(scout8f_infer['box_classes']) == sorted(scout8f_infer['target_classes'])
+print(f"重复类别全部实地确认: target={scout8f_infer['target_classes']}")
+
+print("\n=== Test 8g: direction-state navigation avoids extra stops ===")
 m8f = sv._make_empty_map()
 m8f[5][4] = sv.WALL
 route8f = sv.nav_time_path(m8f, (5, 2), (5, 6))
@@ -213,6 +241,28 @@ segments8f = 1 + sum(a != b for a, b in zip(actions8f, actions8f[1:]))
 assert route8f[1] == len(actions8f) + segments8f * sv.NAV_TIME_TURN_UNITS
 assert segments8f == 3, (route8f, actions8f)
 print(f"方向状态路径: {len(actions8f)} 格 / {segments8f} 段 / 代价 {route8f[1]}")
+
+print("\n=== Test 8h: unresolved mixed-tour item blocks completion ===")
+m8h = sv._make_empty_map()
+m8h[3][3] = sv.BOX
+m8h[7][3] = sv.BOX
+m8h[3][10] = sv.TARGET
+m8h[7][10] = sv.TARGET
+scout8h = sv.plan_scout_phase_v2(
+    m8h, (5, 2), box_classes=[0, 2], target_classes=[1, 2])
+assert not scout8h['all_visited']
+assert scout8h['inferred_count'] == 0
+assert 0 in scout8h['box_classes']
+print("混合 Tour 可先确认其他物体，但无有效类别的箱子仍会阻止最终配对。")
+
+print("\n=== Test 8i: target class outside remaining box multiset is rejected ===")
+scout8i = sv.plan_scout_phase_v2(
+    m8h, (5, 2), box_classes=[1, 2], target_classes=[9, 9])
+assert not scout8i['all_visited']
+assert scout8i['inferred_count'] == 0
+assert scout8i['target_classes'].count(9) <= scout8i['box_classes'].count(9) + \
+       scout8i['box_classes'].count(0)
+print("混合 Tour 仅在剩余异类槽位仍可能配平时接受当前类别。")
 
 # 测试9: V2 + Stage2 完整求解 (走真实路径)
 print("\n=== 测试9: V2 完整求解 ===")
@@ -288,9 +338,9 @@ assert greedy10d is not None
 assert [s['box_idx'] for s in greedy10d['sub_solutions']] == [1, 0]
 print("Stage2 skips an infeasible nearest box and preserves the fixed mapping.")
 
-# Test 11: a box may enter only the current target, not pass through another
-# unused target on the way to a farther target.
-print("\n=== Test 11: block pass-through targets ===")
+# Test 11: 赛规实测——箱子推到不对应目标点只是不消去，可以被推着穿过。
+# 走廊图中把箱子推到远端目标必须穿过近端未用目标，现应可解。
+print("\n=== Test 11: box may pass through an unused target ===")
 m11 = sv._make_empty_map()
 for c in range(2, 9):
     m11[4][c] = sv.WALL
@@ -305,14 +355,17 @@ sub11_far = sv.build_sub_map(
     [False], [False, False],
     0, 1,
 )
-assert sv.sokoban_bfs_single(sub11_far, (5, 2), boxes11[0], targets11[1]) is None
+sol11_far = sv.sokoban_bfs_single(sub11_far, (5, 2), boxes11[0], targets11[1])
+assert sol11_far is not None, "穿过未用目标推到远端目标应可解"
+end11 = sv.simulate_push_actions(sub11_far, (5, 2), boxes11[0], sol11_far) \
+    if hasattr(sv, 'simulate_push_actions') else None
 sub11_near = sv.build_sub_map(
     m11, boxes11, targets11,
     [False], [False, False],
     0, 0,
 )
 assert sv.sokoban_bfs_single(sub11_near, (5, 2), boxes11[0], targets11[0]) is not None
-print("Pass-through target candidate is rejected; current target remains valid.")
+print("Box passes through the unused target; both corridor targets are solvable.")
 
 # Test 12: current six-box first-level regression. The objective includes the
 # direct return to the formal garage and must beat the old feasible greedy plan.

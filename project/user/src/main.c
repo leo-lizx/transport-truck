@@ -51,50 +51,10 @@
 #define printf(...) (0)
 #endif
 
-/*==========================================================================
- *  P0-5: 主循环 5ms tick 节拍 (替代 system_delay_ms 阻塞)
- *  - PIT_CH0 ISR 每 5ms 调用 main_loop_on_pit_tick(), 累加 s_main_tick_pending
- *  - 主循环用 wait_for_tick() 消费节拍, 期间 __WFI 进入低功耗等待中断唤醒
- *  - 当一次消费的 tick > 1 表示主循环上一轮耗时 >5ms, 记入 overrun 仅观测不丢拍
- *  - 三个计数器均为 file-static volatile, 仅 IPS / Live Watch 调试可见
- *========================================================================*/
-static volatile uint32 s_main_tick_pending = 0U;   /* PIT_CH0 累加, 主循环消费 */
-static volatile uint32 s_main_tick_overrun = 0U;   /* 一次消费 >1 的累计差值 */
-static volatile uint32 s_main_tick_total   = 0U;   /* 主循环已消费的 tick 总数 */
-
-/* 由 isr.c 中 PIT_CH0 分支调用; 用 extern 声明对外可见, 实现见本文件末 */
-void main_loop_on_pit_tick(void)
-{
-    s_main_tick_pending++;
-}
-
-/*
- * 阻塞直到下一个 5ms tick 到来, 返回本次消费的 tick 数 (>=1).
- * - 没有 pending tick 时 __WFI() 让 CPU 休眠, 任意中断 (PIT/UART/SysTick) 可唤醒
- * - 唤醒后 while 兜底再判一次, 防止 WFI 偶发未睡稳或被无关中断唤醒
- * - 「读 + 清零」用 __disable_irq/__enable_irq 包成临界区, 与 PIT_CH0 ISR 互斥
- */
-static uint32 wait_for_tick(void)
-{
-    uint32 ticks;
-    while (s_main_tick_pending == 0U)
-    {
-        /* __WFI();  P0-5: 临时关闭, 避免 SWD 进 WFI 后断连; 稳定后再开 */
-    }
-    __disable_irq();
-    ticks = s_main_tick_pending;
-    s_main_tick_pending = 0U;
-    __enable_irq();
-    if (ticks > 1U)
-    {
-        s_main_tick_overrun += (ticks - 1U);
-    }
-    s_main_tick_total += ticks;
-    return ticks;
-}
-
 /*===========================================================================
  *  顶层运行模式开关 —— 编译期十二选一, 烧录时只有一种模式生效
+ *  (上提至 5ms tick 机制之前: wait_for_tick 内按 GAME 模式条件编译
+ *   空闲解算推进, 引用处必须已能看到 MAIN_RUN_MODE)
  *  ────────────────────────────────────────────────────────────────
  *  调试递进建议:
  *    ③ 单轮 → ② 航向 → ③ 四角 → ④ 摄像头显示 → ⑤ 解算验证 → ⑧ 硬编码 → ⑦ 第一关 → ① 正式比赛
@@ -128,8 +88,59 @@ static uint32 wait_for_tick(void)
 #define MAIN_RUN_MODE_BOARD_TEST      (11)  /* 新主板测试: 屏幕显示 yaw 和手转车轮的编码器反馈 */
 
 /* ═══════════ 改下面这行切换运行模式 (0~11) ═══════════ */
-#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_HARDCODED_MAP)
+#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_GAME)
 /* ═══════════ 改上面这行切换运行模式 (0~11) ═══════════ */
+
+/*==========================================================================
+ *  P0-5: 主循环 5ms tick 节拍 (替代 system_delay_ms 阻塞)
+ *  - PIT_CH0 ISR 每 5ms 调用 main_loop_on_pit_tick(), 累加 s_main_tick_pending
+ *  - 主循环用 wait_for_tick() 消费节拍, 期间 __WFI 进入低功耗等待中断唤醒
+ *  - 当一次消费的 tick > 1 表示主循环上一轮耗时 >5ms, 记入 overrun 仅观测不丢拍
+ *  - 三个计数器均为 file-static volatile, 仅 IPS / Live Watch 调试可见
+ *========================================================================*/
+static volatile uint32 s_main_tick_pending = 0U;   /* PIT_CH0 累加, 主循环消费 */
+static volatile uint32 s_main_tick_overrun = 0U;   /* 一次消费 >1 的累计差值 */
+static volatile uint32 s_main_tick_total   = 0U;   /* 主循环已消费的 tick 总数 */
+
+/* 由 isr.c 中 PIT_CH0 分支调用; 用 extern 声明对外可见, 实现见本文件末 */
+void main_loop_on_pit_tick(void)
+{
+    s_main_tick_pending++;
+}
+
+/*
+ * 阻塞直到下一个 5ms tick 到来, 返回本次消费的 tick 数 (>=1).
+ * - 没有 pending tick 时 __WFI() 让 CPU 休眠, 任意中断 (PIT/UART/SysTick) 可唤醒
+ * - 唤醒后 while 兜底再判一次, 防止 WFI 偶发未睡稳或被无关中断唤醒
+ * - 「读 + 清零」用 __disable_irq/__enable_irq 包成临界区, 与 PIT_CH0 ISR 互斥
+ * - GAME 模式下空档调用 Game_Logic_Idle_Plan_Step() 推进解算：常规单元约
+ *   100-250μs，PLAN_PATH 之外立即返回 0。罕见例外：搜索预算耗尽时求解器的
+ *   贪心兜底会在一次调用内同步跑数 ms（旧代码它同样发生在 Task_Run 拍内），
+ *   此时 tick 消费延后、可能一次合并消费多拍（差值计入 s_main_tick_overrun，
+ *   主循环对合并拍只执行一轮任务）。底盘 5ms/20ms 闭环全在 PIT ISR，不受
+ *   主循环延迟影响。若日后恢复 __WFI，需仅在 Idle_Plan_Step 返回 0 时休眠。
+ */
+static uint32 wait_for_tick(void)
+{
+    uint32 ticks;
+    while (s_main_tick_pending == 0U)
+    {
+#if (MAIN_RUN_MODE == MAIN_RUN_MODE_GAME)
+        Game_Logic_Idle_Plan_Step();
+#endif
+        /* __WFI();  P0-5: 临时关闭, 避免 SWD 进 WFI 后断连; 稳定后再开 */
+    }
+    __disable_irq();
+    ticks = s_main_tick_pending;
+    s_main_tick_pending = 0U;
+    __enable_irq();
+    if (ticks > 1U)
+    {
+        s_main_tick_overrun += (ticks - 1U);
+    }
+    s_main_tick_total += ticks;
+    return ticks;
+}
 
 /* OpenART1 地图链路硬件口: 若实测 UART4 走 D0/D1, 只改下面两行宏. */
 #define MAIN_OPENART1_UART            (UART_4)
@@ -2566,7 +2577,10 @@ int main(void)
 #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_BOARD_TEST)
             main_board_test_render_100ms();
 #else
-#if (MAIN_RUN_MODE != MAIN_RUN_MODE_POINT_NAV)
+#if (MAIN_RUN_MODE == MAIN_RUN_MODE_GAME)
+            /* 正式比赛只更新已接纳的冻结地图，同时显示 BOX/TARGET 分类结果。 */
+            chassis_menu_render_game_frozen_100ms();
+#elif (MAIN_RUN_MODE != MAIN_RUN_MODE_POINT_NAV)
             chassis_menu_render_100ms();
 #endif
 #if (MAIN_RUN_MODE == MAIN_RUN_MODE_STATIC_VERIFY)

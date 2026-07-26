@@ -412,15 +412,16 @@
 
 /* ---- 速度限幅 ---- */
 
-/** 车体平移最大合成线速度 (m/s)
- *  P0-修复 2026-05-19 (轮子停转): 1.20→0.70 (TB6612 过流关断)
- *  0.70: d_stop=0.117m, BRAKE_DIST=0.25m 有裕量 */
-#define CHASSIS_MAX_LINEAR_SPEED_MPS        (1.80f)
+/** 地图坐标系 X 方向最大线速度 (m/s)；保留原宏名兼容现有调用方。 */
+#define CHASSIS_MAX_LINEAR_SPEED_MPS        (2.00f)
+
+/** 地图坐标系 Y 方向最大线速度 (m/s) */
+#define CHASSIS_MAX_LINEAR_SPEED_Y_MPS      (1.30f)
 
 /** 正常控制路径的单轮速度兑底上限 (m/s) — 等比例缩放保方向 */
 #define CHASSIS_WHEEL_SPEED_CAP_MPS         (4.0f)
 
-/** 在线调参时线速度上限硬限制 (m/s) */
+/** 在线调参时 X/Y 线速度上限硬限制 (m/s) */
 #define CHASSIS_TUNE_MAX_LINEAR_SPEED_LIMIT_MPS  (4.0f)
 
 /** 在线调参时角速度上限硬限制 (°/s) */

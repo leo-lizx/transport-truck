@@ -124,7 +124,8 @@ volatile chassis_tune_params_t g_chassis_tune_params = {
         CHASSIS_WHEEL_PID_RB_KD,
     },
     CHASSIS_POS_KP, CHASSIS_POS_Y_KP, CHASSIS_YAW_KP,
-    CHASSIS_MAX_LINEAR_SPEED_MPS, CHASSIS_MAX_YAW_SPEED_DPS,
+    CHASSIS_MAX_LINEAR_SPEED_MPS, CHASSIS_MAX_LINEAR_SPEED_Y_MPS,
+    CHASSIS_MAX_YAW_SPEED_DPS,
     CHASSIS_CMD_ACCEL_LIMIT_MPS2, CHASSIS_CMD_ACCEL_LIMIT_Y_MPS2,
     CHASSIS_CMD_ACCEL_LIMIT_DPS2,
 
@@ -305,6 +306,7 @@ static float position_axis_velocity_cmd(float axis_error,
                                         float position_gain,
                                         float damping_gain,
                                         float accel_limit,
+                                        float speed_limit,
                                         float integral_term);
 
 /** 调试轮索引安全校验：非法值回退到左前轮 */
@@ -353,6 +355,8 @@ static chassis_tune_params_t sanitize(chassis_tune_params_t p)
     p.yaw_kp               = chassis_clamp_f(p.yaw_kp,               0.0f,   10.0f);
     p.max_linear_speed_mps = chassis_clamp_f(p.max_linear_speed_mps, 0.05f,
                                              CHASSIS_TUNE_MAX_LINEAR_SPEED_LIMIT_MPS);
+    p.max_linear_speed_y_mps = chassis_clamp_f(p.max_linear_speed_y_mps, 0.05f,
+                                               CHASSIS_TUNE_MAX_LINEAR_SPEED_LIMIT_MPS);
     p.max_yaw_speed_dps   = chassis_clamp_f(p.max_yaw_speed_dps,   10.0f,
                                              CHASSIS_TUNE_MAX_YAW_SPEED_LIMIT_DPS);
     p.cmd_accel_limit_mps2 = chassis_clamp_f(p.cmd_accel_limit_mps2, 0.10f, 5.00f);
@@ -361,19 +365,47 @@ static chassis_tune_params_t sanitize(chassis_tune_params_t p)
     return p;
 }
 
-/** 车体速度矢量限幅: (vx,vy)模长 ≤ max_linear, |wz| ≤ max_yaw */
+/**
+ * 给定地图坐标系单位方向，计算同时满足 X/Y 分量上限的沿线速度上限。
+ * 纯 X/Y 运动分别退化为对应轴上限，斜线运动取先触及上限的轴。
+ */
+static float global_direction_speed_limit_mps(float dir_x, float dir_y)
+{
+    float max_x = g_chassis_tune_params.max_linear_speed_mps;
+    float max_y = g_chassis_tune_params.max_linear_speed_y_mps;
+    float speed_limit = max_x + max_y;
+    float abs_dir_x = fabsf(dir_x);
+    float abs_dir_y = fabsf(dir_y);
+
+    if (abs_dir_x > 1e-6f) {
+        float x_limited = max_x / abs_dir_x;
+        if (x_limited < speed_limit) speed_limit = x_limited;
+    }
+    if (abs_dir_y > 1e-6f) {
+        float y_limited = max_y / abs_dir_y;
+        if (y_limited < speed_limit) speed_limit = y_limited;
+    }
+    return speed_limit;
+}
+
+/** 车体平移合速度安全限幅，边界由地图 X/Y 速度矩形的对角线确定。 */
 static void limit_speed(chassis_body_speed_cmd_t *c)
 {
-    float norm;
+    float norm_sq;
+    float max_body_linear_sq =
+        g_chassis_tune_params.max_linear_speed_mps
+            * g_chassis_tune_params.max_linear_speed_mps
+        + g_chassis_tune_params.max_linear_speed_y_mps
+            * g_chassis_tune_params.max_linear_speed_y_mps;
 
     c->wz_dps = chassis_clamp_f(c->wz_dps,
                                 -g_chassis_tune_params.max_yaw_speed_dps,
                                  g_chassis_tune_params.max_yaw_speed_dps);
 
-    norm = sqrtf(c->vx_body_mps * c->vx_body_mps +
-                 c->vy_body_mps * c->vy_body_mps);
-    if (norm > g_chassis_tune_params.max_linear_speed_mps && norm > 1e-6f) {
-        float s = g_chassis_tune_params.max_linear_speed_mps / norm;
+    norm_sq = c->vx_body_mps * c->vx_body_mps
+            + c->vy_body_mps * c->vy_body_mps;
+    if ((norm_sq > max_body_linear_sq) && (norm_sq > 1e-12f)) {
+        float s = sqrtf(max_body_linear_sq / norm_sq);
         c->vx_body_mps *= s;
         c->vy_body_mps *= s;
     }
@@ -404,11 +436,10 @@ static chassis_body_speed_cmd_t ramp_filter(chassis_body_speed_cmd_t tgt,
     return out;
 }
 
-static float clamp_axis_hold_speed(float velocity_cmd)
+static float clamp_axis_hold_speed(float velocity_cmd, float speed_limit)
 {
-    /* 非驱动轴保持速度上限 = max_linear_speed × 比例, 随全局限速自动跟随. */
-    float hold_max = g_chassis_tune_params.max_linear_speed_mps
-                   * CHASSIS_POS_HOLD_SPEED_RATIO;
+    /* 非驱动轴保持速度上限随对应地图轴/直线方向的限速自动跟随。 */
+    float hold_max = speed_limit * CHASSIS_POS_HOLD_SPEED_RATIO;
     return chassis_clamp_f(velocity_cmd, -hold_max, hold_max);
 }
 
@@ -417,6 +448,7 @@ static float axis_hold_velocity_cmd(float hold_error,
                                     float position_gain,
                                     float damping_gain,
                                     float accel_limit,
+                                    float speed_limit,
                                     float integral_term)
 {
     /* 保持轴 1cm 死区: 滤除编码器量化噪声和 odom 短时抖动,
@@ -432,7 +464,9 @@ static float axis_hold_velocity_cmd(float hold_error,
                                        position_gain,
                                        damping_gain,
                                        accel_limit,
-                                       integral_term));
+                                       speed_limit,
+                                       integral_term),
+            speed_limit);
 }
 
 /** 移动航向保护的平移比例: 小误差不降速，中误差线性降速，大误差停走对正。 */
@@ -760,13 +794,14 @@ static float sqrt_controller(float error, float p, float accel_max)
 /**
  * 位置环减速区半径 (m) 自动推导 (替代旧 CHASSIS_POS_BRAKE_DIST_M 常量).
  *
- * 物理约束: 从 max_linear_speed 以 accel_limit 减到 0 的滑行距离
+ * 物理约束: 从当前轴 speed_limit 以 accel_limit 减到 0 的滑行距离
  *   d_stop = v_max² / (2·accel_limit)
  * brake_dist 必须覆盖 d_stop + EPSILON 才能在到位前刹停, 再留 BRAKE_MARGIN 裕量.
- * 用运行时可调的 max_linear_speed / cmd_accel_limit 计算, 调速度/加速度时自动跟随. */
-static float pos_brake_dist_auto(float accel_limit_mps2)
+ * 用运行时可调的轴速度/加速度上限计算, 调速度/加速度时自动跟随. */
+static float pos_brake_dist_auto(float speed_limit_mps,
+                                 float accel_limit_mps2)
 {
-    float v_max = g_chassis_tune_params.max_linear_speed_mps;
+    float v_max = speed_limit_mps;
     float accel = accel_limit_mps2;
     float d_stop = (accel > 1e-6f) ? (v_max * v_max / (2.0f * accel)) : 0.0f;
     return d_stop + CHASSIS_TARGET_REACHED_EPSILON_M + CHASSIS_POS_BRAKE_MARGIN_M;
@@ -777,6 +812,7 @@ static float position_axis_velocity_cmd(float axis_error,
                                         float position_gain,
                                         float damping_gain,
                                         float accel_limit,
+                                        float speed_limit,
                                         float integral_term)
 {
     float position_cmd = sqrt_controller(axis_error, position_gain, accel_limit)
@@ -788,14 +824,14 @@ static float position_axis_velocity_cmd(float axis_error,
      * 此时清零 velocity_cmd 会把积分效果也一起干掉 → KI 调了跟没调一样.
      * position_cmd 与 error 始终同号 (sqrt_controller 保证), 反卷绕仅在超出
      * brake_dist 时做 safety net 缩放, 近端不再触发. */
-    if ((fabsf(axis_error) > pos_brake_dist_auto(accel_limit)) &&
+    if ((fabsf(axis_error) > pos_brake_dist_auto(speed_limit, accel_limit)) &&
         (((axis_error > 0.0f) && (position_cmd < 0.0f)) ||
          ((axis_error < 0.0f) && (position_cmd > 0.0f))))
     {
         velocity_cmd = position_cmd * 0.35f;
     }
 
-    return velocity_cmd;
+    return chassis_clamp_f(velocity_cmd, -speed_limit, speed_limit);
 }
 
 /**
@@ -811,6 +847,7 @@ static float driving_axis_velocity_cmd(float axis_error,
                                        float position_gain,
                                        float damping_gain,
                                        float accel_limit,
+                                       float speed_limit,
                                        float integral_term,
                                        uint8 *out_mpc_active)
 {
@@ -819,12 +856,15 @@ static float driving_axis_velocity_cmd(float axis_error,
     if (chassis_mpc_step(axis_error, &mpc_v)) {
         float abs_error = fabsf(axis_error);
 
+        mpc_v = chassis_clamp_f(mpc_v, -speed_limit, speed_limit);
+
         if (abs_error < CHASSIS_MPC_BLEND_START_DIST_M) {
             float pid_v = position_axis_velocity_cmd(axis_error,
                                                      axis_velocity_lpf,
                                                      position_gain,
                                                      damping_gain,
                                                      accel_limit,
+                                                     speed_limit,
                                                      integral_term);
             /* 融合区按 PID 路径积累 I 项，让接管前后的指令保持连续。 */
             *out_mpc_active = 0U;
@@ -846,6 +886,7 @@ static float driving_axis_velocity_cmd(float axis_error,
                                       position_gain,
                                       damping_gain,
                                       accel_limit,
+                                      speed_limit,
                                       integral_term);
 }
 
@@ -1229,7 +1270,6 @@ void chassis_ctrl_task_20ms(void)
         float accel_y = g_chassis_tune_params.cmd_accel_limit_y_mps2;
         float vxg = 0.0f;
         float vyg = 0.0f;
-        float norm;
         float yerr;
         float yaw_move_scale;
 
@@ -1400,8 +1440,9 @@ void chassis_ctrl_task_20ms(void)
                 float accel_cross;
                 float along_cmd = 0.0f;
                 float cross_cmd = 0.0f;
-                float i_limit = g_chassis_tune_params.max_linear_speed_mps
-                              * CHASSIS_POS_I_LIMIT_RATIO;
+                float max_along_speed;
+                float max_cross_speed;
+                float i_limit;
 
                 chassis_direct_line_error(
                     &s_direct_line,
@@ -1439,11 +1480,17 @@ void chassis_ctrl_task_20ms(void)
                     &s_direct_line, accel_x, accel_y);
                 accel_cross = chassis_direct_line_weighted_param(
                     &s_direct_line, accel_y, accel_x);
+                max_along_speed = global_direction_speed_limit_mps(
+                    s_direct_line.ux, s_direct_line.uy);
+                max_cross_speed = global_direction_speed_limit_mps(
+                    s_direct_line.nx, s_direct_line.ny);
+                i_limit = max_along_speed * CHASSIS_POS_I_LIMIT_RATIO;
                 linear_accel_limit_mps2 = accel_along;
 
                 if (s_direct_state == DIRECT_TRACK) {
                     uint8 mpc_active;
-                    float i_band = pos_brake_dist_auto(accel_along)
+                    float i_band = pos_brake_dist_auto(max_along_speed,
+                                                       accel_along)
                                  * CHASSIS_POS_I_BAND_RATIO;
                     float ki_along = chassis_direct_line_weighted_param(
                         &s_direct_line, CHASSIS_POS_KI, CHASSIS_POS_Y_KI);
@@ -1455,6 +1502,7 @@ void chassis_ctrl_task_20ms(void)
                         kp_along,
                         kd_along,
                         accel_along,
+                        max_along_speed,
                         s_pos_i,
                         &mpc_active);
                     cross_cmd = axis_hold_velocity_cmd(
@@ -1463,6 +1511,7 @@ void chassis_ctrl_task_20ms(void)
                         kp_cross,
                         kp_cross * CHASSIS_POS_HOLD_KD_RATIO,
                         accel_cross,
+                        max_cross_speed,
                         s_pos_i_hold);
 
                     if ((mpc_active == 0U) && (ki_along > 1e-6f) &&
@@ -1517,10 +1566,14 @@ void chassis_ctrl_task_20ms(void)
             float kd_hold_y = kp_y * CHASSIS_POS_HOLD_KD_RATIO;
 
             /* 自动推导的积分/切轴参数 (替代旧 I_LIMIT / I_BAND / SWITCH_TOL 常量) */
-            float brake_dist_x = pos_brake_dist_auto(accel_x);
-            float brake_dist_y = pos_brake_dist_auto(accel_y);
-            float i_limit    = g_chassis_tune_params.max_linear_speed_mps
-                             * CHASSIS_POS_I_LIMIT_RATIO;
+            float brake_dist_x = pos_brake_dist_auto(
+                g_chassis_tune_params.max_linear_speed_mps, accel_x);
+            float brake_dist_y = pos_brake_dist_auto(
+                g_chassis_tune_params.max_linear_speed_y_mps, accel_y);
+            float i_limit_x = g_chassis_tune_params.max_linear_speed_mps
+                            * CHASSIS_POS_I_LIMIT_RATIO;
+            float i_limit_y = g_chassis_tune_params.max_linear_speed_y_mps
+                            * CHASSIS_POS_I_LIMIT_RATIO;
             float i_band_x   = brake_dist_x * CHASSIS_POS_I_BAND_RATIO;
             float i_band_y   = brake_dist_y * CHASSIS_POS_I_BAND_RATIO;
 
@@ -1565,17 +1618,18 @@ void chassis_ctrl_task_20ms(void)
                         vxg = driving_axis_velocity_cmd(dx, s_v_along_lpf,
                             kp_x, kd_x,
                             accel_x,
+                            g_chassis_tune_params.max_linear_speed_mps,
                             s_pos_i, &mpc_active);
                         if (!mpc_active && CHASSIS_POS_KI > 1e-6f && dist < i_band_x) {
                             s_pos_i += CHASSIS_POS_KI * dx * CHASSIS_TASK_DT_20MS_S;
-                            if      (s_pos_i >  i_limit) s_pos_i =  i_limit;
-                            else if (s_pos_i < -i_limit) s_pos_i = -i_limit;
+                            if      (s_pos_i >  i_limit_x) s_pos_i =  i_limit_x;
+                            else if (s_pos_i < -i_limit_x) s_pos_i = -i_limit_x;
                             if (dx * s_pos_i < 0.0f) s_pos_i = 0.0f;
                         }
                         if (fabsf(y_hold_err) > CHASSIS_POS_HOLD_DEAD_ZONE_M) {
                             if (CHASSIS_POS_Y_KI > 1e-6f) {
                                 s_pos_i_hold += CHASSIS_POS_Y_KI * y_hold_err * CHASSIS_TASK_DT_20MS_S;
-                                float hlim = i_limit * 0.5f;
+                                float hlim = i_limit_y * 0.5f;
                                 if      (s_pos_i_hold >  hlim) s_pos_i_hold =  hlim;
                                 else if (s_pos_i_hold < -hlim) s_pos_i_hold = -hlim;
                                 if (y_hold_err * s_pos_i_hold < 0.0f) s_pos_i_hold = 0.0f;
@@ -1584,6 +1638,7 @@ void chassis_ctrl_task_20ms(void)
                         vyg = axis_hold_velocity_cmd(y_hold_err, s_v_cross_lpf,
                             kp_y, kd_hold_y,
                             accel_y,
+                            g_chassis_tune_params.max_linear_speed_y_mps,
                             s_pos_i_hold);
                     }
                 } else {
@@ -1613,17 +1668,18 @@ void chassis_ctrl_task_20ms(void)
                             vyg = driving_axis_velocity_cmd(dy, s_v_cross_lpf,
                                 kp_y, kd_y,
                                 accel_y,
+                                g_chassis_tune_params.max_linear_speed_y_mps,
                                 s_pos_i, &mpc_active);
                             if (!mpc_active && CHASSIS_POS_Y_KI > 1e-6f && dist < i_band_y) {
                                 s_pos_i += CHASSIS_POS_Y_KI * dy * CHASSIS_TASK_DT_20MS_S;
-                                if      (s_pos_i >  i_limit) s_pos_i =  i_limit;
-                                else if (s_pos_i < -i_limit) s_pos_i = -i_limit;
+                                if      (s_pos_i >  i_limit_y) s_pos_i =  i_limit_y;
+                                else if (s_pos_i < -i_limit_y) s_pos_i = -i_limit_y;
                                 if (dy * s_pos_i < 0.0f) s_pos_i = 0.0f;
                             }
                             if (fabsf(x_hold_err) > CHASSIS_POS_HOLD_DEAD_ZONE_M) {
                                 if (CHASSIS_POS_KI > 1e-6f) {
                                     s_pos_i_hold += CHASSIS_POS_KI * x_hold_err * CHASSIS_TASK_DT_20MS_S;
-                                    float hlim = i_limit * 0.5f;
+                                    float hlim = i_limit_x * 0.5f;
                                     if      (s_pos_i_hold >  hlim) s_pos_i_hold =  hlim;
                                     else if (s_pos_i_hold < -hlim) s_pos_i_hold = -hlim;
                                     if (x_hold_err * s_pos_i_hold < 0.0f) s_pos_i_hold = 0.0f;
@@ -1632,6 +1688,7 @@ void chassis_ctrl_task_20ms(void)
                             vxg = axis_hold_velocity_cmd(x_hold_err, s_v_along_lpf,
                                 kp_x, kd_hold_x,
                                 accel_x,
+                                g_chassis_tune_params.max_linear_speed_mps,
                                 s_pos_i_hold);
                         }
                     }
@@ -1639,8 +1696,6 @@ void chassis_ctrl_task_20ms(void)
             }
             }
         }
-        norm = sqrtf(vxg * vxg + vyg * vyg);
-
         /* 减速区 sqrt 限速 (逐轴独立刹车):
          *   P0-修复 2026-07-17: 旧代码用 dist(总距离) 算刹车, 导致 X 快到但 Y 远时
          *   dist 仍大 → 刹车不触发 → X 全速冲过头 → 保持环拉回 → 到点慢.
@@ -1655,7 +1710,10 @@ void chassis_ctrl_task_20ms(void)
                     &s_direct_line,
                     g_chassis_tune_params.pos_kp,
                     g_chassis_tune_params.pos_kp_y);
-                float brake_dist = pos_brake_dist_auto(accel_along);
+                float max_along_speed = global_direction_speed_limit_mps(
+                    s_direct_line.ux, s_direct_line.uy);
+                float brake_dist = pos_brake_dist_auto(max_along_speed,
+                                                        accel_along);
 
                 if ((brake_dist > 1e-6f) &&
                     (fabsf(along_error_m) < brake_dist)) {
@@ -1682,8 +1740,10 @@ void chassis_ctrl_task_20ms(void)
                          * (limited_along_cmd - along_velocity_cmd);
                 }
             } else {
-            float brake_dist_x = pos_brake_dist_auto(accel_x);
-            float brake_dist_y = pos_brake_dist_auto(accel_y);
+            float brake_dist_x = pos_brake_dist_auto(
+                g_chassis_tune_params.max_linear_speed_mps, accel_x);
+            float brake_dist_y = pos_brake_dist_auto(
+                g_chassis_tune_params.max_linear_speed_y_mps, accel_y);
             /* 入口也改用逐轴距离: 任一轴进刹车区就对该轴限速, 不再被另一轴拖累 */
             if ((brake_dist_x > 1e-6f || brake_dist_y > 1e-6f)
                 && (fabsf(dx) < brake_dist_x || fabsf(dy) < brake_dist_y)) {
@@ -1730,12 +1790,13 @@ void chassis_ctrl_task_20ms(void)
             }
             }
         }
-        norm = sqrtf(vxg * vxg + vyg * vyg);  /* 刹车后重算, 供全局限速使用 */
-        if (norm > g_chassis_tune_params.max_linear_speed_mps && norm > 1e-6f) {
-            float sc = g_chassis_tune_params.max_linear_speed_mps / norm;
-            vxg *= sc;
-            vyg *= sc;
-        }
+        /* 在地图坐标系中逐轴限速，再变换到车体系，避免车头方向影响 X/Y 上限。 */
+        vxg = chassis_clamp_f(vxg,
+                              -g_chassis_tune_params.max_linear_speed_mps,
+                               g_chassis_tune_params.max_linear_speed_mps);
+        vyg = chassis_clamp_f(vyg,
+                              -g_chassis_tune_params.max_linear_speed_y_mps,
+                               g_chassis_tune_params.max_linear_speed_y_mps);
 
         /*
          * P0-修复 2026-05-02 (atan2 噪声风暴 + 裸 P yaw 控):
@@ -1928,10 +1989,15 @@ void chassis_ctrl_hold_yaw(float target_yaw_deg)
 
 void chassis_ctrl_rotate_to_deg(float target_yaw_deg)
 {
+    /* 与 move_to_m 同族的临界区：PIT 20ms ISR 若在 s_rotate_active=1 与
+     * s_arrived=0 之间抢占并瞬时完成旋转判定（车头已在容忍带内时单拍即成），
+     * 主线程随后写 s_arrived=0 会永久丢失到位事件。 */
+    __disable_irq();
     s_tgt_yaw_deg = chassis_normalize_angle_deg(target_yaw_deg);
     enter_mode(MODE_YAW_HOLD);  /* 复用 YAW_HOLD: vx=vy=0, 只输出 wz */
     s_rotate_active = 1U;
     s_arrived       = 0U;
+    __enable_irq();
 }
 
 /* ==========================================================================

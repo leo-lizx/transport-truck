@@ -681,8 +681,8 @@ class CarSim:
         n_box = len(self.boxes)
         n_tgt = len(extract_elements(fm, TARGET))
         need = n_box + n_tgt
-        self.log.append(f"[RECOGNIZE] 实地观察 {scout['visited_count']}/{need} 个 "
-                        f"(箱子{n_box}+目标{n_tgt})")
+        self.log.append(f"[RECOGNIZE] 实地观察 {scout['visited_count']} 个"
+                        f" / 共 {need} 个 (箱子{n_box}+目标{n_tgt})")
         for v in scout['visits']:
             kind = '箱子' if v['kind'] == 'box' else '目标'
             self._walk(v['path_actions'], 'RECOGNIZE',

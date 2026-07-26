@@ -86,7 +86,8 @@ typedef struct
     float pos_kp_y;     /**< Y 方向位置环 Kp */
     float yaw_kp;
 
-    float max_linear_speed_mps;
+    float max_linear_speed_mps;    /**< 地图 X 方向速度上限；保留字段名兼容现有调用方 */
+    float max_linear_speed_y_mps;  /**< 地图 Y 方向速度上限 */
     float max_yaw_speed_dps;
 
     float cmd_accel_limit_mps2;    /**< 全局 X 方向加速度上限；保留字段名兼容现有调用方 */

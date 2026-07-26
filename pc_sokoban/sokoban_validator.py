@@ -500,7 +500,7 @@ def plan_scout_phase(the_map: list, player_start: tuple,
 
 
 # ============================================================
-# 侦查 V2 — 同时访问 BOX 和 TARGET (与 C 端 app_recognize 对齐)
+# 侦查 V2 — 先 BOX 后 TARGET，全部实地观察确认 (与 C 端 app_recognize 对齐)
 # 赛题约定: 箱子 class_id ∈ {1..N}, 目标 class_id ∈ {1..N}, 集合相同;
 #           箱-目一一对应 (相同 class_id 互推).
 # ============================================================
@@ -545,7 +545,8 @@ def plan_scout_phase_v2(the_map: list, player_start: tuple,
                          target_classes: Optional[list] = None,
                          initial_heading_quarters: int = 0) -> dict:
     """
-    侦查规划 — 逐个实地访问每个箱子和目标点.
+    侦查规划 — 箱子与目标点统一按观察 Tour 顺序确认；所有物体均实地观察确认
+    （"最后一个目标唯一排除推断"已按固件行为移除——实测不稳定）.
 
     参数:
         box_classes / target_classes:
@@ -558,7 +559,7 @@ def plan_scout_phase_v2(the_map: list, player_start: tuple,
     返回:
         scout_actions, scout_waypoints, visits, player_after_scout,
         all_visited, box_classes, target_classes, box_to_target_idx,
-        visited_count
+        visited_count, inferred_count(恒 0)/inferred_targets(恒 [], 保留兼容)
     """
     boxes   = extract_elements(the_map, BOX)
     targets = extract_elements(the_map, TARGET)
@@ -610,6 +611,21 @@ def plan_scout_phase_v2(the_map: list, player_start: tuple,
 
     def all_resolved() -> bool:
         return all(it['ok'] for it in items)
+
+    def class_assignment_still_possible(kind: str, class_id: int) -> bool:
+        if class_id <= 0:
+            return False
+        box_count = sum(it['kind'] == 'box' and it['ok'] and
+                        it['class_id'] == class_id for it in items)
+        target_count = sum(it['kind'] == 'target' and it['ok'] and
+                           it['class_id'] == class_id for it in items)
+        unresolved_boxes = sum(it['kind'] == 'box' and not it['ok'] for it in items)
+        unresolved_targets = sum(it['kind'] == 'target' and not it['ok'] for it in items)
+        if kind == 'box':
+            return box_count < target_count + unresolved_targets
+        if kind == 'target':
+            return target_count < box_count + unresolved_boxes
+        return False
 
     def observe_options(target: tuple) -> list:
         opts = []
@@ -783,17 +799,21 @@ def plan_scout_phase_v2(the_map: list, player_start: tuple,
 
         route = nav_time_path(the_map, cur, best_obs)
         if route is None:
-            best_it['visited'] = True
-            continue
+            break
         path = route[0]
+
+        cls = best_it['truth_class']
+        if cls <= 0 or not class_assignment_still_possible(best_it['kind'], cls):
+            # 规划期即知无法确认：不提交该段动作，保证失败返回值里
+            # "从起点重放 scout_actions 的落点 == player_after_scout" 不变量。
+            break
 
         acts = path_to_actions(path)
         scout_actions.extend(acts)
         waypoints_flat.extend(path[1:])
 
-        cls = best_it['truth_class']
         best_it['class_id'] = cls
-        best_it['ok'] = (cls > 0)
+        best_it['ok'] = True
         best_it['visited'] = True
 
         face_dir = face_dir_from_observe(best_obs, best_it['pos'])
@@ -893,6 +913,9 @@ def plan_scout_phase_v2(the_map: list, player_start: tuple,
         'target_classes':      out_target_classes,
         'box_to_target_idx':   box_to_target_idx,
         'visited_count':       len(visits),
+        # 排除法推断已移除（镜像固件行为）；键保留恒 0/空，维持调用方兼容。
+        'inferred_count':      0,
+        'inferred_targets':    [],
     }
 
 
@@ -914,16 +937,15 @@ def _action_from_points(src: tuple, dst: tuple) -> Optional[int]:
     return None
 
 
-def _macro_edge(sub_map: list, player: tuple, box: tuple, target: tuple,
+# 赛规实测：箱子推到不对应的目标点只是不消去，可以继续被推着穿过；
+# 非本次目标的 TARGET 格不构成推箱障碍（is_free 已允许进入）。与 C 端
+# sb_macro_make_edge 对齐。
+def _macro_edge(sub_map: list, player: tuple, box: tuple,
                  push_dir: int, previous_push_dir: Optional[int],
-                 block_other_targets: bool,
                  walk_costs: Optional[Dict[tuple, int]] = None) -> Optional[tuple]:
     stand = (box[0] - DR[push_dir], box[1] - DC[push_dir])
     next_box = (box[0] + DR[push_dir], box[1] + DC[push_dir])
     if not (is_free(sub_map, *stand) and is_free(sub_map, *next_box)):
-        return None
-    if (block_other_targets and sub_map[next_box[0]][next_box[1]] == TARGET
-            and next_box != target):
         return None
 
     if walk_costs is None:
@@ -952,8 +974,7 @@ def _macro_edge(sub_map: list, player: tuple, box: tuple, target: tuple,
     return next_box, walk_path, cost
 
 def sokoban_bfs_single(sub_map: list, player: tuple, box: tuple,
-                       target: tuple,
-                       block_other_targets: bool = True) -> Optional[list]:
+                       target: tuple) -> Optional[list]:
     """
     单箱推宏 A*。状态=(box_r, box_c, last_push_dir)，普通行走由导航 BFS 连接。
     返回动作序列 [0..3]，无解返回 None。
@@ -975,8 +996,8 @@ def sokoban_bfs_single(sub_map: list, player: tuple, box: tuple,
     initial_walk_map[box[0]][box[1]] = WALL
     initial_walk_costs, _ = _nav_time_search(initial_walk_map, player, None)
     for d in range(4):
-        edge = _macro_edge(work_map, player, box, target, d, None,
-                           block_other_targets, initial_walk_costs)
+        edge = _macro_edge(work_map, player, box, d, None,
+                           initial_walk_costs)
         if edge is None:
             continue
         next_box, _, edge_cost = edge
@@ -1007,9 +1028,8 @@ def sokoban_bfs_single(sub_map: list, player: tuple, box: tuple,
         state_walk_costs, _ = _nav_time_search(
             state_walk_map, cur_player, previous_dir)
         for d in range(4):
-            edge = _macro_edge(work_map, cur_player, cur_box, target, d,
-                               previous_dir, block_other_targets,
-                               state_walk_costs)
+            edge = _macro_edge(work_map, cur_player, cur_box, d,
+                               previous_dir, state_walk_costs)
             if edge is None:
                 continue
             next_box, _, edge_cost = edge
@@ -1688,8 +1708,7 @@ def plan_bomb(the_map: list, player_pos: tuple,
                 sub = [row[:] for row in the_map]
                 sub[bombs[bi][0]][bombs[bi][1]] = EMPTY
                 sub[wall[0]][wall[1]] = TARGET
-                acts = sokoban_bfs_single(sub, player_pos, bombs[bi], wall,
-                                          block_other_targets=False)
+                acts = sokoban_bfs_single(sub, player_pos, bombs[bi], wall)
                 if acts is not None:
                     flags = _push_flags(acts, player_pos, bombs[bi])
                     rank = ((target_count - reachable) * 60000 +

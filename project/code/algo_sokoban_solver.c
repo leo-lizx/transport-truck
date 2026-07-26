@@ -684,13 +684,13 @@ static uint8 sb_macro_prepare_walk(const uint8 sub_map[MAP_ROWS][MAP_COLS],
                                sb_macro_walk_dir_grid);
 }
 
+/* 赛规实测：箱子推到不对应的目标点只是不消去，可以继续被推着穿过；
+ * 非本次目标的 TARGET 格因此不构成推箱障碍（sb_is_free 已允许进入）。 */
 static uint8 sb_macro_make_edge(const uint8 sub_map[MAP_ROWS][MAP_COLS],
                                 Point_t player,
                                 Point_t box,
-                                Point_t target,
                                 uint8 push_dir,
                                 uint8 previous_push_dir,
-                                uint8 block_other_targets,
                                 uint32 *edge_cost)
 {
     Point_t stand;
@@ -705,11 +705,6 @@ static uint8 sb_macro_make_edge(const uint8 sub_map[MAP_ROWS][MAP_COLS],
 
     if (!sb_is_free(sub_map, stand.y, stand.x) ||
         !sb_is_free(sub_map, box_next.y, box_next.x)) {
-        return 0U;
-    }
-    if (block_other_targets &&
-        sub_map[box_next.y][box_next.x] == MAP_TARGET &&
-        !(box_next.x == target.x && box_next.y == target.y)) {
         return 0U;
     }
 
@@ -750,7 +745,6 @@ typedef struct {
     Point_t reconstruct_player;
     Point_t reconstruct_box;
     SokoAction_e reconstruct_direction;
-    uint8 block_other_targets;
     uint16 macro_count;
     uint16 reconstruct_remaining;
     SokoActionSeq_t *solution;
@@ -760,8 +754,7 @@ static SbSearchContext_t s_sb_search;
 
 static uint8 sb_search_begin(const uint8 sub_map[MAP_ROWS][MAP_COLS],
                              Point_t player, Point_t box, Point_t target,
-                             SokoActionSeq_t *solution,
-                             uint8 block_other_targets)
+                             SokoActionSeq_t *solution)
 {
     memset(&s_sb_search, 0, sizeof(s_sb_search));
     if (!solution || !map_is_inner_cell(player.y, player.x) ||
@@ -776,7 +769,6 @@ static uint8 sb_search_begin(const uint8 sub_map[MAP_ROWS][MAP_COLS],
     s_sb_search.player_start = player;
     s_sb_search.box_start = box;
     s_sb_search.target = target;
-    s_sb_search.block_other_targets = block_other_targets;
     s_sb_search.solution = solution;
     if (box.y == target.y && box.x == target.x) {
         s_sb_search.status = SB_SEARCH_SOLVED;
@@ -803,9 +795,8 @@ static uint8 sb_search_begin(const uint8 sub_map[MAP_ROWS][MAP_COLS],
         uint32 edge_cost;
         Point_t next_box;
         uint16 state;
-        if (!sb_macro_make_edge(sb_macro_base_map, player, box, target, d,
-                                (uint8)SOKO_ACT_NONE,
-                                block_other_targets, &edge_cost)) continue;
+        if (!sb_macro_make_edge(sb_macro_base_map, player, box, d,
+                                (uint8)SOKO_ACT_NONE, &edge_cost)) continue;
         next_box.y = (int8)(box.y + s_dr[d]);
         next_box.x = (int8)(box.x + s_dc[d]);
         state = sb_macro_encode(next_box, d);
@@ -871,9 +862,7 @@ static SbSearchStatus_e sb_search_step(uint8 max_work_units)
                     Point_t next_box;
                     uint16 next_state;
                     if (!sb_macro_make_edge(sb_macro_base_map, current_player,
-                                            current_box, s_sb_search.target,
-                                            d, previous_dir,
-                                            s_sb_search.block_other_targets,
+                                            current_box, d, previous_dir,
                                             &edge_cost)) continue;
                     next_box.y = (int8)(current_box.y + s_dr[d]);
                     next_box.x = (int8)(current_box.x + s_dc[d]);
@@ -947,12 +936,10 @@ static SbSearchStatus_e sb_search_step(uint8 max_work_units)
 
 static uint8 sokoban_bfs_single(const uint8 sub_map[MAP_ROWS][MAP_COLS],
                                 Point_t player, Point_t box, Point_t target,
-                                SokoActionSeq_t *sol,
-                                uint8 block_other_targets)
+                                SokoActionSeq_t *sol)
 {
     SbSearchStatus_e status;
-    if (!sb_search_begin(sub_map, player, box, target, sol,
-                         block_other_targets)) return 0U;
+    if (!sb_search_begin(sub_map, player, box, target, sol)) return 0U;
     do {
         status = sb_search_step(255U);
     } while (status == SB_SEARCH_EXPAND || status == SB_SEARCH_RECONSTRUCT);
@@ -1151,7 +1138,8 @@ static void build_sub_map(const uint8 base_map[MAP_ROWS][MAP_COLS],
         }
     }
 
-    /* Unused targets stay as MAP_TARGET; box BFS blocks entering them. */
+    /* 未用目标保留 MAP_TARGET：仅作地面标记，推箱与行走均可通过
+     * （箱子推到不对应目标点不消去、可继续被推过）。 */
     for (uint8 i = 0; i < target_count; i++) {
         if (i == cur_target_idx) continue;   /* 当前目标保留 */
         if (target_used_flags != 0 &&
@@ -1239,7 +1227,7 @@ static uint8 sokoban_solve_stage1_greedy(const uint8 map[MAP_ROWS][MAP_COLS],
                 build_sub_map(map, boxes, targets, box_n, target_n,
                               solved, t_used, (uint8)best_b, (uint8)best_t, sb_sub_map);
                 if (sokoban_bfs_single(sb_sub_map, cur_player,
-                                       boxes[best_b], targets[best_t], sol, 1U)) {
+                                       boxes[best_b], targets[best_t], sol)) {
                     chosen_b = best_b;
                     chosen_t = best_t;
                     break;
@@ -1322,7 +1310,7 @@ static uint8 sokoban_solve_stage2_greedy(const uint8 map[MAP_ROWS][MAP_COLS],
             build_sub_map(map, boxes, targets, box_n, target_n,
                           solved, t_used, (uint8)best_b, ti, sb_sub_map);
             if (sokoban_bfs_single(sb_sub_map, cur_player,
-                                   boxes[best_b], targets[ti], sol, 1U)) {
+                                   boxes[best_b], targets[ti], sol)) {
                 chosen_b = best_b;
                 break;
             }
@@ -1461,8 +1449,7 @@ static uint8 soko_opt_begin_pair(uint8 solved_mask,
                            cur_player,
                            s_soko_opt.boxes[candidate.b],
                            s_soko_opt.targets[candidate.t],
-                           &s_soko_opt.cur_seq[depth],
-                           1U);
+                           &s_soko_opt.cur_seq[depth]);
 }
 
 /** 动作段的正式执行成本：每格行驶、每个方向航点停站、含推箱航段 Snap。 */
@@ -2036,7 +2023,7 @@ uint8 Sokoban_Solve_Push_Bomb(const uint8 map[MAP_ROWS][MAP_COLS],
     sb_sub_map[bomb_pos.y][bomb_pos.x] = MAP_EMPTY;
     sb_sub_map[wall_pos.y][wall_pos.x] = MAP_TARGET;
 
-    return sokoban_bfs_single(sb_sub_map, player_pos, bomb_pos, wall_pos, sol, 0U);
+    return sokoban_bfs_single(sb_sub_map, player_pos, bomb_pos, wall_pos, sol);
 }
 
 typedef struct {
@@ -2265,7 +2252,7 @@ SokoSearchStatus_e Sokoban_Bomb_Search_Step(uint8 max_work_units,
         if (sb_search_begin(sb_sub_map, s_bomb_search.player,
                             s_bomb_search.bombs[chosen],
                             s_bomb_search.wall,
-                            &s_bomb_search.try_seq, 0U)) {
+                            &s_bomb_search.try_seq)) {
             s_bomb_search.pair_active = 1U;
         }
     }

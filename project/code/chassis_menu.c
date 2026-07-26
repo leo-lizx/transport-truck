@@ -27,7 +27,7 @@
 #define CHASSIS_MENU_FLASH_SECTOR      (127U)
 #define CHASSIS_MENU_FLASH_PAGE        (FLASH_PAGE_7)
 #define CHASSIS_MENU_FLASH_MAGIC       (0x4D4E5455U)
-#define CHASSIS_MENU_FLASH_VERSION     (5U)  /* X/Y 独立位置参数改变了 chassis_tune_params_t 布局 */
+#define CHASSIS_MENU_FLASH_VERSION     (6U)  /* 新增 Y 方向速度上限，chassis_tune_params_t 布局变化 */
 
 typedef struct
 {
@@ -243,7 +243,8 @@ static void menu_update_recognize_object(const AppRecognizeDebug_t *recog)
 static void menu_build_class_line(char line[MENU_TEXT_COLS + 1U],
                                   const char *prefix,
                                   const uint8 class_ids[SOKOBAN_MAX_BOXES],
-                                  uint8 count)
+                                  uint8 count,
+                                  uint8 inferred_mask)
 {
     uint8 cursor = 0U;
     uint8 i;
@@ -258,8 +259,9 @@ static void menu_build_class_line(char line[MENU_TEXT_COLS + 1U],
     {
         uint8 class_id = class_ids[i];
 
-        if ((uint8)(cursor + 3U) > (uint8)MENU_TEXT_COLS) { break; }
+        if ((uint8)(cursor + 4U) > (uint8)MENU_TEXT_COLS) { break; }
         line[cursor++] = ' ';
+        line[cursor++] = ((inferred_mask & (uint8)(1U << i)) != 0U) ? '*' : ' ';
         if (class_id == 0U)
         {
             line[cursor++] = '-';
@@ -286,9 +288,11 @@ static void menu_update_recognize_lists(const AppRecognizeDebug_t *recog)
     char box_line[MENU_TEXT_COLS + 1U];
     char target_line[MENU_TEXT_COLS + 1U];
 
-    menu_build_class_line(box_line, "BOX:", recog->box_class_ids, recog->box_count);
+    menu_build_class_line(box_line, "BOX:", recog->box_class_ids,
+                          recog->box_count, 0U);
     menu_build_class_line(target_line, "TARGET:",
-                          recog->target_class_ids, recog->target_count);
+                          recog->target_class_ids, recog->target_count,
+                          recog->target_inferred_mask);
 
     ips200_set_color(MENU_COLOR_TEXT, MENU_COLOR_BG);
     if ((s_recog_lists_cached == 0U) ||

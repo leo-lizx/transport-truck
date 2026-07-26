@@ -40,7 +40,7 @@
 typedef enum {
     MAP_EMPTY   = 0, // 空地
     MAP_WALL    = 1, // 墙体
-    MAP_TARGET  = 2, // 目的地 (数字点，侦查阶段可直接穿过)
+    MAP_TARGET  = 2, // 目的地地面格（玩家可行走，箱子可推入并继续通过）
     MAP_BOX     = 3, // 箱子 (图片点)
     MAP_BOMB    = 4  // 炸弹
 } MapElement_e;

@@ -5,15 +5,16 @@
  * 用途:
  *   游戏主状态机 STAGE_RECOGNIZE_MAP 的真正内容由本模块承担:
  *     1) 提取地图中所有 BOX 与 TARGET 坐标
- *     2) 小规模按“平移格数 + 四向转角”的精确 tour / BFS 最近观察点计算访问顺序
- *        (与 PC 验证器 plan_scout_phase_v2 对齐)
+ *     2) BOX/TARGET 统一按“平移格数 + 四向转角”的精确 tour / BFS 前瞻计算访问顺序
  *     3) 对每个待识别物体:
  *          - 移动到 Tour 选定的侧面观察点（兼顾路程和四向转角）
  *          - 仅依赖编码器里程计与陀螺仪确认到达观察点
  *          - 原地旋转车头朝向物体
- *          - 主控请求指定 BOX/TARGET；连续三帧同请求、同类别后立即确认
- *     4) 全部物体识别完成后, 按类别与静态推送可达性把 (boxIdx -> targetIdx) 映射写入
- *        g_box_to_target[]
+ *          - 主控请求指定 BOX/TARGET；窗口内全同类连续三帧、或多数票门限确认
+ *          - 未确认先做邻格往返复位，再换其他观察方向（恢复预算 FAIL 兜底），
+ *            不允许跳到下一个物体
+ *     4) 全部箱子与目标逐一实地确认（不做"最后一个目标"排除法推断）；
+ *        随后按类别与静态推送可达性写入映射 g_box_to_target[]
  *        游戏主状态机据此进入 STAGE_PLAN_PATH (Sokoban_Solve_Stage2)
  *
  * 输出:
@@ -80,14 +81,15 @@ typedef struct
     uint8  current_kind;        /* APP_LINK_OBJ_KIND_BOX / TARGET        */
     uint8  current_class_id;    /* 当前连续确认的 class_id (0=未确定)    */
     uint16 sample_count;        /* 已采样次数 (调试用)                   */
-    uint8  visited_count;       /* 已实测访问识别完成数 (含跳过失败)     */
-    uint8  inferred_count;      /* 保留字段, 恒为 0                        */
+    uint8  visited_count;       /* 已实测并确认类别的物体数              */
+    uint8  inferred_count;      /* 恒 0：排除法推断已移除, 字段保留兼容    */
     uint8  resolved_box;        /* 已确定 class_id 的箱子数              */
     uint8  resolved_target;     /* 已确定 class_id 的目标点数            */
     uint8  box_count;           /* 箱子槽位数（按地图从上到下、从左到右） */
     uint8  target_count;        /* 目标点槽位数（按地图从上到下、从左到右）*/
     uint8  box_class_ids[SOKOBAN_MAX_BOXES];
     uint8  target_class_ids[SOKOBAN_MAX_BOXES];
+    uint8  target_inferred_mask; /* 恒 0：排除法推断已移除, 字段保留兼容   */
 } AppRecognizeDebug_t;
 
 /*===================================================================================================================

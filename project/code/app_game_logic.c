@@ -88,6 +88,7 @@ static uint8               s_map_has_bomb_valid = 0U;
  * --------------------------------------------------------------- */
 #define WAIT_START_PHASE0_TIMEOUT_TICKS  (2000U)
 static uint16              s_wait_phase0_ticks  = 0U;
+static uint8               s_return_rotate_started = 0U; /* 直线返库后原地转回 0° 的子步骤 */
 
 /* ----- 自动发车 (左侧发车点 (1,5) → 上位机触发点 (1,4)) -----------
  * 上电后先等待 IMU/编码器滤波稳定；到达 (1,4) 后停车，等待上位机刷新本关地图。
@@ -718,11 +719,14 @@ static void stage_wait_start_handler(void)
     if (s_wait_start_phase == 0U) {
         s_wait_phase0_ticks++;
         if (!is_navigating) {
-            /* 返航全程锁定 0°，避免继承识别巡游后的任意车头角。 */
-            s_nav_heading_deg = APP_GAME_LAUNCH_FACE_YAW_DEG;
-            chassis_ctrl_move_to_m(chassis_grid_x_to_m(APP_GAME_LAUNCH_HOME_X),
-                                   chassis_grid_y_to_m(APP_GAME_LAUNCH_HOME_Y),
-                                   APP_GAME_LAUNCH_FACE_YAW_DEG);
+            /* 返库走两点直线 (DIRECT_LINE)：保持下发瞬间航向沿固定直线平移，
+             * 比逐轴 L 形路径少一段行程；0° 交接航向到库后原地旋转恢复。
+             * 关卡完成后全部地图元素（箱/目标/墙均为屏显）随即消失，
+             * 返库路径无物理障碍，不需要任何避障检查。 */
+            chassis_ctrl_move_to_m_direct(
+                chassis_grid_x_to_m(APP_GAME_LAUNCH_HOME_X),
+                chassis_grid_y_to_m(APP_GAME_LAUNCH_HOME_Y));
+            s_return_rotate_started = 0U;
             is_navigating = 1;
             return;
         }
@@ -734,6 +738,15 @@ static void stage_wait_start_handler(void)
             return;
         }
         if (!chassis_nav_arrived()) return;
+
+        if (s_return_rotate_started == 0U) {
+            /* 直线返库不预旋转；到库后先转回 0° 再交给发车流程，
+             * 避免 LAUNCH_EXIT 的逐轴短程移动叠加大角度旋转。 */
+            chassis_ctrl_rotate_to_deg(APP_GAME_LAUNCH_FACE_YAW_DEG);
+            s_return_rotate_started = 1U;
+            s_wait_phase0_ticks = 0U;   /* 旋转子步骤独享一个完整超时窗口 */
+            return;
+        }
 
         /* 到库后继续做 0° 航向保持，直到下一次发车目标下发。 */
         s_nav_heading_deg = APP_GAME_LAUNCH_FACE_YAW_DEG;
@@ -848,9 +861,9 @@ static void stage_recognize_handler(void)
     /* ============================================================
      * 识别 tour 子状态机驱动 (app_recognize.c):
      *   - Stage1 无数字配对要求（有无炸弹均同）→ DONE_NO_NEED 直接放行
-     *   - Stage2/3: 遍历每个箱子和目标的观察点, 三帧一致后确认 class_id,
-     *               配对成 box→target 映射写入 g_box_to_target[]
-     *   - 不可达或视觉持续无识别 → 停车等待人工处理
+     *   - Stage2/3: BOX/TARGET 混合规划最短观察 Tour；当前物体确认后才切换,
+     *               全部实地确认后配对成 box→target 映射写入 g_box_to_target[]
+     *   - 视觉暂时无结果时循环当前物体观察位；路线不可恢复才停车等待人工处理
      * ============================================================ */
     AppRecognizeStatus_e r = App_Recognize_Tick(g_game_map, g_player_pos,
                                                 map_has_bomb(),
