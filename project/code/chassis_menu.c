@@ -19,7 +19,7 @@
  * The old two-level tuning menu has been collapsed into one race-facing
  * screen:
  *   - 16 x 12 map grid.
- *   - Changed map cells while fresh MAP frames are arriving; retain last frame when stale.
+ *   - Normal modes show fresh MAP frames; race mode shows accepted frozen maps only.
  *   - Car grid position overlay.
  *   - Current yaw angle below the map.
  *===========================================================================*/
@@ -75,6 +75,7 @@ static int32 s_last_pose_x_key = 0;
 static int32 s_last_pose_y_key = 0;
 static int32 s_last_imu_yaw_key = 0;
 static uint8 s_recog_cached = 0U;
+static uint32 s_last_frozen_map_generation = 0U;
 static uint8 s_last_recog_valid = 0U;
 static uint8 s_last_recog_idx = 0U;
 static uint8 s_last_recog_total = 0U;
@@ -318,6 +319,21 @@ static void menu_draw_static_layout(void)
     ips200_show_string(0U, 224U, "M:WAIT S:WAIT W:---/--- ST:00 WAIT_START");
 }
 
+static void menu_prepare_layout_once(void)
+{
+    if (s_need_full_refresh == 0U) {
+        return;
+    }
+
+    menu_draw_static_layout();
+    s_need_full_refresh = 0U;
+    s_last_map_ready = 0xFFU;
+    s_map_cached = 0U;
+    s_dynamic_cached = 0U;
+    s_recog_cached = 0U;
+    s_game_status_cached = 0U;
+}
+
 static void menu_draw_map_cell(uint8 row, uint8 col, uint8 cell)
 {
     uint16 x = (uint16)(MENU_MAP_ORIGIN_X + (uint16)col * MENU_CELL_SIZE + MENU_CELL_GAP);
@@ -521,6 +537,7 @@ void chassis_menu_init(void)
     s_dynamic_cached = 0U;
     s_recog_cached = 0U;
     s_game_status_cached = 0U;
+    s_last_frozen_map_generation = 0U;
 }
 
 void chassis_menu_task_10ms(void)
@@ -541,16 +558,7 @@ void chassis_menu_render_100ms(void)
     map_ready = menu_map_frame_is_fresh(&map_age_ms);
 
     /* 静态布局只在首次进入菜单时绘制一次。 */
-    if (0U != s_need_full_refresh)
-    {
-        menu_draw_static_layout();
-        s_need_full_refresh = 0U;
-        s_last_map_ready = 0xFFU;
-        s_map_cached = 0U;
-        s_dynamic_cached = 0U;
-        s_recog_cached = 0U;
-        s_game_status_cached = 0U;
-    }
+    menu_prepare_layout_once();
 
     if (map_ready)
     {
@@ -560,4 +568,30 @@ void chassis_menu_render_100ms(void)
 
     /* 地图过期时保留最后一帧；状态栏、数字和识别字段按显示值变化局部更新。 */
     menu_update_dynamic_text(map_ready, map_age_ms);
+}
+
+void chassis_menu_render_game_frozen_100ms(void)
+{
+    uint8 map[APP_LINK_MAP_ROWS][APP_LINK_MAP_COLS];
+    uint32 generation = 0U;
+
+    menu_prepare_layout_once();
+
+    /* The grid is already black after drawing the layout. Treat it as an
+     * empty cached map so the first freeze only transfers non-empty cells. */
+    if ((s_map_cached == 0U) && (s_last_frozen_map_generation == 0U)) {
+        memset(s_cached_map, MAP_EMPTY, sizeof(s_cached_map));
+        s_map_cached = 1U;
+    }
+
+    if ((Game_Get_Frozen_Map(map, &generation) == 0U) ||
+        (generation == s_last_frozen_map_generation)) {
+        return;
+    }
+
+    menu_update_map_cells(map);
+    ips200_set_color(MENU_COLOR_OK, MENU_COLOR_BG);
+    ips200_show_string(0U, 16U, "MAP: FROZEN ID:          ");
+    ips200_show_uint(128U, 16U, generation, 5U);
+    s_last_frozen_map_generation = generation;
 }

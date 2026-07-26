@@ -29,9 +29,9 @@ Point_t g_player_pos = {(int8)APP_GAME_LAUNCH_HOME_X, (int8)APP_GAME_LAUNCH_HOME
  * 【P0-2】视觉链路超时回退参数
  *   LINK_LOSS_MS  : 触发"掉线"判定的静默时长门槛
  *   LINK_OK_MS    : 触发"恢复"判定的静默时长门槛 (< LINK_LOSS_MS, 形成迟滞防抖)
- *   视觉端策略 = MAP 帧约 16ms/帧 + 心跳 100ms/次, 200ms 给出 ~2 个心跳余量
+ *   视觉端策略 = 心跳 100ms/次；1s 阈值允许视觉整帧处理和调试输出产生短时抖动。
  * ================================================================== */
-#define LINK_LOSS_MS                   (200U)
+#define LINK_LOSS_MS                   (1000U)
 #define LINK_OK_MS                     (100U)
 
 typedef enum {
@@ -40,8 +40,16 @@ typedef enum {
     EXEC_PUSH_BOMB
 } ExecMode_e;
 
+typedef enum {
+    PLAN_MODE_PUSH = 0,
+    PLAN_MODE_BOMB
+} PlanMode_e;
+
 static GameStage_e current_stage = STAGE_WAIT_START;
 static uint8 is_navigating = 0;
+/* 业务层记录的四正交识别航向，供发车保持和识别 Tour 使用；推箱航点
+ * 与硬编码模式一致走 move_to_grid，由底盘按实测角吸附到最近四正交航向。 */
+static float s_nav_heading_deg = APP_GAME_LAUNCH_FACE_YAW_DEG;
 
 /* ----- 【P0-2】链路状态相关静态变量 -------------------------------- */
 static uint8        s_link_alive       = 0U;     /* 当前链路状态: 1=在线 0=离线/未启动 */
@@ -71,21 +79,9 @@ static uint8               s_wait_start_phase   = 0U;
  *       完整的冻结/解冻生命周期点见这两个函数处的集中注释。
  * --------------------------------------------------------------- */
 static uint8               s_map_freeze         = 0U;
-
-/* ----- 【B3b】航点执行超时保护 -------------------------------------
- * 单航点最长允许执行时长下限 = 5s @ 5ms/tick = 1000 tick.
- * 超时后先重发一次 MOVE_TO; 第二次仍超时切到异常停车状态。
- *
- * O8.3: 固定 5s 对"绕大圈的长航段"易误触发。改为按本段曼哈顿格距线性放宽:
- *   limit = max(WAYPOINT_TIMEOUT_TICKS, 段格距 × WAYPOINT_TICKS_PER_CELL)
- * 刻意保留 5s 作为下限(不缩短既有短航段的超时, 避免引入新的误超时),
- * 只对长航段在其之上加时。每次派发航点时按当前 g_player_pos→目标格重算。
- * --------------------------------------------------------------- */
-#define WAYPOINT_TIMEOUT_TICKS         (1000U)
-#define WAYPOINT_TICKS_PER_CELL        (300U)    /* 每格放宽 1.5s @5ms */
-static uint16              s_wp_timeout_ticks   = 0U;
-static uint16              s_wp_timeout_limit   = WAYPOINT_TIMEOUT_TICKS;
-static uint8               s_wp_retry_count     = 0U;
+static uint32              s_map_snapshot_frame_id = 0U;
+static uint8               s_map_has_bomb_cached = 0U;
+static uint8               s_map_has_bomb_valid = 0U;
 
 /* ----- 【B8】WAIT_START phase 0 自动复位超时 -----------------------
  * 10s 仍到不了发车区 → 跳过自动复位进 phase 1, 让操作员手动放车.
@@ -94,26 +90,27 @@ static uint8               s_wp_retry_count     = 0U;
 static uint16              s_wait_phase0_ticks  = 0U;
 
 /* ----- 自动发车 (左侧发车点 (1,5) → 上位机触发点 (1,4)) -----------
- * 发车不依赖地图；到达 (1,4) 后停车，等待上位机刷新本关地图。
- * LAUNCH_DRIVE_TIMEOUT_TICKS: 4s @5ms 超时兜底 → 重发一次，再失败则停车。
+ * 上电后先等待 IMU/编码器滤波稳定；到达 (1,4) 后停车，等待上位机刷新本关地图。
+ * 与硬编码模式一致，目标发出后持续等待底盘报告到达，不做业务层超时重发。
  * --------------------------------------------------------------- */
-#define LAUNCH_DRIVE_TIMEOUT_TICKS   (800U)
-#define LAUNCH_WARMUP_TICKS          (200U)    /* 1s @5ms, 与硬编码模式发车暖机一致 */
-#define LAUNCH_MAP_STABLE_REQUIRED_FRAMES  (5U)
-#define LAUNCH_MAP_STABLE_TIMEOUT_TICKS    (300U)
+#define LAUNCH_STARTUP_SETTLE_TICKS       (200U)  /* 1s @5ms，仅首次上电发车 */
+#define MAP_STABLE_REQUIRED_FRAMES          (5U)
+#define MAP_STABLE_TIMEOUT_TICKS            (300U)
+static uint16              s_launch_startup_settle_ticks = 0U;
 static uint8               s_launch_drive_issued = 0U;
-static uint16              s_launch_drive_ticks  = 0U;
-static uint8               s_launch_retry_count  = 0U;
-static uint16              s_launch_warmup_ticks = 0U;
 static uint8               s_launch_map_candidate_valid = 0U;
 static uint8               s_launch_map_stable_count = 0U;
 static uint16              s_launch_map_stable_ticks = 0U;
 static uint32              s_launch_map_last_frame_id = 0U;
-static uint32              s_launch_depart_frame_id = 0U;
-static uint32              s_launch_depart_map_hash = 0U;
-static uint8               s_launch_depart_map_valid = 0U;
+static uint32              s_launch_arrival_frame_id = 0U;
+static uint8               s_map_accepted = 0U;
+static uint8               s_solve_succeeded = 0U;
 static uint8               s_launch_map_candidate[MAP_ROWS][MAP_COLS];
 static uint8               s_launch_map_observed[MAP_ROWS][MAP_COLS];
+/* IPS only consumes accepted/frozen maps. Keep this copy independent from
+ * g_game_map because recognition and bomb handling may modify the latter. */
+static uint8               s_display_frozen_map[MAP_ROWS][MAP_COLS];
+static uint32              s_display_frozen_map_generation = 0U;
 
 /* 断链恢复栅栏。恢复期间不沿用暂停前的冻结地图。 */
 static uint32              s_recovery_map_baseline_frame_id = 0U;
@@ -132,6 +129,9 @@ static uint16                g_bomb_wp_idx = 0;
 
 static uint8                 g_box_to_target[SOKOBAN_MAX_BOXES] = {0};
 static ExecMode_e            g_exec_mode = EXEC_NONE;
+static PlanMode_e            s_plan_mode = PLAN_MODE_PUSH;
+static uint8                 s_bomb_strategy = 0U;
+static uint8                 s_bomb_search_started = 0U;
 
 /* 已结束的关卡数，上电初始化时清零。 */
 static uint8                 s_levels_finished = 0U;
@@ -194,20 +194,18 @@ static void copy_map(uint8 dst[MAP_ROWS][MAP_COLS],
     }
 }
 
-/* 仅用于区分驶出前旧图与上位机刷新后的新图；不参与地图合法性判断。 */
-static uint32 map_hash(const uint8 map[MAP_ROWS][MAP_COLS])
+static void publish_frozen_map_for_display(void)
 {
-    uint32 hash = 2166136261UL;
-    uint8 r;
-    uint8 c;
-
-    for (r = 0U; r < (uint8)MAP_ROWS; ++r) {
-        for (c = 0U; c < (uint8)MAP_COLS; ++c) {
-            hash ^= (uint32)map[r][c];
-            hash *= 16777619UL;
-        }
+    copy_map(s_display_frozen_map, g_game_map);
+    s_display_frozen_map_generation++;
+    if (s_display_frozen_map_generation == 0U) {
+        s_display_frozen_map_generation = 1U;
     }
-    return hash;
+}
+
+static void map_cache_invalidate(void)
+{
+    s_map_has_bomb_valid = 0U;
 }
 
 static uint8 launch_map_is_usable(const uint8 map[MAP_ROWS][MAP_COLS])
@@ -215,44 +213,121 @@ static uint8 launch_map_is_usable(const uint8 map[MAP_ROWS][MAP_COLS])
     uint8 r;
     uint8 c;
     uint8 has_wall = 0U;
-    uint8 has_box = 0U;
-    uint8 has_target = 0U;
+    uint8 box_count = 0U;
+    uint8 target_count = 0U;
+    uint8 launch_cell;
 
     for (r = 0U; r < (uint8)MAP_ROWS; ++r) {
         for (c = 0U; c < (uint8)MAP_COLS; ++c) {
             if (map[r][c] == MAP_WALL) {
                 has_wall = 1U;
             } else if (map[r][c] == MAP_BOX) {
-                has_box = 1U;
+                box_count++;
             } else if (map[r][c] == MAP_TARGET) {
-                has_target = 1U;
+                target_count++;
             }
         }
     }
 
-    return (uint8)((has_wall != 0U) && (has_box != 0U) && (has_target != 0U));
+    launch_cell = map[APP_GAME_LAUNCH_EXIT_Y][APP_GAME_LAUNCH_EXIT_X];
+    return (uint8)((has_wall != 0U) &&
+                   (box_count != 0U) &&
+                   (box_count == target_count) &&
+                   (box_count <= SOKOBAN_MAX_BOXES) &&
+                   (launch_cell != MAP_WALL) &&
+                   (launch_cell != MAP_BOX) &&
+                   (launch_cell != MAP_BOMB));
 }
 
-/* 恢复时地图可能已在掉线期间完成最后一次推箱，此时箱子/目标已消失。
- * 因此恢复图只要含有围墙且多帧一致即可；后续由 LEVEL_JUDGE 确认零箱子。 */
+/* 恢复时地图可能已在掉线期间完成最后一次推箱，此时允许箱子/目标同时为零；
+ * 但两者数量仍必须相等，并要求连续多帧一致。 */
 static uint8 recovery_map_is_usable(const uint8 map[MAP_ROWS][MAP_COLS])
 {
     uint8 r;
     uint8 c;
+    uint8 has_wall = 0U;
+    uint8 box_count = 0U;
+    uint8 target_count = 0U;
 
     for (r = 0U; r < (uint8)MAP_ROWS; ++r) {
         for (c = 0U; c < (uint8)MAP_COLS; ++c) {
             if (map[r][c] == MAP_WALL) {
-                return 1U;
+                has_wall = 1U;
+            } else if (map[r][c] == MAP_BOX) {
+                box_count++;
+            } else if (map[r][c] == MAP_TARGET) {
+                target_count++;
             }
         }
     }
-    return 0U;
+    return (uint8)((has_wall != 0U) &&
+                   (box_count == target_count) &&
+                   (box_count <= SOKOBAN_MAX_BOXES));
 }
 
-static uint8 map_stability_tick(uint32 baseline_frame_id,
-                                uint8 reject_depart_map,
-                                uint8 require_new_level_layout)
+/* 到达 (1,4) 后只接纳连续五张完全一致的合法新图。每张图都重新检查
+ * 箱子/目标数量，任意非法帧或布局变化都会重新从第一张开始计数。 */
+static uint8 launch_map_stability_tick(uint32 baseline_frame_id)
+{
+    uint32 frame_id_before = g_link_map_frame_id;
+    uint32 frame_id_after;
+
+    if (s_launch_map_stable_ticks < MAP_STABLE_TIMEOUT_TICKS) {
+        s_launch_map_stable_ticks++;
+    } else {
+        reset_launch_map_stability();
+        return 0U;
+    }
+
+    if ((frame_id_before == 0U) ||
+        (frame_id_before == baseline_frame_id) ||
+        (frame_id_before == s_launch_map_last_frame_id)) {
+        return 0U;
+    }
+
+    app_link_get_map_snapshot(s_launch_map_observed);
+    frame_id_after = g_link_map_frame_id;
+    if (frame_id_after != frame_id_before) {
+        return 0U;
+    }
+    s_launch_map_last_frame_id = frame_id_after;
+
+    if (launch_map_is_usable(s_launch_map_observed) == 0U) {
+        reset_launch_map_stability();
+        return 0U;
+    }
+
+    if (s_launch_map_candidate_valid == 0U) {
+        copy_map(s_launch_map_candidate, s_launch_map_observed);
+        s_launch_map_candidate_valid = 1U;
+        s_launch_map_stable_count = 1U;
+        s_launch_map_stable_ticks = 0U;
+        return 0U;
+    }
+
+    if (maps_equal(s_launch_map_candidate, s_launch_map_observed) != 0U) {
+        if (s_launch_map_stable_count < 255U) {
+            s_launch_map_stable_count++;
+        }
+    } else {
+        copy_map(s_launch_map_candidate, s_launch_map_observed);
+        s_launch_map_stable_count = 1U;
+        s_launch_map_stable_ticks = 0U;
+        return 0U;
+    }
+
+    if (s_launch_map_stable_count < MAP_STABLE_REQUIRED_FRAMES) {
+        return 0U;
+    }
+
+    copy_map(g_game_map, s_launch_map_candidate);
+    s_map_snapshot_frame_id = frame_id_after;
+    map_cache_invalidate();
+    return 1U;
+}
+
+/* 断链恢复仍要求多帧一致，避免推箱过程中用单帧旧箱位恢复执行。 */
+static uint8 recovery_map_stability_tick(uint32 baseline_frame_id)
 {
     uint32 frame_id = g_link_map_frame_id;
 
@@ -260,15 +335,14 @@ static uint8 map_stability_tick(uint32 baseline_frame_id,
         return 0U;
     }
 
-    if (s_launch_map_stable_ticks < LAUNCH_MAP_STABLE_TIMEOUT_TICKS) {
+    if (s_launch_map_stable_ticks < MAP_STABLE_TIMEOUT_TICKS) {
         s_launch_map_stable_ticks++;
     } else {
         reset_launch_map_stability();
         return 0U;
     }
 
-    /* 只接收本次发车指令之后落地的帧。地图可能在车辆行驶到 (1,4) 的途中
-     * 已完成刷新，因此帧栅栏必须取发车前值，不能在到达后重置。 */
+    /* 只接收本次链路恢复栅栏之后落地的新帧。 */
     if ((frame_id == baseline_frame_id) ||
         (frame_id == s_launch_map_last_frame_id)) {
         return 0U;
@@ -276,16 +350,7 @@ static uint8 map_stability_tick(uint32 baseline_frame_id,
     s_launch_map_last_frame_id = frame_id;
 
     app_link_get_map_snapshot(s_launch_map_observed);
-    if (((require_new_level_layout != 0U) &&
-         (launch_map_is_usable(s_launch_map_observed) == 0U)) ||
-        ((require_new_level_layout == 0U) &&
-         (recovery_map_is_usable(s_launch_map_observed) == 0U))) {
-        reset_launch_map_stability();
-        return 0U;
-    }
-    if ((reject_depart_map != 0U) &&
-        (s_launch_depart_map_valid != 0U) &&
-        (map_hash(s_launch_map_observed) == s_launch_depart_map_hash)) {
+    if (recovery_map_is_usable(s_launch_map_observed) == 0U) {
         reset_launch_map_stability();
         return 0U;
     }
@@ -308,8 +373,10 @@ static uint8 map_stability_tick(uint32 baseline_frame_id,
         s_launch_map_stable_ticks = 0U;
     }
 
-    if (s_launch_map_stable_count >= LAUNCH_MAP_STABLE_REQUIRED_FRAMES) {
+    if (s_launch_map_stable_count >= MAP_STABLE_REQUIRED_FRAMES) {
         copy_map(g_game_map, s_launch_map_candidate);
+        s_map_snapshot_frame_id = frame_id;
+        map_cache_invalidate();
         return 1U;
     }
     return 0U;
@@ -318,6 +385,7 @@ static uint8 map_stability_tick(uint32 baseline_frame_id,
 static void reset_exec_context(void)
 {
     Sokoban_Stage1_Search_Cancel();
+    Sokoban_Bomb_Search_Cancel();
     g_soko_solution.is_solved = 0;
     g_soko_solution.total_boxes = 0;
     g_soko_waypoints.count = 0;
@@ -328,19 +396,14 @@ static void reset_exec_context(void)
     g_bomb_waypoints.count = 0;
     g_bomb_wp_idx = 0;
     g_exec_mode = EXEC_NONE;
+    s_plan_mode = PLAN_MODE_PUSH;
+    s_bomb_strategy = 0U;
+    s_bomb_search_started = 0U;
     is_navigating = 0;
-    s_wp_timeout_ticks = 0U;        /* B3b: 航点超时计数清零 */
-    s_wp_timeout_limit = WAYPOINT_TIMEOUT_TICKS;
-    s_wp_retry_count   = 0U;
     s_wait_phase0_ticks = 0U;       /* Issue A: WAIT_START phase 0 计时跨入口清零 */
     s_wait_start_phase = 0U;
     s_launch_drive_issued = 0U;
-    s_launch_drive_ticks  = 0U;
-    s_launch_retry_count  = 0U;
-    s_launch_warmup_ticks = 0U;
-    s_launch_depart_frame_id = 0U;
-    s_launch_depart_map_hash = 0U;
-    s_launch_depart_map_valid = 0U;
+    s_launch_arrival_frame_id = 0U;
     reset_launch_map_stability();
 }
 
@@ -396,14 +459,19 @@ static uint8 get_map_box_count(void)
 
 static uint8 map_has_bomb(void)
 {
+    if (s_map_has_bomb_valid != 0U) return s_map_has_bomb_cached;
+    s_map_has_bomb_cached = 0U;
     for (int8 r = (int8)CHASSIS_GRID_INNER_MIN_Y; r <= (int8)CHASSIS_GRID_INNER_MAX_Y; r++) {
         for (int8 c = (int8)CHASSIS_GRID_INNER_MIN_X; c <= (int8)CHASSIS_GRID_INNER_MAX_X; c++) {
             if (g_game_map[r][c] == MAP_BOMB) {
-                return 1;
+                s_map_has_bomb_cached = 1U;
+                s_map_has_bomb_valid = 1U;
+                return 1U;
             }
         }
     }
-    return 0;
+    s_map_has_bomb_valid = 1U;
+    return 0U;
 }
 
 static Point_t choose_nearest_target(Point_t ref)
@@ -464,105 +532,57 @@ static uint8 chassis_nav_arrived(void)
     return chassis_ctrl_is_arrived();
 }
 
-/* O8.3: 按"当前格 → 目标航点格"的曼哈顿距离给出本段超时上限.
- * 维持 5s 下限(不缩短既有短航段超时), 仅对长航段线性放宽。 */
-static uint16 waypoint_timeout_limit(Point_t target)
-{
-    int16 dx = (int16)target.x - (int16)g_player_pos.x;
-    int16 dy = (int16)target.y - (int16)g_player_pos.y;
-    uint32 limit;
-
-    if (dx < 0) dx = (int16)-dx;
-    if (dy < 0) dy = (int16)-dy;
-    limit = (uint32)((uint16)(dx + dy)) * (uint32)WAYPOINT_TICKS_PER_CELL;
-
-    if (limit < (uint32)WAYPOINT_TIMEOUT_TICKS) {
-        return WAYPOINT_TIMEOUT_TICKS;
-    }
-    return (limit > 0xFFFFUL) ? 0xFFFFU : (uint16)limit;
-}
-
-static void move_to_grid_keep_current_yaw(Point_t target)
-{
-    chassis_pose_t pose = chassis_ctrl_get_pose();
-
-    /* snap 到最近 90° 倍数: 消除识别转向残留的斜角, 保证轴对齐平移精度 */
-    chassis_ctrl_move_to_m(chassis_grid_x_to_m((uint8)target.x),
-                           chassis_grid_y_to_m((uint8)target.y),
-                           chassis_snap_yaw_to_cardinal_deg(pose.yaw_deg));
-}
-
-/* 派发一个航点: 按地图坐标移动, 保持当前车头角, 并复位超时计数。 */
+/* 与硬编码模式一致：每个推箱航点使用网格接口下发一次，随后持续等待到达。 */
 static void dispatch_waypoint(const SokoWaypointPath_t *wp, uint16 idx)
 {
-    move_to_grid_keep_current_yaw(wp->points[idx]);
+    Point_t target = wp->points[idx];
+
+    chassis_ctrl_move_to_grid((uint8)target.x, (uint8)target.y);
     is_navigating = 1;
-    s_wp_timeout_ticks = 0U;
-    s_wp_timeout_limit = waypoint_timeout_limit(wp->points[idx]);
 }
 
 static uint8 exec_waypoints_common(const SokoWaypointPath_t *wp, uint16 *wp_idx)
 {
     if (!is_navigating) {
         if (*wp_idx < wp->count) {
-            dispatch_waypoint(wp, *wp_idx);   /* B3b: 派发新航点, 超时计数重置+按段长定上限 */
+            dispatch_waypoint(wp, *wp_idx);
         }
         return 0;
     }
 
-    /* B3b: 航点超时保护 — 超时(随段长放宽)先重发, 再超时停车。 */
-    s_wp_timeout_ticks++;
     if (!chassis_nav_arrived()) {
-        if (s_wp_timeout_ticks > s_wp_timeout_limit) {
-            if (s_wp_retry_count == 0U) {
-                /* 第 1 次超时: 刹停后重发同一航点。 */
-                ++s_wp_retry_count;
-                chassis_ctrl_stop();
-                is_navigating = 0U;
-                s_wp_timeout_ticks = 0U;
-                return 0;
-            }
-            /* 第 2 次仍超时 → 停车等待人工处理。 */
-            s_wp_retry_count   = 0U;
-            s_wp_timeout_ticks = 0U;
-            chassis_ctrl_stop();
-            is_navigating = 0U;
-            goto_stage(STAGE_DEADLOCK_RESET);
-            return 0;
-        }
         return 0;
     }
 
     is_navigating = 0;
-    s_wp_retry_count   = 0U;       /* 到位 → 超时状态全部清零 */
-    s_wp_timeout_ticks = 0U;
     (*wp_idx)++;
-
-    if (*wp_idx < wp->count) {
-        dispatch_waypoint(wp, *wp_idx);
-        return 0;
-    }
-
-    return 1;
+    return (*wp_idx >= wp->count) ? 1U : 0U;
 }
 
 static uint8 exec_push_box_solution(void)
 {
-    if (g_soko_wp_idx >= g_soko_waypoints.count) {
-        g_soko_sub_idx++;
-        if (g_soko_sub_idx >= g_soko_solution.total_boxes) {
-            return 1;
-        }
-
-        Sokoban_Seq_To_Waypoints(
-            &g_soko_solution.sub_solutions[g_soko_sub_idx],
-            g_player_pos,                              /* B5: 用实时格而非 BFS 预测格 */
-            &g_soko_waypoints);
-        g_soko_wp_idx = 0;
-        is_navigating = 0;
+    /* exec_waypoints_common() 的完成只表示“当前箱子的子路径结束”，
+     * 不能直接向上层报告整关完成，否则比赛模式会在第一箱后提前结算。 */
+    if (g_soko_wp_idx < g_soko_waypoints.count &&
+        exec_waypoints_common(&g_soko_waypoints, &g_soko_wp_idx) == 0U) {
+        return 0U;
     }
 
-    return exec_waypoints_common(&g_soko_waypoints, &g_soko_wp_idx);
+    g_soko_sub_idx++;
+    if (g_soko_sub_idx >= g_soko_solution.total_boxes) {
+        return 1U;
+    }
+
+    if (Sokoban_Seq_To_Waypoints(
+            &g_soko_solution.sub_solutions[g_soko_sub_idx],
+            g_player_pos,                              /* B5: 用实时格而非 BFS 预测格 */
+            &g_soko_waypoints) == 0U) {
+        goto_stage(STAGE_DEADLOCK_RESET);
+        return 0U;
+    }
+    g_soko_wp_idx = 0U;
+    is_navigating = 0U;
+    return 0U;
 }
 
 /* ==========================================================================
@@ -595,24 +615,18 @@ static uint8 find_first_unreachable_target(Point_t *blocked_target)
     return 0;
 }
 
-static uint8 build_bomb_plan(Point_t blocked_target)
+static uint8 activate_bomb_plan(void)
 {
-    /* 多炸弹联合规划: 一次性给出 (炸弹, 墙体, 推炸弹动作序列).
-     * 取代旧的 "固定推扫描序第一颗炸弹 + 墙体独立打分" 三步式, 后者在
-     * 多炸弹时常因 "最优墙体的第一颗炸弹推不过去" 而误判无解。 */
-    if (!Sokoban_Plan_Bomb(g_game_map, g_player_pos, blocked_target,
-                           &g_bomb_pos, &g_bomb_wall_pos,
-                           &g_bomb_action_seq)) {
-        return 0;
+    if (Sokoban_Seq_To_Waypoints(&g_bomb_action_seq,
+                                 g_player_pos,
+                                 &g_bomb_waypoints) == 0U) {
+        return 0U;
     }
-
-    Sokoban_Seq_To_Waypoints(&g_bomb_action_seq,
-                             g_player_pos,
-                             &g_bomb_waypoints);
     g_bomb_wp_idx = 0;
     g_exec_mode = EXEC_PUSH_BOMB;
     is_navigating = 0;
-    return 1;
+    s_solve_succeeded = 1U;
+    return 1U;
 }
 
 static uint8 activate_push_box_solution(void)
@@ -630,31 +644,8 @@ static uint8 activate_push_box_solution(void)
     g_soko_wp_idx = 0U;
     g_exec_mode = EXEC_PUSH_BOX;
     is_navigating = 0U;
+    s_solve_succeeded = 1U;
     return 1U;
-}
-
-static uint8 build_push_box_plan(void)
-{
-    uint8 box_count = get_map_box_count();
-
-    if (box_count == 0) {
-        return 1;
-    }
-
-    /* B2: 第 1 关由 stage_plan_handler 的分时搜索分支处理；
-     * 第 2 关 = 必须按数字配对 (Stage2, 用 g_box_to_target[])
-     * 第 3 关 = 含炸弹 (Stage2 + 炸弹辅助)
-     * 判据只使用固定比赛顺序: 第 2 关无炸弹也必须按映射配对.
-     */
-    if (current_level_number() < 2U ||
-        !Sokoban_Solve_Stage2(g_game_map, g_player_pos,
-                              g_box_to_target,
-                              box_count,
-                              &g_soko_solution)) {
-        return 0;
-    }
-
-    return activate_push_box_solution();
 }
 
 /* ==========================================================================
@@ -664,21 +655,19 @@ static uint8 build_push_box_plan(void)
 
 static void prepare_launch_departure(void)
 {
-    /* 上位机只在车到达 (1,4) 后刷新地图。发车前保存帧栅栏和旧图摘要，
-     * 等图阶段据此拒绝仍在连续发送的上一关地图。 */
-    s_launch_depart_frame_id = g_link_map_frame_id;
-    copy_map(s_launch_map_observed, g_game_map);
-    s_launch_depart_map_valid = launch_map_is_usable(s_launch_map_observed);
-    s_launch_depart_map_hash = (s_launch_depart_map_valid != 0U)
-                             ? map_hash(s_launch_map_observed)
-                             : 0U;
+    /* OpenART 负责连续帧稳定过滤；主控将在到达 (1,4) 并停车后建立
+     * 接收栅栏，行驶途中落地的地图不能参与本关解算。 */
+    s_launch_arrival_frame_id = 0U;
+    s_map_accepted = 0U;
+    s_solve_succeeded = 0U;
     reset_launch_map_stability();
-    s_launch_map_last_frame_id = s_launch_depart_frame_id;
 }
 
 static void prepare_recovery_map_wait(void)
 {
     chassis_ctrl_stop();
+    s_map_accepted = 0U;
+    s_solve_succeeded = 0U;
     reset_exec_context();
     map_snapshot_release();
     clear_box_target_mapping();
@@ -695,11 +684,18 @@ void Game_Logic_Init(void)
     chassis_ctrl_stop();
     current_stage = STAGE_WAIT_START;
     is_navigating = 0U;
+    s_nav_heading_deg = APP_GAME_LAUNCH_FACE_YAW_DEG;
     s_link_alive = 0U;
     s_link_ever_alive = 0U;
     s_stage_resume = STAGE_WAIT_START;
     s_link_pause_reason = LINK_PAUSE_NONE;
     s_levels_finished = 0U;
+    s_map_accepted = 0U;
+    s_solve_succeeded = 0U;
+    s_launch_startup_settle_ticks = 0U;
+    s_map_snapshot_frame_id = 0U;
+    s_map_has_bomb_cached = 0U;
+    s_map_has_bomb_valid = 0U;
     reset_exec_context();
     /* 上电发车位置就是 (1,5)，首次启动跳过返航子阶段；关间返航仍从 phase 0 开始。 */
     s_wait_start_phase = 1U;
@@ -707,11 +703,14 @@ void Game_Logic_Init(void)
     clear_box_target_mapping();
     App_Recognize_Reset();
     memset(g_game_map, 0, sizeof(g_game_map));
+    memset(s_display_frozen_map, 0, sizeof(s_display_frozen_map));
+    s_display_frozen_map_generation = 0U;
 }
 
 static void stage_wait_start_handler(void)
 {
-    /* 仅保留左侧发车区。phase 0 依靠里程计返回 (1,5)，phase 1 保持 0° 并暖机；
+    /* 仅保留左侧发车区。phase 0 依靠里程计返回 (1,5)；phase 1 在首次上电时等待滤波稳定，
+     * 关间返航后不重复等待。
      * 地图在发车和到达 (1,4) 后的等待阶段始终解冻。
      */
     map_snapshot_release();
@@ -720,6 +719,7 @@ static void stage_wait_start_handler(void)
         s_wait_phase0_ticks++;
         if (!is_navigating) {
             /* 返航全程锁定 0°，避免继承识别巡游后的任意车头角。 */
+            s_nav_heading_deg = APP_GAME_LAUNCH_FACE_YAW_DEG;
             chassis_ctrl_move_to_m(chassis_grid_x_to_m(APP_GAME_LAUNCH_HOME_X),
                                    chassis_grid_y_to_m(APP_GAME_LAUNCH_HOME_Y),
                                    APP_GAME_LAUNCH_FACE_YAW_DEG);
@@ -736,6 +736,7 @@ static void stage_wait_start_handler(void)
         if (!chassis_nav_arrived()) return;
 
         /* 到库后继续做 0° 航向保持，直到下一次发车目标下发。 */
+        s_nav_heading_deg = APP_GAME_LAUNCH_FACE_YAW_DEG;
         chassis_ctrl_hold_yaw(APP_GAME_LAUNCH_FACE_YAW_DEG);
         is_navigating = 0;
         s_wait_phase0_ticks = 0U;
@@ -747,16 +748,18 @@ static void stage_wait_start_handler(void)
         return;
     }
 
-    /* 与硬编码模式保持相同的发车前置条件：只保持 0°，等待 IMU KF、编码器和
-     * 速度滤波稳定后再发车。这里禁止运行时 set_pose，避免 PIT 已运行时重写
-     * yaw/KF/odom 基准产生瞬态不一致。 */
-    if (s_launch_warmup_ticks == 0U) {
-        chassis_ctrl_hold_yaw(APP_GAME_LAUNCH_FACE_YAW_DEG);
-    }
-    if (++s_launch_warmup_ticks < LAUNCH_WARMUP_TICKS) {
-        return;
+    if (s_launch_startup_settle_ticks < LAUNCH_STARTUP_SETTLE_TICKS) {
+        if (s_launch_startup_settle_ticks == 0U) {
+            /* 上电稳定阶段保持 MODE_STOPPED；发车指令下发时再启用闭环。 */
+            chassis_ctrl_stop();
+        }
+        s_launch_startup_settle_ticks++;
+        if (s_launch_startup_settle_ticks < LAUNCH_STARTUP_SETTLE_TICKS) {
+            return;
+        }
     }
 
+    s_nav_heading_deg = APP_GAME_LAUNCH_FACE_YAW_DEG;
     reset_exec_context();
     map_snapshot_release();
     clear_box_target_mapping();
@@ -770,11 +773,11 @@ static void stage_launch_exit_handler(void)
     map_snapshot_release();
 
     if (s_launch_drive_issued == 0U) {
+        s_nav_heading_deg = APP_GAME_LAUNCH_FACE_YAW_DEG;
         chassis_ctrl_move_to_m(chassis_grid_x_to_m(APP_GAME_LAUNCH_EXIT_X),
                                chassis_grid_y_to_m(APP_GAME_LAUNCH_EXIT_Y),
                                APP_GAME_LAUNCH_FACE_YAW_DEG);
         s_launch_drive_issued = 1U;
-        s_launch_drive_ticks  = 0U;
         return;
     }
 
@@ -783,41 +786,38 @@ static void stage_launch_exit_handler(void)
     if (chassis_nav_arrived()) {
         chassis_ctrl_stop();
         s_launch_drive_issued = 0U;
-        s_launch_drive_ticks = 0U;
-        s_launch_retry_count = 0U;
+        /* 停车后才建立收图栅栏。reset_launch_map_stability() 会同步记录
+         * 此刻已完整落地的最后一帧，后续只接受帧号更晚的新地图。 */
+        reset_launch_map_stability();
+        s_launch_arrival_frame_id = s_launch_map_last_frame_id;
         goto_stage(STAGE_WAIT_MAP_REFRESH);
-        return;
-    }
-
-    /* 发车超时兜底: 重发一次; 仍超时则转死局复位。 */
-    s_launch_drive_ticks++;
-    if (s_launch_drive_ticks >= LAUNCH_DRIVE_TIMEOUT_TICKS) {
-        chassis_ctrl_stop();
-        s_launch_drive_issued = 0U;
-        s_launch_drive_ticks  = 0U;
-        if (s_launch_retry_count == 0U) {
-            s_launch_retry_count = 1U;   /* 允许重发一次 */
-        } else {
-            s_launch_retry_count = 0U;
-            reset_exec_context();
-            goto_stage(STAGE_DEADLOCK_RESET);
-        }
     }
 }
 
 static void stage_wait_map_refresh_handler(void)
 {
-    /* 到达 (1,4) 后保持停车和地图解冻；只有上位机刷新出的稳定新图才可
-     * 进入识别，避免用发车前旧图规划本关。 */
+    /* 到达 (1,4) 并停车后，在主控侧重新确认五张完整地图完全一致。
+     * 这样冻结条件不依赖 OpenART 是否实现了地图投票。 */
     map_snapshot_release();
-    if (map_stability_tick(s_launch_depart_frame_id, 1U, 1U) == 0U) {
+    if (launch_map_stability_tick(s_launch_arrival_frame_id) == 0U) {
         return;
     }
 
+    s_map_accepted = 1U;
     clear_box_target_mapping();
     App_Recognize_Reset();
     map_snapshot_freeze();
-    goto_stage(STAGE_RECOGNIZE_MAP);
+    publish_frozen_map_for_display();
+    /* 发车与等待新地图期间保持电机关闭；确认收到合法的新地图后，才按
+     * 业务层记录的四正交航向开启保持。后续识别/航点命令会正常覆盖该模式。 */
+    chassis_ctrl_hold_yaw(s_nav_heading_deg);
+    if (current_level_number() == 1U) {
+        /* 第一关不需要分类，直接让规划器复制冻结地图，省去识别空转的一拍。 */
+        reset_exec_context();
+        goto_stage(STAGE_PLAN_PATH);
+    } else {
+        goto_stage(STAGE_RECOGNIZE_MAP);
+    }
 }
 
 static void stage_wait_recovery_map_handler(void)
@@ -827,13 +827,15 @@ static void stage_wait_recovery_map_handler(void)
         return;
     }
 
-    if (map_stability_tick(s_recovery_map_baseline_frame_id, 0U, 0U) == 0U) {
+    if (recovery_map_stability_tick(s_recovery_map_baseline_frame_id) == 0U) {
         return;
     }
 
+    s_map_accepted = 1U;
     clear_box_target_mapping();
     App_Recognize_Reset();
     map_snapshot_freeze();
+    publish_frozen_map_for_display();
 
     /* 掉线期间若已完成最后一箱，直接进入本关完成判定。 */
     current_stage = (get_map_box_count() == 0U)
@@ -853,6 +855,7 @@ static void stage_recognize_handler(void)
     AppRecognizeStatus_e r = App_Recognize_Tick(g_game_map, g_player_pos,
                                                 map_has_bomb(),
                                                 current_level_number(),
+                                                &s_nav_heading_deg,
                                                 g_box_to_target);
     switch (r)
     {
@@ -880,79 +883,80 @@ static void stage_recognize_handler(void)
     }
 }
 
-/* O8.1: 破局炸弹决策链 (由 stage_plan_handler 内联链抽出)。
- *   1) 角落/冻结死局: 先尝试"死箱最近目标"；失败后继续后续策略，避免漏掉其他可行爆破点;
- *   2) 再试"玩家走不到的目标", 最后试"有炸弹时的通用破局";
- *   任一成功 → 返回 1 (炸弹段已就绪)；全部失败 → 返回 0。
- */
-static uint8 try_build_breakout_bomb(void)
+/* 破局策略顺序保持不变，但每拍只验证一个炸弹-墙体对，避免同步遍历
+ * 全图墙体和全部炸弹阻塞 5ms 比赛主循环。 */
+static SokoSearchStatus_e breakout_bomb_search_step(void)
 {
-    Point_t dead_box = { -1, -1 };
-    Point_t blocked_target;
+    while (s_bomb_strategy < 3U)
+    {
+        if (s_bomb_search_started == 0U)
+        {
+            Point_t blocked_target = {-1, -1};
+            uint8 strategy_available = 0U;
 
-    if (Sokoban_Is_Deadlock(g_game_map, &dead_box)) {
-        blocked_target = choose_nearest_target(dead_box);
-        if ((blocked_target.x >= 0) && build_bomb_plan(blocked_target)) {
-            return 1;
+            if (s_bomb_strategy == 0U)
+            {
+                Point_t dead_box = {-1, -1};
+                if (Sokoban_Is_Deadlock(g_game_map, &dead_box))
+                {
+                    blocked_target = choose_nearest_target(dead_box);
+                    strategy_available = (uint8)(blocked_target.x >= 0);
+                }
+            }
+            else if (s_bomb_strategy == 1U)
+            {
+                strategy_available = find_first_unreachable_target(&blocked_target);
+            }
+            else if (map_has_bomb())
+            {
+                strategy_available = 1U;
+            }
+
+            if (strategy_available == 0U ||
+                !Sokoban_Bomb_Search_Begin(g_game_map, g_player_pos,
+                                           blocked_target))
+            {
+                ++s_bomb_strategy;
+                continue;
+            }
+            s_bomb_search_started = 1U;
+        }
+
+        {
+            SokoSearchStatus_e status = Sokoban_Bomb_Search_Step(
+                1U, &g_bomb_pos, &g_bomb_wall_pos, &g_bomb_action_seq);
+            if (status == SOKO_SEARCH_RUNNING) return status;
+            Sokoban_Bomb_Search_Cancel();
+            s_bomb_search_started = 0U;
+            if (status == SOKO_SEARCH_SOLVED && activate_bomb_plan())
+            {
+                return SOKO_SEARCH_SOLVED;
+            }
+            ++s_bomb_strategy;
         }
     }
-
-    blocked_target.x = -1;
-    blocked_target.y = -1;
-    if (find_first_unreachable_target(&blocked_target) &&
-        build_bomb_plan(blocked_target)) {
-        return 1;
-    }
-
-    /* 通用炸弹兜底 (多炸弹关键补强):
-     * 推箱规划失败, 但既无死局、目标对玩家也都"可走到" —— 典型成因是
-     * 炸弹/内墙堵在 *箱子* 的推进通道上 (find_first_unreachable_target 只看
-     * 玩家→目标可达, 看不到箱子被堵)。此时以"最大化破局收益"为目标再尝试炸墙开路;
-     * Sokoban_Plan_Bomb 内部会确保选中的墙确有炸弹可推, 找不到则失败。 */
-    if (map_has_bomb()) {
-        Point_t no_target = { -1, -1 };
-        if (build_bomb_plan(no_target)) {
-            return 1;
-        }
-    }
-    return 0;
+    return SOKO_SEARCH_FAILED;
 }
 
 static void stage_plan_handler(void)
 {
+    SokoSearchStatus_e search_status;
+    Point_t home = { (int8)APP_GAME_LAUNCH_HOME_X,
+                     (int8)APP_GAME_LAUNCH_HOME_Y };
+
     if (get_map_box_count() == 0U) {
         Sokoban_Stage1_Search_Cancel();
+        Sokoban_Bomb_Search_Cancel();
         goto_stage(STAGE_LEVEL_JUDGE);
         return;
     }
 
-    if (current_level_number() == 1U) {
-        SokoSearchStatus_e search_status;
-        Point_t home = { (int8)APP_GAME_LAUNCH_HOME_X,
-                         (int8)APP_GAME_LAUNCH_HOME_Y };
-
-        if (g_soko_exec_init == 0U) {
-            g_soko_exec_init = 1U;
-            if (!Sokoban_Stage1_Search_Begin(g_game_map, g_player_pos, home)) {
-                map_snapshot_release();
-                if (try_build_breakout_bomb()) goto_stage(STAGE_EXECUTE_ACTION);
-                else goto_stage(STAGE_DEADLOCK_RESET);
-                return;
-            }
-            /* Begin 已复制规划地图；后续分时搜索不依赖视觉快照持续冻结。 */
-            map_snapshot_release();
-            return;
-        }
-
-        /* 每个 5ms tick 只评估一个箱-目标候选，控制单拍最坏耗时。 */
-        search_status = Sokoban_Stage1_Search_Step(1U, &g_soko_solution);
+    if (s_plan_mode == PLAN_MODE_BOMB)
+    {
+        search_status = breakout_bomb_search_step();
         if (search_status == SOKO_SEARCH_RUNNING) return;
-        Sokoban_Stage1_Search_Cancel();
-        if (search_status == SOKO_SEARCH_SOLVED && activate_push_box_solution()) {
-            goto_stage(STAGE_EXECUTE_ACTION);
-            return;
-        }
-        if (try_build_breakout_bomb()) {
+        if (search_status == SOKO_SEARCH_SOLVED)
+        {
             goto_stage(STAGE_EXECUTE_ACTION);
             return;
         }
@@ -960,24 +964,48 @@ static void stage_plan_handler(void)
         return;
     }
 
-    if (g_soko_exec_init) {
+    if (g_soko_exec_init == 0U)
+    {
+        uint8 begin_ok;
+        uint8 box_count = get_map_box_count();
+        s_solve_succeeded = 0U;
+        if (current_level_number() == 1U)
+        {
+            begin_ok = Sokoban_Stage1_Search_Begin(g_game_map, g_player_pos, home);
+        }
+        else
+        {
+            begin_ok = Sokoban_Stage2_Search_Begin(
+                g_game_map, g_player_pos, g_box_to_target, box_count, home);
+        }
+        g_soko_exec_init = 1U;
+        /* Begin 已复制地图与固定映射；后续搜索不依赖视觉快照持续冻结。 */
+        map_snapshot_release();
+        if (begin_ok == 0U)
+        {
+            g_soko_exec_init = 0U;
+            s_plan_mode = PLAN_MODE_BOMB;
+        }
         return;
     }
 
-    g_soko_exec_init = 1U;
-    /* 第二、三关保留固定映射同步规划；规划完成后恢复视觉地图刷新。 */
-    map_snapshot_release();
-    if (build_push_box_plan()) {
+    /* 每次只推进一个有界宏状态；主循环等待下一次 5ms tick 的空闲时间会
+     * 继续调用 Game_Logic_Idle_Plan_Step()，无需人为等待下一拍。 */
+    search_status = (current_level_number() == 1U)
+                  ? Sokoban_Stage1_Search_Step(1U, &g_soko_solution)
+                  : Sokoban_Stage2_Search_Step(1U, &g_soko_solution);
+    if (search_status == SOKO_SEARCH_RUNNING) return;
+    Sokoban_Stage1_Search_Cancel();
+    g_soko_exec_init = 0U;
+    if (search_status == SOKO_SEARCH_SOLVED && activate_push_box_solution())
+    {
         goto_stage(STAGE_EXECUTE_ACTION);
         return;
     }
 
-    if (try_build_breakout_bomb()) {
-        goto_stage(STAGE_EXECUTE_ACTION);
-        return;
-    }
-
-    goto_stage(STAGE_DEADLOCK_RESET);
+    s_plan_mode = PLAN_MODE_BOMB;
+    s_bomb_strategy = 0U;
+    s_bomb_search_started = 0U;
 }
 
 static void stage_execute_handler(void)
@@ -995,6 +1023,7 @@ static void stage_execute_handler(void)
              * 若视觉端在推炸弹过程中把 wall_pos 改写成 BOMB(被推到位时), 上面只清 WALL→EMPTY,
              * BOMB 残留, 必须再补一次. 幂等. */
             g_game_map[g_bomb_wall_pos.y][g_bomb_wall_pos.x] = MAP_EMPTY;
+            map_cache_invalidate();
             /* B1: 主控本地权威, 锁定地图; 直到本关结束(WAIT_START / DONE) 才解冻.
              * 视觉端不一定在 1 帧内同步爆炸结果, 防 g_game_map 被陈旧帧覆盖. */
             map_snapshot_freeze();
@@ -1015,12 +1044,9 @@ static void stage_execute_handler(void)
 
 static void stage_level_judge_handler(void)
 {
-    if (get_map_box_count() != 0) {
-        goto_stage(STAGE_PLAN_PATH);
-        return;
-    }
-
-    /* 箱子已全部推完 = 本关成功结束。所有关卡均保持 0° 返回 (1,5)；
+    /* 完整解算的全部子路径都已由底盘逐一确认到达，此时直接按本关完成处理。
+     * 不再用可能滞后的视觉地图重新判断箱子数量，行为与硬编码模式一致。
+     * 所有关卡均保持 0° 返回 (1,5)；
      * 前两关随后再驶到 (1,4) 触发新图，第三关返航后收车。 */
     chassis_ctrl_stop();
     mark_current_level_finished();
@@ -1048,13 +1074,15 @@ static void stage_done_handler(void)
  * ----------------------------------------------------------------
  * update_link_state():
  *   每个调度 tick 在 Game_Logic_Task_Run 入口被调用一次
- *   - OpenART1 MAP 链路是全局必需链路
- *   - OpenART2 BOX_CLASS 链路只在需要分类识别的 RECOGNIZE_MAP 阶段必需
+ *   - OpenART1 MAP 链路只在收图、识别和恢复阶段是必需链路
+ *   - OpenART2 BOX_CLASS 链路只在车已对准物体的 SAMPLE 子阶段必需；
+ *     INIT/NAV/FACE 不能因尚无分类帧而阻止车辆到达观察位
  *   - 用 LINK_LOSS_MS / LINK_OK_MS 做迟滞判定
  *   - 状态翻转时:
- *       OK  -> LOSS : 保存 current_stage 到 s_stage_resume, 切到 PAUSE, 立即 chassis_ctrl_stop()
- *       LOSS-> OK   : WAIT_START 重新取图发车；其他业务阶段重新进入 RECOGNIZE_MAP，
- *                     避免用掉线前的陈旧识别结果继续执行
+ *       必需阶段 OK -> LOSS : 保存 current_stage 到 s_stage_resume, 切到 PAUSE, 立即停车
+ *       规划/执行期 MAP LOSS: 只记录链路离线，继续使用已接纳地图和已下发航点
+ *       必需阶段 LOSS -> OK: 等待新地图并重新识别/规划
+ *       可选阶段 LOSS -> OK: 仅恢复链路在线标志，不重置当前执行上下文
  *
  * stage_pause_on_link_loss_handler():
  *   PAUSE 状态下不做任何业务逻辑, 只是周期性确保电机维持在停车状态
@@ -1069,6 +1097,42 @@ static void stage_done_handler(void)
 uint8 Game_Link_Is_Alive(void)
 {
     return s_link_alive;
+}
+
+void Game_Get_Runtime_Status(GameRuntimeStatus_t *out)
+{
+    if (out == NULL) {
+        return;
+    }
+
+    out->stage = current_stage;
+    out->map_accepted = s_map_accepted;
+    out->solve_succeeded = s_solve_succeeded;
+    out->waypoint_issued = 0U;
+    out->waypoint_index = 0U;
+    out->waypoint_count = 0U;
+
+    if (g_exec_mode == EXEC_PUSH_BOX) {
+        out->waypoint_index = g_soko_wp_idx;
+        out->waypoint_count = g_soko_waypoints.count;
+        out->waypoint_issued = is_navigating;
+    } else if (g_exec_mode == EXEC_PUSH_BOMB) {
+        out->waypoint_index = g_bomb_wp_idx;
+        out->waypoint_count = g_bomb_waypoints.count;
+        out->waypoint_issued = is_navigating;
+    }
+}
+
+uint8 Game_Get_Frozen_Map(uint8 out[MAP_ROWS][MAP_COLS], uint32 *generation)
+{
+    if ((out == NULL) || (generation == NULL) ||
+        (s_display_frozen_map_generation == 0U)) {
+        return 0U;
+    }
+
+    copy_map(out, s_display_frozen_map);
+    *generation = s_display_frozen_map_generation;
+    return 1U;
 }
 
 /* ==================================================================
@@ -1091,11 +1155,27 @@ static uint32 link_silence_ms(uint32 now_ms, uint32 last_ms)
 
 static uint8 recognize_stage_needs_class_link(void)
 {
+    AppRecognizeDebug_t debug;
+
     if (current_stage != STAGE_RECOGNIZE_MAP)
     {
         return 0U;
     }
-    return (uint8)(current_level_number() >= 2U);
+
+    /* OpenART2 may not produce a class frame until the car reaches an
+     * observation point and faces the pattern. Requiring that link during
+     * INIT/NAV/FACE creates a circular wait: the car is stopped before it can
+     * move into view. */
+    App_Recognize_Get_Debug(&debug);
+    return (uint8)((current_level_number() >= 2U) &&
+                   (debug.sub_state == RECOG_SUB_SAMPLE));
+}
+
+static uint8 current_stage_needs_map_link(void)
+{
+    return (uint8)((current_stage == STAGE_WAIT_MAP_REFRESH) ||
+                   (current_stage == STAGE_RECOGNIZE_MAP) ||
+                   (current_stage == STAGE_WAIT_RECOVERY_MAP));
 }
 
 static void enter_link_pause(LinkPauseReason_e reason)
@@ -1125,6 +1205,8 @@ static void enter_link_pause(LinkPauseReason_e reason)
 
 static void recover_from_link_pause(void)
 {
+    LinkPauseReason_e recovered_reason = s_link_pause_reason;
+
     s_link_alive = 1U;
     s_link_pause_reason = LINK_PAUSE_NONE;
     if (current_stage == STAGE_WAIT_RECOVERY_MAP)
@@ -1140,6 +1222,15 @@ static void recover_from_link_pause(void)
     {
         chassis_ctrl_stop();
         is_navigating  = 0U;
+        if ((recovered_reason == LINK_PAUSE_CLASS) &&
+            (s_stage_resume == STAGE_RECOGNIZE_MAP))
+        {
+            /* Class loss is only armed in SAMPLE, where the car is already
+             * stopped and facing the object. Resume that sampling window
+             * instead of discarding the accepted map and restarting tour. */
+            current_stage = STAGE_RECOGNIZE_MAP;
+            return;
+        }
         if (s_stage_resume == STAGE_WAIT_START)
         {
             /* 返航掉线恢复后重新到 (1,5)，随后仍按“先发车、后等图”执行。 */
@@ -1152,9 +1243,8 @@ static void recover_from_link_pause(void)
         }
         if (s_stage_resume == STAGE_LAUNCH_EXIT)
         {
-            /* 保留发车前帧栅栏；只重发 (1,4) 目标，避免漏掉移动期间已刷新的地图。 */
+            /* 重新下发 (1,4) 目标；到站后再建立本轮收图栅栏。 */
             s_launch_drive_issued = 0U;
-            s_launch_drive_ticks = 0U;
             map_snapshot_release();
             current_stage = STAGE_LAUNCH_EXIT;
             return;
@@ -1188,7 +1278,8 @@ static void update_link_state(void)
     uint8 class_seen = (g_link_last_class_link_ms != 0U) ? 1U : 0U;
     uint8 map_loss = (uint8)((map_seen != 0U) && (map_silence_ms > LINK_LOSS_MS));
     uint8 map_recovered = (uint8)((map_seen != 0U) && (map_silence_ms < LINK_OK_MS));
-    uint8 class_loss = (uint8)(((class_seen == 0U) || (class_silence_ms > LINK_LOSS_MS)) &&
+    uint8 class_loss = (uint8)((class_seen != 0U) &&
+                               (class_silence_ms > LINK_LOSS_MS) &&
                                (recognize_stage_needs_class_link() != 0U));
     uint8 class_recovered = (uint8)((class_seen != 0U) && (class_silence_ms < LINK_OK_MS));
 
@@ -1204,7 +1295,14 @@ static void update_link_state(void)
 
     if (s_link_alive) {
         if (map_loss != 0U) {
-            enter_link_pause(LINK_PAUSE_MAP);
+            if (current_stage_needs_map_link() != 0U) {
+                enter_link_pause(LINK_PAUSE_MAP);
+            } else {
+                /* 规划和航点执行只依赖已接纳的本地状态。记录物理掉线但不停车，
+                 * 避免短暂视觉静默清空解算结果并反复进入 RECOVERY。 */
+                s_link_alive = 0U;
+                s_link_pause_reason = LINK_PAUSE_MAP;
+            }
         }
         else if (class_loss != 0U) {
             enter_link_pause(LINK_PAUSE_CLASS);
@@ -1248,9 +1346,16 @@ void Game_Logic_Task_Run(void)
      *
      * B1+B12: s_map_freeze=1 时 (识别 tour / 炸弹爆炸后) 跳过拷贝, 由主控本地权威.
      */
-    if (s_link_alive && !s_map_freeze)
+    if (s_link_alive && !s_map_freeze &&
+        g_link_map_frame_id != s_map_snapshot_frame_id)
     {
+        uint32 frame_id_before = g_link_map_frame_id;
         app_link_get_map_snapshot(g_game_map);
+        if (g_link_map_frame_id == frame_id_before)
+        {
+            s_map_snapshot_frame_id = frame_id_before;
+            map_cache_invalidate();
+        }
     }
 
     /* 底盘位姿只来自编码器里程计与陀螺仪；视觉只更新地图和分类。 */
@@ -1307,4 +1412,16 @@ void Game_Logic_Task_Run(void)
             break;
     }
 
+}
+
+uint8 Game_Logic_Idle_Plan_Step(void)
+{
+    if (current_stage != STAGE_PLAN_PATH) {
+        return 0U;
+    }
+
+    /* Main-thread only: consume exactly one bounded planner unit so a PIT tick
+     * can delay at most one unit before the normal 5ms task regains control. */
+    stage_plan_handler();
+    return 1U;
 }

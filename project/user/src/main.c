@@ -54,7 +54,7 @@
 /*==========================================================================
  *  P0-5: 主循环 5ms tick 节拍 (替代 system_delay_ms 阻塞)
  *  - PIT_CH0 ISR 每 5ms 调用 main_loop_on_pit_tick(), 累加 s_main_tick_pending
- *  - 主循环用 wait_for_tick() 消费节拍, 期间 __WFI 进入低功耗等待中断唤醒
+ *  - 主循环用 wait_for_tick() 消费节拍；比赛规划期利用等待空档推进一个有界搜索单元
  *  - 当一次消费的 tick > 1 表示主循环上一轮耗时 >5ms, 记入 overrun 仅观测不丢拍
  *  - 三个计数器均为 file-static volatile, 仅 IPS / Live Watch 调试可见
  *========================================================================*/
@@ -70,8 +70,8 @@ void main_loop_on_pit_tick(void)
 
 /*
  * 阻塞直到下一个 5ms tick 到来, 返回本次消费的 tick 数 (>=1).
- * - 没有 pending tick 时 __WFI() 让 CPU 休眠, 任意中断 (PIT/UART/SysTick) 可唤醒
- * - 唤醒后 while 兜底再判一次, 防止 WFI 偶发未睡稳或被无关中断唤醒
+ * - 没有 pending tick 时，规划阶段推进一个工作单元，其余阶段维持原有空转等待
+ * - 每个工作单元结束后重新检查 pending，PIT/UART ISR 始终可以抢占主循环
  * - 「读 + 清零」用 __disable_irq/__enable_irq 包成临界区, 与 PIT_CH0 ISR 互斥
  */
 static uint32 wait_for_tick(void)
@@ -79,6 +79,10 @@ static uint32 wait_for_tick(void)
     uint32 ticks;
     while (s_main_tick_pending == 0U)
     {
+        /* 求解器原先每个宏状态固定等待一次5ms tick，三箱地图会累计到约20s。
+         * 这里利用原本空转的等待时间推进；PIT ISR仍可随时置 pending，单次只做
+         * 一个有界工作单元，下一次循环立即把控制权交回正常5ms任务。 */
+        (void)Game_Logic_Idle_Plan_Step();
         /* __WFI();  P0-5: 临时关闭, 避免 SWD 进 WFI 后断连; 稳定后再开 */
     }
     __disable_irq();
@@ -2605,20 +2609,9 @@ int main(void)
 #else
 #if (MAIN_RUN_MODE != MAIN_RUN_MODE_POINT_NAV)
 #if (MAIN_RUN_MODE == MAIN_RUN_MODE_GAME)
-            {
-                GameRuntimeStatus_t game_status;
-                Game_Get_Runtime_Status(&game_status);
-                /* 比赛计时中的识别、规划和运动阶段不刷 SPI 屏；仅在等待、
-                 * 异常或结束时保留状态画面，避免显示传输拉长主循环。 */
-                if (game_status.stage == STAGE_WAIT_MAP_REFRESH ||
-                    game_status.stage == STAGE_WAIT_RECOVERY_MAP ||
-                    game_status.stage == STAGE_DEADLOCK_RESET ||
-                    game_status.stage == STAGE_PAUSE_ON_LINK_LOSS ||
-                    game_status.stage == STAGE_DONE)
-                {
-                    chassis_menu_render_100ms();
-                }
-            }
+            /* 比赛屏幕不再读取实时 UART 地图。该函数只有在五帧门产生新的
+             * 冻结快照时才写 SPI，其余调用立即返回。 */
+            chassis_menu_render_game_frozen_100ms();
 #else
             chassis_menu_render_100ms();
 #endif

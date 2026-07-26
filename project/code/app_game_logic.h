@@ -94,6 +94,10 @@ extern uint8 g_game_map[MAP_ROWS][MAP_COLS];
 // 业务调度函数
 void Game_Logic_Task_Run(void);
 
+/* 利用主循环等待下一拍的空档推进一个有界规划单元；仅主线程调用。
+ * 只有 STAGE_PLAN_PATH 实际推进时返回 1。 */
+uint8 Game_Logic_Idle_Plan_Step(void);
+
 /* 正式比赛状态初始化：上电已在 (1,5)，从第一关发车准备开始。 */
 void Game_Logic_Init(void);
 
@@ -102,7 +106,7 @@ void Game_Logic_Init(void);
  * Game_Link_Is_Alive():
  *   1: 当前所监控的视觉链路在线
  *      - 地图链路: OpenART1 MAP/heartbeat 在线
- *      - 识别阶段: 需要分类时 OpenART1 + OpenART2 均在线
+ *      - 图案采样阶段: OpenART1 + OpenART2 均在线
  *   0: 所需链路已超时
  *      - 收图/识别阶段进入 STAGE_PAUSE_ON_LINK_LOSS
  *      - 规划/执行阶段只记录离线，不中断已有航点
@@ -112,6 +116,11 @@ uint8 Game_Link_Is_Alive(void);
 
 /* Read-only race-flow status used by the differential IPS refresh. */
 void Game_Get_Runtime_Status(GameRuntimeStatus_t *out);
+
+/* Copy the latest map accepted by the five-frame freeze gate.
+ * Returns 0 before the first map is frozen; generation increments once per
+ * accepted map so the IPS can ignore live UART frames and redraw only once. */
+uint8 Game_Get_Frozen_Map(uint8 out[MAP_ROWS][MAP_COLS], uint32 *generation);
 
 /* ==================================================================
  * 【B17】识别 tour 进度查询接口 (转发自 App_Recognize_Get_Debug)
