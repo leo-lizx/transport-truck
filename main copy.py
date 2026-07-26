@@ -112,11 +112,16 @@ CAR_VOTE_MIN = 2
 car_vote_hist = []
 
 # ========================================================
-# 【新增】：数据传输与全局地图投票配置
+# 【修改更新】：基于时间的动态数据传输与全局地图投票配置
 # ========================================================
-TX_VOTE_FRAMES = 5       # 设定多帧累积次数，5帧进行一次全局投票并发送（降低传输频率）
-tx_vote_buffer_map = []  # 暂存多帧的 192 网格地图数据
-tx_vote_buffer_car = []  # 暂存多帧的车辆坐标数据
+# 【深度优化】：废弃原先写死的 TX_VOTE_FRAMES = 5 机制，改为时间轴驱动
+# 这样能够完美适配硬件-软件通讯架构，防止底层传输阻塞，同时利用闲置算力
+TX_INTERVAL_MS = 300     # 【核心参数】：设定每次数据传输的间隔时长（毫秒）。
+                         # 该参数可任意更改。间隔内累积的帧数越多，投票越精准，
+                         # 系统会根据实际帧率，动态计算在此间隔内的判定次数。
+_last_tx_ms = time.ticks_ms() # 用于记录上一次成功打包下发数据的时间戳
+tx_vote_buffer_map = []  # 动态长度：暂存多帧的 192 网格地图数据缓冲池
+tx_vote_buffer_car = []  # 动态长度：暂存多帧的车辆坐标数据缓冲池
 # ========================================================
 
 def calc_grid_point(x_idx, y_idx, img_w, img_h):
@@ -463,52 +468,67 @@ while(True):
     # car_x, car_y = vote_car_position(car_found, car_x, car_y)
 
     # ======================================================================
-    # 【核心修改区】：将当前帧解析数据送入缓冲，累计多帧执行全局投票
+    # 【核心修改区】：基于时间的动态缓冲，累计时间内的所有帧执行全局投票
     # ======================================================================
+    # 不论间隔多长，摄像头只要抓到一帧就算出一次特征，无脑压入缓冲池
     tx_vote_buffer_map.append(map_list)
     tx_vote_buffer_car.append((car_found, car_x, car_y))
 
-    # 判断是否达到指定的判定帧数 (例如积累了 5 帧)
-    if len(tx_vote_buffer_map) >= TX_VOTE_FRAMES:
-        final_map_list = []
+    current_ms = time.ticks_ms()
+    
+    # 【关键触发器】：判断当前时间与上一次下发时间的时间差，是否已经满足设定的 TX_INTERVAL_MS
+    # 此逻辑完美解决了系统帧率波动时传输频率不稳定的问题，并释放了 CPU 开销。
+    if time.ticks_diff(current_ms, _last_tx_ms) >= TX_INTERVAL_MS:
+        
+        # 动态判定次数的体现：在上述间隔时间内，系统实际跑了多少帧，就在此处判定多少次。
+        # 比如如果设间隔 100ms 且帧率是 60帧/秒，此处 dynamic_vote_count 大约就是 6 次判定。
+        # 如果你后续把 TX_INTERVAL_MS 调整成 500ms，判定次数就会自动飙升到 30 次！
+        dynamic_vote_count = len(tx_vote_buffer_map)
+        
+        # 边界防护：确保确实积累了数据帧才进行统计，防止出现空指针或除零
+        if dynamic_vote_count > 0:
+            final_map_list = []
 
-        # 1. 赛道网格投票：分别提取 192 个格子在过去 5 帧的识别结果
-        for i in range(ROWS * COLS):
-            cell_votes = [frame_map[i] for frame_map in tx_vote_buffer_map]
-            # 统计并取众数作为该格子最终传输结果 (利用集合去重和count特性)
-            best_char = max(set(cell_votes), key=cell_votes.count)
-            final_map_list.append(best_char)
+            # 1. 赛道网格投票：分别提取 192 个格子在过去这一个时间周期内的动态次识别结果
+            for i in range(ROWS * COLS):
+                cell_votes = [frame_map[i] for frame_map in tx_vote_buffer_map]
+                # 统计并取众数作为该格子最终传输结果 (利用集合去重和count特性，算法复杂度低)
+                best_char = max(set(cell_votes), key=cell_votes.count)
+                final_map_list.append(best_char)
 
-        # 2. 小车坐标投票：提取过去 5 帧内成功识别到小车的坐标
-        valid_car_votes = [(cx, cy) for fnd, cx, cy in tx_vote_buffer_car if fnd]
-        if len(valid_car_votes) > 0:
-            final_car_pos = max(set(valid_car_votes), key=valid_car_votes.count)
-            final_car_found = True
-            final_car_x, final_car_y = final_car_pos
-        else:
-            final_car_found = False
-            final_car_x, final_car_y = 225, 225 # 无效坐标
+            # 2. 小车坐标投票：提取该时间周期内，成功识别到小车的有效坐标集合
+            valid_car_votes = [(cx, cy) for fnd, cx, cy in tx_vote_buffer_car if fnd]
+            if len(valid_car_votes) > 0:
+                # 基于这个动态时间池中占比最大的坐标点，敲定最后基准以抗击突发光斑或抖动
+                final_car_pos = max(set(valid_car_votes), key=valid_car_votes.count)
+                final_car_found = True
+                final_car_x, final_car_y = final_car_pos
+            else:
+                final_car_found = False
+                final_car_x, final_car_y = 225, 225 # 无效坐标
 
-        # 组装最终给主控的单@字符地图 (此时使用的是多帧投票后的最优结果)
-        map_list_out = build_map_with_single_car(final_map_list, final_car_found, final_car_x, final_car_y)
+            # 组装最终给主控的单@字符地图 (此时使用的是基于动态时间的全局最优解)
+            map_list_out = build_map_with_single_car(final_map_list, final_car_found, final_car_x, final_car_y)
 
-        # 记录本次打包的数据以供 IDE 监控随时打印
-        last_map_list_out = map_list_out
-        last_car_x, last_car_y = final_car_x, final_car_y
+            # 记录本次打包的数据以供 IDE 监控随时打印
+            last_map_list_out = map_list_out
+            last_car_x, last_car_y = final_car_x, final_car_y
 
-        # --- 阶段 C：串口打包发送 (194 字节全场通讯) ---
-        # 此时传输频率降低为原先的 1/TX_VOTE_FRAMES，且准确率通过多帧投票获得大幅提升
-        try:
-            map_bytes = "".join(map_list_out).encode("ascii")
-            payload = map_bytes + bytes([final_car_x, final_car_y])
-            if len(payload) == 194:
-                uart.write(pack_frame(PROTO_TYPE_MAP, payload))
-        except Exception as e:
-            print("UART TX Error:", e)
+            # --- 阶段 C：串口打包发送 (194 字节全场通讯) ---
+            # 此时传输完全被 TX_INTERVAL_MS 严格卡位，彻底杜绝了高频硬发导致的 MCU 死机或溢出
+            try:
+                map_bytes = "".join(map_list_out).encode("ascii")
+                payload = map_bytes + bytes([final_car_x, final_car_y])
+                if len(payload) == 194:
+                    uart.write(pack_frame(PROTO_TYPE_MAP, payload))
+            except Exception as e:
+                print("UART TX Error:", e)
 
-        # 清空缓冲区，开始下一次判定累积周期
+        # 【极其重要】：无论刚才是否发生了异常断联，只要时间周期走完了，
+        # 都必须彻底清空多帧缓冲区，并同步重置计时器，让系统迎接下一次干净的动态累加周期。
         tx_vote_buffer_map = []
         tx_vote_buffer_car = []
+        _last_tx_ms = current_ms
 
     # 发送系统心跳 (不受地图降频约束，必须独立维持高频发送防止主控掉线)
     send_heartbeat_if_due()
