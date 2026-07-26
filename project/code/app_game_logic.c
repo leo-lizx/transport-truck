@@ -122,6 +122,22 @@ static uint8                 g_soko_sub_idx = 0;
 static uint16                g_soko_wp_idx = 0;
 static uint8                 g_soko_exec_init = 0;
 
+/* 第一关滚动规划：当前箱执行时，后台只解算其完成后的剩余地图。
+ * 不复制约 16KB 的完整动作解；改存航点和每段后的预测地图，约 6.5KB BSS，
+ * 供后台尚未结束时无等待地沿用最近一次完整可行解。 */
+static uint8                 s_roll_active = 0U;
+static uint8                 s_roll_boxes_remaining = 0U;
+static uint8                 s_roll_bg_start_pending = 0U;
+static uint8                 s_roll_bg_active = 0U;
+static uint8                 s_roll_bg_expected_boxes = 0U;
+static uint8                 s_roll_after_active_map[MAP_ROWS][MAP_COLS];
+static Point_t               s_roll_after_active_player;
+static SokoWaypointPath_t    s_roll_queue_waypoints[SOKOBAN_MAX_BOXES];
+static uint8                 s_roll_queue_after_map[SOKOBAN_MAX_BOXES][MAP_ROWS][MAP_COLS];
+static Point_t               s_roll_queue_after_player[SOKOBAN_MAX_BOXES];
+static uint8                 s_roll_queue_count = 0U;
+static uint8                 s_roll_queue_next = 0U;
+
 static Point_t               g_bomb_pos;
 static Point_t               g_bomb_wall_pos;
 static SokoActionSeq_t       g_bomb_action_seq;
@@ -393,6 +409,13 @@ static void reset_exec_context(void)
     g_soko_sub_idx = 0;
     g_soko_wp_idx = 0;
     g_soko_exec_init = 0;
+    s_roll_active = 0U;
+    s_roll_boxes_remaining = 0U;
+    s_roll_bg_start_pending = 0U;
+    s_roll_bg_active = 0U;
+    s_roll_bg_expected_boxes = 0U;
+    s_roll_queue_count = 0U;
+    s_roll_queue_next = 0U;
 
     g_bomb_waypoints.count = 0;
     g_bomb_wp_idx = 0;
@@ -422,11 +445,10 @@ static void goto_stage(GameStage_e next)
  * 所有对 s_map_freeze 的置位/清零都经由这两个函数, 便于:
  *   - 用函数名一次检索出全部生命周期点 (降低新增 stage 时漏配的风险);
  *   - 把"为何冻结/解冻"的语义集中在此处记录。
- * 注意: freeze 取值依赖运行时条件 (识别是否改图 App_Recognize_Map_Changed、
- * 炸弹爆破后对 PLAN 那一拍的单拍保护), 不能化简为"纯 stage→freeze 静态表"
- * (那样会改变上述条件与时序语义), 故此处只做集中封装, 不改变任何时序。
+ * 注意: freeze 取值依赖地图接纳与规划器完成私有拷贝的时序，以及炸弹爆破后
+ * 对 PLAN 那一拍的单拍保护，不能化简为"纯 stage→freeze 静态表"。
  *
- * 冻结 (hold, freeze=1) 点: 驶出后新地图稳定/链路恢复进 RECOGNIZE 前、识别完成且地图被清障改动、
+ * 冻结 (hold, freeze=1) 点: 驶出后新地图稳定/链路恢复进 RECOGNIZE 前、识别完成进入规划前、
  *                            炸弹爆破后保护 PLAN_PATH 当拍快照;
  * 解冻 (release, freeze=0) 点: WAIT_START/LAUNCH_EXIT/WAIT_MAP_REFRESH、识别失败、PLAN 完成本拍、DONE。 */
 static void map_snapshot_freeze(void)
@@ -560,6 +582,189 @@ static uint8 exec_waypoints_common(const SokoWaypointPath_t *wp, uint16 *wp_idx)
     return (*wp_idx >= wp->count) ? 1U : 0U;
 }
 
+static uint8 rolling_seq_is_push(const SokoActionSeq_t *seq, uint16 index)
+{
+    return (uint8)((seq->push_bitmap[index >> 3] >> (index & 7U)) & 1U);
+}
+
+/* 在预测地图上回放一个“单箱到目标”子解。箱子到达该段目标后与目标点
+ * 一起消失，输出正好可作为剩余箱规划器的下一张输入地图。 */
+static uint8 rolling_apply_subsolution(
+    const uint8 input_map[MAP_ROWS][MAP_COLS],
+    Point_t start_player,
+    const SokoActionSeq_t *seq,
+    uint8 output_map[MAP_ROWS][MAP_COLS],
+    Point_t *end_player)
+{
+    static const int8 dr[4] = {-1, 1, 0, 0};
+    static const int8 dc[4] = {0, 0, -1, 1};
+    Point_t player = start_player;
+    Point_t active_box = {-1, -1};
+    uint8 box_under = MAP_EMPTY;
+    uint8 has_active_box = 0U;
+
+    if (input_map == NULL || seq == NULL || end_player == NULL ||
+        seq->count == 0U || seq->count > (uint16)SOKOBAN_MAX_ACTIONS) {
+        return 0U;
+    }
+    copy_map(output_map, input_map);
+
+    for (uint16 i = 0U; i < seq->count; ++i) {
+        uint8 direction = (uint8)seq->actions[i];
+        Point_t next;
+
+        if (direction > (uint8)SOKO_ACT_RIGHT) { return 0U; }
+        next.x = (int8)(player.x + dc[direction]);
+        next.y = (int8)(player.y + dr[direction]);
+        if (next.x < 0 || next.x >= (int8)MAP_COLS ||
+            next.y < 0 || next.y >= (int8)MAP_ROWS) {
+            return 0U;
+        }
+
+        if (rolling_seq_is_push(seq, i) != 0U) {
+            Point_t box_to;
+            uint8 next_under;
+
+            if (output_map[next.y][next.x] != MAP_BOX ||
+                (has_active_box != 0U &&
+                 (next.x != active_box.x || next.y != active_box.y))) {
+                return 0U;
+            }
+            box_to.x = (int8)(next.x + dc[direction]);
+            box_to.y = (int8)(next.y + dr[direction]);
+            if (box_to.x < 0 || box_to.x >= (int8)MAP_COLS ||
+                box_to.y < 0 || box_to.y >= (int8)MAP_ROWS) {
+                return 0U;
+            }
+            next_under = output_map[box_to.y][box_to.x];
+            if (next_under != MAP_EMPTY && next_under != MAP_TARGET) {
+                return 0U;
+            }
+
+            output_map[next.y][next.x] = box_under;
+            output_map[box_to.y][box_to.x] = MAP_BOX;
+            box_under = next_under;
+            active_box = box_to;
+            has_active_box = 1U;
+        } else if (output_map[next.y][next.x] != MAP_EMPTY &&
+                   output_map[next.y][next.x] != MAP_TARGET) {
+            return 0U;
+        }
+        player = next;
+    }
+
+    if (has_active_box == 0U || box_under != MAP_TARGET ||
+        output_map[active_box.y][active_box.x] != MAP_BOX) {
+        return 0U;
+    }
+    output_map[active_box.y][active_box.x] = MAP_EMPTY;
+    *end_player = player;
+    return 1U;
+}
+
+/* 把完整可行解压缩为后续箱子的航点/残余地图队列。后台优化只有在整份
+ * 新解均成功转换后才会被执行端采用。 */
+static uint8 rolling_build_queue(const SokoFullSolution_t *solution,
+                                 uint8 first_sub_index,
+                                 const uint8 first_map[MAP_ROWS][MAP_COLS],
+                                 Point_t first_player)
+{
+    const uint8 (*source_map)[MAP_COLS] = first_map;
+    Point_t player = first_player;
+    uint8 queue_count = 0U;
+
+    if (solution == NULL || solution->is_solved == 0U ||
+        solution->total_boxes == 0U ||
+        solution->total_boxes > (uint8)SOKOBAN_MAX_BOXES ||
+        first_sub_index > solution->total_boxes) {
+        return 0U;
+    }
+
+    for (uint8 sub = first_sub_index; sub < solution->total_boxes; ++sub) {
+        Point_t predicted_end;
+
+        if (Sokoban_Seq_To_Waypoints(&solution->sub_solutions[sub],
+                                     player,
+                                     &s_roll_queue_waypoints[queue_count]) == 0U ||
+            !rolling_apply_subsolution(source_map,
+                                       player,
+                                       &solution->sub_solutions[sub],
+                                       s_roll_queue_after_map[queue_count],
+                                       &predicted_end) ||
+            predicted_end.x != solution->player_end_pos[sub].x ||
+            predicted_end.y != solution->player_end_pos[sub].y) {
+            s_roll_queue_count = 0U;
+            s_roll_queue_next = 0U;
+            return 0U;
+        }
+
+        s_roll_queue_after_player[queue_count] = predicted_end;
+        source_map = s_roll_queue_after_map[queue_count];
+        player = predicted_end;
+        queue_count++;
+    }
+
+    s_roll_queue_count = queue_count;
+    s_roll_queue_next = 0U;
+    return 1U;
+}
+
+static uint8 rolling_activate_initial_solution(void)
+{
+    Point_t predicted_end;
+
+    if (!g_soko_solution.is_solved || g_soko_solution.total_boxes == 0U ||
+        g_soko_solution.total_boxes > (uint8)SOKOBAN_MAX_BOXES ||
+        Sokoban_Seq_To_Waypoints(&g_soko_solution.sub_solutions[0],
+                                 g_player_pos,
+                                 &g_soko_waypoints) == 0U ||
+        !rolling_apply_subsolution(g_game_map,
+                                   g_player_pos,
+                                   &g_soko_solution.sub_solutions[0],
+                                   s_roll_after_active_map,
+                                   &predicted_end) ||
+        predicted_end.x != g_soko_solution.player_end_pos[0].x ||
+        predicted_end.y != g_soko_solution.player_end_pos[0].y ||
+        !rolling_build_queue(&g_soko_solution,
+                             1U,
+                             s_roll_after_active_map,
+                             predicted_end)) {
+        return 0U;
+    }
+
+    s_roll_active = 1U;
+    s_roll_boxes_remaining = g_soko_solution.total_boxes;
+    s_roll_after_active_player = predicted_end;
+    s_roll_bg_start_pending =
+        (uint8)(s_roll_boxes_remaining > 1U);
+    s_roll_bg_active = 0U;
+    s_roll_bg_expected_boxes = 0U;
+    g_soko_sub_idx = 0U;
+    g_soko_wp_idx = 0U;
+    g_exec_mode = EXEC_PUSH_BOX;
+    is_navigating = 0U;
+    s_solve_succeeded = 1U;
+    return 1U;
+}
+
+static uint8 rolling_promote_queued_solution(void)
+{
+    uint8 queue_index;
+
+    if (s_roll_queue_next >= s_roll_queue_count) { return 0U; }
+    queue_index = s_roll_queue_next++;
+    g_soko_waypoints = s_roll_queue_waypoints[queue_index];
+    copy_map(s_roll_after_active_map,
+             s_roll_queue_after_map[queue_index]);
+    s_roll_after_active_player =
+        s_roll_queue_after_player[queue_index];
+    g_soko_wp_idx = 0U;
+    is_navigating = 0U;
+    s_roll_bg_start_pending =
+        (uint8)(s_roll_boxes_remaining > 1U);
+    return 1U;
+}
+
 static uint8 exec_push_box_solution(void)
 {
     /* exec_waypoints_common() 的完成只表示“当前箱子的子路径结束”，
@@ -570,6 +775,26 @@ static uint8 exec_push_box_solution(void)
     }
 
     g_soko_sub_idx++;
+    if (s_roll_active != 0U) {
+        if (s_roll_boxes_remaining == 0U) {
+            goto_stage(STAGE_DEADLOCK_RESET);
+            return 0U;
+        }
+        s_roll_boxes_remaining--;
+        if (s_roll_boxes_remaining == 0U) { return 1U; }
+
+        /* 后台若尚在搜索，保留旧完整解生成的队列并立即执行，不在箱间停车。 */
+        if (s_roll_bg_active != 0U) {
+            Sokoban_Stage1_Search_Cancel();
+            s_roll_bg_active = 0U;
+        }
+        s_roll_bg_start_pending = 0U;
+        if (!rolling_promote_queued_solution()) {
+            goto_stage(STAGE_DEADLOCK_RESET);
+        }
+        return 0U;
+    }
+
     if (g_soko_sub_idx >= g_soko_solution.total_boxes) {
         return 1U;
     }
@@ -647,6 +872,53 @@ static uint8 activate_push_box_solution(void)
     is_navigating = 0U;
     s_solve_succeeded = 1U;
     return 1U;
+}
+
+/* 仅由主循环 tick 间空档调用。Begin 会复制预测地图，此后执行端可以继续
+ * 更新自己的滚动队列，不会与求解器共享可变地图。 */
+static uint8 rolling_background_idle_step(void)
+{
+    Point_t home = { (int8)APP_GAME_LAUNCH_HOME_X,
+                     (int8)APP_GAME_LAUNCH_HOME_Y };
+
+    if (s_roll_active == 0U || current_stage != STAGE_EXECUTE_ACTION) {
+        return 0U;
+    }
+
+    if (s_roll_bg_start_pending != 0U) {
+        s_roll_bg_start_pending = 0U;
+        if (s_roll_boxes_remaining <= 1U) { return 0U; }
+
+        s_roll_bg_expected_boxes =
+            (uint8)(s_roll_boxes_remaining - 1U);
+        s_roll_bg_active = Sokoban_Stage1_Search_Begin(
+            s_roll_after_active_map,
+            s_roll_after_active_player,
+            home);
+        return 1U;
+    }
+
+    if (s_roll_bg_active != 0U) {
+        SokoSearchStatus_e status =
+            Sokoban_Stage1_Search_Step(1U, &g_soko_solution);
+
+        if (status == SOKO_SEARCH_RUNNING) { return 1U; }
+        if (status == SOKO_SEARCH_SOLVED &&
+            Sokoban_Search_Has_Incumbent() != 0U &&
+            g_soko_solution.total_boxes == s_roll_bg_expected_boxes) {
+            /* 完整优化结果准备好后再原子式替换兜底队列；执行中的当前
+             * g_soko_waypoints 不参与替换。 */
+            (void)rolling_build_queue(&g_soko_solution,
+                                      0U,
+                                      s_roll_after_active_map,
+                                      s_roll_after_active_player);
+        }
+        Sokoban_Stage1_Search_Cancel();
+        s_roll_bg_active = 0U;
+        return 1U;
+    }
+
+    return 0U;
 }
 
 /* ==========================================================================
@@ -876,13 +1148,9 @@ static void stage_recognize_handler(void)
             return;
         case APP_RECOG_DONE_OK:
         case APP_RECOG_DONE_NO_NEED:
-            /* 清障推箱后先保留主控动态地图, 直到 PLAN_PATH 本拍完成解算。
-             * 否则视觉端的一帧旧地图可能在解算前把移动结果覆盖掉。 */
-            if (App_Recognize_Map_Changed()) {
-                map_snapshot_freeze();
-            } else {
-                map_snapshot_release();
-            }
+            /* 识别使用的是已接纳地图；无论是否清障，都保持冻结到规划器 Begin
+             * 完成私有拷贝，避免两阶段之间被迟到地图帧覆盖。 */
+            map_snapshot_freeze();
             reset_exec_context();
             goto_stage(STAGE_PLAN_PATH);
             return;
@@ -1001,17 +1269,43 @@ static void stage_plan_handler(void)
         }
         return;
     }
+}
 
-    /* 每次只推进一个有界宏状态；主循环等待下一次 5ms tick 的空闲时间会
-     * 继续调用 Game_Logic_Idle_Plan_Step()，无需人为等待下一拍。 */
+/* 推箱搜索只在 wait_for_tick() 空档推进，避免贪心种子生成或队列压缩
+ * 落入 Game_Logic_Task_Run 的 800us 实时预算。 */
+static void stage_push_search_idle_step(void)
+{
+    SokoSearchStatus_e search_status;
+
+    if (current_stage != STAGE_PLAN_PATH ||
+        s_plan_mode != PLAN_MODE_PUSH ||
+        g_soko_exec_init == 0U) {
+        return;
+    }
+
     search_status = (current_level_number() == 1U)
                   ? Sokoban_Stage1_Search_Step(1U, &g_soko_solution)
                   : Sokoban_Stage2_Search_Step(1U, &g_soko_solution);
-    if (search_status == SOKO_SEARCH_RUNNING) return;
+
+    if (current_level_number() == 1U &&
+        Sokoban_Search_Has_Incumbent() != 0U) {
+        uint8 activated = rolling_activate_initial_solution();
+        Sokoban_Stage1_Search_Cancel();
+        g_soko_exec_init = 0U;
+        if (activated != 0U) {
+            goto_stage(STAGE_EXECUTE_ACTION);
+            return;
+        }
+        s_plan_mode = PLAN_MODE_BOMB;
+        s_bomb_strategy = 0U;
+        s_bomb_search_started = 0U;
+        return;
+    }
+
+    if (search_status == SOKO_SEARCH_RUNNING) { return; }
     Sokoban_Stage1_Search_Cancel();
     g_soko_exec_init = 0U;
-    if (search_status == SOKO_SEARCH_SOLVED && activate_push_box_solution())
-    {
+    if (search_status == SOKO_SEARCH_SOLVED && activate_push_box_solution()) {
         goto_stage(STAGE_EXECUTE_ACTION);
         return;
     }
@@ -1087,7 +1381,8 @@ static void stage_done_handler(void)
  * ----------------------------------------------------------------
  * update_link_state():
  *   每个调度 tick 在 Game_Logic_Task_Run 入口被调用一次
- *   - OpenART1 MAP 链路只在收图、识别和恢复阶段是必需链路
+ *   - OpenART1 MAP 链路只在收图和恢复阶段是必需链路；地图冻结后的识别/执行
+ *     使用主控本地快照
  *   - OpenART2 BOX_CLASS 链路只在车已对准物体的 SAMPLE 子阶段必需；
  *     INIT/NAV/FACE 不能因尚无分类帧而阻止车辆到达观察位
  *   - 用 LINK_LOSS_MS / LINK_OK_MS 做迟滞判定
@@ -1186,8 +1481,10 @@ static uint8 recognize_stage_needs_class_link(void)
 
 static uint8 current_stage_needs_map_link(void)
 {
+    /* 五帧地图一旦接纳即由主控冻结。识别巡航、规划和执行都只依赖该本地
+     * 快照；若继续把 RECOGNIZE 绑定到地图心跳，车离开 (1,4) 后地图端静默
+     * 1s 就会停车并错误地重新等待五帧地图。 */
     return (uint8)((current_stage == STAGE_WAIT_MAP_REFRESH) ||
-                   (current_stage == STAGE_RECOGNIZE_MAP) ||
                    (current_stage == STAGE_WAIT_RECOVERY_MAP));
 }
 
@@ -1429,12 +1726,14 @@ void Game_Logic_Task_Run(void)
 
 uint8 Game_Logic_Idle_Plan_Step(void)
 {
-    if (current_stage != STAGE_PLAN_PATH) {
-        return 0U;
+    if (current_stage == STAGE_PLAN_PATH) {
+        if (s_plan_mode == PLAN_MODE_PUSH && g_soko_exec_init != 0U) {
+            stage_push_search_idle_step();
+        } else {
+            stage_plan_handler();
+        }
+        return 1U;
     }
 
-    /* Main-thread only: consume exactly one bounded planner unit so a PIT tick
-     * can delay at most one unit before the normal 5ms task regains control. */
-    stage_plan_handler();
-    return 1U;
+    return rolling_background_idle_step();
 }

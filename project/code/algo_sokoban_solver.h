@@ -224,6 +224,10 @@ uint8 Sokoban_Stage1_Search_Begin(const uint8 map[MAP_ROWS][MAP_COLS],
 SokoSearchStatus_e Sokoban_Stage1_Search_Step(uint8 max_work_units,
                                               SokoFullSolution_t *result);
 
+/** 当前分时搜索是否已经生成完整可执行解；即使仍在继续优化也可返回 1。
+ *  后续 Step 可能用更优完整解覆盖 result，执行前须先复制所需段或 Cancel。 */
+uint8 Sokoban_Search_Has_Incumbent(void);
+
 /** 取消尚未结束的第一关分时搜索并释放上下文。 */
 void Sokoban_Stage1_Search_Cancel(void);
 

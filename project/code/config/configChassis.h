@@ -413,10 +413,10 @@
 /* ---- 速度限幅 ---- */
 
 /** 地图坐标系 X 方向最大线速度 (m/s)；保留原宏名兼容现有调用方。 */
-#define CHASSIS_MAX_LINEAR_SPEED_MPS        (2.00f)
+#define CHASSIS_MAX_LINEAR_SPEED_MPS        (1.30f)
 
 /** 地图坐标系 Y 方向最大线速度 (m/s) */
-#define CHASSIS_MAX_LINEAR_SPEED_Y_MPS      (1.30f)
+#define CHASSIS_MAX_LINEAR_SPEED_Y_MPS      (1.00f)
 
 /** 正常控制路径的单轮速度兑底上限 (m/s) — 等比例缩放保方向 */
 #define CHASSIS_WHEEL_SPEED_CAP_MPS         (4.0f)

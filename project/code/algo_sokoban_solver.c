@@ -1331,15 +1331,14 @@ static uint8 sokoban_solve_stage2_greedy(const uint8 map[MAP_ROWS][MAP_COLS],
  *  Stage1/2 稳健优化层
  *
  *  策略:
- *    1) 先跑旧贪心, 得到一个可行上界;
- *    2) 3 箱精确搜索, 5 箱分支限界搜索;
+ *    1) 多箱先跑旧贪心, 得到一个可立即执行的可行上界;
+ *    2) 3 箱以内精确搜索, 更多箱子做有预算的分支限界搜索;
  *    3) 搜索失败/超限时保留贪心解, 不让规划层退化为无解。
  * ========================================================================== */
 
 #define SOKO_OPT_EXACT_BOX_LIMIT       (3U)
-#define SOKO_OPT_BRANCH_BOX_LIMIT      (5U)
-#define SOKO_STAGE1_PAIR_LIMIT         (256UL)
-#define SOKO_STAGE2_PAIR_LIMIT         (512UL)
+#define SOKO_STAGE1_PAIR_LIMIT          (64UL)
+#define SOKO_STAGE2_PAIR_LIMIT          (96UL)
 
 typedef struct {
     uint8 b;
@@ -1381,6 +1380,7 @@ typedef struct {
     Point_t stage1_home;
     uint8 stage1_depth;
     uint8 pair_active;
+    uint8 greedy_seed_pending;
     SokoOptCandidate_t pair_candidate;
     SokoStage1Frame_t stage1_frames[SOKOBAN_MAX_BOXES + 1U];
 } SokoOptContext_t;
@@ -1493,6 +1493,37 @@ static uint32 soko_search_return_cost(Point_t player, Point_t home)
     return cost;
 }
 
+static uint32 soko_solution_time_cost(const SokoFullSolution_t *solution,
+                                      Point_t home)
+{
+    uint32 cost = 0UL;
+    Point_t player;
+
+    if (!solution || !solution->is_solved || solution->total_boxes == 0U ||
+        solution->total_boxes > (uint8)SOKOBAN_MAX_BOXES) {
+        return SB_MACRO_COST_INF;
+    }
+
+    player = solution->player_end_pos[solution->total_boxes - 1U];
+    for (uint8 i = 0U; i < solution->total_boxes; ++i) {
+        uint32 seq_cost = soko_seq_time_cost(&solution->sub_solutions[i]);
+        if (seq_cost == SB_MACRO_COST_INF ||
+            cost > (SB_MACRO_COST_INF - seq_cost)) {
+            return SB_MACRO_COST_INF;
+        }
+        cost += seq_cost;
+    }
+
+    {
+        uint32 return_cost = soko_search_return_cost(player, home);
+        if (return_cost == SB_MACRO_COST_INF ||
+            cost > (SB_MACRO_COST_INF - return_cost)) {
+            return SB_MACRO_COST_INF;
+        }
+        return cost + return_cost;
+    }
+}
+
 static void soko_stage1_prepare_frame(SokoStage1Frame_t *frame)
 {
     if (!frame || frame->initialized) return;
@@ -1591,8 +1622,9 @@ static uint8 soko_search_begin(const uint8 map[MAP_ROWS][MAP_COLS],
     s_soko_opt.stage1_home = home_pos;
     s_soko_opt.stage1_depth = 0U;
     s_soko_opt.best_cost = SB_MACRO_COST_INF;
+    s_soko_opt.greedy_seed_pending = (uint8)(s_soko_opt.box_n > 1U);
     if (fixed_mapping != 0U) {
-        s_soko_opt.node_limit = (s_soko_opt.box_n <= SOKO_OPT_BRANCH_BOX_LIMIT)
+        s_soko_opt.node_limit = (s_soko_opt.box_n <= SOKO_OPT_EXACT_BOX_LIMIT)
                               ? 0UL : SOKO_STAGE2_PAIR_LIMIT;
     } else {
         s_soko_opt.node_limit = (s_soko_opt.box_n <= SOKO_OPT_EXACT_BOX_LIMIT)
@@ -1646,6 +1678,34 @@ SokoSearchStatus_e Sokoban_Stage1_Search_Step(uint8 max_work_units,
         return s_soko_opt.stage1_status;
     }
     if (max_work_units == 0U) max_work_units = 1U;
+
+    /* 多箱搜索先用已有贪心规划建立可执行上界。此前这里只在 256 个配对
+     * 预算耗尽后才调用贪心，导致前面的分支几乎无法按总行车时间剪枝。 */
+    if (s_soko_opt.greedy_seed_pending != 0U) {
+        uint8 seed_ok;
+        uint32 seed_cost;
+
+        s_soko_opt.greedy_seed_pending = 0U;
+        seed_ok = (s_soko_opt.fixed_mapping != 0U)
+                ? sokoban_solve_stage2_greedy(s_soko_opt.map_copy,
+                                              s_soko_opt.stage1_frames[0].player,
+                                              s_soko_opt.mapping,
+                                              s_soko_opt.box_n,
+                                              result)
+                : sokoban_solve_stage1_greedy(s_soko_opt.map_copy,
+                                              s_soko_opt.stage1_frames[0].player,
+                                              result);
+        seed_cost = seed_ok
+                  ? soko_solution_time_cost(result, s_soko_opt.stage1_home)
+                  : SB_MACRO_COST_INF;
+        if (seed_cost != SB_MACRO_COST_INF) {
+            s_soko_opt.best_cost = seed_cost;
+            s_soko_opt.best_valid = 1U;
+        } else {
+            memset(result, 0, sizeof(*result));
+        }
+        ++evaluated;
+    }
 
     while (evaluated < max_work_units) {
         SokoStage1Frame_t *frame =
@@ -1716,25 +1776,8 @@ SokoSearchStatus_e Sokoban_Stage1_Search_Step(uint8 max_work_units,
 
         if (s_soko_opt.node_limit != 0UL &&
             s_soko_opt.node_count >= s_soko_opt.node_limit) {
-            /* 多箱简单图通常很早即可得到完整分支；若 256 次预算内恰好尚未走到叶子，
-             * 只在这个罕见终点调用已有贪心解，避免把可解地图误报成死局。 */
-            if (!s_soko_opt.best_valid) {
-                uint8 fallback_ok;
-                if (s_soko_opt.fixed_mapping != 0U) {
-                    fallback_ok = sokoban_solve_stage2_greedy(
-                        s_soko_opt.map_copy,
-                        s_soko_opt.stage1_frames[0].player,
-                        s_soko_opt.mapping,
-                        s_soko_opt.box_n,
-                        result);
-                } else {
-                    fallback_ok = sokoban_solve_stage1_greedy(
-                        s_soko_opt.map_copy,
-                        s_soko_opt.stage1_frames[0].player,
-                        result);
-                }
-                if (fallback_ok != 0U) s_soko_opt.best_valid = 1U;
-            }
+            /* 多箱从贪心可行解开始；预算只用于按真实行车时间继续改良。
+             * 达到上限后直接采用当前最好方案，不再重复运行同一份贪心搜索。 */
             s_soko_opt.stage1_status = s_soko_opt.best_valid
                                       ? SOKO_SEARCH_SOLVED
                                       : SOKO_SEARCH_FAILED;
@@ -1772,6 +1815,13 @@ SokoSearchStatus_e Sokoban_Stage2_Search_Step(uint8 max_work_units,
         return SOKO_SEARCH_FAILED;
     }
     return Sokoban_Stage1_Search_Step(max_work_units, result);
+}
+
+uint8 Sokoban_Search_Has_Incumbent(void)
+{
+    return (uint8)((s_soko_opt.best_valid != 0U) &&
+                   (s_soko_opt.out != NULL) &&
+                   (s_soko_opt.out->is_solved != 0U));
 }
 
 void Sokoban_Stage1_Search_Cancel(void)

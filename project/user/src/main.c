@@ -113,9 +113,10 @@ void main_loop_on_pit_tick(void)
  * - 没有 pending tick 时 __WFI() 让 CPU 休眠, 任意中断 (PIT/UART/SysTick) 可唤醒
  * - 唤醒后 while 兜底再判一次, 防止 WFI 偶发未睡稳或被无关中断唤醒
  * - 「读 + 清零」用 __disable_irq/__enable_irq 包成临界区, 与 PIT_CH0 ISR 互斥
- * - GAME 模式下空档调用 Game_Logic_Idle_Plan_Step() 推进解算：常规单元约
- *   100-250μs，PLAN_PATH 之外立即返回 0。罕见例外：搜索预算耗尽时求解器的
- *   贪心兜底会在一次调用内同步跑数 ms（旧代码它同样发生在 Task_Run 拍内），
+ * - GAME 模式下空档调用 Game_Logic_Idle_Plan_Step() 推进前台解算或第一关
+ *   行驶中的剩余箱后台解算：常规单元约 100-250μs，无规划任务时立即返回 0。
+ *   完整贪心可行解会在首次规划调用内同步生成，复杂地图可能用时数 ms；
+ *   它在主循环空档而非 Task_Run 实时拍内执行。
  *   此时 tick 消费延后、可能一次合并消费多拍（差值计入 s_main_tick_overrun，
  *   主循环对合并拍只执行一轮任务）。底盘 5ms/20ms 闭环全在 PIT ISR，不受
  *   主循环延迟影响。若日后恢复 __WFI，需仅在 Idle_Plan_Step 返回 0 时休眠。

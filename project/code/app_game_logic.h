@@ -95,7 +95,7 @@ extern uint8 g_game_map[MAP_ROWS][MAP_COLS];
 void Game_Logic_Task_Run(void);
 
 /* 利用主循环等待下一拍的空档推进一个有界规划单元；仅主线程调用。
- * 只有 STAGE_PLAN_PATH 实际推进时返回 1。 */
+ * STAGE_PLAN_PATH 前台求解或第一关 EXECUTE 后台滚动求解推进时返回 1。 */
 uint8 Game_Logic_Idle_Plan_Step(void);
 
 /* 正式比赛状态初始化：上电已在 (1,5)，从第一关发车准备开始。 */
@@ -108,7 +108,7 @@ void Game_Logic_Init(void);
  *      - 地图链路: OpenART1 MAP/heartbeat 在线
  *      - 图案采样阶段: OpenART1 + OpenART2 均在线
  *   0: 所需链路已超时
- *      - 收图/识别阶段进入 STAGE_PAUSE_ON_LINK_LOSS
+ *      - 收图/恢复阶段进入 STAGE_PAUSE_ON_LINK_LOSS
  *      - 规划/执行阶段只记录离线，不中断已有航点
  * 用途: 菜单 / IPS 显示、调试上位机查询。
  * ================================================================== */
