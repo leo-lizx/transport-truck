@@ -153,6 +153,7 @@ static uint8                 s_partial_batch_active = 0U;
 static uint8                 s_partial_target_mask = 0U;
 static uint8                 s_remaining_task_rescan = 0U;
 static uint8                 s_completion_verify_active = 0U;
+static uint8                 s_bomb_mapping_rescan_active = 0U;
 static uint32                s_completion_map_len_err_baseline = 0U;
 static uint8                 s_partial_plan_map[MAP_ROWS][MAP_COLS];
 static uint8                 s_partial_plan_mapping[SOKOBAN_MAX_BOXES];
@@ -1090,6 +1091,28 @@ static uint8 predict_bomb_result(void)
     return 1U;
 }
 
+/* 爆炸只改变墙体和炸弹，不应改变箱子/目标位置。位置完全一致时，
+ * 行列扫描索引也保持不变，可以安全复用爆炸前已经识别的类别映射。 */
+static uint8 bomb_rescan_items_match_prediction(void)
+{
+    uint8 r;
+    uint8 c;
+
+    for (r = 0U; r < (uint8)MAP_ROWS; ++r) {
+        for (c = 0U; c < (uint8)MAP_COLS; ++c) {
+            if ((g_game_map[r][c] == MAP_BOX) !=
+                (s_bomb_verify_map[r][c] == MAP_BOX)) {
+                return 0U;
+            }
+            if ((g_game_map[r][c] == MAP_TARGET) !=
+                (s_bomb_verify_map[r][c] == MAP_TARGET)) {
+                return 0U;
+            }
+        }
+    }
+    return 1U;
+}
+
 /* 炸弹联合搜索和 Stage2 共用单箱静态缓冲，因此必须先结束/取消前者，
  * 再在空闲切片中验证爆炸后的固定映射是否可完整执行。 */
 static uint8 begin_bomb_candidate_verification(void)
@@ -1212,16 +1235,20 @@ static void prepare_launch_departure(void)
 }
 
 /* 链路恢复、部分批次完成或完整推箱后的校验，均从当前空地建立新帧栅栏并重读地图。 */
-static void prepare_map_rescan_wait(uint8 remaining_task_rescan)
+static void prepare_map_rescan_wait_internal(uint8 remaining_task_rescan,
+                                             uint8 preserve_mapping)
 {
     chassis_ctrl_stop();
     s_map_accepted = 0U;
     s_solve_succeeded = 0U;
     reset_exec_context();
     map_snapshot_release();
-    clear_box_target_mapping();
+    if (preserve_mapping == 0U) {
+        clear_box_target_mapping();
+    }
     s_remaining_task_rescan = remaining_task_rescan;
     s_completion_verify_active = 0U;
+    s_bomb_mapping_rescan_active = preserve_mapping;
     s_completion_map_len_err_baseline =
         g_link_map_stats.frames_len_err;
     App_Recognize_Reset();
@@ -1230,6 +1257,18 @@ static void prepare_map_rescan_wait(uint8 remaining_task_rescan)
     reset_launch_map_stability();
     s_launch_map_last_frame_id = s_recovery_map_baseline_frame_id;
     current_stage = STAGE_WAIT_RECOVERY_MAP;
+}
+
+static void prepare_map_rescan_wait(uint8 remaining_task_rescan)
+{
+    prepare_map_rescan_wait_internal(remaining_task_rescan, 0U);
+}
+
+/* 爆炸后的新图只用于校正墙体布局；箱子/目标未变化时保留已识别映射，
+ * 避免同一批图案在推炸弹前后重复巡航识别。 */
+static void prepare_bomb_map_rescan_wait(void)
+{
+    prepare_map_rescan_wait_internal(1U, 1U);
 }
 
 /* 各关完整计划执行结束后先校验视觉残图；空白或非法结果立即按已推完处理。 */
@@ -1260,6 +1299,7 @@ void Game_Logic_Init(void)
     s_map_has_bomb_valid = 0U;
     s_remaining_task_rescan = 0U;
     s_completion_verify_active = 0U;
+    s_bomb_mapping_rescan_active = 0U;
     s_completion_map_len_err_baseline = 0U;
     reset_exec_context();
     /* 上电发车位置就是 (1,5)，首次启动跳过返航子阶段；关间返航仍从 phase 0 开始。 */
@@ -1402,6 +1442,7 @@ static void stage_wait_recovery_map_handler(void)
     uint8 box_count;
     uint8 target_count;
     uint8 remaining_task_rescan;
+    uint8 bomb_mapping_rescan;
 
     /* 链路恢复/部分批次重读/完整推箱复核阶段始终停车；仅在线时消费新结果。 */
     if (s_link_alive == 0U) {
@@ -1422,7 +1463,10 @@ static void stage_wait_recovery_map_handler(void)
     }
 
     s_map_accepted = 1U;
-    clear_box_target_mapping();
+    bomb_mapping_rescan = s_bomb_mapping_rescan_active;
+    if (bomb_mapping_rescan == 0U) {
+        clear_box_target_mapping();
+    }
     App_Recognize_Reset();
     map_snapshot_freeze();
     publish_frozen_map_for_display();
@@ -1432,6 +1476,19 @@ static void stage_wait_recovery_map_handler(void)
     remaining_task_rescan = s_remaining_task_rescan;
     s_remaining_task_rescan = 0U;
     s_completion_verify_active = 0U;
+    s_bomb_mapping_rescan_active = 0U;
+
+    if (bomb_mapping_rescan != 0U && box_count != 0U) {
+        if (bomb_rescan_items_match_prediction() != 0U) {
+            /* 实际墙体地图已经稳定，类别索引未变，直接按原映射重新解算。 */
+            reset_exec_context();
+            goto_stage(STAGE_PLAN_PATH);
+            return;
+        }
+        /* 视觉结果显示箱子或目标位置异常变化，旧索引不再安全；
+         * 仅这种异常情况回退到通用重新识别流程。 */
+        clear_box_target_mapping();
+    }
 
     /* 剩余任务复扫若只剩唯一箱子与目标点，其对应关系已唯一，无需再跑类别识别。 */
     if (remaining_task_rescan != 0U &&
@@ -1721,9 +1778,9 @@ static void stage_execute_handler(void)
              * BOMB 残留, 必须再补一次. 幂等. */
             g_game_map[g_bomb_wall_pos.y][g_bomb_wall_pos.x] = MAP_EMPTY;
             map_cache_invalidate();
-            /* 物理爆炸后视觉地图才是墙体结果的权威来源；从当前空地建立
-             * 新帧栅栏，确认稳定地图后重新识别/规划剩余任务。 */
-            prepare_map_rescan_wait(1U);
+            /* 物理爆炸后重读真实墙体地图，但保留已经确认的箱子类别映射；
+             * 箱子/目标位置异常变化时，恢复阶段才会回退到重新识别。 */
+            prepare_bomb_map_rescan_wait();
             return;
         }
     } else {
