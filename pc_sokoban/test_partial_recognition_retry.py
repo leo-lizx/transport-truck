@@ -142,17 +142,21 @@ def test_post_push_valid_remaining_map_enters_rescue() -> None:
     assert decision == {'status': 'direct_push', 'mapping': [0]}
 
 
-def test_post_push_blank_map_completes_only_after_timeout() -> None:
+def test_post_push_blank_map_completes_immediately() -> None:
     blank_map = [
         [sv.EMPTY for _ in range(sv.MAP_COLS)]
         for _ in range(sv.MAP_ROWS)
     ]
 
     assert sv.post_push_verification_decision(blank_map) == {
+        'status': 'complete', 'reason': 'empty_map'}
+    assert sv.post_push_verification_decision(None) == {
         'status': 'wait_for_map'}
-    assert sv.post_push_verification_decision(
-        blank_map, timed_out=True) == {
-            'status': 'complete', 'reason': 'blank_timeout'}
+
+    invalid_map = sv._make_empty_map()
+    invalid_map[5][5] = sv.BOX
+    assert sv.post_push_verification_decision(invalid_map) == {
+        'status': 'complete', 'reason': 'invalid_map'}
 
 
 if __name__ == '__main__':
@@ -163,5 +167,5 @@ if __name__ == '__main__':
     test_remaining_single_box_keeps_stage3_bomb_replanning()
     test_remaining_rescan_requires_exactly_one_box_and_target()
     test_post_push_valid_remaining_map_enters_rescue()
-    test_post_push_blank_map_completes_only_after_timeout()
+    test_post_push_blank_map_completes_immediately()
     print('partial recognition retry tests passed')

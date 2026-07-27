@@ -1223,26 +1223,28 @@ def mapping_for_remaining_rescan(the_map: list) -> Optional[list]:
     return None
 
 
-def post_push_verification_decision(the_map: Optional[list],
-                                    timed_out: bool = False) -> dict:
+def post_push_verification_decision(the_map: Optional[list]) -> dict:
     """镜像第二/三关完整推箱后的地图复核决策。"""
-    if the_map is not None:
-        boxes = extract_elements(the_map, BOX)
-        targets = extract_elements(the_map, TARGET)
-        has_wall = any(WALL in row for row in the_map)
-        is_usable = has_wall and len(boxes) == len(targets) and \
-            len(boxes) <= MAX_BOXES
-        if is_usable:
-            if not boxes:
-                return {'status': 'complete', 'reason': 'valid_empty_map'}
-            mapping = mapping_for_remaining_rescan(the_map)
-            if mapping is not None:
-                return {'status': 'direct_push', 'mapping': mapping}
-            return {'status': 'recognize_remaining'}
+    if the_map is None:
+        return {'status': 'wait_for_map'}
 
-    if timed_out:
-        return {'status': 'complete', 'reason': 'blank_timeout'}
-    return {'status': 'wait_for_map'}
+    boxes = extract_elements(the_map, BOX)
+    targets = extract_elements(the_map, TARGET)
+    box_count = sum(row.count(BOX) for row in the_map)
+    target_count = sum(row.count(TARGET) for row in the_map)
+    if box_count == 0 and target_count == 0:
+        return {'status': 'complete', 'reason': 'empty_map'}
+
+    has_wall = any(WALL in row for row in the_map)
+    is_usable = has_wall and box_count == target_count and \
+        box_count <= MAX_BOXES
+    if not is_usable:
+        return {'status': 'complete', 'reason': 'invalid_map'}
+
+    mapping = mapping_for_remaining_rescan(the_map)
+    if mapping is not None:
+        return {'status': 'direct_push', 'mapping': mapping}
+    return {'status': 'recognize_remaining'}
 
 
 def build_partial_stage2_problem(the_map: list,

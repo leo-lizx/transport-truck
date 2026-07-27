@@ -97,7 +97,6 @@ static uint8               s_return_rotate_started = 0U; /* 直线返库后原�
 #define LAUNCH_STARTUP_SETTLE_TICKS       (200U)  /* 1s @5ms，仅首次上电发车 */
 #define MAP_STABLE_REQUIRED_FRAMES          (5U)
 #define MAP_STABLE_TIMEOUT_TICKS            (300U)
-#define POST_PUSH_VERIFY_TIMEOUT_TICKS       (600U) /* 3s @5ms：地图刷新 + 五帧稳定校验 */
 static uint16              s_launch_startup_settle_ticks = 0U;
 static uint8               s_launch_drive_issued = 0U;
 static uint8               s_launch_map_candidate_valid = 0U;
@@ -153,7 +152,7 @@ static uint8                 s_partial_batch_active = 0U;
 static uint8                 s_partial_target_mask = 0U;
 static uint8                 s_remaining_task_rescan = 0U;
 static uint8                 s_completion_verify_active = 0U;
-static uint16                s_completion_verify_ticks = 0U;
+static uint32                s_completion_map_len_err_baseline = 0U;
 static uint8                 s_partial_plan_map[MAP_ROWS][MAP_COLS];
 static uint8                 s_partial_plan_mapping[SOKOBAN_MAX_BOXES];
 static ExecMode_e            g_exec_mode = EXEC_NONE;
@@ -291,6 +290,45 @@ static uint8 recovery_map_is_usable(const uint8 map[MAP_ROWS][MAP_COLS])
     return (uint8)((has_wall != 0U) &&
                    (box_count == target_count) &&
                    (box_count <= SOKOBAN_MAX_BOXES));
+}
+
+/* 完整推箱后的新结果若为空或结构非法，按视觉端“场地已清空”约定直接完成。 */
+static uint8 completion_invalid_or_empty_map_received(uint32 baseline_frame_id)
+{
+    uint32 frame_id_before = g_link_map_frame_id;
+    uint32 frame_id_after;
+    uint8 r;
+    uint8 c;
+
+    if (s_completion_verify_active == 0U) {
+        return 0U;
+    }
+    if (g_link_map_stats.frames_len_err !=
+        s_completion_map_len_err_baseline) {
+        return 1U;
+    }
+    if (frame_id_before == 0U ||
+        frame_id_before == baseline_frame_id ||
+        frame_id_before == s_launch_map_last_frame_id) {
+        return 0U;
+    }
+
+    app_link_get_map_snapshot(s_launch_map_observed);
+    frame_id_after = g_link_map_frame_id;
+    if (frame_id_after != frame_id_before) {
+        return 0U;
+    }
+
+    for (r = 0U; r < (uint8)MAP_ROWS; ++r) {
+        for (c = 0U; c < (uint8)MAP_COLS; ++c) {
+            if (s_launch_map_observed[r][c] == MAP_BOX ||
+                s_launch_map_observed[r][c] == MAP_TARGET) {
+                return (uint8)(recovery_map_is_usable(
+                    s_launch_map_observed) == 0U);
+            }
+        }
+    }
+    return 1U;
 }
 
 /* 到达 (1,4) 后只接纳连续五张完全一致的合法新图。每张图都重新检查
@@ -1084,7 +1122,8 @@ static void prepare_map_rescan_wait(uint8 remaining_task_rescan)
     clear_box_target_mapping();
     s_remaining_task_rescan = remaining_task_rescan;
     s_completion_verify_active = 0U;
-    s_completion_verify_ticks = 0U;
+    s_completion_map_len_err_baseline =
+        g_link_map_stats.frames_len_err;
     App_Recognize_Reset();
 
     s_recovery_map_baseline_frame_id = g_link_map_frame_id;
@@ -1093,11 +1132,13 @@ static void prepare_map_rescan_wait(uint8 remaining_task_rescan)
     current_stage = STAGE_WAIT_RECOVERY_MAP;
 }
 
-/* 第二/三关完整计划执行结束后先校验视觉残图；空白无效图由限时窗口判定为已推完。 */
+/* 第二/三关完整计划执行结束后先校验视觉残图；空白或非法结果立即按已推完处理。 */
 static void prepare_completion_verify_wait(void)
 {
     prepare_map_rescan_wait(1U);
     s_completion_verify_active = 1U;
+    s_completion_map_len_err_baseline =
+        g_link_map_stats.frames_len_err;
 }
 
 void Game_Logic_Init(void)
@@ -1119,7 +1160,7 @@ void Game_Logic_Init(void)
     s_map_has_bomb_valid = 0U;
     s_remaining_task_rescan = 0U;
     s_completion_verify_active = 0U;
-    s_completion_verify_ticks = 0U;
+    s_completion_map_len_err_baseline = 0U;
     reset_exec_context();
     /* 上电发车位置就是 (1,5)，首次启动跳过返航子阶段；关间返航仍从 phase 0 开始。 */
     s_wait_start_phase = 1U;
@@ -1262,24 +1303,21 @@ static void stage_wait_recovery_map_handler(void)
     uint8 target_count;
     uint8 remaining_task_rescan;
 
-    /* 链路恢复/部分批次重读阶段始终停车；仅在线时消费新帧。 */
+    /* 链路恢复/部分批次重读/完整推箱复核阶段始终停车；仅在线时消费新结果。 */
     if (s_link_alive == 0U) {
         return;
     }
 
+    if (completion_invalid_or_empty_map_received(
+            s_recovery_map_baseline_frame_id) != 0U) {
+        /* 全空白或非法地图无需等待完整地图的五帧稳定。 */
+        s_completion_verify_active = 0U;
+        s_remaining_task_rescan = 0U;
+        goto_stage(STAGE_LEVEL_JUDGE);
+        return;
+    }
+
     if (recovery_map_stability_tick(s_recovery_map_baseline_frame_id) == 0U) {
-        if (s_completion_verify_active != 0U) {
-            if (s_completion_verify_ticks < POST_PUSH_VERIFY_TIMEOUT_TICKS) {
-                s_completion_verify_ticks++;
-            }
-            if (s_completion_verify_ticks >= POST_PUSH_VERIFY_TIMEOUT_TICKS) {
-                /* 推空后视觉端不会形成可用地图；仅在线累计满窗口才按完成处理。 */
-                s_completion_verify_active = 0U;
-                s_completion_verify_ticks = 0U;
-                s_remaining_task_rescan = 0U;
-                goto_stage(STAGE_LEVEL_JUDGE);
-            }
-        }
         return;
     }
 
@@ -1294,7 +1332,6 @@ static void stage_wait_recovery_map_handler(void)
     remaining_task_rescan = s_remaining_task_rescan;
     s_remaining_task_rescan = 0U;
     s_completion_verify_active = 0U;
-    s_completion_verify_ticks = 0U;
 
     /* 部分批次后的稳定地图若只剩唯一箱子与目标点，其对应关系已唯一，无需再跑类别识别。 */
     if (remaining_task_rescan != 0U &&
@@ -1583,8 +1620,8 @@ static void stage_execute_handler(void)
 
 static void stage_level_judge_handler(void)
 {
-    /* 第一关仍由完整执行结果直接确认；第二/三关只有在稳定新图已无剩余箱子，
-     * 或在线校验窗口内始终没有可用地图（推空后的空白输出）时才会到达此处。
+    /* 第一关仍由完整执行结果直接确认；第二/三关在新图已无箱子/目标，
+     * 或完整推箱后的新结果不是合法地图时才会到达此处。
      * 所有关卡均保持 0° 返回 (1,5)；
      * 前两关随后再驶到 (1,4) 触发新图，第三关返航后收车。 */
     chassis_ctrl_stop();
@@ -1758,9 +1795,8 @@ static void recover_from_link_pause(void)
         s_recovery_map_baseline_frame_id = g_link_map_frame_id;
         reset_launch_map_stability();
         s_launch_map_last_frame_id = s_recovery_map_baseline_frame_id;
-        if (s_completion_verify_active != 0U) {
-            s_completion_verify_ticks = 0U;
-        }
+        s_completion_map_len_err_baseline =
+            g_link_map_stats.frames_len_err;
         return;
     }
     if (current_stage == STAGE_PAUSE_ON_LINK_LOSS)
