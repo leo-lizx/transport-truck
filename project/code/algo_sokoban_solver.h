@@ -389,6 +389,9 @@ SokoSearchStatus_e Sokoban_Bomb_Search_Step(uint8 max_work_units,
                                             Point_t *out_wall_pos,
                                             SokoActionSeq_t *out_seq);
 void Sokoban_Bomb_Search_Cancel(void);
+/** 新一轮破局前清空、候选验证失败后登记炸弹-墙体排除项。 */
+void Sokoban_Bomb_Search_Clear_Rejections(void);
+uint8 Sokoban_Bomb_Search_Reject_Pair(Point_t bomb_pos, Point_t wall_pos);
 
 /* ======================================================================
  *  顶层迭代求解（推箱 + 多炸弹一气呵成）

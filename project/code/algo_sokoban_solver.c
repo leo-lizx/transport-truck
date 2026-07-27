@@ -2107,6 +2107,9 @@ typedef struct {
 } SokoBombSearchContext_t;
 
 static SokoBombSearchContext_t s_bomb_search;
+/* 每个墙体格用 8 bit 标记已被上层完整可解性校验否决的炸弹索引。
+ * Begin 会重建搜索上下文，但同一轮破局需要跨策略保留这些排除项。 */
+static uint8 s_bomb_rejected_pairs[SB_RC];
 
 /* 返回 1=得到候选墙，0=扫描结束，-1=本拍评估了一面墙但门控未通过。 */
 static int8 soko_bomb_prepare_next_wall(void)
@@ -2280,6 +2283,12 @@ SokoSearchStatus_e Sokoban_Bomb_Search_Step(uint8 max_work_units,
         for (uint8 bi = 0U; bi < s_bomb_search.bomb_count; ++bi) {
             int16 distance;
             if ((s_bomb_search.tried_bombs & (uint8)(1U << bi)) != 0U) continue;
+            if ((s_bomb_rejected_pairs[
+                    (uint16)s_bomb_search.wall.y * (uint16)MAP_COLS +
+                    (uint16)s_bomb_search.wall.x] &
+                 (uint8)(1U << bi)) != 0U) {
+                continue;
+            }
             distance = (int16)(abs(s_bomb_search.bombs[bi].x - s_bomb_search.wall.x) +
                                abs(s_bomb_search.bombs[bi].y - s_bomb_search.wall.y));
             if (distance < chosen_distance) {
@@ -2316,6 +2325,28 @@ void Sokoban_Bomb_Search_Cancel(void)
     s_sb_search.status = SB_SEARCH_IDLE;
 }
 
+void Sokoban_Bomb_Search_Clear_Rejections(void)
+{
+    memset(s_bomb_rejected_pairs, 0, sizeof(s_bomb_rejected_pairs));
+}
+
+uint8 Sokoban_Bomb_Search_Reject_Pair(Point_t bomb_pos, Point_t wall_pos)
+{
+    uint16 wall_cell;
+
+    if (!map_is_inner_cell(wall_pos.y, wall_pos.x)) return 0U;
+    wall_cell = (uint16)wall_pos.y * (uint16)MAP_COLS +
+                (uint16)wall_pos.x;
+    for (uint8 bi = 0U; bi < s_bomb_search.bomb_count; ++bi) {
+        if (s_bomb_search.bombs[bi].x == bomb_pos.x &&
+            s_bomb_search.bombs[bi].y == bomb_pos.y) {
+            s_bomb_rejected_pairs[wall_cell] |= (uint8)(1U << bi);
+            return 1U;
+        }
+    }
+    return 0U;
+}
+
 uint8 Sokoban_Plan_Bomb(const uint8 map[MAP_ROWS][MAP_COLS],
                         Point_t player_pos,
                         Point_t blocked_target,
@@ -2324,6 +2355,7 @@ uint8 Sokoban_Plan_Bomb(const uint8 map[MAP_ROWS][MAP_COLS],
                         SokoActionSeq_t *out_seq)
 {
     SokoSearchStatus_e status;
+    Sokoban_Bomb_Search_Clear_Rejections();
     if (!out_bomb_pos || !out_wall_pos || !out_seq ||
         !Sokoban_Bomb_Search_Begin(map, player_pos, blocked_target)) {
         return 0U;

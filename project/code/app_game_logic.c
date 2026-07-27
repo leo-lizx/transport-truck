@@ -42,7 +42,8 @@ typedef enum {
 
 typedef enum {
     PLAN_MODE_PUSH = 0,
-    PLAN_MODE_BOMB
+    PLAN_MODE_BOMB,
+    PLAN_MODE_BOMB_VERIFY
 } PlanMode_e;
 
 static GameStage_e current_stage = STAGE_WAIT_START;
@@ -159,6 +160,8 @@ static ExecMode_e            g_exec_mode = EXEC_NONE;
 static PlanMode_e            s_plan_mode = PLAN_MODE_PUSH;
 static uint8                 s_bomb_strategy = 0U;
 static uint8                 s_bomb_search_started = 0U;
+static uint8                 s_bomb_verify_map[MAP_ROWS][MAP_COLS];
+static Point_t               s_bomb_verify_player;
 
 /* 已结束的关卡数，上电初始化时清零。 */
 static uint8                 s_levels_finished = 0U;
@@ -472,6 +475,7 @@ static void reset_exec_context(void)
     s_plan_mode = PLAN_MODE_PUSH;
     s_bomb_strategy = 0U;
     s_bomb_search_started = 0U;
+    Sokoban_Bomb_Search_Clear_Rejections();
     is_navigating = 0;
     s_wait_phase0_ticks = 0U;       /* Issue A: WAIT_START phase 0 计时跨入口清零 */
     s_wait_start_phase = 0U;
@@ -494,11 +498,11 @@ static void goto_stage(GameStage_e next)
  * 所有对 s_map_freeze 的置位/清零都经由这两个函数, 便于:
  *   - 用函数名一次检索出全部生命周期点 (降低新增 stage 时漏配的风险);
  *   - 把"为何冻结/解冻"的语义集中在此处记录。
- * 注意: freeze 取值依赖地图接纳与规划器完成私有拷贝的时序，以及炸弹爆破后
- * 对 PLAN 那一拍的单拍保护，不能化简为"纯 stage→freeze 静态表"。
+ * 注意: freeze 取值依赖地图接纳与规划器完成私有拷贝的时序；炸弹爆破后会
+ * 直接进入新地图栅栏，不能化简为"纯 stage→freeze 静态表"。
  *
- * 冻结 (hold, freeze=1) 点: 驶出后新地图稳定/恢复或部分批次重读后进 RECOGNIZE 前、识别完成进入规划前、
- *                            炸弹爆破后保护 PLAN_PATH 当拍快照;
+ * 冻结 (hold, freeze=1) 点: 驶出后新地图稳定/恢复或部分批次重读后进 RECOGNIZE 前、
+ *                            识别完成进入规划前;
  * 解冻 (release, freeze=0) 点: WAIT_START/LAUNCH_EXIT/WAIT_MAP_REFRESH、识别失败、PLAN 完成本拍、DONE。 */
 static void map_snapshot_freeze(void)
 {
@@ -526,7 +530,10 @@ static void clear_box_target_mapping(void)
  * - 未匹配目标恢复为空地，保持可行走属性；
  * - 匹配索引按压缩后行列扫描顺序重新编号。
  */
-static uint8 build_partial_plan_problem(void)
+static uint8 build_partial_plan_problem_from(
+    const uint8 source_map[MAP_ROWS][MAP_COLS],
+    uint8 output_map[MAP_ROWS][MAP_COLS],
+    uint8 output_mapping[SOKOBAN_MAX_BOXES])
 {
     uint8 box_count = 0U;
     uint8 target_count = 0U;
@@ -546,9 +553,9 @@ static uint8 build_partial_plan_problem(void)
 
     for (r = 0U; r < (uint8)MAP_ROWS; ++r) {
         for (c = 0U; c < (uint8)MAP_COLS; ++c) {
-            if (g_game_map[r][c] == MAP_BOX) {
+            if (source_map[r][c] == MAP_BOX) {
                 box_count++;
-            } else if (g_game_map[r][c] == MAP_TARGET) {
+            } else if (source_map[r][c] == MAP_TARGET) {
                 target_count++;
             }
         }
@@ -578,15 +585,15 @@ static uint8 build_partial_plan_problem(void)
         return 0U;
     }
 
-    copy_map(s_partial_plan_map, g_game_map);
+    copy_map(output_map, source_map);
     box_idx = 0U;
     target_idx = 0U;
     for (r = 0U; r < (uint8)MAP_ROWS; ++r) {
         for (c = 0U; c < (uint8)MAP_COLS; ++c) {
-            if (g_game_map[r][c] == MAP_BOX) {
+            if (source_map[r][c] == MAP_BOX) {
                 uint8 mapped_target = g_box_to_target[box_idx++];
                 if (mapped_target == APP_RECOG_TARGET_UNMATCHED) {
-                    s_partial_plan_map[r][c] = MAP_WALL;
+                    output_map[r][c] = MAP_WALL;
                 } else {
                     uint8 reduced_target_idx = 0U;
                     uint8 ti;
@@ -595,12 +602,12 @@ static uint8 build_partial_plan_problem(void)
                             reduced_target_idx++;
                         }
                     }
-                    s_partial_plan_mapping[reduced_box_idx++] =
+                    output_mapping[reduced_box_idx++] =
                         reduced_target_idx;
                 }
-            } else if (g_game_map[r][c] == MAP_TARGET) {
+            } else if (source_map[r][c] == MAP_TARGET) {
                 if ((target_mask & (uint8)(1U << target_idx)) == 0U) {
-                    s_partial_plan_map[r][c] = MAP_EMPTY;
+                    output_map[r][c] = MAP_EMPTY;
                 }
                 target_idx++;
             }
@@ -610,6 +617,12 @@ static uint8 build_partial_plan_problem(void)
     s_partial_target_mask = target_mask;
     return (uint8)(reduced_box_idx == s_matched_box_count &&
                    target_idx == target_count);
+}
+
+static uint8 build_partial_plan_problem(void)
+{
+    return build_partial_plan_problem_from(
+        g_game_map, s_partial_plan_map, s_partial_plan_mapping);
 }
 
 static uint8 get_map_box_count(void)
@@ -1030,6 +1043,93 @@ static uint8 activate_bomb_plan(void)
     return 1U;
 }
 
+static void start_fresh_bomb_search(void)
+{
+    Sokoban_Bomb_Search_Clear_Rejections();
+    s_plan_mode = PLAN_MODE_BOMB;
+    s_bomb_strategy = 0U;
+    s_bomb_search_started = 0U;
+}
+
+static uint8 predict_bomb_result(void)
+{
+    Point_t player = g_player_pos;
+
+    if (g_bomb_pos.x < (int8)CHASSIS_GRID_INNER_MIN_X ||
+        g_bomb_pos.x > (int8)CHASSIS_GRID_INNER_MAX_X ||
+        g_bomb_pos.y < (int8)CHASSIS_GRID_INNER_MIN_Y ||
+        g_bomb_pos.y > (int8)CHASSIS_GRID_INNER_MAX_Y ||
+        g_bomb_wall_pos.x < (int8)CHASSIS_GRID_INNER_MIN_X ||
+        g_bomb_wall_pos.x > (int8)CHASSIS_GRID_INNER_MAX_X ||
+        g_bomb_wall_pos.y < (int8)CHASSIS_GRID_INNER_MIN_Y ||
+        g_bomb_wall_pos.y > (int8)CHASSIS_GRID_INNER_MAX_Y) {
+        return 0U;
+    }
+
+    for (uint16 i = 0U; i < g_bomb_action_seq.count; ++i) {
+        switch (g_bomb_action_seq.actions[i]) {
+            case SOKO_ACT_UP:    --player.y; break;
+            case SOKO_ACT_DOWN:  ++player.y; break;
+            case SOKO_ACT_LEFT:  --player.x; break;
+            case SOKO_ACT_RIGHT: ++player.x; break;
+            default: return 0U;
+        }
+        if (player.x < (int8)CHASSIS_GRID_INNER_MIN_X ||
+            player.x > (int8)CHASSIS_GRID_INNER_MAX_X ||
+            player.y < (int8)CHASSIS_GRID_INNER_MIN_Y ||
+            player.y > (int8)CHASSIS_GRID_INNER_MAX_Y) {
+            return 0U;
+        }
+    }
+
+    copy_map(s_bomb_verify_map, g_game_map);
+    s_bomb_verify_map[g_bomb_pos.y][g_bomb_pos.x] = MAP_EMPTY;
+    Sokoban_Apply_Bomb_Explosion(s_bomb_verify_map, g_bomb_wall_pos);
+    s_bomb_verify_map[g_bomb_wall_pos.y][g_bomb_wall_pos.x] = MAP_EMPTY;
+    s_bomb_verify_player = player;
+    return 1U;
+}
+
+/* 炸弹联合搜索和 Stage2 共用单箱静态缓冲，因此必须先结束/取消前者，
+ * 再在空闲切片中验证爆炸后的固定映射是否可完整执行。 */
+static uint8 begin_bomb_candidate_verification(void)
+{
+    Point_t home = { (int8)APP_GAME_LAUNCH_HOME_X,
+                     (int8)APP_GAME_LAUNCH_HOME_Y };
+    uint8 begin_ok;
+
+    if (predict_bomb_result() == 0U) return 0U;
+    if (s_partial_batch_active != 0U) {
+        if (build_partial_plan_problem_from(
+                s_bomb_verify_map,
+                s_partial_plan_map,
+                s_partial_plan_mapping) == 0U) {
+            return 0U;
+        }
+        begin_ok = Sokoban_Stage2_Search_Begin(
+            s_partial_plan_map, s_bomb_verify_player,
+            s_partial_plan_mapping, s_matched_box_count, home);
+    } else {
+        begin_ok = Sokoban_Stage2_Search_Begin(
+            s_bomb_verify_map, s_bomb_verify_player,
+            g_box_to_target, get_map_box_count(), home);
+    }
+    g_soko_exec_init = begin_ok;
+    return begin_ok;
+}
+
+static void reject_bomb_candidate_and_resume(void)
+{
+    if (Sokoban_Bomb_Search_Reject_Pair(
+            g_bomb_pos, g_bomb_wall_pos) == 0U) {
+        /* 候选必定来自当前搜索上下文；若上下文异常，终止本轮而不是
+         * 重复选中同一组合形成静止死循环。 */
+        s_bomb_strategy = 3U;
+    }
+    s_plan_mode = PLAN_MODE_BOMB;
+    s_bomb_search_started = 0U;
+}
+
 static uint8 activate_push_box_solution(void)
 {
     if (!g_soko_solution.is_solved || g_soko_solution.total_boxes == 0U) {
@@ -1445,9 +1545,18 @@ static SokoSearchStatus_e breakout_bomb_search_step(void)
             if (status == SOKO_SEARCH_RUNNING) return status;
             Sokoban_Bomb_Search_Cancel();
             s_bomb_search_started = 0U;
-            if (status == SOKO_SEARCH_SOLVED && activate_bomb_plan())
-            {
-                return SOKO_SEARCH_SOLVED;
+            if (status == SOKO_SEARCH_SOLVED) {
+                if (current_level_number() == 3U) {
+                    if (begin_bomb_candidate_verification() != 0U) {
+                        s_plan_mode = PLAN_MODE_BOMB_VERIFY;
+                    } else {
+                        reject_bomb_candidate_and_resume();
+                    }
+                    return SOKO_SEARCH_RUNNING;
+                }
+                if (activate_bomb_plan() != 0U) {
+                    return SOKO_SEARCH_SOLVED;
+                }
             }
             ++s_bomb_strategy;
         }
@@ -1477,14 +1586,15 @@ static void stage_plan_handler(void)
             goto_stage(STAGE_EXECUTE_ACTION);
             return;
         }
-        if (s_partial_batch_active != 0U) {
-            /* 第三关本轮匹配受阻且现有炸弹也无法破局，重新识别而非误判整关失败。 */
+        if (current_level_number() == 3U) {
+            /* 第三关规划失败统一重读实际地图，不进入永久 DEADLOCK 停车。 */
             prepare_map_rescan_wait(1U);
             return;
         }
         goto_stage(STAGE_DEADLOCK_RESET);
         return;
     }
+    if (s_plan_mode == PLAN_MODE_BOMB_VERIFY) return;
 
     if (g_soko_exec_init == 0U)
     {
@@ -1521,7 +1631,7 @@ static void stage_plan_handler(void)
                 prepare_map_rescan_wait(1U);
                 return;
             }
-            s_plan_mode = PLAN_MODE_BOMB;
+            start_fresh_bomb_search();
         }
         return;
     }
@@ -1552,9 +1662,7 @@ static void stage_push_search_idle_step(void)
             goto_stage(STAGE_EXECUTE_ACTION);
             return;
         }
-        s_plan_mode = PLAN_MODE_BOMB;
-        s_bomb_strategy = 0U;
-        s_bomb_search_started = 0U;
+        start_fresh_bomb_search();
         return;
     }
 
@@ -1571,9 +1679,30 @@ static void stage_push_search_idle_step(void)
         prepare_map_rescan_wait(1U);
         return;
     }
-    s_plan_mode = PLAN_MODE_BOMB;
-    s_bomb_strategy = 0U;
-    s_bomb_search_started = 0U;
+    start_fresh_bomb_search();
+}
+
+static void stage_bomb_verify_idle_step(void)
+{
+    SokoSearchStatus_e search_status;
+
+    if (current_stage != STAGE_PLAN_PATH ||
+        s_plan_mode != PLAN_MODE_BOMB_VERIFY ||
+        g_soko_exec_init == 0U) {
+        return;
+    }
+
+    search_status = Sokoban_Stage2_Search_Step(1U, &g_soko_solution);
+    if (search_status == SOKO_SEARCH_RUNNING) return;
+
+    Sokoban_Stage1_Search_Cancel();
+    g_soko_exec_init = 0U;
+    if (search_status == SOKO_SEARCH_SOLVED &&
+        activate_bomb_plan() != 0U) {
+        goto_stage(STAGE_EXECUTE_ACTION);
+        return;
+    }
+    reject_bomb_candidate_and_resume();
 }
 
 static void stage_execute_handler(void)
@@ -1592,11 +1721,9 @@ static void stage_execute_handler(void)
              * BOMB 残留, 必须再补一次. 幂等. */
             g_game_map[g_bomb_wall_pos.y][g_bomb_wall_pos.x] = MAP_EMPTY;
             map_cache_invalidate();
-            /* B1: 主控本地权威, 锁定地图; 直到本关结束(WAIT_START / DONE) 才解冻.
-             * 视觉端不一定在 1 帧内同步爆炸结果, 防 g_game_map 被陈旧帧覆盖. */
-            map_snapshot_freeze();
-            reset_exec_context();
-            goto_stage(STAGE_PLAN_PATH);
+            /* 物理爆炸后视觉地图才是墙体结果的权威来源；从当前空地建立
+             * 新帧栅栏，确认稳定地图后重新识别/规划剩余任务。 */
+            prepare_map_rescan_wait(1U);
             return;
         }
     } else {
@@ -2000,6 +2127,9 @@ uint8 Game_Logic_Idle_Plan_Step(void)
     if (current_stage == STAGE_PLAN_PATH) {
         if (s_plan_mode == PLAN_MODE_PUSH && g_soko_exec_init != 0U) {
             stage_push_search_idle_step();
+        } else if (s_plan_mode == PLAN_MODE_BOMB_VERIFY &&
+                   g_soko_exec_init != 0U) {
+            stage_bomb_verify_idle_step();
         } else {
             stage_plan_handler();
         }
