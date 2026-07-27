@@ -1232,7 +1232,7 @@ static void prepare_map_rescan_wait(uint8 remaining_task_rescan)
     current_stage = STAGE_WAIT_RECOVERY_MAP;
 }
 
-/* 第二/三关完整计划执行结束后先校验视觉残图；空白或非法结果立即按已推完处理。 */
+/* 各关完整计划执行结束后先校验视觉残图；空白或非法结果立即按已推完处理。 */
 static void prepare_completion_verify_wait(void)
 {
     prepare_map_rescan_wait(1U);
@@ -1433,7 +1433,7 @@ static void stage_wait_recovery_map_handler(void)
     s_remaining_task_rescan = 0U;
     s_completion_verify_active = 0U;
 
-    /* 部分批次后的稳定地图若只剩唯一箱子与目标点，其对应关系已唯一，无需再跑类别识别。 */
+    /* 剩余任务复扫若只剩唯一箱子与目标点，其对应关系已唯一，无需再跑类别识别。 */
     if (remaining_task_rescan != 0U &&
         box_count == 1U && target_count == 1U) {
         g_box_to_target[0] = 0U;
@@ -1443,7 +1443,7 @@ static void stage_wait_recovery_map_handler(void)
         return;
     }
 
-    /* 掉线期间或上一部分批次若已完成最后一箱，直接进入本关完成判定。 */
+    /* 掉线恢复或上一执行批次若已完成最后一箱，直接进入本关完成判定。 */
     current_stage = (box_count == 0U)
                   ? STAGE_LEVEL_JUDGE
                   : STAGE_RECOGNIZE_MAP;
@@ -1735,20 +1735,16 @@ static void stage_execute_handler(void)
         if (s_partial_batch_active != 0U) {
             /* 最后一推后车位于原箱子格（空地），直接在此等待新地图。 */
             prepare_map_rescan_wait(1U);
-        } else if (current_level_number() >= 2U) {
+        } else {
             /* 完整计划也可能因识别或执行偏差留下箱子，先用新地图复核再判定通关。 */
             prepare_completion_verify_wait();
-        } else {
-            reset_exec_context();
-            goto_stage(STAGE_LEVEL_JUDGE);
         }
     }
 }
 
 static void stage_level_judge_handler(void)
 {
-    /* 第一关仍由完整执行结果直接确认；第二/三关在新图已无箱子/目标，
-     * 或完整推箱后的新结果不是合法地图时才会到达此处。
+    /* 各关均在复核新图已无箱子/目标，或完整推箱后的新结果不是合法地图时到达此处。
      * 所有关卡均保持 0° 返回 (1,5)；
      * 前两关随后再驶到 (1,4) 触发新图，第三关返航后收车。 */
     chassis_ctrl_stop();
