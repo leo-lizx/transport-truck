@@ -49,7 +49,7 @@
  * 内环(本段):   wz_cmd - wz_actual → PWM (PI), 取代旧 GAIN×wz 开环 */
 /* 角速度线性 PWM 前馈：按麦轮 yaw 符号叠加到四轮 PID 输出。
  * 它只补偿随目标角速度变化的基础驱动力，不替代下方静摩擦 breakaway 前馈。 */
-#define CHASSIS_YAW_PWM_GAIN              (200.0f)
+#define CHASSIS_YAW_PWM_GAIN              (300.0f)
 
 /* 保持轴直接 PWM 前馈: 绕过轮速 PID, 把车体速度 (vx,vy) 直接换算成 PWM.
  *   问题同 yaw: 保持轴输出 0.06m/s → 轮速 PID 只给 40×0.06=2.4PWM → 无力纠偏.
