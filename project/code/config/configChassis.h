@@ -153,7 +153,7 @@
 
 /** 移动中重新对正阈值: |err| 达到此值时立即停止平移并原地校正。
  *  ENTER~REALIGN 之间按误差线性降低平移速度，兼顾速度与航向保持。 */
-#define CHASSIS_YAW_MOVE_REALIGN_DEG         (5.0f)
+#define CHASSIS_YAW_MOVE_REALIGN_DEG         (10.0f)
 
 /** 即位锁需车体稳定: |rate| < 此值 */
 #define CHASSIS_YAW_INPOS_SETTLE_DPS        (10.0f)
@@ -271,7 +271,7 @@
 /* kd=KP×0.30=1.65, 适中阻尼: 远距高速有制动力不冲, 近距不拖死 */
 /* kd=5.50×0.40=2.20, 强阻尼拽住车速, 配合低FLOOR刹进EPSILON */
 #define CHASSIS_POS_KD_RATIO                (0.15f)  /* X: Kd = X_Kp × 此比例 */
-#define CHASSIS_POS_Y_KD_RATIO              (0.10f)  /* Y: Kd = Y_Kp × 此比例 */
+#define CHASSIS_POS_Y_KD_RATIO              (0.15f)  /* Y: Kd = Y_Kp × 此比例 */
 #define CHASSIS_POS_HOLD_KD_RATIO           (0.70f)
 /* 0.50→0.05: 刹车区从55cm缩到~10cm, 太大会让车过早限速, 不影响防冲 */
 #define CHASSIS_POS_BRAKE_MARGIN_M          (0.20f)
@@ -413,10 +413,10 @@
 /* ---- 速度限幅 ---- */
 
 /** 地图坐标系 X 方向最大线速度 (m/s)；保留原宏名兼容现有调用方。 */
-#define CHASSIS_MAX_LINEAR_SPEED_MPS        (1.30f)
+#define CHASSIS_MAX_LINEAR_SPEED_MPS        (1.60f)
 
 /** 地图坐标系 Y 方向最大线速度 (m/s) */
-#define CHASSIS_MAX_LINEAR_SPEED_Y_MPS      (1.00f)
+#define CHASSIS_MAX_LINEAR_SPEED_Y_MPS      (1.30f)
 
 /** 正常控制路径的单轮速度兑底上限 (m/s) — 等比例缩放保方向 */
 #define CHASSIS_WHEEL_SPEED_CAP_MPS         (4.0f)
