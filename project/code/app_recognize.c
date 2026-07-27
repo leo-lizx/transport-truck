@@ -13,14 +13,15 @@
  *        - 保持状态机记录的 90° 基准航向移动到观察点，仅依赖里程计到位
  *        - 按“物体格-观察格”旋转到 0/90/180/-90° 朝向物体
  *        - 转向到位后再静稳一小段时间才开始采样，避免拖影帧计票
- *        - 主控指定 BOX/TARGET 与 request_id；窗口内无异类帧时连续三帧即确认，
- *          出现异类帧（斜视闪烁）时改用多数票 + 领先度门限，拒绝误确认
- *        - 首次采样超时先向侧面/后方邻格移动一格再返回原观察格，重新静稳采样；
- *          仍失败才换到该物体的其他观察方向；
- *          未确认时只重试当前物体，不允许跳到下一个物体
+ *        - 主控发送当前 BOX/TARGET 类型与 request_id；视觉端只运行对应模型，
+ *          主控校验请求、类型和类别约束后立即采信最终结论
+ *        - 采样超时后标记当前观察方向失败，将该物体放回未确认集合；
+ *          重新对全部未确认 BOX/TARGET 规划混合 Tour，路线合适时再从
+ *          该物体的其他方向观察，避免为追单个远观察位反复穿场
  *        - 保持采样后的车头角, 直接继续下一个物体
  *   4. 全部箱子与目标逐一实地确认（不做"最后一个目标"排除法推断——实测不稳定，
- *      识别不到/存疑时走邻格往返或换位重试）；随后按相同 class_id 与静态推送可达性配对生成
+ *      识别不到/存疑时改换观察方向并与其他待观察物体统一排程）；
+ *      随后按相同 class_id 与静态推送可达性配对生成
  *      g_box_to_target[]，避免仅按直线距离把贴边箱分给无法起推的目标
  *
  * 资源:
@@ -39,19 +40,9 @@
  * 调参 (集中, 后续可挪到 chassis_config.h)
  *=================================================================================================================*/
 
-/** 窗口内无异类有效帧时，连续三帧同 request_id、同类型、同 class_id 即确认（快速通道）。 */
-#define RECOG_CONFIRM_CONSEC_SAMPLES   (3U)
-
-/** 窗口内出现异类有效帧（斜视下模型在类别间闪烁）时改用多数票判定：
- *  最高票 ≥ VOTE_MIN 且占有效帧数 ≥3/4 且领先第二名 ≥ VOTE_LEAD 才确认。
- *  连续 3 帧规则对"闪烁序列中的 3 连串"（如 5,5,3,3,3）无拒绝能力，
- *  会把斜视误判永久写图；投票门限用极小的时间代价换确认可靠性。 */
-#define RECOG_CONFIRM_VOTE_MIN         (4U)
-#define RECOG_CONFIRM_VOTE_LEAD        (3U)
-
-/** 单一观察位无法得到一致结果时的恢复窗口；到时先邻格往返复位，再换方向。
- *  1500→2000ms: 投票通道最多需要 ~7 帧有效结果，低帧率下 1500ms 偏紧。 */
-#define RECOG_SAMPLE_TIMEOUT_MS        (2000U)
+/** OpenART2 最长 1s 完成快速确认/降级投票；主控保留 1200ms 硬上限，
+ *  覆盖结果帧偶发丢失、请求重发和视觉端单次推理抖动。 */
+#define RECOG_SAMPLE_TIMEOUT_MS        (1200U)
 
 /** SAMPLE 中定期重发同一请求，覆盖 OpenART2 重启或请求帧偶发损坏。 */
 #define RECOG_REQUEST_RETRY_MS         (200U)
@@ -73,11 +64,9 @@
  *  立即采样会把拖影/未稳帧计入确认。要求到位状态连续保持 150ms 才开始采样。 */
 #define RECOG_FACE_SETTLE_TICKS        (30U)
 
-/** 单个物体的恢复预算：标记失败观察位（采样超时/NAV/FACE 失败）累计超过
- *  该值（即第 7 次标记）时整轮 FAIL 交回 DEADLOCK_RESET。"未确认不切换物体"
- *  策略若无上限，视觉对某图案系统性失效（破损/反光/持续闪烁）时车辆会绕该
- *  物体无限巡游，且 GAME 模式无看门狗。每个观察方向经过“首次采样 + 邻格
- *  往返后二次采样”仍失败才计 1 次标记；7 次覆盖四个方向并允许短时恢复。 */
+/** 单个物体的恢复预算：采样/NAV/FACE 失败每标记一次观察方向计 1 次，
+ *  第 7 次失败时整轮 FAIL 交回 DEADLOCK_RESET。预算按物体单独保存，
+ *  使失败物体被全局 Tour 延后期间不会丢失已用恢复次数。 */
 #define RECOG_OBJECT_RECOVER_LIMIT     (6U)
 
 /** 单个观察位的 SAMPLE 最大 tick 数 */
@@ -115,6 +104,7 @@ typedef struct
     uint8   visited;        /* 1 = 已实测确认, 不再选                  */
     uint8   ok;             /* 1 = class_id 已确定 (≠0)              */
     uint8   failed_observe_mask; /* 已失败观察方向 bit0..3              */
+    uint8   recover_count;  /* 该物体累计失败观察次数              */
 } RecogItem_t;
 
 static AppRecognizeSub_e s_sub_state    = RECOG_SUB_INIT;
@@ -128,8 +118,6 @@ static uint8             s_cur_idx      = 0U;     /* s_items 中当前处理项 
 static uint8  s_nav_started     = 0U;
 static uint8  s_face_started    = 0U;
 static uint8  s_face_settle_ticks = 0U;   /* FACE 到位后已连续保持到位的 tick 数 */
-static uint8  s_observe_reposition_done = 0U; /* 当前观察位是否已完成邻格往返复位 */
-static uint8  s_object_recover_count = 0U; /* 当前物体累计标记失败观察位的次数 */
 static uint16 s_subphase_ticks  = 0U;     /* B3a: NAV/FACE 子阶段计时, enter_sub_* 时清零 */
 static uint16 s_nav_timeout_limit = RECOG_NAV_TIMEOUT_TICKS;
 static AppRecogClearPlan_t s_nav_plan;
@@ -140,13 +128,10 @@ static Point_t s_nav_apply_player;
 static uint8   s_map_changed     = 0U;
 static uint8   s_nav_replay_map[MAP_ROWS][MAP_COLS];
 
-/* 当前识别请求与连续确认统计 */
+/* 当前识别请求与最终结果统计 */
 static uint16 s_sample_ticks    = 0U;
 static uint16 s_sample_total    = 0U;
-static uint8  s_sample_last_class = 0U;
-static uint8  s_sample_consec_class = 0U;
-static uint8  s_sample_class_votes[RECOG_CLASS_ID_MAX + 1U]; /* 窗口内各类别有效帧计票 */
-static uint32 s_last_seen_frame_id = 0U;     /* 已采样过的最大 frame_id, 防重复计票 */
+static uint32 s_last_seen_frame_id = 0U;     /* 已处理过的最大 frame_id, 防重复采信 */
 static uint8  s_active_request_id = 0U;
 static uint8  s_request_sequence = 0U;       /* 不随单轮 Reset 清零，避免迟到帧重新命中 */
 static uint16 s_request_retry_ticks = 0U;
@@ -251,7 +236,7 @@ static uint8 recog_nav_arrived(void)
 static uint8 class_assignment_still_possible(uint8 kind, uint8 class_id);
 
 /*===================================================================================================================
- * 指定类型请求 — 连续一致结果判定
+ * 指定类型识别请求 — 采信视觉端最终结论
  *=================================================================================================================*/
 
 static void sample_state_reset(void)
@@ -260,19 +245,16 @@ static void sample_state_reset(void)
 
     s_sample_ticks = 0U;
     s_sample_total = 0U;
-    s_sample_last_class = 0U;
-    s_sample_consec_class = 0U;
     s_request_retry_ticks = 0U;
-    memset(s_sample_class_votes, 0, sizeof(s_sample_class_votes));
-    /* 丢弃转向完成前已经落地的最后一帧，只统计进入 SAMPLE 后的新帧。 */
+    /* 丢弃转向完成前已经落地的最后一帧，只处理进入 SAMPLE 后的新帧。 */
     app_link_get_box_class_snapshot(&snap);
     s_last_seen_frame_id = (snap.valid != 0U) ? snap.frame_id : 0U;
 }
 
 /**
- * @return  >0 = 已确认的 class_id;
+ * @return  >0 = 视觉端已确认的 class_id;
  *           0 = 还在采样;
- *          -2 = 当前观察位窗口内仍未取得一致结果，需要恢复当前物体
+ *          -2 = 视觉汇总失败/类型冲突/采样超时，需要更换观察方向
  */
 static int16 sample_confirm_step(uint8 expect_kind)
 {
@@ -284,7 +266,8 @@ static int16 sample_confirm_step(uint8 expect_kind)
     s_sample_ticks++;
     s_request_retry_ticks++;
 
-    /* 仅统计当前请求产生的新鲜帧，旧观察点或其他类型的结果不会污染连续确认。 */
+    /* 视觉端只在快速确认或降级投票结束后发送结论；主控只负责
+     * request_id、类型和类别约束校验，不再对同一缓存结论重复投票。 */
     if ((snap.valid != 0U) && (snap.frame_id != s_last_seen_frame_id))
     {
         s_last_seen_frame_id = snap.frame_id;
@@ -294,74 +277,27 @@ static int16 sample_confirm_step(uint8 expect_kind)
             return 0;
         }
 
-        if ((snap.obj_kind != expect_kind) ||
-            (snap.request_id != s_active_request_id))
+        if (snap.request_id != s_active_request_id)
         {
-            /* 迟到帧：忽略且不打断当前请求已经取得的连续结果。 */
-        }
-        else if ((snap.class_id == 0U) ||
-                 (snap.class_id > (uint8)RECOG_CLASS_ID_MAX) ||
-                 !class_assignment_still_possible(expect_kind, snap.class_id))
-        {
-            s_sample_last_class = 0U;
-            s_sample_consec_class = 0U;
+            /* 旧观察点迟到帧：忽略。 */
         }
         else
         {
-            s_sample_total++;
-            if (s_sample_class_votes[snap.class_id] < 255U)
+            if (s_sample_total < 0xFFFFU)
             {
-                s_sample_class_votes[snap.class_id]++;
-            }
-            if (s_sample_last_class == snap.class_id)
-            {
-                if (s_sample_consec_class < 255U) { s_sample_consec_class++; }
-            }
-            else
-            {
-                s_sample_last_class = snap.class_id;
-                s_sample_consec_class = 1U;
+                s_sample_total++;
             }
 
-            /* 快速通道：窗口内全部有效帧同类（正对稳定识别）时，
-             * 连续三帧即确认，速度与旧规则一致。 */
-            if (s_sample_consec_class >= (uint8)RECOG_CONFIRM_CONSEC_SAMPLES &&
-                (uint16)s_sample_class_votes[snap.class_id] >= s_sample_total)
+            /* class_id=0 只由视觉端在 1s 汇总仍失败时发送；
+             * 类型不符同样说明当前观察画面不可靠，立即换观察方向。 */
+            if ((snap.class_id == 0U) ||
+                (snap.obj_kind != expect_kind) ||
+                (snap.class_id > (uint8)RECOG_CLASS_ID_MAX) ||
+                !class_assignment_still_possible(expect_kind, snap.class_id))
             {
-                return (int16)snap.class_id;
+                return -2;
             }
-
-            /* 投票通道：仅当窗口内确有异类有效帧（真正的斜视闪烁）时启用，
-             * 要求最高票 ≥VOTE_MIN、占有效帧 ≥3/4、领先第二名 ≥VOTE_LEAD。
-             * second==0 的稀疏序列（同类零散帧夹大量 class-0 背景帧）不在此
-             * 确认——那是"物体偏出视野中央"的症状，应走超时→往返复位/换向恢复。 */
-            {
-                uint8 top_class = 0U;
-                uint8 top_votes = 0U;
-                uint8 second_votes = 0U;
-                for (uint8 cid = 1U; cid <= (uint8)RECOG_CLASS_ID_MAX; ++cid)
-                {
-                    uint8 votes = s_sample_class_votes[cid];
-                    if (votes > top_votes)
-                    {
-                        second_votes = top_votes;
-                        top_votes = votes;
-                        top_class = cid;
-                    }
-                    else if (votes > second_votes)
-                    {
-                        second_votes = votes;
-                    }
-                }
-                if (second_votes > 0U &&
-                    top_votes >= (uint8)RECOG_CONFIRM_VOTE_MIN &&
-                    (uint16)top_votes * 4U >= s_sample_total * 3U &&
-                    (uint8)(top_votes - second_votes) >=
-                        (uint8)RECOG_CONFIRM_VOTE_LEAD)
-                {
-                    return (int16)top_class;
-                }
-            }
+            return (int16)snap.class_id;
         }
     }
 
@@ -371,7 +307,7 @@ static int16 sample_confirm_step(uint8 expect_kind)
         s_request_retry_ticks = 0U;
     }
 
-    /* 只把它作为故障退出上限；绝不拿不足三帧的最高票兜底。 */
+    /* 视觉端结果帧丢失或未运行时的硬故障退出上限。 */
     if (s_sample_ticks >= (uint16)RECOG_SAMPLE_MAX_TICKS)
     {
         return -2;
@@ -456,6 +392,7 @@ static void extract_items(const uint8 map[MAP_ROWS][MAP_COLS])
                 s_items[s_item_count].visited  = 0U;
                 s_items[s_item_count].ok       = 0U;
                 s_items[s_item_count].failed_observe_mask = 0U;
+                s_items[s_item_count].recover_count = 0U;
                 ++s_item_count;
                 ++s_box_count;
             }
@@ -468,6 +405,7 @@ static void extract_items(const uint8 map[MAP_ROWS][MAP_COLS])
                 s_items[s_item_count].visited  = 0U;
                 s_items[s_item_count].ok       = 0U;
                 s_items[s_item_count].failed_observe_mask = 0U;
+                s_items[s_item_count].recover_count = 0U;
                 ++s_item_count;
                 ++s_target_count;
             }
@@ -492,6 +430,7 @@ static uint8 recog_is_observe_standable(const uint8 map[MAP_ROWS][MAP_COLS],
 static uint16 observe_route_cost_from_flood(const uint8 map[MAP_ROWS][MAP_COLS],
                                             const uint16 time_cost[MAP_ROWS][MAP_COLS],
                                             Point_t object,
+                                            uint8 failed_observe_mask,
                                             uint8 start_heading,
                                             Point_t *best_observe)
 {
@@ -507,7 +446,8 @@ static uint16 observe_route_cost_from_flood(const uint8 map[MAP_ROWS][MAP_COLS],
         uint8 heading;
         uint16 cost;
 
-        if (!recog_is_observe_standable(map, y, x)) { continue; }
+        if ((failed_observe_mask & (uint8)(1U << d)) != 0U ||
+            !recog_is_observe_standable(map, y, x)) { continue; }
         if (time_cost[y][x] >= (uint16)ALGO_NAV_TIME_COST_UNREACHABLE) { continue; }
 
         candidate.x = x;
@@ -546,70 +486,21 @@ static void mark_current_observe_failed(void)
     bit = observe_direction_bit(s_items[s_cur_idx].pos,
                                 s_items[s_cur_idx].observe);
     s_items[s_cur_idx].failed_observe_mask |= bit;
-    if (s_object_recover_count < 255U) { s_object_recover_count++; }
+    if (s_items[s_cur_idx].recover_count < 255U)
+    {
+        s_items[s_cur_idx].recover_count++;
+    }
+    /* 原缓存 Tour 可能仍指向刚失败的观察格，必须全部重算。 */
+    s_tour_cached_count = 0U;
+    s_tour_cached_next = 0U;
 }
 
 /* 恢复预算耗尽判定；四个恢复分支在 mark 后统一检查。 */
 static uint8 recog_object_recover_exhausted(void)
 {
-    return (uint8)(s_object_recover_count > (uint8)RECOG_OBJECT_RECOVER_LIMIT);
-}
-
-/**
- * 为同一个物体选择尚未失败的相邻观察格。四个方向都尝试过后清空掩码
- * 重新循环，保证视觉暂时失效时不会把当前物体跳过去。
- */
-static uint8 pick_current_retry_observe(const uint8 map[MAP_ROWS][MAP_COLS],
-                                        Point_t cur,
-                                        float nav_heading_deg,
-                                        Point_t *out_observe)
-{
-    static const int8 dr[4] = {-1, 1, 0, 0};
-    static const int8 dc[4] = {0, 0, -1, 1};
-    uint8 start_heading = recog_nav_heading_index(nav_heading_deg);
-
-    if (out_observe == NULL || s_cur_idx >= s_item_count) { return 0U; }
-    if (!Algo_Nav_Time_Flood(map, cur, SOKO_ACT_NONE,
-                             s_pick_time_cost, NULL)) { return 0U; }
-
-    for (uint8 pass = 0U; pass < 2U; ++pass)
-    {
-        uint16 best_cost = RECOG_ROUTE_COST_INF;
-        uint8 found = 0U;
-
-        if (pass != 0U) { s_items[s_cur_idx].failed_observe_mask = 0U; }
-        for (uint8 d = 0U; d < 4U; ++d)
-        {
-            uint8 bit = (uint8)(1U << d);
-            Point_t candidate;
-            uint8 face_heading;
-            uint16 cost;
-
-            if ((s_items[s_cur_idx].failed_observe_mask & bit) != 0U) { continue; }
-            candidate.y = (int8)(s_items[s_cur_idx].pos.y + dr[d]);
-            candidate.x = (int8)(s_items[s_cur_idx].pos.x + dc[d]);
-            if (!recog_is_observe_standable(map, candidate.y, candidate.x) ||
-                s_pick_time_cost[candidate.y][candidate.x] >=
-                    (uint16)ALGO_NAV_TIME_COST_UNREACHABLE ||
-                !recog_face_heading_index(candidate, s_items[s_cur_idx].pos,
-                                           &face_heading))
-            {
-                continue;
-            }
-
-            cost = (uint16)(s_pick_time_cost[candidate.y][candidate.x] +
-                (uint16)recog_quarter_turns(start_heading, face_heading) *
-                (uint16)RECOG_TOUR_QUARTER_TURN_COST);
-            if (cost < best_cost)
-            {
-                best_cost = cost;
-                *out_observe = candidate;
-                found = 1U;
-            }
-        }
-        if (found != 0U) { return 1U; }
-    }
-    return 0U;
+    if (s_cur_idx >= s_item_count) { return 1U; }
+    return (uint8)(s_items[s_cur_idx].recover_count >
+                   (uint8)RECOG_OBJECT_RECOVER_LIMIT);
 }
 
 /**
@@ -655,6 +546,8 @@ static uint8 pick_exact_direct_tour(const uint8 map[MAP_ROWS][MAP_COLS],
         {
             int8 y = (int8)(object.y + dr[d]);
             int8 x = (int8)(object.x + dc[d]);
+            if ((s_items[item_idx[local]].failed_observe_mask &
+                 (uint8)(1U << d)) != 0U) { continue; }
             if (!recog_is_observe_standable(map, y, x)) { continue; }
             if (cand_count >= (uint8)RECOG_TOUR_MAX_CANDIDATES) { return 0U; }
             cand_pos[cand_count].x = x;
@@ -816,7 +709,8 @@ static uint8 pick_nearest_direct_item(const uint8 map[MAP_ROWS][MAP_COLS],
         if (!s_items[i].visited)
         {
             first_cost[i] = observe_route_cost_from_flood(
-                map, s_pick_time_cost, s_items[i].pos, start_heading,
+                map, s_pick_time_cost, s_items[i].pos,
+                s_items[i].failed_observe_mask, start_heading,
                 &first_observe[i]);
         }
     }
@@ -841,7 +735,8 @@ static uint8 pick_nearest_direct_item(const uint8 map[MAP_ROWS][MAP_COLS],
                 uint16 next_cost;
                 if (j == i || s_items[j].visited) continue;
                 next_cost = observe_route_cost_from_flood(
-                    map, s_pick_time_cost, s_items[j].pos, face_heading, NULL);
+                    map, s_pick_time_cost, s_items[j].pos,
+                    s_items[j].failed_observe_mask, face_heading, NULL);
                 if (next_cost < next_best) next_best = next_cost;
             }
         }
@@ -908,8 +803,15 @@ static uint8 pick_next_item(const uint8 map[MAP_ROWS][MAP_COLS],
     {
         uint8 cached_item = s_tour_cached_item[s_tour_cached_next];
         Point_t cached_observe = s_tour_cached_observe[s_tour_cached_next];
+        uint8 cached_direction = 0U;
         s_tour_cached_next++;
+        if (cached_item < s_item_count)
+        {
+            cached_direction = observe_direction_bit(s_items[cached_item].pos,
+                                                      cached_observe);
+        }
         if (cached_item < s_item_count && !s_items[cached_item].visited &&
+            (s_items[cached_item].failed_observe_mask & cached_direction) == 0U &&
             recog_is_observe_standable(map, cached_observe.y, cached_observe.x))
         {
             *preferred_observe = cached_observe;
@@ -920,20 +822,37 @@ static uint8 pick_next_item(const uint8 map[MAP_ROWS][MAP_COLS],
     s_tour_cached_count = 0U;
     s_tour_cached_next = 0U;
 
-    if (remaining <= (uint8)RECOG_EXACT_TOUR_ITEM_LIMIT &&
-        pick_exact_direct_tour(map, cur, nav_heading_deg,
-                               &best, preferred_observe))
+    /* 第一轮严格排除已失败的观察方向。只有全部未确认物体都
+     * 没有剩余可直达方向时，才清除方向掩码重新循环；这样当前物体
+     * 的换位很远时，会先消费附近其他物体，而不是立即追远观察位。 */
+    for (uint8 pass = 0U; pass < 2U; ++pass)
     {
-        *has_preferred_observe = 1U;
-        return best;
-    }
+        if (pass != 0U)
+        {
+            for (uint8 i = 0U; i < s_item_count; ++i)
+            {
+                if (!s_items[i].visited)
+                {
+                    s_items[i].failed_observe_mask = 0U;
+                }
+            }
+        }
 
-    best = pick_nearest_direct_item(map, cur, nav_heading_deg,
-                                    preferred_observe);
-    if (best != 0xFFU)
-    {
-        *has_preferred_observe = 1U;
-        return best;
+        if (remaining <= (uint8)RECOG_EXACT_TOUR_ITEM_LIMIT &&
+            pick_exact_direct_tour(map, cur, nav_heading_deg,
+                                   &best, preferred_observe))
+        {
+            *has_preferred_observe = 1U;
+            return best;
+        }
+
+        best = pick_nearest_direct_item(map, cur, nav_heading_deg,
+                                        preferred_observe);
+        if (best != 0xFFU)
+        {
+            *has_preferred_observe = 1U;
+            return best;
+        }
     }
 
     return pick_clearable_item(map, cur);
@@ -1309,93 +1228,6 @@ static uint8 prepare_nav_plan(const uint8 map[MAP_ROWS][MAP_COLS],
     return commit_nav_plan(map, player_pos);
 }
 
-static uint8 prepare_retry_current_plan(const uint8 map[MAP_ROWS][MAP_COLS],
-                                        Point_t player_pos,
-                                        float nav_heading_deg)
-{
-    Point_t observe;
-
-    s_tour_cached_count = 0U;
-    s_tour_cached_next = 0U;
-    s_observe_reposition_done = 0U; /* 新观察方向允许一次邻格往返复位 */
-    if (!pick_current_retry_observe(map, player_pos, nav_heading_deg,
-                                    &observe))
-    {
-        return 0U;
-    }
-    return prepare_nav_plan(map, player_pos, &observe);
-}
-
-/*
- * 首次采样超时后的观察位复位：优先横向移动一格（左右均不可用时向后），
- * 随即返回原观察格。往返会让底盘重新执行到位闭环，之后 FACE 的静稳门再
- * 保持 150ms 才发出新 request_id；同一观察方向只执行一次，二次失败即换向。
- */
-static uint8 try_reposition_observe_retry(const uint8 map[MAP_ROWS][MAP_COLS],
-                                          Point_t player_pos)
-{
-    static const uint8 opposite[4] = {
-        SOKO_ACT_DOWN, SOKO_ACT_UP, SOKO_ACT_RIGHT, SOKO_ACT_LEFT
-    };
-    Point_t observe;
-    Point_t object;
-    int8 away_x;
-    int8 away_y;
-    int8 move_x[3];
-    int8 move_y[3];
-
-    if (s_observe_reposition_done != 0U) { return 0U; }
-    if (s_cur_idx >= s_item_count) { return 0U; }
-
-    observe = s_items[s_cur_idx].observe;
-    object = s_items[s_cur_idx].pos;
-    away_x = (int8)(observe.x - object.x);
-    away_y = (int8)(observe.y - object.y);
-    if ((int8)(away_x * away_x + away_y * away_y) != 1 ||
-        player_pos.x != observe.x || player_pos.y != observe.y)
-    {
-        return 0U;
-    }
-
-    /* 左/右横移优先，最后才沿视轴后退；绝不朝物体所在格移动。 */
-    move_x[0] = (int8)-away_y; move_y[0] = away_x;
-    move_x[1] = away_y;       move_y[1] = (int8)-away_x;
-    move_x[2] = away_x;       move_y[2] = away_y;
-
-    for (uint8 i = 0U; i < 3U; ++i)
-    {
-        Point_t reset_cell;
-        uint8 action;
-
-        reset_cell.x = (int8)(observe.x + move_x[i]);
-        reset_cell.y = (int8)(observe.y + move_y[i]);
-        if ((reset_cell.x == object.x && reset_cell.y == object.y) ||
-            !recog_is_observe_standable(map, reset_cell.y, reset_cell.x))
-        {
-            continue;
-        }
-
-        if      (move_x[i] == 0  && move_y[i] == -1) action = SOKO_ACT_UP;
-        else if (move_x[i] == 0  && move_y[i] ==  1) action = SOKO_ACT_DOWN;
-        else if (move_x[i] == -1 && move_y[i] ==  0) action = SOKO_ACT_LEFT;
-        else if (move_x[i] ==  1 && move_y[i] ==  0) action = SOKO_ACT_RIGHT;
-        else continue;
-
-        memset(&s_nav_plan, 0, sizeof(s_nav_plan));
-        s_nav_plan.actions.actions[0] = (SokoAction_e)action;
-        s_nav_plan.actions.actions[1] = (SokoAction_e)opposite[action];
-        s_nav_plan.actions.count = 2U;
-        s_nav_plan.observe = observe;
-        s_nav_plan.player_end = observe;
-        s_nav_plan.push_count = 0U;
-        if (!commit_nav_plan(map, player_pos)) { return 0U; }
-
-        s_observe_reposition_done = 1U;
-        return 1U;
-    }
-    return 0U;
-}
-
 static uint8 apply_nav_plan_to_waypoint(uint8 map[MAP_ROWS][MAP_COLS],
                                         Point_t waypoint)
 {
@@ -1501,8 +1333,16 @@ static void enter_sub_sample(void)
 static void enter_sub_next(void)
 {
     s_sub_state = RECOG_SUB_NEXT;
-    s_observe_reposition_done = 0U;
-    s_object_recover_count = 0U;  /* 恢复预算按物体计，确认后清零 */
+}
+
+/* 当前观察方向失败后不立即追该物体的备选位。将它保留在
+ * 未确认集合中，NEXT 会把它与其他 BOX/TARGET 一起重新规划。 */
+static uint8 defer_current_observe_failure(void)
+{
+    mark_current_observe_failed();
+    if (recog_object_recover_exhausted()) { return 0U; }
+    enter_sub_next();
+    return 1U;
 }
 
 /*===================================================================================================================
@@ -1519,8 +1359,6 @@ void App_Recognize_Reset(void)
     s_nav_started  = 0U;
     s_face_started = 0U;
     s_face_settle_ticks = 0U;
-    s_observe_reposition_done = 0U;
-    s_object_recover_count = 0U;
     s_nav_wp_idx   = 0U;
     s_nav_actions_applied = 0U;
     s_map_changed  = 0U;
@@ -1623,15 +1461,11 @@ AppRecognizeStatus_e App_Recognize_Tick(uint8 map[MAP_ROWS][MAP_COLS],
                         s_sub_state = RECOG_SUB_FAIL;
                         return APP_RECOG_FAIL;
                     }
-                    mark_current_observe_failed();
-                    if (recog_object_recover_exhausted() ||
-                        !prepare_retry_current_plan(map, player_pos,
-                                                    *nav_heading_deg_io))
+                    if (!defer_current_observe_failure())
                     {
                         s_sub_state = RECOG_SUB_FAIL;
                         return APP_RECOG_FAIL;
                     }
-                    enter_sub_nav();
                     return APP_RECOG_RUNNING;
                 }
                 if (!recog_nav_arrived())
@@ -1674,15 +1508,11 @@ AppRecognizeStatus_e App_Recognize_Tick(uint8 map[MAP_ROWS][MAP_COLS],
                                              &yaw_target))
                 {
                     chassis_ctrl_stop();
-                    mark_current_observe_failed();
-                    if (recog_object_recover_exhausted() ||
-                        !prepare_retry_current_plan(map, player_pos,
-                                                    *nav_heading_deg_io))
+                    if (!defer_current_observe_failure())
                     {
                         s_sub_state = RECOG_SUB_FAIL;
                         return APP_RECOG_FAIL;
                     }
-                    enter_sub_nav();
                     return APP_RECOG_RUNNING;
                 }
                 *nav_heading_deg_io = yaw_target;
@@ -1694,15 +1524,11 @@ AppRecognizeStatus_e App_Recognize_Tick(uint8 map[MAP_ROWS][MAP_COLS],
             if (s_subphase_ticks > RECOG_FACE_TIMEOUT_TICKS)
             {
                 chassis_ctrl_stop();
-                mark_current_observe_failed();
-                if (recog_object_recover_exhausted() ||
-                    !prepare_retry_current_plan(map, player_pos,
-                                                *nav_heading_deg_io))
+                if (!defer_current_observe_failure())
                 {
                     s_sub_state = RECOG_SUB_FAIL;
                     return APP_RECOG_FAIL;
                 }
-                enter_sub_nav();
                 return APP_RECOG_RUNNING;
             }
             if (!chassis_ctrl_is_arrived())
@@ -1733,32 +1559,15 @@ AppRecognizeStatus_e App_Recognize_Tick(uint8 map[MAP_ROWS][MAP_COLS],
             }
             else if (r < 0)
             {
-                /* 采样窗口只触发当前物体恢复；未确认前绝不切换物体。
-                 * 首次失败先邻格往返并回原观察格重新静稳采样，二次失败
-                 * 才标记当前方向并选择其他观察位置。 */
+                /* 当前方向采样失败后立即延后该物体；全局 Tour 决定先去
+                 * 附近其他物体，还是从该物体的另一方向重试。 */
                 chassis_ctrl_stop();
-                if (try_reposition_observe_retry(map, player_pos))
-                {
-                    enter_sub_nav();
-                    return APP_RECOG_RUNNING;
-                }
-                mark_current_observe_failed();
-                if (recog_object_recover_exhausted())
+                if (!defer_current_observe_failure())
                 {
                     /* 恢复预算耗尽：视觉对该物体持续无法确认，明确失败交回
                      * DEADLOCK_RESET，避免比赛计时内绕单个物体无限巡游。 */
                     s_sub_state = RECOG_SUB_FAIL;
                     return APP_RECOG_FAIL;
-                }
-                if (prepare_retry_current_plan(map, player_pos,
-                                               *nav_heading_deg_io))
-                {
-                    enter_sub_nav();
-                }
-                else
-                {
-                    /* 仍停在已知观察格时重新校正朝向并生成新 request_id。 */
-                    enter_sub_face();
                 }
             }
             return APP_RECOG_RUNNING;

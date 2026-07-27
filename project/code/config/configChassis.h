@@ -153,7 +153,7 @@
 
 /** 移动中重新对正阈值: |err| 达到此值时立即停止平移并原地校正。
  *  ENTER~REALIGN 之间按误差线性降低平移速度，兼顾速度与航向保持。 */
-#define CHASSIS_YAW_MOVE_REALIGN_DEG         (5.0f)
+#define CHASSIS_YAW_MOVE_REALIGN_DEG         (10.0f)
 
 /** 即位锁需车体稳定: |rate| < 此值 */
 #define CHASSIS_YAW_INPOS_SETTLE_DPS        (10.0f)

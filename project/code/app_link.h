@@ -18,7 +18,7 @@
  * 当前任务实现:
  *   - TYPE=0x01 MAP        : 兼容 192B ASCII 地图; 推荐 194B = 192B 地图 + car_x + car_y
  *   - TYPE=0x10 HEARTBEAT  : 1 字节自增 seq, 用于链路保活与丢包率统计
- *   - TYPE=0x11 RECOG_REQUEST: 主控指定本次只识别 BOX 或 TARGET，并携带请求编号
+ *   - TYPE=0x11 RECOG_REQUEST: 主控指定 BOX/TARGET 类型并携带请求编号
  *
  * 不在本任务范围 (留给 P0-2 / P1):
  *   - 链路超时回退状态机 (本文件只更新时间戳与心跳计数, 不做回退)
@@ -180,7 +180,7 @@ uint32 app_link_get_ms(void);
 /*-------------------------------------------------------------------------------------------------------------------
  * 函数: app_link_send_recog_request
  * 功能: 通过 OpenART2/UART1 发送识别请求，载荷为 [obj_kind][request_id]
- * 备注: request_id=0 保留为“尚无请求”；非法参数不会发送。
+ * 备注: obj_kind 必须为 BOX/TARGET，request_id=0 保留；非法参数不发送。
  *-----------------------------------------------------------------------------------------------------------------*/
 void app_link_send_recog_request(uint8 obj_kind, uint8 request_id);
 

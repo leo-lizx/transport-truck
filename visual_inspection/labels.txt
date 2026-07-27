@@ -8,7 +8,6 @@
 07gg_bond
 08calabash_brothers
 09grey_wolf
-background
 num_0
 num_1
 num_2

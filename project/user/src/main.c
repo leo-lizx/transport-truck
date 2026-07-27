@@ -72,7 +72,7 @@
  *   8   MAIN_RUN_MODE_HARDCODED_MAP         ✅    代码内置          固定发车: 上电解算→Y轴平移发车→推箱→回库
  *   9   MAIN_RUN_MODE_OPENART2_TEST         ❌    OpenART2 UART1   分类链路自测: 只显示 BOX_CLASS, 车不动
  *   10  MAIN_RUN_MODE_LEVEL2_TEST           ✅    OpenART1+2       第二关单测: 收图→发车→分类→Stage2推箱→回库
- *   11  MAIN_RUN_MODE_BOARD_TEST            ❌    无               新主板自测: 屏幕显示 yaw、活动编码器轮号和轮速
+ *   11  MAIN_RUN_MODE_BOARD_TEST            ❌    OpenART2 UART1   分类结果转发: UART8 向上位机输出 BOX/TARGET 和类别号
  *=========================================================================*/
 #define MAIN_RUN_MODE_GAME            (0)   /* 正式比赛: 完整视觉+推箱+底盘闭环 */
 #define MAIN_RUN_MODE_YAW_HOLD        (1)   /* 航向保持: 车不动, IMU 锁角度调 yaw PID */
@@ -85,7 +85,7 @@
 #define MAIN_RUN_MODE_HARDCODED_MAP   (8)   /* 硬编码地图: 上电解算→Y轴平移发车→跑→回发车点 */
 #define MAIN_RUN_MODE_OPENART2_TEST   (9)   /* OpenART2 分类链路测试: 屏幕显示 BOX/TARGET/NONE, 车不动 */
 #define MAIN_RUN_MODE_LEVEL2_TEST     (10)  /* 第二关测试: 收图→固定发车→分类识别→Stage2推箱→回库 */
-#define MAIN_RUN_MODE_BOARD_TEST      (11)  /* 新主板测试: 屏幕显示 yaw 和手转车轮的编码器反馈 */
+#define MAIN_RUN_MODE_BOARD_TEST      (11)  /* OpenART2 识别结果通过 UART8 转发给上位机 */
 
 /* ═══════════ 改下面这行切换运行模式 (0~11) ═══════════ */
 #define MAIN_RUN_MODE                 (MAIN_RUN_MODE_GAME)
@@ -1850,7 +1850,7 @@ static void main_mode5_render_100ms(void)
 /*  ⬇⬇⬇ 姿态闭环调试阶段这里全部被 #if 屏蔽, 不会被编译, 不要删 ⬇⬇⬇          */
 /* ========================================================================== */
 #if (MAIN_RUN_MODE == MAIN_RUN_MODE_SINGLE_WHEEL)
-#define MAIN_PID_DEBUG_WHEEL_INDEX    (CHASSIS_WHEEL_LB)  /* 0=LF, 1=RF, 2=LB, 3=RB */
+#define MAIN_PID_DEBUG_WHEEL_INDEX    (CHASSIS_WHEEL_RF)  /* 0=LF, 1=RF, 2=LB, 3=RB */
 #define MAIN_PID_DEBUG_TARGET_MPS     (0.10f)             /* target wheel speed, m/s */
 #define MAIN_PID_DEBUG_FORCE_PID      (1)                 /* 1=use KP/KI/KD below */
 #define MAIN_PID_DEBUG_KP             (200.0f)
@@ -1927,6 +1927,92 @@ static void main_board_test_render_100ms(void)
 
     ips200_show_string(64U, 144U, "          ");
     ips200_show_float(64U, 144U, active_speed_mps, 2U, 3U);
+}
+#endif
+
+#if (MAIN_RUN_MODE == MAIN_RUN_MODE_BOARD_TEST)
+#define MAIN_OA2_FORWARD_RETRY_MS     (200U)
+#define MAIN_OA2_FORWARD_REQUEST_KIND (APP_LINK_OBJ_KIND_BOX) /* BOX 或 TARGET */
+
+static uint8  s_oa2_forward_request_id = 1U;
+static uint8  s_oa2_forward_request_sent = 0U;
+static uint32 s_oa2_forward_last_request_ms = 0U;
+static uint32 s_oa2_forward_last_frame_id = 0U;
+
+static void main_oa2_forward_send_request(uint32 now_ms)
+{
+    app_link_send_recog_request((uint8)MAIN_OA2_FORWARD_REQUEST_KIND,
+                                s_oa2_forward_request_id);
+    s_oa2_forward_last_request_ms = now_ms;
+    s_oa2_forward_request_sent = 1U;
+}
+
+static void main_oa2_forward_advance_request(void)
+{
+    s_oa2_forward_request_id++;
+    if (s_oa2_forward_request_id == 0U)
+    {
+        s_oa2_forward_request_id = 1U;
+    }
+}
+
+static void main_run_oa2_forward_5ms(void)
+{
+    app_link_box_class_snapshot_t snap;
+    uint32 now_ms = app_link_get_ms();
+
+    chassis_ctrl_stop();
+
+    if ((s_oa2_forward_request_sent == 0U) ||
+        ((now_ms - s_oa2_forward_last_request_ms) >= MAIN_OA2_FORWARD_RETRY_MS))
+    {
+        main_oa2_forward_send_request(now_ms);
+    }
+
+    app_link_get_box_class_snapshot(&snap);
+    if ((snap.valid == 0U) ||
+        (snap.frame_id == s_oa2_forward_last_frame_id))
+    {
+        return;
+    }
+    s_oa2_forward_last_frame_id = snap.frame_id;
+
+    /* 忽略 OpenART2 切换请求时可能残留的旧结果，避免上位机误判。 */
+    if (snap.request_id != s_oa2_forward_request_id)
+    {
+        return;
+    }
+
+    {
+        char line[96U];
+        const char *kind_name = "INVALID";
+
+        if (snap.class_id == APP_LINK_CLASS_ID_NONE)
+        {
+            kind_name = "NONE";
+        }
+        else if (snap.obj_kind == APP_LINK_OBJ_KIND_BOX)
+        {
+            kind_name = "BOX";
+        }
+        else if (snap.obj_kind == APP_LINK_OBJ_KIND_TARGET)
+        {
+            kind_name = "TARGET";
+        }
+
+        sprintf(line,
+                "OA2_RESULT,type=%s,class=%u,request=%u,seq=%u,frame=%lu\r\n",
+                kind_name,
+                (unsigned int)snap.class_id,
+                (unsigned int)snap.request_id,
+                (unsigned int)snap.vision_seq,
+                (unsigned long)snap.frame_id);
+        uart_write_string(DEBUG_UART_INDEX, line);
+    }
+
+    /* 每个请求只转发一次最终结果，然后立即开启下一次识别。 */
+    main_oa2_forward_advance_request();
+    main_oa2_forward_send_request(now_ms);
 }
 #endif
 
@@ -2178,6 +2264,12 @@ int main(void)
     clock_init(BOARD_BOOTCLOCKRUN_CORE_CLOCK);  // 默认528MHz，降低电池冷启动的VDD_SOC需求
 #if DEBUG_UART_ENABLE
     debug_init();                   // 调试端口初始化
+#elif (MAIN_RUN_MODE == MAIN_RUN_MODE_BOARD_TEST)
+    /* 模式11独立启用 UART8 发送文本，不改变正式比赛的全局日志开关。 */
+    uart_init(DEBUG_UART_INDEX,
+              DEBUG_UART_BAUDRATE,
+              DEBUG_UART_TX_PIN,
+              DEBUG_UART_RX_PIN);
 #endif
 
     // ------------------------------------------------------------------
@@ -2190,12 +2282,12 @@ int main(void)
 #endif
 
     // OpenART2: 分类识别模块, 通过 UART1 上报 BOX_CLASS/HEARTBEAT 帧.
-#if ((MAIN_RUN_MODE == MAIN_RUN_MODE_GAME) || (MAIN_RUN_MODE == MAIN_RUN_MODE_OPENART2_TEST) || (MAIN_RUN_MODE == MAIN_RUN_MODE_LEVEL2_TEST))
+#if ((MAIN_RUN_MODE == MAIN_RUN_MODE_GAME) || (MAIN_RUN_MODE == MAIN_RUN_MODE_OPENART2_TEST) || (MAIN_RUN_MODE == MAIN_RUN_MODE_LEVEL2_TEST) || (MAIN_RUN_MODE == MAIN_RUN_MODE_BOARD_TEST))
     uart_init(MAIN_OPENART2_UART, 115200, MAIN_OPENART2_UART_TX, MAIN_OPENART2_UART_RX);
     uart_rx_interrupt(MAIN_OPENART2_UART, 1);
 #endif
 
-#if ((MAIN_RUN_MODE == MAIN_RUN_MODE_GAME) || (MAIN_RUN_MODE == MAIN_RUN_MODE_SOKO_SELFTEST) || (MAIN_RUN_MODE == MAIN_RUN_MODE_SOLVE_VERIFY) || (MAIN_RUN_MODE == MAIN_RUN_MODE_LEVEL1_TEST) || (MAIN_RUN_MODE == MAIN_RUN_MODE_OPENART2_TEST) || (MAIN_RUN_MODE == MAIN_RUN_MODE_LEVEL2_TEST))
+#if ((MAIN_RUN_MODE == MAIN_RUN_MODE_GAME) || (MAIN_RUN_MODE == MAIN_RUN_MODE_SOKO_SELFTEST) || (MAIN_RUN_MODE == MAIN_RUN_MODE_SOLVE_VERIFY) || (MAIN_RUN_MODE == MAIN_RUN_MODE_LEVEL1_TEST) || (MAIN_RUN_MODE == MAIN_RUN_MODE_OPENART2_TEST) || (MAIN_RUN_MODE == MAIN_RUN_MODE_LEVEL2_TEST) || (MAIN_RUN_MODE == MAIN_RUN_MODE_BOARD_TEST))
     app_link_init();                /* P0-1: 协议解析层初始化, 必须在 uart_rx_interrupt 之后 */
 #endif
 
@@ -2290,7 +2382,8 @@ int main(void)
     printf("OA2_BOOT wait BOX_CLASS from OpenART2 (UART1)...\n");
     chassis_ctrl_stop();
 #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_BOARD_TEST)
-    /* 新主板测试只采集 IMU/编码器，保持四路电机 PWM 关闭。 */
+    uart_write_string(DEBUG_UART_INDEX,
+                      "OA2_FORWARD_READY,uart=8,baud=115200\r\n");
     chassis_ctrl_stop();
   #if (CHASSIS_MENU_ENABLE != 0)
     main_board_test_render_100ms();
@@ -2553,7 +2646,7 @@ int main(void)
     #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_OPENART2_TEST)
         main_run_openart2_test_5ms();
     #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_BOARD_TEST)
-        /* yaw 与编码器采样均由 PIT 周期任务完成，主循环只负责屏幕刷新。 */
+        main_run_oa2_forward_5ms();
     #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_LEVEL1_TEST)
         main_run_level1_test_5ms();
         main_run_level1_test_log_50ms();

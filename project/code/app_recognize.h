@@ -10,9 +10,9 @@
  *          - 移动到 Tour 选定的侧面观察点（兼顾路程和四向转角）
  *          - 仅依赖编码器里程计与陀螺仪确认到达观察点
  *          - 原地旋转车头朝向物体
- *          - 主控请求指定 BOX/TARGET；窗口内全同类连续三帧、或多数票门限确认
- *          - 未确认先做邻格往返复位，再换其他观察方向（恢复预算 FAIL 兜底），
- *            不允许跳到下一个物体
+ *          - 主控仅发送 request_id；视觉自行判断 BOX/TARGET，主控校验后确认
+ *          - 未确认则标记当前观察方向失败，与其他未确认物体重新规划 Tour；
+ *            路线合适时再从该物体的其他方向观察（恢复预算 FAIL 兜底）
  *     4) 全部箱子与目标逐一实地确认（不做"最后一个目标"排除法推断）；
  *        随后按类别与静态推送可达性写入映射 g_box_to_target[]
  *        游戏主状态机据此进入 STAGE_PLAN_PATH (Sokoban_Solve_Stage2)
@@ -65,7 +65,7 @@ typedef enum
     RECOG_SUB_FACE,            /* 原地旋转车头朝向物体                     */
     RECOG_SUB_SAMPLE,          /* 按 request_id 连续确认视觉分类结果       */
     RECOG_SUB_RETURN_YAW,      /* 旧调试枚举: 采样后保持当前 yaw, 不再回正 */
-    RECOG_SUB_NEXT,            /* 当前物体完成, 切下一个                   */
+    RECOG_SUB_NEXT,            /* 当前物体完成/延后, 全局选下一个          */
     RECOG_SUB_DONE,            /* 全部完成 (对外输出 DONE_OK 一帧后归 INIT)*/
     RECOG_SUB_FAIL             /* 不可达或视觉超时                         */
 } AppRecognizeSub_e;
@@ -80,7 +80,7 @@ typedef struct
     uint8  current_idx;         /* 当前正在识别第几个                    */
     uint8  current_kind;        /* APP_LINK_OBJ_KIND_BOX / TARGET        */
     uint8  current_class_id;    /* 当前连续确认的 class_id (0=未确定)    */
-    uint16 sample_count;        /* 已采样次数 (调试用)                   */
+    uint16 sample_count;        /* 当前请求已收到的视觉最终结果帧数       */
     uint8  visited_count;       /* 已实测并确认类别的物体数              */
     uint8  inferred_count;      /* 恒 0：排除法推断已移除, 字段保留兼容    */
     uint8  resolved_box;        /* 已确定 class_id 的箱子数              */
