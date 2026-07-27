@@ -81,8 +81,56 @@ def test_stage3_partial_match_keeps_bomb_replanning() -> None:
     assert batch['phases'][-1]['kind'] == 'push'
 
 
+def test_remaining_single_box_skips_recognition_in_stage2() -> None:
+    game_map = sv._make_empty_map()
+    game_map[5][5] = sv.BOX
+    game_map[5][8] = sv.TARGET
+
+    mapping = sv.mapping_for_remaining_rescan(game_map)
+    assert mapping == [0]
+
+    batch = sv.solve_recognized_batch(2, game_map, (5, 4), mapping)
+    assert batch is not None
+    assert batch['status'] == 'pushed'
+    assert batch['matched_count'] == 1
+    assert not batch['needs_rescan']
+
+
+def test_remaining_single_box_keeps_stage3_bomb_replanning() -> None:
+    game_map = sv._make_empty_map()
+    for row in range(1, 11):
+        game_map[row][7] = sv.WALL
+    game_map[4][3] = sv.BOX
+    game_map[4][10] = sv.TARGET
+    game_map[5][5] = sv.BOMB
+
+    mapping = sv.mapping_for_remaining_rescan(game_map)
+    assert mapping == [0]
+
+    batch = sv.solve_recognized_batch(3, game_map, (6, 2), mapping)
+    assert batch is not None
+    assert batch['status'] == 'pushed'
+    assert not batch['needs_rescan']
+    assert any(phase['kind'] == 'bomb' for phase in batch['phases'])
+    assert batch['phases'][-1]['kind'] == 'push'
+
+
+def test_remaining_rescan_requires_exactly_one_box_and_target() -> None:
+    game_map = sv._make_empty_map()
+    game_map[5][5] = sv.BOX
+    assert sv.mapping_for_remaining_rescan(game_map) is None
+
+    game_map[5][8] = sv.TARGET
+    game_map[7][5] = sv.BOX
+    game_map[7][8] = sv.TARGET
+    assert sv.mapping_for_remaining_rescan(game_map) is None
+
+
 if __name__ == '__main__':
     test_zero_match_requests_rescan()
     test_stage2_pushes_partial_match_then_rescans()
     test_stage3_partial_match_keeps_bomb_replanning()
+    test_remaining_single_box_skips_recognition_in_stage2()
+    test_remaining_single_box_keeps_stage3_bomb_replanning()
+    test_remaining_rescan_requires_exactly_one_box_and_target()
     print('partial recognition retry tests passed')

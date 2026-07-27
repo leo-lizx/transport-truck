@@ -150,6 +150,7 @@ static uint8                 g_box_to_target[SOKOBAN_MAX_BOXES] = {0};
 static uint8                 s_matched_box_count = 0U;
 static uint8                 s_partial_batch_active = 0U;
 static uint8                 s_partial_target_mask = 0U;
+static uint8                 s_remaining_task_rescan = 0U;
 static uint8                 s_partial_plan_map[MAP_ROWS][MAP_COLS];
 static uint8                 s_partial_plan_mapping[SOKOBAN_MAX_BOXES];
 static ExecMode_e            g_exec_mode = EXEC_NONE;
@@ -576,6 +577,19 @@ static uint8 get_map_box_count(void)
     for (int8 r = (int8)CHASSIS_GRID_INNER_MIN_Y; r <= (int8)CHASSIS_GRID_INNER_MAX_Y; r++) {
         for (int8 c = (int8)CHASSIS_GRID_INNER_MIN_X; c <= (int8)CHASSIS_GRID_INNER_MAX_X; c++) {
             if (g_game_map[r][c] == MAP_BOX) {
+                count++;
+            }
+        }
+    }
+    return count;
+}
+
+static uint8 get_map_target_count(void)
+{
+    uint8 count = 0U;
+    for (int8 r = (int8)CHASSIS_GRID_INNER_MIN_Y; r <= (int8)CHASSIS_GRID_INNER_MAX_Y; r++) {
+        for (int8 c = (int8)CHASSIS_GRID_INNER_MIN_X; c <= (int8)CHASSIS_GRID_INNER_MAX_X; c++) {
+            if (g_game_map[r][c] == MAP_TARGET) {
                 count++;
             }
         }
@@ -1057,7 +1071,7 @@ static void prepare_launch_departure(void)
 }
 
 /* 链路恢复或部分批次完成后，均从当前空地建立新帧栅栏并重读地图。 */
-static void prepare_map_rescan_wait(void)
+static void prepare_map_rescan_wait(uint8 remaining_task_rescan)
 {
     chassis_ctrl_stop();
     s_map_accepted = 0U;
@@ -1065,6 +1079,7 @@ static void prepare_map_rescan_wait(void)
     reset_exec_context();
     map_snapshot_release();
     clear_box_target_mapping();
+    s_remaining_task_rescan = remaining_task_rescan;
     App_Recognize_Reset();
 
     s_recovery_map_baseline_frame_id = g_link_map_frame_id;
@@ -1090,6 +1105,7 @@ void Game_Logic_Init(void)
     s_map_snapshot_frame_id = 0U;
     s_map_has_bomb_cached = 0U;
     s_map_has_bomb_valid = 0U;
+    s_remaining_task_rescan = 0U;
     reset_exec_context();
     /* 上电发车位置就是 (1,5)，首次启动跳过返航子阶段；关间返航仍从 phase 0 开始。 */
     s_wait_start_phase = 1U;
@@ -1228,6 +1244,10 @@ static void stage_wait_map_refresh_handler(void)
 
 static void stage_wait_recovery_map_handler(void)
 {
+    uint8 box_count;
+    uint8 target_count;
+    uint8 remaining_task_rescan;
+
     /* 链路恢复/部分批次重读阶段始终停车；仅在线时消费新帧。 */
     if (s_link_alive == 0U) {
         return;
@@ -1243,8 +1263,23 @@ static void stage_wait_recovery_map_handler(void)
     map_snapshot_freeze();
     publish_frozen_map_for_display();
 
+    box_count = get_map_box_count();
+    target_count = get_map_target_count();
+    remaining_task_rescan = s_remaining_task_rescan;
+    s_remaining_task_rescan = 0U;
+
+    /* 部分批次后的稳定地图若只剩唯一箱子与目标点，其对应关系已唯一，无需再跑类别识别。 */
+    if (remaining_task_rescan != 0U &&
+        box_count == 1U && target_count == 1U) {
+        g_box_to_target[0] = 0U;
+        s_matched_box_count = 1U;
+        reset_exec_context();
+        goto_stage(STAGE_PLAN_PATH);
+        return;
+    }
+
     /* 掉线期间或上一部分批次若已完成最后一箱，直接进入本关完成判定。 */
-    current_stage = (get_map_box_count() == 0U)
+    current_stage = (box_count == 0U)
                   ? STAGE_LEVEL_JUDGE
                   : STAGE_RECOGNIZE_MAP;
 }
@@ -1273,7 +1308,7 @@ static void stage_recognize_handler(void)
             s_partial_batch_active = 1U;
             if (s_matched_box_count == 0U) {
                 /* 本轮没有任何同类可行配对：不空跑求解器，直接等新图重识别。 */
-                prepare_map_rescan_wait();
+                prepare_map_rescan_wait(1U);
                 return;
             }
             map_snapshot_freeze();
@@ -1379,7 +1414,7 @@ static void stage_plan_handler(void)
         }
         if (s_partial_batch_active != 0U) {
             /* 第三关本轮匹配受阻且现有炸弹也无法破局，重新识别而非误判整关失败。 */
-            prepare_map_rescan_wait();
+            prepare_map_rescan_wait(1U);
             return;
         }
         goto_stage(STAGE_DEADLOCK_RESET);
@@ -1398,7 +1433,7 @@ static void stage_plan_handler(void)
         else if (s_partial_batch_active != 0U)
         {
             if (build_partial_plan_problem() == 0U) {
-                prepare_map_rescan_wait();
+                prepare_map_rescan_wait(1U);
                 return;
             }
             begin_ok = Sokoban_Stage2_Search_Begin(
@@ -1418,7 +1453,7 @@ static void stage_plan_handler(void)
             g_soko_exec_init = 0U;
             if (s_partial_batch_active != 0U &&
                 current_level_number() == 2U) {
-                prepare_map_rescan_wait();
+                prepare_map_rescan_wait(1U);
                 return;
             }
             s_plan_mode = PLAN_MODE_BOMB;
@@ -1468,7 +1503,7 @@ static void stage_push_search_idle_step(void)
 
     if (s_partial_batch_active != 0U &&
         current_level_number() == 2U) {
-        prepare_map_rescan_wait();
+        prepare_map_rescan_wait(1U);
         return;
     }
     s_plan_mode = PLAN_MODE_BOMB;
@@ -1507,7 +1542,7 @@ static void stage_execute_handler(void)
     if (done) {
         if (s_partial_batch_active != 0U) {
             /* 最后一推后车位于原箱子格（空地），直接在此等待新地图。 */
-            prepare_map_rescan_wait();
+            prepare_map_rescan_wait(1U);
         } else {
             reset_exec_context();
             goto_stage(STAGE_LEVEL_JUDGE);
@@ -1740,7 +1775,7 @@ static void recover_from_link_pause(void)
         }
         /* 规划/识别/执行期掉线后不得冻结并复用掉线前地图。
          * 从恢复时刻建立新帧栅栏，等待 5 帧新鲜一致地图后再识别/重规划。 */
-        prepare_map_rescan_wait();
+        prepare_map_rescan_wait(0U);
         (void)s_stage_resume;
     }
 }

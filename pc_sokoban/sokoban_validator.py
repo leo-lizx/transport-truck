@@ -1214,6 +1214,15 @@ def _solve_stage1_greedy(the_map: list, player_pos: tuple) -> Optional[dict]:
 # Stage 2 求解 — 指定箱→目标映射
 # ============================================================
 
+def mapping_for_remaining_rescan(the_map: list) -> Optional[list]:
+    """部分批次复扫只剩一个箱子和一个目标点时，返回其唯一映射。"""
+    boxes = extract_elements(the_map, BOX)
+    targets = extract_elements(the_map, TARGET)
+    if len(boxes) == 1 and len(targets) == 1:
+        return [0]
+    return None
+
+
 def build_partial_stage2_problem(the_map: list,
                                  box_to_target_idx: list) -> Optional[dict]:
     """
