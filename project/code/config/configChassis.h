@@ -735,14 +735,14 @@
 /** Yaw 角度精度权重 (°⁻²): 大→转得猛/停得准, 小→柔和.
  *  H 矩阵中实际贡献 = Q_POS × dt² × (N+QF) = Q_POS × 0.006,
  *  需要 ≥ 0.04 才能与 R_VEL 抗衡. Q_POS=12 时 pos 贡献 ≈ 0.072, 与 R_VEL 持平. */
-#define CHASSIS_MPC_YAW_Q_POS                   (1.60f)
+#define CHASSIS_MPC_YAW_Q_POS                   (3.60f)
 
 /** Yaw 角速度代价 (s²/°²): 大→转速降低, 小→更接近 max_yaw_speed.
  *  Q_POS=12 + R_VEL=0.04 组合: err=5°→320dps, err=2°→140dps, err=0.5°→35dps. */
-#define CHASSIS_MPC_YAW_R_VEL                   (0.10f)
+#define CHASSIS_MPC_YAW_R_VEL                   (0.08f)
 
 /** Yaw 角速度平滑代价: 大→加速柔和, 小→响应快 */
-#define CHASSIS_MPC_YAW_R_SMOOTH                (0.01f)
+#define CHASSIS_MPC_YAW_R_SMOOTH                (0.10f)
 
 /** Yaw 终端角度额外权重: Q_term = Q_POS * 此值 */
 #define CHASSIS_MPC_YAW_QF_FACTOR               (5.0f)
