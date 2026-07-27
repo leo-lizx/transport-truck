@@ -157,11 +157,11 @@ except Exception as e:
     raise e
 
 # 方式 A：从文件加载标签 (推荐，和逐飞历程一致)
-# 确保 SD 卡里有一个 labels.txt，里面按训练时的顺序写满 21 个类别的名字
+# 确保 SD 卡里有一个 labels.txt，里面按训练时的顺序写满 20 个类别的名字
 try:
     labels = [line.rstrip() for line in open("/sd/labels.txt")]
 except:
-    # 方式 B：如果不想建 txt 文件，可以直接在这里把 21 个类别写死
+    # 方式 B：如果不想建 txt 文件，可以直接在这里把 20 个类别写死
     print("未找到 labels.txt，使用默认标签")
     labels = [
         "00mickey_mouse",
@@ -174,7 +174,6 @@ except:
         "07gg_bond",
         "08calabash_brothers",
         "09grey_wolf",
-        "background",
         "num_0",
         "num_1",
         "num_2",
@@ -221,8 +220,8 @@ while(True):
             candidate_start = 0
             candidate_end = 10
         else:
-            candidate_start = 11
-            candidate_end = 21
+            candidate_start = 10
+            candidate_end = 20
 
         max_index = candidate_start
         for index in range(candidate_start + 1, candidate_end):
@@ -245,19 +244,26 @@ while(True):
         # ==========================================
 
         mapped_obj_kind = active_request_kind
-        mapped_class_id = 0 # 默认 0 表示未识别/背景
+        mapped_class_id = 0 # 默认 0 表示未识别/置信度不足
 
-        # 指定集合的最佳结果必须同时超过 70% 且强于背景，才算确切识别。
-        if max_confidence > 0.70 and max_confidence > predictions[10]:
+        # 20 类模型没有背景类别；指定集合的最佳结果超过 70% 才算确切识别。
+        if max_confidence > 0.70:
             if active_request_kind == OBJ_KIND_BOX:
                 mapped_class_id = max_index + 1
             else:
-                mapped_class_id = (max_index - 11) + 1
+                mapped_class_id = (max_index - 10) + 1
+
+        confidence_pct = int(max_confidence * 100)
+        if confidence_pct < 0:
+            confidence_pct = 0
+        elif confidence_pct > 100:
+            confidence_pct = 100
 
         # 【构造 BOX_CLASS 帧】
         # TYPE=0x02，PAYLOAD 回传本次主控 request_id。
-        # PAYLOAD = [obj_kind, class_id, vision_seq, request_id]
-        data_packet = bytes([mapped_obj_kind, mapped_class_id, vision_seq, active_request_id])
+        # PAYLOAD = [obj_kind, class_id, vision_seq, request_id, confidence_pct]
+        data_packet = bytes([mapped_obj_kind, mapped_class_id, vision_seq,
+                             active_request_id, confidence_pct])
 
         # 使用 pack_frame 打包并发送 (会自动加上 AA 55、TYPE、LEN、CRC)
         uart.write(pack_frame(0x02, data_packet))

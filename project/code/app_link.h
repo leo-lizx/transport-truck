@@ -56,13 +56,14 @@ typedef enum
 } app_link_type_e;
 
 /*-- BOX_CLASS 帧载荷常量 (识别 tour) -----------------------------------------------------------------------------
- * Payload 4 字节: [obj_kind][class_id][seq][request_id]
+ * Payload 5 字节: [obj_kind][class_id][seq][request_id][confidence_pct]
  *   obj_kind : 0=BOX(图片箱子)  1=TARGET(数字目标)
- *   class_id : 1..N 有效类别;  0 = 无识别 / 背景
+ *   class_id : 1..N 有效类别;  0 = 无识别 / 置信度不足
  *   seq      : 视觉端自增 seq, 用于丢包/防重统计 (主控不据此切流)
  *   request_id: 原样回传主控请求编号；主控只采纳当前请求的结果
+ *   confidence_pct: 模型置信率百分数, 0..100
  *--------------------------------------------------------------------------------------------------------------*/
-#define APP_LINK_BOX_CLASS_PAYLOAD_LEN  (4U)
+#define APP_LINK_BOX_CLASS_PAYLOAD_LEN  (5U)
 #define APP_LINK_RECOG_REQUEST_PAYLOAD_LEN (2U)
 #define APP_LINK_OBJ_KIND_BOX           (0U)
 #define APP_LINK_OBJ_KIND_TARGET        (1U)
@@ -230,6 +231,7 @@ typedef struct
     uint8  class_id;    /* 1..N (0 = 无识别)                                     */
     uint8  vision_seq;  /* 视觉端自增 seq, 透传                                  */
     uint8  request_id;  /* 视觉端回传的主控识别请求编号                           */
+    uint8  confidence_pct; /* 模型置信率百分数, 0..100                            */
     uint32 stamp_ms;    /* 落地时间, 与 app_link_get_ms() 同源                   */
     uint32 frame_id;    /* 主控侧帧号, 每收到一帧自增                            */
     uint8  valid;       /* 至少收到过一帧合法 BOX_CLASS                          */

@@ -117,6 +117,7 @@ static volatile uint8  s_box_cls_kind     = 0U;
 static volatile uint8  s_box_cls_id       = 0U;
 static volatile uint8  s_box_cls_vseq     = 0U;
 static volatile uint8  s_box_cls_request_id = 0U;
+static volatile uint8  s_box_cls_confidence_pct = 0U;
 static volatile uint32 s_box_cls_ms       = 0U;
 static volatile uint32 s_box_cls_frame_id = 0U;
 static volatile uint8  s_box_cls_valid    = 0U;
@@ -174,7 +175,8 @@ void app_link_get_car_snapshot(app_link_car_snapshot_t *out)
  * BOX_CLASS 帧 - ISR 写入 (载荷已经过 LEN/CRC 校验)
  *-----------------------------------------------------------------------------------------------------------------*/
 static void commit_box_class_frame(uint8 obj_kind, uint8 class_id,
-                                   uint8 vision_seq, uint8 request_id)
+                                   uint8 vision_seq, uint8 request_id,
+                                   uint8 confidence_pct)
 {
     if ((s_box_cls_vseq_seen != 0U) &&
         (vision_seq != (uint8)(s_box_cls_last_vseq + 1U)))
@@ -190,6 +192,7 @@ static void commit_box_class_frame(uint8 obj_kind, uint8 class_id,
     s_box_cls_id       = class_id;
     s_box_cls_vseq     = vision_seq;
     s_box_cls_request_id = request_id;
+    s_box_cls_confidence_pct = confidence_pct;
     s_box_cls_ms       = s_ms_now;
     s_box_cls_frame_id++;
     s_box_cls_valid    = 1U;
@@ -214,6 +217,7 @@ void app_link_get_box_class_snapshot(app_link_box_class_snapshot_t *out)
         out->class_id   = s_box_cls_id;
         out->vision_seq = s_box_cls_vseq;
         out->request_id = s_box_cls_request_id;
+        out->confidence_pct = s_box_cls_confidence_pct;
         out->stamp_ms   = s_box_cls_ms;
         out->frame_id   = s_box_cls_frame_id;
         out->valid      = s_box_cls_valid;
@@ -617,6 +621,7 @@ static void dispatch_frame(app_link_port_e port, const app_link_parser_t *parser
             uint8 class_id;
             uint8 vision_seq;
             uint8 request_id;
+            uint8 confidence_pct;
 
             if (port != APP_LINK_PORT_CLASS)
             {
@@ -632,14 +637,17 @@ static void dispatch_frame(app_link_port_e port, const app_link_parser_t *parser
             class_id   = parser->rx_payload[1];
             vision_seq = parser->rx_payload[2];
             request_id = parser->rx_payload[3];
-            if ((obj_kind != APP_LINK_OBJ_KIND_BOX) &&
-                (obj_kind != APP_LINK_OBJ_KIND_TARGET) ||
-                (request_id == 0U))
+            confidence_pct = parser->rx_payload[4];
+            if (((obj_kind != APP_LINK_OBJ_KIND_BOX) &&
+                 (obj_kind != APP_LINK_OBJ_KIND_TARGET)) ||
+                (request_id == 0U) ||
+                (confidence_pct > 100U))
             {
                 stats_inc_len_err(port);
                 break;
             }
-            commit_box_class_frame(obj_kind, class_id, vision_seq, request_id);
+            commit_box_class_frame(obj_kind, class_id, vision_seq, request_id,
+                                   confidence_pct);
             stats_inc_ok(port);
             g_link_last_box_class_ms  = s_ms_now;
             g_link_last_class_link_ms = s_ms_now;
@@ -710,6 +718,7 @@ void app_link_init(void)
     s_box_cls_id       = 0U;
     s_box_cls_vseq     = 0U;
     s_box_cls_request_id = 0U;
+    s_box_cls_confidence_pct = 0U;
     s_box_cls_ms       = 0U;
     s_box_cls_frame_id = 0U;
     s_box_cls_valid    = 0U;
