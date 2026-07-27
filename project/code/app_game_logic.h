@@ -74,7 +74,7 @@ typedef enum {
     STAGE_DEADLOCK_RESET,           // 异常停车：自动死局返航/重置暂时关闭
     STAGE_DONE,                     // 全流程完成
     STAGE_PAUSE_ON_LINK_LOSS,       // 【P0-2】视觉链路超时刹停
-    STAGE_WAIT_RECOVERY_MAP         // 断链恢复/部分批次完成：原地等待新鲜稳定地图后重规划
+    STAGE_WAIT_RECOVERY_MAP         // 断链恢复/部分批次/推完校验：原地等待新鲜稳定地图
 } GameStage_e;
 
 /* Race-flow diagnostics for the IPS status line. */

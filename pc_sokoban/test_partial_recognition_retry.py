@@ -126,6 +126,35 @@ def test_remaining_rescan_requires_exactly_one_box_and_target() -> None:
     assert sv.mapping_for_remaining_rescan(game_map) is None
 
 
+def test_post_push_valid_remaining_map_enters_rescue() -> None:
+    game_map = sv._make_empty_map()
+    game_map[3][3] = sv.BOX
+    game_map[7][3] = sv.BOX
+    game_map[3][10] = sv.TARGET
+    game_map[7][10] = sv.TARGET
+
+    decision = sv.post_push_verification_decision(game_map)
+    assert decision['status'] == 'recognize_remaining'
+
+    game_map[7][3] = sv.EMPTY
+    game_map[7][10] = sv.EMPTY
+    decision = sv.post_push_verification_decision(game_map)
+    assert decision == {'status': 'direct_push', 'mapping': [0]}
+
+
+def test_post_push_blank_map_completes_only_after_timeout() -> None:
+    blank_map = [
+        [sv.EMPTY for _ in range(sv.MAP_COLS)]
+        for _ in range(sv.MAP_ROWS)
+    ]
+
+    assert sv.post_push_verification_decision(blank_map) == {
+        'status': 'wait_for_map'}
+    assert sv.post_push_verification_decision(
+        blank_map, timed_out=True) == {
+            'status': 'complete', 'reason': 'blank_timeout'}
+
+
 if __name__ == '__main__':
     test_zero_match_requests_rescan()
     test_stage2_pushes_partial_match_then_rescans()
@@ -133,4 +162,6 @@ if __name__ == '__main__':
     test_remaining_single_box_skips_recognition_in_stage2()
     test_remaining_single_box_keeps_stage3_bomb_replanning()
     test_remaining_rescan_requires_exactly_one_box_and_target()
+    test_post_push_valid_remaining_map_enters_rescue()
+    test_post_push_blank_map_completes_only_after_timeout()
     print('partial recognition retry tests passed')

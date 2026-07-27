@@ -1223,6 +1223,28 @@ def mapping_for_remaining_rescan(the_map: list) -> Optional[list]:
     return None
 
 
+def post_push_verification_decision(the_map: Optional[list],
+                                    timed_out: bool = False) -> dict:
+    """镜像第二/三关完整推箱后的地图复核决策。"""
+    if the_map is not None:
+        boxes = extract_elements(the_map, BOX)
+        targets = extract_elements(the_map, TARGET)
+        has_wall = any(WALL in row for row in the_map)
+        is_usable = has_wall and len(boxes) == len(targets) and \
+            len(boxes) <= MAX_BOXES
+        if is_usable:
+            if not boxes:
+                return {'status': 'complete', 'reason': 'valid_empty_map'}
+            mapping = mapping_for_remaining_rescan(the_map)
+            if mapping is not None:
+                return {'status': 'direct_push', 'mapping': mapping}
+            return {'status': 'recognize_remaining'}
+
+    if timed_out:
+        return {'status': 'complete', 'reason': 'blank_timeout'}
+    return {'status': 'wait_for_map'}
+
+
 def build_partial_stage2_problem(the_map: list,
                                  box_to_target_idx: list) -> Optional[dict]:
     """
