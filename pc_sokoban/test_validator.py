@@ -255,14 +255,59 @@ assert scout8h['inferred_count'] == 0
 assert 0 in scout8h['box_classes']
 print("混合 Tour 可先确认其他物体，但无有效类别的箱子仍会阻止最终配对。")
 
-print("\n=== Test 8i: target class outside remaining box multiset is rejected ===")
+print("\n=== Test 8i: mismatched classes finish observation and request rescan ===")
 scout8i = sv.plan_scout_phase_v2(
     m8h, (5, 2), box_classes=[1, 2], target_classes=[9, 9])
-assert not scout8i['all_visited']
+assert scout8i['all_visited']
 assert scout8i['inferred_count'] == 0
-assert scout8i['target_classes'].count(9) <= scout8i['box_classes'].count(9) + \
-       scout8i['box_classes'].count(0)
-print("混合 Tour 仅在剩余异类槽位仍可能配平时接受当前类别。")
+assert scout8i['matched_count'] == 0
+assert scout8i['box_to_target_idx'] == [
+    sv.UNMATCHED_TARGET, sv.UNMATCHED_TARGET]
+batch8i = sv.solve_recognized_batch(
+    2, m8h, scout8i['player_after_scout'],
+    scout8i['box_to_target_idx'])
+assert batch8i is not None
+assert batch8i['status'] == 'rescan_without_push'
+assert batch8i['needs_rescan']
+print("错误类别仍完成整轮观察；无匹配项时原地等待新地图重识别。")
+
+print("\n=== Test 8j: partial matches are pushed before rescan ===")
+scout8j = sv.plan_scout_phase_v2(
+    m8h, (5, 2), box_classes=[1, 2], target_classes=[1, 9])
+assert scout8j['all_visited']
+assert scout8j['matched_count'] == 1
+assert scout8j['box_to_target_idx'] == [0, sv.UNMATCHED_TARGET]
+problem8j = sv.build_partial_stage2_problem(
+    m8h, scout8j['box_to_target_idx'])
+assert problem8j is not None
+assert problem8j['map'][7][3] == sv.WALL
+assert problem8j['map'][7][10] == sv.EMPTY
+batch8j = sv.solve_recognized_batch(
+    2, m8h, scout8j['player_after_scout'],
+    scout8j['box_to_target_idx'])
+assert batch8j is not None and batch8j['status'] == 'pushed'
+assert batch8j['matched_count'] == 1 and batch8j['needs_rescan']
+assert len(batch8j['push_result']['sub_solutions']) == 1
+assert problem8j['map'][batch8j['player_after'][0]][batch8j['player_after'][1]] \
+       in (sv.EMPTY, sv.TARGET)
+print("未匹配箱保留为障碍；已匹配箱完成后车辆停在空地并进入重读图。")
+
+print("\n=== Test 8k: Stage3 partial batch preserves bomb replanning ===")
+m8k = sv._make_empty_map()
+for row8k in range(1, 11):
+    m8k[row8k][7] = sv.WALL
+m8k[4][3] = sv.BOX
+m8k[8][3] = sv.BOX
+m8k[4][10] = sv.TARGET
+m8k[8][10] = sv.TARGET
+m8k[5][5] = sv.BOMB
+batch8k = sv.solve_recognized_batch(
+    3, m8k, (6, 2), [0, sv.UNMATCHED_TARGET])
+assert batch8k is not None and batch8k['status'] == 'pushed'
+assert batch8k['needs_rescan'] and batch8k['matched_count'] == 1
+assert any(phase['kind'] == 'bomb' for phase in batch8k['phases'])
+assert batch8k['phases'][-1]['kind'] == 'push'
+print("第三关先按已匹配目标炸墙并推箱，随后同样进入剩余地图重识别。")
 
 # 测试9: V2 + Stage2 完整求解 (走真实路径)
 print("\n=== 测试9: V2 完整求解 ===")

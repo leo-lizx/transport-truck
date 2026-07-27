@@ -54,8 +54,8 @@ visual-group/
 | 模块 | 作用 |
 |------|------|
 | `app_link.*` | OpenART 串口协议解析、地图/分类/位姿快照维护 |
-| `app_game_logic.*` | 游戏主状态机，组织识别、规划、执行和关卡切换 |
-| `app_recognize.*` | 箱子与目标识别流程，生成箱子到目标的类别映射 |
+| `app_game_logic.*` | 游戏主状态机，组织识别、规划、执行、部分匹配重读图和关卡切换 |
+| `app_recognize.*` | 箱子与目标识别流程，生成完整或最大可行子集的类别映射 |
 | `app_recognize_clear.*` | 识别路径被阻挡时的清障规划 |
 | `app_vision_fusion.*` | OpenART 视觉位姿与底盘里程计融合 |
 | `algo_sokoban_solver.*` | 推箱子求解、导航 BFS、死局判断和炸弹规划 |
@@ -75,6 +75,7 @@ visual-group/
 |------|------|
 | `sokoban_validator.py` | Python 版地图、BFS、死局与炸弹规划验证器 |
 | `test_validator.py` | 验证器测试用例 |
+| `test_partial_recognition_retry.py` | 第二/三关部分匹配优先执行与重读图回归 |
 | `sokoban_car_sim.py` | 小车推箱仿真辅助脚本 |
 
 ## 工程入口

@@ -44,6 +44,7 @@ BOX    = 3
 BOMB   = 4
 
 MAX_BOXES = 8
+UNMATCHED_TARGET = 0xFF
 
 # 单次推箱最大步数（镜像 C 端 algo_sokoban_solver.h::SOKOBAN_MAX_ACTIONS）
 SOKOBAN_MAX_ACTIONS = 500
@@ -559,6 +560,7 @@ def plan_scout_phase_v2(the_map: list, player_start: tuple,
     返回:
         scout_actions, scout_waypoints, visits, player_after_scout,
         all_visited, box_classes, target_classes, box_to_target_idx,
+        matched_count, mapping_complete,
         visited_count, inferred_count(恒 0)/inferred_targets(恒 [], 保留兼容)
     """
     boxes   = extract_elements(the_map, BOX)
@@ -611,21 +613,6 @@ def plan_scout_phase_v2(the_map: list, player_start: tuple,
 
     def all_resolved() -> bool:
         return all(it['ok'] for it in items)
-
-    def class_assignment_still_possible(kind: str, class_id: int) -> bool:
-        if class_id <= 0:
-            return False
-        box_count = sum(it['kind'] == 'box' and it['ok'] and
-                        it['class_id'] == class_id for it in items)
-        target_count = sum(it['kind'] == 'target' and it['ok'] and
-                           it['class_id'] == class_id for it in items)
-        unresolved_boxes = sum(it['kind'] == 'box' and not it['ok'] for it in items)
-        unresolved_targets = sum(it['kind'] == 'target' and not it['ok'] for it in items)
-        if kind == 'box':
-            return box_count < target_count + unresolved_targets
-        if kind == 'target':
-            return target_count < box_count + unresolved_boxes
-        return False
 
     def observe_options(target: tuple) -> list:
         opts = []
@@ -803,7 +790,7 @@ def plan_scout_phase_v2(the_map: list, player_start: tuple,
         path = route[0]
 
         cls = best_it['truth_class']
-        if cls <= 0 or not class_assignment_still_possible(best_it['kind'], cls):
+        if cls <= 0:
             # 规划期即知无法确认：不提交该段动作，保证失败返回值里
             # "从起点重放 scout_actions 的落点 == player_after_scout" 不变量。
             break
@@ -839,23 +826,21 @@ def plan_scout_phase_v2(the_map: list, player_start: tuple,
         else:
             out_target_classes[it['item_idx']] = it['class_id']
 
-    box_to_target_idx: list = [0] * n_box
+    box_to_target_idx: list = [UNMATCHED_TARGET] * n_box
+    matched_count = 0
     if all_resolved() and n_box == n_tgt:
         box_done = [False] * n_box
-        ok = True
 
         for bi in range(n_box):
             if box_done[bi]:
                 continue
             cls = out_box_classes[bi]
             if cls == 0:
-                ok = False
                 break
 
             group_boxes = [i for i, c in enumerate(out_box_classes) if c == cls]
             group_targets = [i for i, c in enumerate(out_target_classes) if c == cls]
-            if len(group_boxes) != len(group_targets) or not group_boxes:
-                ok = False
+            if not group_boxes:
                 break
 
             walls_removable = bool(extract_elements(the_map, BOMB))
@@ -864,18 +849,30 @@ def plan_scout_phase_v2(the_map: list, player_start: tuple,
                     the_map, targets[target_idx], walls_removable)
                 for target_idx in group_targets
             }
+            best_count = -1
             best_cost = None
-            best_assign = None
+            best_assign = [UNMATCHED_TARGET] * len(group_boxes)
             used = [False] * len(group_targets)
-            cur_assign = [0] * len(group_boxes)
+            cur_assign = [UNMATCHED_TARGET] * len(group_boxes)
 
-            def dfs(depth: int, cur_cost: int) -> None:
-                nonlocal best_cost, best_assign
-                if best_cost is not None and cur_cost >= best_cost:
+            def dfs(depth: int, cur_count: int, cur_cost: int) -> None:
+                nonlocal best_count, best_cost, best_assign
+                remaining_boxes = len(group_boxes) - depth
+                remaining_targets = len(group_targets) - cur_count
+                max_possible = cur_count + min(remaining_boxes, remaining_targets)
+                if max_possible < best_count:
+                    return
+                if max_possible == best_count and best_cost is not None and \
+                   cur_cost >= best_cost:
                     return
                 if depth >= len(group_boxes):
-                    best_cost = cur_cost
-                    best_assign = list(cur_assign)
+                    if cur_count > best_count or (
+                        cur_count == best_count and
+                        (best_cost is None or cur_cost < best_cost)
+                    ):
+                        best_count = cur_count
+                        best_cost = cur_cost
+                        best_assign = list(cur_assign)
                     return
 
                 box_pos = boxes[group_boxes[depth]]
@@ -887,21 +884,21 @@ def plan_scout_phase_v2(the_map: list, player_start: tuple,
                         continue
                     used[local_ti] = True
                     cur_assign[depth] = target_idx
-                    dfs(depth + 1, cur_cost + step_cost)
+                    dfs(depth + 1, cur_count + 1, cur_cost + step_cost)
                     used[local_ti] = False
+                cur_assign[depth] = UNMATCHED_TARGET
+                dfs(depth + 1, cur_count, cur_cost)
 
-            dfs(0, 0)
-            if best_assign is None:
-                ok = False
-                break
+            dfs(0, 0, 0)
 
             for local_bi, target_idx in enumerate(best_assign):
                 box_idx = group_boxes[local_bi]
                 box_to_target_idx[box_idx] = target_idx
                 box_done[box_idx] = True
-
-        if not ok:
-            box_to_target_idx = []
+                if target_idx != UNMATCHED_TARGET:
+                    matched_count += 1
+    else:
+        box_to_target_idx = []
 
     return {
         'scout_actions':       scout_actions,
@@ -912,6 +909,8 @@ def plan_scout_phase_v2(the_map: list, player_start: tuple,
         'box_classes':         out_box_classes,
         'target_classes':      out_target_classes,
         'box_to_target_idx':   box_to_target_idx,
+        'matched_count':       matched_count,
+        'mapping_complete':    matched_count == n_box and n_box == n_tgt,
         'visited_count':       len(visits),
         # 排除法推断已移除（镜像固件行为）；键保留恒 0/空，维持调用方兼容。
         'inferred_count':      0,
@@ -1214,6 +1213,60 @@ def _solve_stage1_greedy(the_map: list, player_pos: tuple) -> Optional[dict]:
 # ============================================================
 # Stage 2 求解 — 指定箱→目标映射
 # ============================================================
+
+def build_partial_stage2_problem(the_map: list,
+                                 box_to_target_idx: list) -> Optional[dict]:
+    """
+    镜像主控的部分匹配压缩：
+      - 未匹配箱子改成 WALL，保留真实阻挡；
+      - 未匹配目标改成 EMPTY；
+      - 已匹配目标按压缩后的扫描顺序重编号。
+    """
+    boxes = extract_elements(the_map, BOX)
+    targets = extract_elements(the_map, TARGET)
+    if not boxes or len(boxes) != len(targets) or \
+       len(box_to_target_idx) != len(boxes) or len(boxes) > MAX_BOXES:
+        return None
+
+    selected_targets = []
+    selected_boxes = []
+    seen_targets = set()
+    for bi, ti in enumerate(box_to_target_idx):
+        if ti == UNMATCHED_TARGET:
+            continue
+        if not isinstance(ti, int) or ti < 0 or ti >= len(targets) or \
+           ti in seen_targets:
+            return None
+        seen_targets.add(ti)
+        selected_boxes.append(bi)
+        selected_targets.append(ti)
+    if not selected_boxes:
+        return None
+
+    reduced_target_index = {
+        original_idx: reduced_idx
+        for reduced_idx, original_idx in enumerate(sorted(selected_targets))
+    }
+    partial_map = [row[:] for row in the_map]
+    for bi, pos in enumerate(boxes):
+        if box_to_target_idx[bi] == UNMATCHED_TARGET:
+            partial_map[pos[0]][pos[1]] = WALL
+    for ti, pos in enumerate(targets):
+        if ti not in seen_targets:
+            partial_map[pos[0]][pos[1]] = EMPTY
+
+    reduced_mapping = [
+        reduced_target_index[box_to_target_idx[bi]]
+        for bi in selected_boxes
+    ]
+    return {
+        'map': partial_map,
+        'mapping': reduced_mapping,
+        'matched_count': len(selected_boxes),
+        'selected_box_indices': selected_boxes,
+        'selected_target_indices': sorted(selected_targets),
+    }
+
 
 def _solve_stage2_greedy(the_map: list, player_pos: tuple,
                          box_to_target_idx: list) -> Optional[dict]:
@@ -1886,6 +1939,127 @@ def solve_full(the_map: list, player_pos: tuple,
         player = pe
 
     return None     # 轮次预算耗尽
+
+
+def solve_recognized_batch(stage: int, the_map: list, player_pos: tuple,
+                           box_to_target_idx: list,
+                           max_rounds: int = MAX_BOXES + 2) -> Optional[dict]:
+    """
+    镜像第二/三关“先推已匹配子集”的单轮控制逻辑。
+
+    返回 status='pushed' 时，push_result 是本轮应执行的全部已匹配箱；
+    needs_rescan=True 表示执行后应在当前空地重新读图。没有匹配或本轮
+    暂不可解时返回 status='rescan_without_push'。
+    """
+    if stage not in (2, 3):
+        return None
+    boxes = extract_elements(the_map, BOX)
+    targets = extract_elements(the_map, TARGET)
+    if len(boxes) != len(targets) or len(box_to_target_idx) != len(boxes):
+        return None
+
+    matched_count = sum(ti != UNMATCHED_TARGET
+                        for ti in box_to_target_idx)
+    if matched_count == 0:
+        return {
+            'status': 'rescan_without_push',
+            'needs_rescan': True,
+            'matched_count': 0,
+            'phases': [],
+            'map_after_bombs': [row[:] for row in the_map],
+            'player_after': player_pos,
+        }
+
+    work = [row[:] for row in the_map]
+    player = player_pos
+    phases = []
+    for _ in range(max_rounds):
+        problem = build_partial_stage2_problem(work, box_to_target_idx)
+        if problem is None or problem['matched_count'] != matched_count:
+            return None
+
+        push = solve_stage2(problem['map'], player, problem['mapping'],
+                            home_pos=(5, 1))
+        if push is not None:
+            cur = player
+            for sub in push['sub_solutions']:
+                phases.append({
+                    'kind': 'push',
+                    'actions': sub['actions'],
+                    'movable': push['boxes'][sub['box_idx']],
+                    'player_start': cur,
+                })
+                cur = sub['player_end']
+            return {
+                'status': 'pushed',
+                'needs_rescan': matched_count < len(boxes),
+                'matched_count': matched_count,
+                'phases': phases,
+                'push_result': push,
+                'map_after_bombs': work,
+                'player_after': cur,
+            }
+
+        if stage == 2:
+            break
+
+        selected_targets = [
+            targets[ti] for ti in problem['selected_target_indices']
+        ]
+
+        def nearest_selected_target(ref: tuple) -> Optional[tuple]:
+            return min(
+                selected_targets,
+                key=lambda target: abs(target[0] - ref[0]) +
+                                   abs(target[1] - ref[1]),
+                default=None,
+            )
+
+        def first_unreachable_selected_target() -> Optional[tuple]:
+            return next(
+                (target for target in selected_targets
+                 if nav_bfs(work, player, target) is None),
+                None,
+            )
+
+        dead, dead_box = check_deadlock(work)
+        plan = None
+        if dead and dead_box is not None:
+            blocked_target = nearest_selected_target(dead_box)
+            if blocked_target is not None:
+                plan = plan_bomb(work, player, blocked_target)
+        if plan is None:
+            blocked_target = first_unreachable_selected_target()
+            if blocked_target is not None:
+                plan = plan_bomb(work, player, blocked_target)
+        if plan is None and extract_elements(work, BOMB):
+            plan = plan_bomb(work, player, None)
+        if plan is None:
+            break
+
+        bomb, wall, actions = plan
+        phases.append({
+            'kind': 'bomb',
+            'actions': actions,
+            'movable': bomb,
+            'wall': wall,
+            'player_start': player,
+        })
+        player_end, bomb_end = simulate_actions(actions, player, bomb)
+        assert bomb_end == wall, (bomb_end, wall)
+        work[bomb[0]][bomb[1]] = EMPTY
+        apply_bomb_explosion(work, wall)
+        work[wall[0]][wall[1]] = EMPTY
+        player = player_end
+
+    return {
+        'status': 'rescan_without_push',
+        'needs_rescan': True,
+        'matched_count': matched_count,
+        'phases': phases,
+        'map_after_bombs': work,
+        'player_after': player,
+    }
 
 
 def flatten_stage3(raw: Optional[dict], base_map: list) -> Optional[dict]:

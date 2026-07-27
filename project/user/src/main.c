@@ -603,6 +603,8 @@ static uint8               s_l2_sub_idx      = 0U;
 static uint16              s_l2_wp_idx       = 0U;
 static uint8               s_l2_navigating   = 0U;
 static uint8               s_l2_recog_started = 0U;
+static uint8               s_l2_matched_count = 0U;
+static float               s_l2_nav_heading_deg = APP_GAME_LAUNCH_FACE_YAW_DEG;
 static uint16              s_l2_warmup_ticks = 0U;
 static uint16              s_l2_nav_ticks    = 0U;
 static uint32              s_l2_map_recv_ms  = 0U;
@@ -698,7 +700,8 @@ static void main_l2_wait_map_5ms(void)
             printf("L2_ERR=NOT_LEVEL2_BOMB_PRESENT first MAP remains locked\n");
             return;
         }
-        memset(s_l2_box_to_target, 0, sizeof(s_l2_box_to_target));
+        memset(s_l2_box_to_target, APP_RECOG_TARGET_UNMATCHED,
+               sizeof(s_l2_box_to_target));
         App_Recognize_Reset();
         s_l2_recog_started = 0U;
         s_l2_phase = L2_PHASE_WARMUP;
@@ -726,7 +729,9 @@ static void main_l2_recognize_5ms(void)
 
     if (s_l2_recog_started == 0U)
     {
-        memset(s_l2_box_to_target, 0, sizeof(s_l2_box_to_target));
+        memset(s_l2_box_to_target, APP_RECOG_TARGET_UNMATCHED,
+               sizeof(s_l2_box_to_target));
+        s_l2_matched_count = 0U;
         App_Recognize_Reset();
         s_l2_recog_started = 1U;
         printf("L2_RECOG_START grid=%d,%d boxes=%d\n",
@@ -734,7 +739,8 @@ static void main_l2_recognize_5ms(void)
     }
 
     r = App_Recognize_Tick(s_l2_map, cur, main_l2_map_has_bomb(),
-                           2U, s_l2_box_to_target);
+                           2U, &s_l2_nav_heading_deg,
+                           s_l2_box_to_target, &s_l2_matched_count);
     if ((r == APP_RECOG_DONE_OK) || (r == APP_RECOG_DONE_NO_NEED))
     {
         uint8 i, box_count = main_l2_box_count();
@@ -745,6 +751,14 @@ static void main_l2_recognize_5ms(void)
         }
         printf("\n");
         s_l2_phase = L2_PHASE_SOLVE;
+        return;
+    }
+    if (r == APP_RECOG_DONE_PARTIAL)
+    {
+        chassis_ctrl_stop();
+        printf("L2_RECOG_PARTIAL matched=%d standalone test stops\n",
+               (int)s_l2_matched_count);
+        s_l2_phase = L2_PHASE_FAIL;
         return;
     }
     if (r == APP_RECOG_FAIL)

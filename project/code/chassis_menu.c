@@ -492,7 +492,7 @@ static const char *menu_stage_text(GameStage_e stage)
         case STAGE_DEADLOCK_RESET:      return "07 DEADLOCK  ";
         case STAGE_DONE:                return "08 DONE      ";
         case STAGE_PAUSE_ON_LINK_LOSS:  return "09 LINK_LOSS ";
-        case STAGE_WAIT_RECOVERY_MAP:   return "10 RECOVERY  ";
+        case STAGE_WAIT_RECOVERY_MAP:   return "10 RESCAN    ";
         default:                        return "?? UNKNOWN   ";
     }
 }

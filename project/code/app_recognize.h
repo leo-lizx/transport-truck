@@ -15,11 +15,13 @@
  *          - 未确认时直接换其他观察方向（恢复预算 FAIL 兜底），
  *            不允许跳到下一个物体
  *     4) 全部箱子与目标逐一实地确认（不做"最后一个目标"排除法推断）；
- *        随后按类别与静态推送可达性写入映射 g_box_to_target[]
- *        游戏主状态机据此进入 STAGE_PLAN_PATH (Sokoban_Solve_Stage2)
+ *        随后按类别与静态推送可达性写入映射 g_box_to_target[]。类别多重集
+ *        不一致时保留最大可行子集，未匹配箱子写 APP_RECOG_TARGET_UNMATCHED，
+ *        由游戏主状态机先完成已匹配子集，再重新读图识别剩余物体。
  *
  * 输出:
- *   - g_box_to_target[i] : 第 i 个箱子 (按 extract 顺序) 应推到第 ? 号目标 (按 extract 顺序)
+ *   - g_box_to_target[i] : 第 i 个箱子 (按 extract 顺序) 应推到第 ? 号目标 (按 extract 顺序)，
+ *                          APP_RECOG_TARGET_UNMATCHED 表示本轮不执行该箱子
  *   - App_Recognize_Tick 返回值见 AppRecognizeStatus_e, 业务侧据此切 stage
  *
  * 与硬件层契约:
@@ -33,7 +35,8 @@
  *     冷启动, 链路恢复后自动重新走识别流程 (RECOGNIZE_MAP 是恢复点)
  *
  * 资源占用:
- *   - 全部 static, BSS 约 7KB; 单循环线程, 不可重入, 不可在 ISR 调用
+ *   - 全部 static, BSS 约 10KB（含 3KB 部分匹配 DP）;
+ *     单循环线程, 不可重入, 不可在 ISR 调用
  *********************************************************************************************************************/
 #ifndef _APP_RECOGNIZE_H_
 #define _APP_RECOGNIZE_H_
@@ -52,9 +55,13 @@ typedef enum
 {
     APP_RECOG_RUNNING = 0,    /* 仍在识别中, 继续 tick                                  */
     APP_RECOG_DONE_OK,        /* 全部物体识别完成, 映射已写入 g_box_to_target[]         */
+    APP_RECOG_DONE_PARTIAL,   /* 全部物体识别完成, 但仅得到部分可行映射                 */
     APP_RECOG_DONE_NO_NEED,   /* 当前关卡不需要数字识别 (如 Stage1), 直接进 PLAN */
     APP_RECOG_FAIL            /* 物体不可达 / 视觉持续无识别 → 上层应切 DEADLOCK_RESET */
 } AppRecognizeStatus_e;
+
+/** g_box_to_target[] 中表示“本轮未匹配，不进入推箱子集”的目标索引。 */
+#define APP_RECOG_TARGET_UNMATCHED (0xFFU)
 
 /*===================================================================================================================
  * 子状态枚举 — 仅供调试观测 (菜单/IPS), 不要求外部业务依赖具体值
@@ -114,7 +121,8 @@ void App_Recognize_Reset(void);
  * @param nav_heading_deg_io [in,out] 当前逻辑导航航向；输入和输出均限定为
  *        0/90/180/-90 度。观察转向完成后写回该物体对应的正交航向，
  *        后续平移直接保持此值，不根据 IMU 实测角重新选择航向。
- * @param box_to_target_out  [out] 长度 SOKOBAN_MAX_BOXES, DONE_OK 时被填充
+ * @param box_to_target_out  [out] 长度 SOKOBAN_MAX_BOXES, DONE_OK/PARTIAL 时被填充
+ * @param matched_count_out  [out] DONE_OK/PARTIAL 时写入本轮可执行的匹配箱数
  *
  * @return AppRecognizeStatus_e
  */
@@ -123,7 +131,8 @@ AppRecognizeStatus_e App_Recognize_Tick(uint8 map[MAP_ROWS][MAP_COLS],
                                         uint8 has_bomb,
                                         uint8 level,
                                         float *nav_heading_deg_io,
-                                        uint8 box_to_target_out[SOKOBAN_MAX_BOXES]);
+                                        uint8 box_to_target_out[SOKOBAN_MAX_BOXES],
+                                        uint8 *matched_count_out);
 
 /**
  * @brief 取调试信息 (供菜单/IPS显示)

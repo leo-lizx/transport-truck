@@ -145,6 +145,13 @@ static SokoWaypointPath_t    g_bomb_waypoints;
 static uint16                g_bomb_wp_idx = 0;
 
 static uint8                 g_box_to_target[SOKOBAN_MAX_BOXES] = {0};
+/* 第二/三关类别不完全配平时，只规划本轮最大可行匹配子集。未匹配箱子
+ * 在子地图中作为墙保留，避免计划穿过真实仍在场的箱子。 */
+static uint8                 s_matched_box_count = 0U;
+static uint8                 s_partial_batch_active = 0U;
+static uint8                 s_partial_target_mask = 0U;
+static uint8                 s_partial_plan_map[MAP_ROWS][MAP_COLS];
+static uint8                 s_partial_plan_mapping[SOKOBAN_MAX_BOXES];
 static ExecMode_e            g_exec_mode = EXEC_NONE;
 static PlanMode_e            s_plan_mode = PLAN_MODE_PUSH;
 static uint8                 s_bomb_strategy = 0U;
@@ -256,7 +263,7 @@ static uint8 launch_map_is_usable(const uint8 map[MAP_ROWS][MAP_COLS])
                    (launch_cell != MAP_BOMB));
 }
 
-/* 恢复时地图可能已在掉线期间完成最后一次推箱，此时允许箱子/目标同时为零；
+/* 恢复或部分批次重读时可能已完成最后一次推箱，此时允许箱子/目标同时为零；
  * 但两者数量仍必须相等，并要求连续多帧一致。 */
 static uint8 recovery_map_is_usable(const uint8 map[MAP_ROWS][MAP_COLS])
 {
@@ -343,7 +350,7 @@ static uint8 launch_map_stability_tick(uint32 baseline_frame_id)
     return 1U;
 }
 
-/* 断链恢复仍要求多帧一致，避免推箱过程中用单帧旧箱位恢复执行。 */
+/* 断链恢复与部分批次重读均要求多帧一致，避免用单帧旧箱位恢复执行。 */
 static uint8 recovery_map_stability_tick(uint32 baseline_frame_id)
 {
     uint32 frame_id = g_link_map_frame_id;
@@ -448,7 +455,7 @@ static void goto_stage(GameStage_e next)
  * 注意: freeze 取值依赖地图接纳与规划器完成私有拷贝的时序，以及炸弹爆破后
  * 对 PLAN 那一拍的单拍保护，不能化简为"纯 stage→freeze 静态表"。
  *
- * 冻结 (hold, freeze=1) 点: 驶出后新地图稳定/链路恢复进 RECOGNIZE 前、识别完成进入规划前、
+ * 冻结 (hold, freeze=1) 点: 驶出后新地图稳定/恢复或部分批次重读后进 RECOGNIZE 前、识别完成进入规划前、
  *                            炸弹爆破后保护 PLAN_PATH 当拍快照;
  * 解冻 (release, freeze=0) 点: WAIT_START/LAUNCH_EXIT/WAIT_MAP_REFRESH、识别失败、PLAN 完成本拍、DONE。 */
 static void map_snapshot_freeze(void)
@@ -464,7 +471,103 @@ static void map_snapshot_release(void)
 /** 进入新识别轮次前废弃旧的箱子到目标映射。 */
 static void clear_box_target_mapping(void)
 {
-    memset(g_box_to_target, 0, sizeof(g_box_to_target));
+    memset(g_box_to_target, APP_RECOG_TARGET_UNMATCHED,
+           sizeof(g_box_to_target));
+    s_matched_box_count = 0U;
+    s_partial_batch_active = 0U;
+    s_partial_target_mask = 0U;
+}
+
+/**
+ * 将部分类别映射压缩成 Stage2 求解器可直接使用的完整子问题：
+ * - 未匹配箱子改成墙，保持其真实阻挡作用；
+ * - 未匹配目标恢复为空地，保持可行走属性；
+ * - 匹配索引按压缩后行列扫描顺序重新编号。
+ */
+static uint8 build_partial_plan_problem(void)
+{
+    uint8 box_count = 0U;
+    uint8 target_count = 0U;
+    uint8 selected_count = 0U;
+    uint8 target_mask = 0U;
+    uint8 box_idx = 0U;
+    uint8 target_idx = 0U;
+    uint8 reduced_box_idx = 0U;
+    uint8 r;
+    uint8 c;
+
+    if (s_partial_batch_active == 0U ||
+        s_matched_box_count == 0U ||
+        s_matched_box_count > (uint8)SOKOBAN_MAX_BOXES) {
+        return 0U;
+    }
+
+    for (r = 0U; r < (uint8)MAP_ROWS; ++r) {
+        for (c = 0U; c < (uint8)MAP_COLS; ++c) {
+            if (g_game_map[r][c] == MAP_BOX) {
+                box_count++;
+            } else if (g_game_map[r][c] == MAP_TARGET) {
+                target_count++;
+            }
+        }
+    }
+    if (box_count == 0U || box_count != target_count ||
+        box_count > (uint8)SOKOBAN_MAX_BOXES) {
+        return 0U;
+    }
+
+    for (box_idx = 0U; box_idx < box_count; ++box_idx) {
+        uint8 mapped_target = g_box_to_target[box_idx];
+        uint8 target_bit;
+        if (mapped_target == APP_RECOG_TARGET_UNMATCHED) {
+            continue;
+        }
+        if (mapped_target >= target_count) {
+            return 0U;
+        }
+        target_bit = (uint8)(1U << mapped_target);
+        if ((target_mask & target_bit) != 0U) {
+            return 0U;
+        }
+        target_mask = (uint8)(target_mask | target_bit);
+        selected_count++;
+    }
+    if (selected_count != s_matched_box_count) {
+        return 0U;
+    }
+
+    copy_map(s_partial_plan_map, g_game_map);
+    box_idx = 0U;
+    target_idx = 0U;
+    for (r = 0U; r < (uint8)MAP_ROWS; ++r) {
+        for (c = 0U; c < (uint8)MAP_COLS; ++c) {
+            if (g_game_map[r][c] == MAP_BOX) {
+                uint8 mapped_target = g_box_to_target[box_idx++];
+                if (mapped_target == APP_RECOG_TARGET_UNMATCHED) {
+                    s_partial_plan_map[r][c] = MAP_WALL;
+                } else {
+                    uint8 reduced_target_idx = 0U;
+                    uint8 ti;
+                    for (ti = 0U; ti < mapped_target; ++ti) {
+                        if ((target_mask & (uint8)(1U << ti)) != 0U) {
+                            reduced_target_idx++;
+                        }
+                    }
+                    s_partial_plan_mapping[reduced_box_idx++] =
+                        reduced_target_idx;
+                }
+            } else if (g_game_map[r][c] == MAP_TARGET) {
+                if ((target_mask & (uint8)(1U << target_idx)) == 0U) {
+                    s_partial_plan_map[r][c] = MAP_EMPTY;
+                }
+                target_idx++;
+            }
+        }
+    }
+
+    s_partial_target_mask = target_mask;
+    return (uint8)(reduced_box_idx == s_matched_box_count &&
+                   target_idx == target_count);
 }
 
 static uint8 get_map_box_count(void)
@@ -501,10 +604,18 @@ static Point_t choose_nearest_target(Point_t ref)
 {
     Point_t best = {-1, -1};
     int16 best_d = 32767;
+    uint8 target_idx = 0U;
 
     for (int8 r = (int8)CHASSIS_GRID_INNER_MIN_Y; r <= (int8)CHASSIS_GRID_INNER_MAX_Y; r++) {
         for (int8 c = (int8)CHASSIS_GRID_INNER_MIN_X; c <= (int8)CHASSIS_GRID_INNER_MAX_X; c++) {
             if (g_game_map[r][c] != MAP_TARGET) continue;
+            if (s_partial_batch_active != 0U &&
+                (target_idx >= (uint8)SOKOBAN_MAX_BOXES ||
+                 (s_partial_target_mask & (uint8)(1U << target_idx)) == 0U)) {
+                target_idx++;
+                continue;
+            }
+            target_idx++;
 
             int16 dx = (int16)c - (int16)ref.x;
             int16 dy = (int16)r - (int16)ref.y;
@@ -818,6 +929,7 @@ static uint8 exec_push_box_solution(void)
 static uint8 find_first_unreachable_target(Point_t *blocked_target)
 {
     static uint8 reach[MAP_ROWS][MAP_COLS];
+    uint8 target_idx = 0U;
 
     if (!blocked_target) return 0;
 
@@ -830,6 +942,14 @@ static uint8 find_first_unreachable_target(Point_t *blocked_target)
         for (int8 c = (int8)CHASSIS_GRID_INNER_MIN_X; c <= (int8)CHASSIS_GRID_INNER_MAX_X; c++) {
             if (g_game_map[r][c] == MAP_TARGET) {
                 Point_t tp = {c, r};
+                if (s_partial_batch_active != 0U &&
+                    (target_idx >= (uint8)SOKOBAN_MAX_BOXES ||
+                     (s_partial_target_mask &
+                      (uint8)(1U << target_idx)) == 0U)) {
+                    target_idx++;
+                    continue;
+                }
+                target_idx++;
                 if (!Algo_Nav_Is_Reachable(reach, tp)) {
                     *blocked_target = tp;
                     return 1;
@@ -936,7 +1056,8 @@ static void prepare_launch_departure(void)
     reset_launch_map_stability();
 }
 
-static void prepare_recovery_map_wait(void)
+/* 链路恢复或部分批次完成后，均从当前空地建立新帧栅栏并重读地图。 */
+static void prepare_map_rescan_wait(void)
 {
     chassis_ctrl_stop();
     s_map_accepted = 0U;
@@ -1107,7 +1228,7 @@ static void stage_wait_map_refresh_handler(void)
 
 static void stage_wait_recovery_map_handler(void)
 {
-    /* 恢复阶段始终保持停车；仅在链路在线时消费新帧。 */
+    /* 链路恢复/部分批次重读阶段始终停车；仅在线时消费新帧。 */
     if (s_link_alive == 0U) {
         return;
     }
@@ -1122,7 +1243,7 @@ static void stage_wait_recovery_map_handler(void)
     map_snapshot_freeze();
     publish_frozen_map_for_display();
 
-    /* 掉线期间若已完成最后一箱，直接进入本关完成判定。 */
+    /* 掉线期间或上一部分批次若已完成最后一箱，直接进入本关完成判定。 */
     current_stage = (get_map_box_count() == 0U)
                   ? STAGE_LEVEL_JUDGE
                   : STAGE_RECOGNIZE_MAP;
@@ -1134,20 +1255,35 @@ static void stage_recognize_handler(void)
      * 识别 tour 子状态机驱动 (app_recognize.c):
      *   - Stage1 无数字配对要求（有无炸弹均同）→ DONE_NO_NEED 直接放行
      *   - Stage2/3: BOX/TARGET 混合规划最短观察 Tour；当前物体确认后才切换,
-     *               全部实地确认后配对成 box→target 映射写入 g_box_to_target[]
+     *               全部实地确认后写入最大可行 box→target 映射。类别不配平时
+     *               先执行已匹配子集，再从当前空地重读图继续识别剩余项
      *   - 视觉暂时无结果时循环当前物体观察位；路线不可恢复才停车等待人工处理
      * ============================================================ */
     AppRecognizeStatus_e r = App_Recognize_Tick(g_game_map, g_player_pos,
                                                 map_has_bomb(),
                                                 current_level_number(),
                                                 &s_nav_heading_deg,
-                                                g_box_to_target);
+                                                g_box_to_target,
+                                                &s_matched_box_count);
     switch (r)
     {
         case APP_RECOG_RUNNING:
             return;
+        case APP_RECOG_DONE_PARTIAL:
+            s_partial_batch_active = 1U;
+            if (s_matched_box_count == 0U) {
+                /* 本轮没有任何同类可行配对：不空跑求解器，直接等新图重识别。 */
+                prepare_map_rescan_wait();
+                return;
+            }
+            map_snapshot_freeze();
+            reset_exec_context();
+            goto_stage(STAGE_PLAN_PATH);
+            return;
         case APP_RECOG_DONE_OK:
         case APP_RECOG_DONE_NO_NEED:
+            s_partial_batch_active = 0U;
+            s_partial_target_mask = 0U;
             /* 识别使用的是已接纳地图；无论是否清障，都保持冻结到规划器 Begin
              * 完成私有拷贝，避免两阶段之间被迟到地图帧覆盖。 */
             map_snapshot_freeze();
@@ -1241,6 +1377,11 @@ static void stage_plan_handler(void)
             goto_stage(STAGE_EXECUTE_ACTION);
             return;
         }
+        if (s_partial_batch_active != 0U) {
+            /* 第三关本轮匹配受阻且现有炸弹也无法破局，重新识别而非误判整关失败。 */
+            prepare_map_rescan_wait();
+            return;
+        }
         goto_stage(STAGE_DEADLOCK_RESET);
         return;
     }
@@ -1254,6 +1395,16 @@ static void stage_plan_handler(void)
         {
             begin_ok = Sokoban_Stage1_Search_Begin(g_game_map, g_player_pos, home);
         }
+        else if (s_partial_batch_active != 0U)
+        {
+            if (build_partial_plan_problem() == 0U) {
+                prepare_map_rescan_wait();
+                return;
+            }
+            begin_ok = Sokoban_Stage2_Search_Begin(
+                s_partial_plan_map, g_player_pos,
+                s_partial_plan_mapping, s_matched_box_count, home);
+        }
         else
         {
             begin_ok = Sokoban_Stage2_Search_Begin(
@@ -1265,6 +1416,11 @@ static void stage_plan_handler(void)
         if (begin_ok == 0U)
         {
             g_soko_exec_init = 0U;
+            if (s_partial_batch_active != 0U &&
+                current_level_number() == 2U) {
+                prepare_map_rescan_wait();
+                return;
+            }
             s_plan_mode = PLAN_MODE_BOMB;
         }
         return;
@@ -1310,6 +1466,11 @@ static void stage_push_search_idle_step(void)
         return;
     }
 
+    if (s_partial_batch_active != 0U &&
+        current_level_number() == 2U) {
+        prepare_map_rescan_wait();
+        return;
+    }
     s_plan_mode = PLAN_MODE_BOMB;
     s_bomb_strategy = 0U;
     s_bomb_search_started = 0U;
@@ -1344,8 +1505,13 @@ static void stage_execute_handler(void)
     }
 
     if (done) {
-        reset_exec_context();
-        goto_stage(STAGE_LEVEL_JUDGE);
+        if (s_partial_batch_active != 0U) {
+            /* 最后一推后车位于原箱子格（空地），直接在此等待新地图。 */
+            prepare_map_rescan_wait();
+        } else {
+            reset_exec_context();
+            goto_stage(STAGE_LEVEL_JUDGE);
+        }
     }
 }
 
@@ -1574,7 +1740,7 @@ static void recover_from_link_pause(void)
         }
         /* 规划/识别/执行期掉线后不得冻结并复用掉线前地图。
          * 从恢复时刻建立新帧栅栏，等待 5 帧新鲜一致地图后再识别/重规划。 */
-        prepare_recovery_map_wait();
+        prepare_map_rescan_wait();
         (void)s_stage_resume;
     }
 }

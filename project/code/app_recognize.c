@@ -100,6 +100,7 @@
 #define RECOG_TOUR_MASK_COUNT          (1U << RECOG_EXACT_TOUR_ITEM_LIMIT)
 #define RECOG_TOUR_MAX_CANDIDATES      (RECOG_EXACT_TOUR_ITEM_LIMIT * 4U)
 #define RECOG_ROUTE_COST_INF           (0xFFFFU)
+#define RECOG_MATCH_MASK_COUNT         (1U << SOKOBAN_MAX_BOXES)
 
 /** 90° 观察转向的等效路程代价（格）。当前 120°/s 角速度下，单次 90°
  *  转向连同加减速和到位稳定明显慢于单格平移；取 4 格用于优先减少大角度
@@ -122,6 +123,8 @@ typedef struct
 } RecogItem_t;
 
 static AppRecognizeSub_e s_sub_state    = RECOG_SUB_INIT;
+static AppRecognizeStatus_e s_done_status = APP_RECOG_DONE_OK;
+static uint8             s_done_matched_count = 0U;
 static RecogItem_t       s_items[2 * RECOG_MAX_TARGETS];
 static uint8             s_item_count   = 0U;
 static uint8             s_box_count    = 0U;
@@ -173,6 +176,10 @@ static NavPath_t s_pick_nav_path;
 /* 重复类别匹配 scratch：反向推箱 BFS 共用一张距离图和一个 12×16 队列，约 0.6KB BSS。 */
 static Point_t s_match_queue[MAP_ROWS * MAP_COLS];
 static uint16  s_match_cost[SOKOBAN_MAX_BOXES][SOKOBAN_MAX_BOXES];
+/* 最大匹配/最小推数子集 DP：两层 cost + 4bit/箱的目标编码，约 3KB BSS。
+ * 取代递归排列枚举，保证识别完成拍最多 O(8×256×8) 个转移。 */
+static uint16  s_match_dp_cost[2][RECOG_MATCH_MASK_COUNT];
+static uint32  s_match_dp_assign[2][RECOG_MATCH_MASK_COUNT];
 
 /*===================================================================================================================
  * 内部工具
@@ -253,8 +260,6 @@ static uint8 recog_nav_arrived(void)
     return chassis_ctrl_is_arrived();
 }
 
-static uint8 class_assignment_still_possible(uint8 kind, uint8 class_id);
-
 /*===================================================================================================================
  * 指定类型请求 — 连续一致结果判定
  *=================================================================================================================*/
@@ -307,8 +312,7 @@ static int16 sample_confirm_step(uint8 expect_kind)
             /* 迟到帧：忽略且不打断当前请求已经取得的连续结果。 */
         }
         else if ((snap.class_id == 0U) ||
-                 (snap.class_id > (uint8)RECOG_CLASS_ID_MAX) ||
-                 !class_assignment_still_possible(expect_kind, snap.class_id))
+                 (snap.class_id > (uint8)RECOG_CLASS_ID_MAX))
         {
             s_sample_last_class = 0U;
             s_sample_consec_class = 0U;
@@ -431,44 +435,6 @@ static uint8 all_resolved(void)
         if (!s_items[i].ok) { return 0U; }
     }
     return 1U;
-}
-
-/*
- * 混合 Tour 允许先观察任一类型，因此不能再要求“全部箱子已知后目标才有效”。
- * 这里按尚未识别的异类槽位保留容量：当前类别至少仍存在一种完成两侧多重集
- * 配平的可能时才接受，避免已知结果明显超配。
- */
-static uint8 class_assignment_still_possible(uint8 kind, uint8 class_id)
-{
-    uint8 box_matches = 0U;
-    uint8 target_matches = 0U;
-    uint8 unresolved_boxes = 0U;
-    uint8 unresolved_targets = 0U;
-
-    if (class_id == 0U || class_id > (uint8)RECOG_CLASS_ID_MAX) { return 0U; }
-    for (uint8 i = 0U; i < s_item_count; ++i)
-    {
-        if (s_items[i].kind == APP_LINK_OBJ_KIND_BOX)
-        {
-            if (!s_items[i].ok) { ++unresolved_boxes; }
-            else if (s_items[i].class_id == class_id) { ++box_matches; }
-        }
-        else if (s_items[i].kind == APP_LINK_OBJ_KIND_TARGET)
-        {
-            if (!s_items[i].ok) { ++unresolved_targets; }
-            else if (s_items[i].class_id == class_id) { ++target_matches; }
-        }
-    }
-
-    if (kind == APP_LINK_OBJ_KIND_BOX)
-    {
-        return (uint8)(box_matches < (uint8)(target_matches + unresolved_targets));
-    }
-    if (kind == APP_LINK_OBJ_KIND_TARGET)
-    {
-        return (uint8)(target_matches < (uint8)(box_matches + unresolved_boxes));
-    }
-    return 0U;
 }
 
 static void extract_items(const uint8 map[MAP_ROWS][MAP_COLS])
@@ -1056,56 +1022,117 @@ static void build_static_push_distance(const uint8 map[MAP_ROWS][MAP_COLS],
     }
 }
 
-static void search_min_cost_match(const uint8 group_boxes[SOKOBAN_MAX_BOXES],
-                                  const uint8 group_targets[SOKOBAN_MAX_BOXES],
-                                  uint8 group_count,
-                                  uint8 depth,
-                                  uint8 used_mask,
-                                  uint16 cur_cost,
-                                  uint16 *best_cost,
-                                  uint8 cur_assign[SOKOBAN_MAX_BOXES],
-                                  uint8 best_assign[SOKOBAN_MAX_BOXES])
+static uint8 match_mask_popcount(uint8 mask)
 {
-    uint8 i;
+    uint8 count = 0U;
+    while (mask != 0U) {
+        count = (uint8)(count + (mask & 1U));
+        mask >>= 1U;
+    }
+    return count;
+}
 
-    if (depth >= group_count) {
-        if (cur_cost < *best_cost) {
-            *best_cost = cur_cost;
-            for (i = 0U; i < group_count; ++i) {
-                best_assign[i] = cur_assign[i];
+static uint8 find_max_count_min_cost_match(
+    const uint8 group_boxes[SOKOBAN_MAX_BOXES],
+    const uint8 group_targets[SOKOBAN_MAX_BOXES],
+    uint8 group_box_count,
+    uint8 group_target_count,
+    uint8 best_assign[SOKOBAN_MAX_BOXES])
+{
+    uint8 current_layer = 0U;
+    uint8 depth;
+    uint8 best_count = 0U;
+    uint16 best_cost = 0xFFFFU;
+    uint16 best_mask = 0U;
+
+    memset(s_match_dp_cost, 0xFF, sizeof(s_match_dp_cost));
+    memset(s_match_dp_assign, 0xFF, sizeof(s_match_dp_assign));
+    s_match_dp_cost[current_layer][0] = 0U;
+
+    for (depth = 0U; depth < group_box_count; ++depth) {
+        uint8 next_layer = (uint8)(current_layer ^ 1U);
+        uint16 mask;
+
+        /* 默认转移为跳过当前箱子；匹配转移再覆盖更低成本。 */
+        memcpy(s_match_dp_cost[next_layer],
+               s_match_dp_cost[current_layer],
+               sizeof(s_match_dp_cost[next_layer]));
+        memcpy(s_match_dp_assign[next_layer],
+               s_match_dp_assign[current_layer],
+               sizeof(s_match_dp_assign[next_layer]));
+
+        for (mask = 0U; mask < (uint16)RECOG_MATCH_MASK_COUNT; ++mask) {
+            uint16 cur_cost = s_match_dp_cost[current_layer][mask];
+            uint8 target_local_idx;
+            if (cur_cost == 0xFFFFU) { continue; }
+
+            for (target_local_idx = 0U;
+                 target_local_idx < group_target_count;
+                 ++target_local_idx) {
+                uint8 target_bit = (uint8)(1U << target_local_idx);
+                uint16 step_cost;
+                uint16 next_mask;
+                uint16 next_cost;
+                uint32 next_assign;
+                uint8 shift;
+
+                if (((uint8)mask & target_bit) != 0U) { continue; }
+                step_cost =
+                    s_match_cost[group_boxes[depth]]
+                                [group_targets[target_local_idx]];
+                if (step_cost == 0xFFFFU ||
+                    (uint16)(cur_cost + step_cost) < cur_cost) {
+                    continue;
+                }
+
+                next_mask = (uint16)(mask | target_bit);
+                next_cost = (uint16)(cur_cost + step_cost);
+                if (next_cost >= s_match_dp_cost[next_layer][next_mask]) {
+                    continue;
+                }
+
+                shift = (uint8)(depth * 4U);
+                next_assign = s_match_dp_assign[current_layer][mask];
+                next_assign &= ~((uint32)0x0FU << shift);
+                next_assign |= (uint32)target_local_idx << shift;
+                s_match_dp_cost[next_layer][next_mask] = next_cost;
+                s_match_dp_assign[next_layer][next_mask] = next_assign;
             }
         }
-        return;
+        current_layer = next_layer;
     }
 
-    if (cur_cost >= *best_cost) {
-        return;
+    for (uint16 mask = 0U;
+         mask < (uint16)RECOG_MATCH_MASK_COUNT;
+         ++mask) {
+        uint16 cost = s_match_dp_cost[current_layer][mask];
+        uint8 count;
+        if (cost == 0xFFFFU) { continue; }
+        count = match_mask_popcount((uint8)mask);
+        if (count > best_count ||
+            (count == best_count && cost < best_cost)) {
+            best_count = count;
+            best_cost = cost;
+            best_mask = mask;
+        }
     }
 
-    for (i = 0U; i < group_count; ++i) {
-        uint8 bit = (uint8)(1U << i);
-        uint16 step_cost;
-        if ((used_mask & bit) != 0U) { continue; }
-
-        step_cost = s_match_cost[group_boxes[depth]][group_targets[i]];
-        if (step_cost == 0xFFFFU) { continue; }
-        if ((uint16)(cur_cost + step_cost) < cur_cost) { continue; }
-
-        cur_assign[depth] = group_targets[i];
-        search_min_cost_match(group_boxes, group_targets,
-                              group_count,
-                              (uint8)(depth + 1U),
-                              (uint8)(used_mask | bit),
-                              (uint16)(cur_cost + step_cost),
-                              best_cost,
-                              cur_assign,
-                              best_assign);
+    for (depth = 0U; depth < group_box_count; ++depth) {
+        uint8 shift = (uint8)(depth * 4U);
+        uint8 target_local_idx = (uint8)(
+            (s_match_dp_assign[current_layer][best_mask] >> shift) & 0x0FU);
+        best_assign[depth] =
+            (target_local_idx < group_target_count)
+            ? group_targets[target_local_idx]
+            : APP_RECOG_TARGET_UNMATCHED;
     }
+    return best_count;
 }
 
 static uint8 build_box_to_target_mapping(const uint8 map[MAP_ROWS][MAP_COLS],
                                          uint8 has_bomb,
-                                         uint8 box_to_target_out[SOKOBAN_MAX_BOXES])
+                                         uint8 box_to_target_out[SOKOBAN_MAX_BOXES],
+                                         uint8 *matched_count_out)
 {
     uint8 box_class[SOKOBAN_MAX_BOXES];
     uint8 tgt_class[SOKOBAN_MAX_BOXES];
@@ -1115,6 +1142,10 @@ static uint8 build_box_to_target_mapping(const uint8 map[MAP_ROWS][MAP_COLS],
     uint8 tgt_idx_in_extract = 0U;
     int8 r, c;
 
+    if (matched_count_out == NULL) { return 0U; }
+    *matched_count_out = 0U;
+    memset(box_to_target_out, APP_RECOG_TARGET_UNMATCHED,
+           (size_t)SOKOBAN_MAX_BOXES);
     memset(box_class, 0, sizeof(box_class));
     memset(tgt_class, 0, sizeof(tgt_class));
     memset(box_pos, 0, sizeof(box_pos));
@@ -1170,7 +1201,10 @@ static uint8 build_box_to_target_mapping(const uint8 map[MAP_ROWS][MAP_COLS],
         }
     }
 
-    /* 同 class_id 内只保留静态可推组合，并按总推数最小做一一匹配。 */
+    /*
+     * 同 class_id 内先最大化静态可推的匹配数量，再最小化总推数。
+     * 识别结果多重集不一致时，未匹配箱子保留 0xFF，交由下一轮重读图重新识别。
+     */
     {
         uint8 box_done[SOKOBAN_MAX_BOXES] = {0};
         uint8 bi;
@@ -1179,11 +1213,10 @@ static uint8 build_box_to_target_mapping(const uint8 map[MAP_ROWS][MAP_COLS],
             uint8 cls = box_class[bi];
             uint8 group_boxes[SOKOBAN_MAX_BOXES];
             uint8 group_targets[SOKOBAN_MAX_BOXES];
-            uint8 cur_assign[SOKOBAN_MAX_BOXES];
             uint8 best_assign[SOKOBAN_MAX_BOXES];
             uint8 group_box_count = 0U;
             uint8 group_target_count = 0U;
-            uint16 best_cost = 0xFFFFU;
+            uint8 group_matched_count;
             uint8 i;
             uint8 ti;
 
@@ -1201,28 +1234,21 @@ static uint8 build_box_to_target_mapping(const uint8 map[MAP_ROWS][MAP_COLS],
                 }
             }
 
-            if (group_box_count != group_target_count) { return 0U; }
             if (group_box_count == 0U) { return 0U; }
 
-            memset(cur_assign, 0, sizeof(cur_assign));
-            memset(best_assign, 0, sizeof(best_assign));
-            search_min_cost_match(group_boxes, group_targets,
-                                  group_box_count,
-                                  0U, 0U, 0U,
-                                  &best_cost,
-                                  cur_assign,
-                                  best_assign);
-            if (best_cost == 0xFFFFU) { return 0U; }
+            memset(best_assign, APP_RECOG_TARGET_UNMATCHED,
+                   sizeof(best_assign));
+            group_matched_count = find_max_count_min_cost_match(
+                group_boxes, group_targets,
+                group_box_count, group_target_count,
+                best_assign);
+            *matched_count_out =
+                (uint8)(*matched_count_out + group_matched_count);
 
             for (i = 0U; i < group_box_count; ++i) {
                 box_to_target_out[group_boxes[i]] = best_assign[i];
                 box_done[group_boxes[i]] = 1U;
             }
-        }
-
-        for (; bi < (uint8)SOKOBAN_MAX_BOXES; ++bi)
-        {
-            box_to_target_out[bi] = 0U;
         }
     }
     return 1U;
@@ -1475,6 +1501,8 @@ static void enter_sub_next(void)
 void App_Recognize_Reset(void)
 {
     s_sub_state    = RECOG_SUB_INIT;
+    s_done_status  = APP_RECOG_DONE_OK;
+    s_done_matched_count = 0U;
     s_item_count   = 0U;
     s_box_count    = 0U;
     s_target_count = 0U;
@@ -1502,9 +1530,12 @@ AppRecognizeStatus_e App_Recognize_Tick(uint8 map[MAP_ROWS][MAP_COLS],
                                         uint8 has_bomb,
                                         uint8 level,
                                         float *nav_heading_deg_io,
-                                        uint8 box_to_target_out[SOKOBAN_MAX_BOXES])
+                                        uint8 box_to_target_out[SOKOBAN_MAX_BOXES],
+                                        uint8 *matched_count_out)
 {
-    if (nav_heading_deg_io == NULL)
+    if (nav_heading_deg_io == NULL ||
+        box_to_target_out == NULL ||
+        matched_count_out == NULL)
     {
         chassis_ctrl_stop();
         s_sub_state = RECOG_SUB_FAIL;
@@ -1524,6 +1555,7 @@ AppRecognizeStatus_e App_Recognize_Tick(uint8 map[MAP_ROWS][MAP_COLS],
             /* 第一关无数字配对要求，跳过整圈分类 Tour，缩短连续计时总时长。 */
             if (level <= 1U)
             {
+                *matched_count_out = 0U;
                 return APP_RECOG_DONE_NO_NEED;
             }
 
@@ -1531,6 +1563,7 @@ AppRecognizeStatus_e App_Recognize_Tick(uint8 map[MAP_ROWS][MAP_COLS],
             if (s_item_count == 0U)
             {
                 /* 地图无 BOX/TARGET → 没东西可识别, 放行 */
+                *matched_count_out = 0U;
                 return APP_RECOG_DONE_NO_NEED;
             }
             if (s_box_count != s_target_count)
@@ -1742,10 +1775,19 @@ AppRecognizeStatus_e App_Recognize_Tick(uint8 map[MAP_ROWS][MAP_COLS],
             /* 全部实地确认 → 配对。 */
             if (all_resolved())
             {
-                if (build_box_to_target_mapping(map, has_bomb, box_to_target_out))
+                uint8 matched_count = 0U;
+                if (build_box_to_target_mapping(map, has_bomb,
+                                                box_to_target_out,
+                                                &matched_count))
                 {
+                    *matched_count_out = matched_count;
+                    s_done_matched_count = matched_count;
+                    s_done_status =
+                        (matched_count == s_box_count)
+                        ? APP_RECOG_DONE_OK
+                        : APP_RECOG_DONE_PARTIAL;
                     s_sub_state = RECOG_SUB_DONE;
-                    return APP_RECOG_DONE_OK;
+                    return s_done_status;
                 }
                 s_sub_state = RECOG_SUB_FAIL;
                 return APP_RECOG_FAIL;
@@ -1775,7 +1817,8 @@ AppRecognizeStatus_e App_Recognize_Tick(uint8 map[MAP_ROWS][MAP_COLS],
 
         case RECOG_SUB_DONE:
         {
-            return APP_RECOG_DONE_OK;
+            *matched_count_out = s_done_matched_count;
+            return s_done_status;
         }
 
         case RECOG_SUB_FAIL:
