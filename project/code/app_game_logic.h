@@ -64,8 +64,8 @@
 
 // 游戏主流程状态机枚举
 typedef enum {
-    STAGE_WAIT_START = 0,           // 首次从 (1,5) 发车；关间返回并停在 (1,5)
-    STAGE_LAUNCH_EXIT,              // 从 (1,5) 驶向上位机触发点 (1,4)
+    STAGE_WAIT_START = 0,           // 首次从贴边位发车；关间返回并停在 (1,5)
+    STAGE_LAUNCH_EXIT,              // 首次贴边位/关间 (1,5) 驶向触发点 (1,4)
     STAGE_WAIT_MAP_REFRESH,         // 已到 (1,4)，停车等待上位机刷新地图
     STAGE_RECOGNIZE_MAP,            // 识别地图与箱子
     STAGE_PLAN_PATH,                // 寻路/推箱策略计算
@@ -98,7 +98,7 @@ void Game_Logic_Task_Run(void);
  * STAGE_PLAN_PATH 前台求解或第一关 EXECUTE 后台滚动求解推进时返回 1。 */
 uint8 Game_Logic_Idle_Plan_Step(void);
 
-/* 正式比赛状态初始化：上电已在 (1,5)，从第一关发车准备开始。 */
+/* 正式比赛状态初始化：上电已在贴边发车位，从第一关发车准备开始。 */
 void Game_Logic_Init(void);
 
 /* ==================================================================

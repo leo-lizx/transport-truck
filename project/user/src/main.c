@@ -88,7 +88,7 @@
 #define MAIN_RUN_MODE_BOARD_TEST      (11)  /* 新主板测试: 屏幕显示 yaw 和手转车轮的编码器反馈 */
 
 /* ═══════════ 改下面这行切换运行模式 (0~11) ═══════════ */
-#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_POINT_NAV)
+#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_GAME)
 /* ═══════════ 改上面这行切换运行模式 (0~11) ═══════════ */
 
 /*==========================================================================
@@ -163,8 +163,11 @@ static uint32 wait_for_tick(void)
 #define MAIN_POS_NAV_START_X_GRID     (1.0f)
 #define MAIN_POS_NAV_START_Y_GRID     (5.5f)
 
-#define MAIN_POS_GAME_START_X_GRID    (1.0f)
-#define MAIN_POS_GAME_START_Y_GRID    (5.0f)
+/* GAME 仅首次上电使用贴边发车位：车体左侧、下端分别贴齐发车区
+ * 黄色胶带内侧。场地绝对中心 (0.115m, 1.200m) 换算到当前里程计
+ * 原点（可通行内场左上边界）后为 (-0.085m, 1.000m)。 */
+#define MAIN_POS_GAME_START_X_M       (-0.085f)
+#define MAIN_POS_GAME_START_Y_M       (1.000f)
 
 #define MAIN_POS_HCM_HOME_X_GRID      (MAIN_POS_NAV_START_X_GRID)
 #define MAIN_POS_HCM_HOME_Y_GRID      (MAIN_POS_NAV_START_Y_GRID)
@@ -2254,9 +2257,9 @@ int main(void)
                           MAIN_POS_GRID_TO_M_Y(MAIN_POS_HCM_HOME_Y_GRID),
                           0.0f);
 #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_GAME)
-    /* 正式比赛上电时车辆已经位于 (1,5)，只需从该点驶向 (1,4)。 */
-    chassis_ctrl_set_pose(MAIN_POS_GRID_TO_M_X(MAIN_POS_GAME_START_X_GRID),
-                          MAIN_POS_GRID_TO_M_Y(MAIN_POS_GAME_START_Y_GRID),
+    /* 首次上电从贴边位直接驶向 (1,4)；关间仍由游戏状态机返回 (1,5) 后发车。 */
+    chassis_ctrl_set_pose(MAIN_POS_GAME_START_X_M,
+                          MAIN_POS_GAME_START_Y_M,
                           APP_GAME_LAUNCH_FACE_YAW_DEG);
 #else
     /* 解算/导航起点: 整数格约定 (1, 5.5) → 自动换算成米送入里程计原点. */

@@ -91,8 +91,9 @@ static uint8               s_map_has_bomb_valid = 0U;
 static uint16              s_wait_phase0_ticks  = 0U;
 static uint8               s_return_rotate_started = 0U; /* 直线返库后原地转回 0° 的子步骤 */
 
-/* ----- 自动发车 (左侧发车点 (1,5) → 上位机触发点 (1,4)) -----------
- * 上电后先等待 IMU/编码器滤波稳定；到达 (1,4) 后停车，等待上位机刷新本关地图。
+/* ----- 自动发车 (首次贴边位/关间 (1,5) → 上位机触发点 (1,4)) -------
+ * 首次上电从贴边位出发，关间仍从 (1,5) 出发；到达 (1,4) 后停车，
+ * 等待上位机刷新本关地图。
  * 与硬编码模式一致，目标发出后持续等待底盘报告到达，不做业务层超时重发。
  * --------------------------------------------------------------- */
 #define LAUNCH_STARTUP_SETTLE_TICKS       (200U)  /* 1s @5ms，仅首次上电发车 */
@@ -1302,7 +1303,8 @@ void Game_Logic_Init(void)
     s_bomb_mapping_rescan_active = 0U;
     s_completion_map_len_err_baseline = 0U;
     reset_exec_context();
-    /* 上电发车位置就是 (1,5)，首次启动跳过返航子阶段；关间返航仍从 phase 0 开始。 */
+    /* 首次上电已由 main 设置为贴边发车位，因此跳过返航子阶段；
+     * 关间 reset_exec_context() 会恢复 phase 0，仍先返回 (1,5)。 */
     s_wait_start_phase = 1U;
     map_snapshot_release();
     clear_box_target_mapping();
