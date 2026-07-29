@@ -332,6 +332,9 @@ uint16 Sokoban_Seq_To_Waypoints(const SokoActionSeq_t *seq,
                                 Point_t start_pos,
                                 SokoWaypointPath_t *wp_path);
 
+/** 按正式执行模型计算动作段耗时：行驶、方向航点停站和推箱 Snap。 */
+uint32 Sokoban_Seq_Time_Cost(const SokoActionSeq_t *seq);
+
 /**
  * @brief 关卡完成后的单命令返库航点。
  *

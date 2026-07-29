@@ -72,7 +72,7 @@
  *   8   MAIN_RUN_MODE_HARDCODED_MAP         ✅    代码内置          固定发车: 上电解算→Y轴平移发车→推箱→回库
  *   9   MAIN_RUN_MODE_OPENART2_TEST         ❌    OpenART2 UART1   分类链路自测: 只显示 BOX_CLASS, 车不动
  *   10  MAIN_RUN_MODE_LEVEL2_TEST           ✅    OpenART1+2       第二关单测: 收图→发车→分类→Stage2推箱→回库
- *   11  MAIN_RUN_MODE_BOARD_TEST            ❌    无               新主板自测: 屏幕显示 yaw、活动编码器轮号和轮速
+ *   11  MAIN_RUN_MODE_BOARD_TEST            ✅    无               新主板自测: 四路电机驱动 PWM 固定为 80%
  *=========================================================================*/
 #define MAIN_RUN_MODE_GAME            (0)   /* 正式比赛: 完整视觉+推箱+底盘闭环 */
 #define MAIN_RUN_MODE_YAW_HOLD        (1)   /* 航向保持: 车不动, IMU 锁角度调 yaw PID */
@@ -85,10 +85,10 @@
 #define MAIN_RUN_MODE_HARDCODED_MAP   (8)   /* 硬编码地图: 上电解算→Y轴平移发车→跑→回发车点 */
 #define MAIN_RUN_MODE_OPENART2_TEST   (9)   /* OpenART2 分类链路测试: 屏幕显示 BOX/TARGET/NONE, 车不动 */
 #define MAIN_RUN_MODE_LEVEL2_TEST     (10)  /* 第二关测试: 收图→固定发车→分类识别→Stage2推箱→回库 */
-#define MAIN_RUN_MODE_BOARD_TEST      (11)  /* 新主板测试: 屏幕显示 yaw 和手转车轮的编码器反馈 */
+#define MAIN_RUN_MODE_BOARD_TEST      (11)  /* 新主板测试: 四路电机驱动 PWM 固定为 80% */
 
 /* ═══════════ 改下面这行切换运行模式 (0~11) ═══════════ */
-#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_GAME)
+#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_SINGLE_WHEEL)
 /* ═══════════ 改上面这行切换运行模式 (0~11) ═══════════ */
 
 /*==========================================================================
@@ -1867,7 +1867,7 @@ static void main_mode5_render_100ms(void)
 /*  ⬇⬇⬇ 姿态闭环调试阶段这里全部被 #if 屏蔽, 不会被编译, 不要删 ⬇⬇⬇          */
 /* ========================================================================== */
 #if (MAIN_RUN_MODE == MAIN_RUN_MODE_SINGLE_WHEEL)
-#define MAIN_PID_DEBUG_WHEEL_INDEX    (CHASSIS_WHEEL_LB)  /* 0=LF, 1=RF, 2=LB, 3=RB */
+#define MAIN_PID_DEBUG_WHEEL_INDEX    (CHASSIS_WHEEL_LF)  /* 0=LF, 1=RF, 2=LB, 3=RB */
 #define MAIN_PID_DEBUG_TARGET_MPS     (0.10f)             /* target wheel speed, m/s */
 #define MAIN_PID_DEBUG_FORCE_PID      (1)                 /* 1=use KP/KI/KD below */
 #define MAIN_PID_DEBUG_KP             (200.0f)
@@ -2307,8 +2307,12 @@ int main(void)
     printf("OA2_BOOT wait BOX_CLASS from OpenART2 (UART1)...\n");
     chassis_ctrl_stop();
 #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_BOARD_TEST)
-    /* 新主板测试只采集 IMU/编码器，保持四路电机 PWM 关闭。 */
+    /* 新主板测试：四路电机驱动 PWM 固定为 80%。 */
     chassis_ctrl_stop();
+    pwm_set_duty(MOTOR_LF_PWM_CHANNEL, PWM_DUTY_MAX * 80U / 100U);
+    pwm_set_duty(MOTOR_RF_PWM_CHANNEL, PWM_DUTY_MAX * 80U / 100U);
+    pwm_set_duty(MOTOR_LB_PWM_CHANNEL, PWM_DUTY_MAX * 80U / 100U);
+    pwm_set_duty(MOTOR_RB_PWM_CHANNEL, PWM_DUTY_MAX * 80U / 100U);
   #if (CHASSIS_MENU_ENABLE != 0)
     main_board_test_render_100ms();
   #endif

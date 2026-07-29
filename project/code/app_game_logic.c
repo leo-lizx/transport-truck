@@ -174,6 +174,11 @@ static uint8                 s_line_sweep_initial_box_count = 0U;
 static uint8                 s_line_sweep_planned_count = 0U;
 static uint8                 s_line_sweep_execute_index = 0U;
 static uint16                s_line_sweep_attempted_mask = 0U;
+static uint8                 s_line_sweep_compare_active = 0U;
+static uint8                 s_line_sweep_compare_box_idx = 0U;
+static uint8                 s_line_sweep_best_valid = 0U;
+static uint32                s_line_sweep_best_cost_ms = 0xFFFFFFFFUL;
+static Point_t               s_line_sweep_best_player;
 static Point_t               s_line_sweep_candidate_box;
 static Point_t               s_line_sweep_candidate_staging;
 static uint8                 s_line_sweep_candidate_direction = SOKO_ACT_NONE;
@@ -496,6 +501,10 @@ static void reset_exec_context(void)
     s_line_sweep_planned_count = 0U;
     s_line_sweep_execute_index = 0U;
     s_line_sweep_attempted_mask = 0U;
+    s_line_sweep_compare_active = 0U;
+    s_line_sweep_compare_box_idx = 0U;
+    s_line_sweep_best_valid = 0U;
+    s_line_sweep_best_cost_ms = 0xFFFFFFFFUL;
     s_line_sweep_candidate_direction = SOKO_ACT_NONE;
     s_line_sweep_sweep_length = 0U;
 
@@ -715,6 +724,14 @@ static void reset_line_sweep_context(void)
     s_line_sweep_planned_count = 0U;
     s_line_sweep_execute_index = 0U;
     s_line_sweep_attempted_mask = 0U;
+    s_line_sweep_compare_active = 0U;
+    s_line_sweep_compare_box_idx = 0U;
+    s_line_sweep_best_valid = 0U;
+    s_line_sweep_best_cost_ms = 0xFFFFFFFFUL;
+    s_line_sweep_best_player.x = -1;
+    s_line_sweep_best_player.y = -1;
+    s_line_sweep_candidate_box.x = -1;
+    s_line_sweep_candidate_box.y = -1;
     s_line_sweep_candidate_staging.x = -1;
     s_line_sweep_candidate_staging.y = -1;
     s_line_sweep_candidate_direction = SOKO_ACT_NONE;
@@ -832,9 +849,9 @@ static uint16 line_sweep_candidate_cost(Point_t player,
     return (uint16)(dx1 + dy1 + dx2 + dy2);
 }
 
-/* 每拍只选一个未尝试的 box/direction，按玩家→箱子→入口的曼哈顿
- * 代价贪心排序。原地图语义保持不变，最后一推方向由求解终态约束。
- * 返回 1=可开始搜索，2=本候选静态不可行，0=已穷尽。 */
+/* 先按玩家→箱子→入口的曼哈顿代价选当前箱子，再依次实际求解它的
+ * 两侧入口。原地图语义保持不变，最后一推方向由求解终态约束。
+ * 返回 1=可开始搜索，2=本候选静态不可行，3=两侧已比较，0=已穷尽。 */
 static uint8 build_line_sweep_plan_problem(void)
 {
     Point_t boxes[SOKOBAN_MAX_BOXES];
@@ -845,6 +862,7 @@ static uint8 build_line_sweep_plan_problem(void)
     uint8 candidate_box_idx = 0U;
     uint8 candidate_id = 0U;
     uint8 found = 0U;
+    uint16 compare_mask;
     uint16 best_cost = 0xFFFFU;
     int8 direction;
     int8 near_axis;
@@ -876,7 +894,22 @@ static uint8 build_line_sweep_plan_problem(void)
         return 0U;
     }
 
+    if (s_line_sweep_compare_active != 0U) {
+        if (s_line_sweep_compare_box_idx >= box_count) return 0U;
+        compare_mask = (uint16)(3U <<
+            (uint8)(s_line_sweep_compare_box_idx * 2U));
+        if ((s_line_sweep_attempted_mask & compare_mask) == compare_mask) {
+            if (s_line_sweep_best_valid != 0U) return 3U;
+            s_line_sweep_compare_active = 0U;
+            s_line_sweep_best_cost_ms = 0xFFFFFFFFUL;
+        }
+    }
+
     for (uint8 i = 0U; i < box_count; ++i) {
+        if (s_line_sweep_compare_active != 0U &&
+            i != s_line_sweep_compare_box_idx) {
+            continue;
+        }
         for (uint8 direction_slot = 0U; direction_slot < 2U;
              ++direction_slot) {
             Point_t candidate_staging;
@@ -903,12 +936,19 @@ static uint8 build_line_sweep_plan_problem(void)
         }
     }
     if (found == 0U) return 0U;
+    if (s_line_sweep_compare_active == 0U) {
+        s_line_sweep_compare_active = 1U;
+        s_line_sweep_compare_box_idx = candidate_box_idx;
+        s_line_sweep_best_valid = 0U;
+        s_line_sweep_best_cost_ms = 0xFFFFFFFFUL;
+    }
     s_line_sweep_attempted_mask |= (uint16)(1U << candidate_id);
 
     direction = ((candidate_id & 1U) == 0U) ? 1 : -1;
     near_axis = (direction > 0) ? s_line_sweep_min_axis
                                 : s_line_sweep_max_axis;
     active_box = boxes[candidate_box_idx];
+    s_line_sweep_candidate_box = active_box;
 
     /* 已位于目标段内部的箱子无法在不拉箱的前提下先退到某一端。 */
     if (((s_line_sweep_horizontal != 0U &&
@@ -932,7 +972,6 @@ static uint8 build_line_sweep_plan_problem(void)
          s_roll_after_active_map[staging.y][staging.x] != MAP_EMPTY)) {
         return 2U;
     }
-    s_line_sweep_candidate_box = active_box;
     s_line_sweep_candidate_staging = staging;
     s_line_sweep_sweep_length = (uint8)(s_line_sweep_max_axis -
                                         s_line_sweep_min_axis + 1);
@@ -1135,15 +1174,16 @@ static uint8 line_sweep_seq_append_push(SokoActionSeq_t *seq,
     return 1U;
 }
 
-/* 单箱子搜索只负责把箱子送到目标线外的 staging。这里在空闲时间
- * 追加直线扫过整段目标的推送，转成航点并更新下一箱的预测起点。 */
-static uint8 commit_line_sweep_subplan(void)
+/* 单箱搜索只负责把箱子送到目标线外的 staging。这里追加整段盲扫，
+ * 按正式执行耗时记录当前箱子两侧中的较优候选。 */
+static uint8 consider_line_sweep_candidate(void)
 {
     static const int8 dr[4] = {-1, 1, 0, 0};
     static const int8 dc[4] = {0, 0, -1, 1};
     SokoActionSeq_t *seq;
     Point_t predicted_player;
     Point_t staging_player;
+    uint32 candidate_cost_ms;
     uint8 last_push_found = 0U;
     uint8 queue_index = s_line_sweep_planned_count;
 
@@ -1186,12 +1226,6 @@ static uint8 commit_line_sweep_subplan(void)
             return 0U;
         }
     }
-    if (Sokoban_Seq_To_Waypoints(
-            seq, s_roll_after_active_player,
-            &s_roll_queue_waypoints[queue_index]) == 0U) {
-        return 0U;
-    }
-
     predicted_player = g_soko_solution.player_end_pos[0];
     predicted_player.x = (int8)(predicted_player.x +
         dc[s_line_sweep_candidate_direction] * s_line_sweep_sweep_length);
@@ -1203,14 +1237,49 @@ static uint8 commit_line_sweep_subplan(void)
         return 0U;
     }
 
+    candidate_cost_ms = Sokoban_Seq_Time_Cost(seq);
+    if (s_line_sweep_best_valid != 0U &&
+        candidate_cost_ms >= s_line_sweep_best_cost_ms) {
+        return 1U;
+    }
+    if (Sokoban_Seq_To_Waypoints(
+            seq, s_roll_after_active_player,
+            &s_roll_queue_waypoints[queue_index]) == 0U) {
+        return 0U;
+    }
+    s_line_sweep_best_valid = 1U;
+    s_line_sweep_best_cost_ms = candidate_cost_ms;
+    s_line_sweep_best_player = predicted_player;
+    return 1U;
+}
+
+/* 当前箱子的两侧均已尝试后，只提交耗时较短的可行侧；不枚举后续箱子
+ * 的方向组合，因此仍是逐箱贪心规划。 */
+static uint8 finalize_line_sweep_box_choice(void)
+{
+    uint8 queue_index = s_line_sweep_planned_count;
+
+    if (s_line_sweep_plan_active == 0U ||
+        s_line_sweep_compare_active == 0U ||
+        s_line_sweep_best_valid == 0U ||
+        queue_index >= s_line_sweep_initial_box_count ||
+        s_roll_after_active_map[s_line_sweep_candidate_box.y]
+                               [s_line_sweep_candidate_box.x] != MAP_BOX) {
+        return 0U;
+    }
+
     /* 命中的箱/目标类别在扫线中途会消失；预测模型只删除该箱的
      * 开局位置，并保留整条目标为后续箱子的可通行扫描走廊。 */
     s_roll_after_active_map[s_line_sweep_candidate_box.y]
                            [s_line_sweep_candidate_box.x] = MAP_EMPTY;
-    s_roll_after_active_player = predicted_player;
-    s_roll_queue_after_player[queue_index] = predicted_player;
+    s_roll_after_active_player = s_line_sweep_best_player;
+    s_roll_queue_after_player[queue_index] = s_line_sweep_best_player;
     s_line_sweep_planned_count++;
     s_line_sweep_attempted_mask = 0U;
+    s_line_sweep_compare_active = 0U;
+    s_line_sweep_best_valid = 0U;
+    s_line_sweep_best_cost_ms = 0xFFFFFFFFUL;
+    s_line_sweep_candidate_direction = SOKO_ACT_NONE;
     g_soko_solution.is_solved = 0U;
     g_soko_solution.total_boxes = 0U;
 
@@ -2159,6 +2228,12 @@ static void stage_plan_handler(void)
                 return;
             }
             if (build_status == 2U) return;
+            if (build_status == 3U) {
+                if (finalize_line_sweep_box_choice() == 0U) {
+                    fallback_line_sweep_to_recognition();
+                }
+                return;
+            }
             begin_ok = Sokoban_Directional_Push_Search_Begin(
                 s_roll_after_active_map,
                 s_roll_after_active_player,
@@ -2239,8 +2314,10 @@ static void stage_push_search_idle_step(void)
     g_soko_exec_init = 0U;
     if (s_line_sweep_plan_active != 0U) {
         if (search_status == SOKO_SEARCH_SOLVED) {
-            (void)commit_line_sweep_subplan();
+            (void)consider_line_sweep_candidate();
         }
+        g_soko_solution.is_solved = 0U;
+        g_soko_solution.total_boxes = 0U;
         return;
     }
     if (search_status == SOKO_SEARCH_SOLVED && activate_push_box_solution()) {

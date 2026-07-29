@@ -1491,7 +1491,7 @@ static uint8 soko_opt_begin_pair(uint8 solved_mask,
 }
 
 /** 动作段的正式执行成本：每格行驶、每个方向航点停站、含推箱航段 Snap。 */
-static uint32 soko_seq_time_cost(const SokoActionSeq_t *seq)
+uint32 Sokoban_Seq_Time_Cost(const SokoActionSeq_t *seq)
 {
     uint32 cost = 0UL;
     uint16 segment_start = 0U;
@@ -1544,7 +1544,7 @@ static uint32 soko_solution_time_cost(const SokoFullSolution_t *solution,
 
     player = solution->player_end_pos[solution->total_boxes - 1U];
     for (uint8 i = 0U; i < solution->total_boxes; ++i) {
-        uint32 seq_cost = soko_seq_time_cost(&solution->sub_solutions[i]);
+        uint32 seq_cost = Sokoban_Seq_Time_Cost(&solution->sub_solutions[i]);
         if (seq_cost == SB_MACRO_COST_INF ||
             cost > (SB_MACRO_COST_INF - seq_cost)) {
             return SB_MACRO_COST_INF;
@@ -1765,7 +1765,7 @@ SokoSearchStatus_e Sokoban_Stage1_Search_Step(uint8 max_work_units,
                 &s_soko_opt.cur_seq[depth], frame->player,
                 s_soko_opt.boxes[candidate.b]);
             {
-                uint32 seq_cost = soko_seq_time_cost(&s_soko_opt.cur_seq[depth]);
+                uint32 seq_cost = Sokoban_Seq_Time_Cost(&s_soko_opt.cur_seq[depth]);
                 uint32 next_cost;
                 SokoStage1Frame_t *child;
                 if (seq_cost == SB_MACRO_COST_INF ||
@@ -2459,7 +2459,7 @@ SokoSearchStatus_e Sokoban_Bomb_Search_Step(uint8 max_work_units,
                 uint8 bomb_index = s_bomb_search.pair_bomb_index;
                 uint32 rank =
                     (uint32)s_bomb_search.wall_unreachable_targets * 60000UL
-                    + soko_seq_time_cost(&s_bomb_search.try_seq)
+                    + Sokoban_Seq_Time_Cost(&s_bomb_search.try_seq)
                     + s_bomb_search.wall_post_cost_ms;
                 if (!s_bomb_search.best_valid || rank < s_bomb_search.best_rank ||
                     (rank == s_bomb_search.best_rank &&
