@@ -2257,7 +2257,7 @@ int main(void)
                           MAIN_POS_GRID_TO_M_Y(MAIN_POS_HCM_HOME_Y_GRID),
                           0.0f);
 #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_GAME)
-    /* 首次上电从贴边位直接驶向 (1,4)；关间仍由游戏状态机返回 (1,5) 后发车。 */
+    /* 首次上电从贴边位直接驶向 (2,5)；关间仍由游戏状态机返回 (1,5) 后发车。 */
     chassis_ctrl_set_pose(MAIN_POS_GAME_START_X_M,
                           MAIN_POS_GAME_START_Y_M,
                           APP_GAME_LAUNCH_FACE_YAW_DEG);

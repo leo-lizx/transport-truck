@@ -51,7 +51,7 @@ UP, DOWN, LEFT, RIGHT = 0, 1, 2, 3
 
 # ============================================================
 # 正式固件发车契约 (app_game_logic.c)
-#   唯一库位 (row=5,col=1) → 地图刷新触发格 (row=4,col=1)
+#   唯一库位 (row=5,col=1) → 地图刷新触发格 (row=5,col=2)
 # ============================================================
 START_ROW = 5
 ZONE_LEFT = 'left'
@@ -62,7 +62,7 @@ def launch_cells(zone: str) -> Tuple[tuple, tuple, list]:
     """返回正式比赛唯一的 (起步格, 触发格, 发车走廊)。"""
     del zone
     start = (5, 1)
-    exit_c = (4, 1)
+    exit_c = (5, 2)
     corridor = [start, exit_c]
     return start, exit_c, corridor
 
@@ -256,7 +256,7 @@ def _save_custom_map(name: str, text: str, level: int,
 
 
 # ============================================================
-# 地图生成 (强制玩家从左库位起步, 预留向上发车走廊, 校验可解)
+# 地图生成 (强制玩家从左库位起步, 预留向右发车走廊, 校验可解)
 # ============================================================
 
 def _inner_list() -> list:
@@ -813,8 +813,25 @@ def build_timeline(info: dict) -> Tuple[List[dict], List[str]]:
 
 def run_selftest() -> int:
     rc = 0
+    expected_start = (5, 1)
+    expected_exit = (5, 2)
+    start, exit_c, corridor = launch_cells(ZONE_LEFT)
+    if (start, exit_c, corridor) != (expected_start, expected_exit,
+                                     [expected_start, expected_exit]):
+        print(f"Launch contract mismatch: {start} -> {exit_c}, corridor={corridor}")
+        rc = 1
+
     for level in (1, 2, 3):
         info = gen_level_map(level, box_count=2, seed=20260608 + level)
+        if info['start'] != expected_start or info['exit'] != expected_exit:
+            print(f"Level {level}: launch cells mismatch "
+                  f"{info['start']} -> {info['exit']}")
+            rc = 1
+            continue
+        if any(info['map'][r][c] != EMPTY for r, c in corridor):
+            print(f"Level {level}: launch corridor is not empty")
+            rc = 1
+            continue
         if level == 1 and (info.get('box_classes') or info.get('target_classes')):
             print("Level 1: class labels should be empty")
             rc = 1
@@ -1098,9 +1115,9 @@ def launch_gui():
                                text='*** PASS ***', fill=COL_OK, font=F_TXT)
 
     def _draw_zone(fr):
-        # 正式比赛唯一左库位及其上方地图刷新触发格。
-        c = INNER_C_MIN
-        for r in (4, 5):
+        # 正式比赛唯一左库位及其右侧地图刷新触发格。
+        start, exit_c, _ = launch_cells(ZONE_LEFT)
+        for r, c in (start, exit_c):
             x0, y0, x1, y1 = cell_rect(r, c)
             canvas.create_rectangle(x0 + 1, y0 + 1, x1 - 1, y1 - 1, outline=COL_ZONE, dash=(2, 2))
 

@@ -65,8 +65,8 @@
 // 游戏主流程状态机枚举
 typedef enum {
     STAGE_WAIT_START = 0,           // 首次从贴边位发车；关间返回并停在 (1,5)
-    STAGE_LAUNCH_EXIT,              // 首次贴边位/关间 (1,5) 驶向触发点 (1,4)
-    STAGE_WAIT_MAP_REFRESH,         // 已到 (1,4)，停车等待上位机刷新地图
+    STAGE_LAUNCH_EXIT,              // 首次贴边位/关间 (1,5) 驶向触发点 (2,5)
+    STAGE_WAIT_MAP_REFRESH,         // 已到 (2,5)，停车等待上位机刷新地图
     STAGE_RECOGNIZE_MAP,            // 识别地图与箱子
     STAGE_PLAN_PATH,                // 寻路/推箱策略计算
     STAGE_EXECUTE_ACTION,           // 执行推箱动作

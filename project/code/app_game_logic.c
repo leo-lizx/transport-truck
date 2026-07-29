@@ -14,8 +14,8 @@
  */
 #define APP_GAME_LAUNCH_HOME_X       (1U)
 #define APP_GAME_LAUNCH_HOME_Y       (5U)
-#define APP_GAME_LAUNCH_EXIT_X       (1U)
-#define APP_GAME_LAUNCH_EXIT_Y       (4U)
+#define APP_GAME_LAUNCH_EXIT_X       (2U)
+#define APP_GAME_LAUNCH_EXIT_Y       (5U)
 
 uint8 g_game_map[MAP_ROWS][MAP_COLS];
 Point_t g_player_pos = {(int8)APP_GAME_LAUNCH_HOME_X, (int8)APP_GAME_LAUNCH_HOME_Y};
@@ -91,8 +91,8 @@ static uint8               s_map_has_bomb_valid = 0U;
 static uint16              s_wait_phase0_ticks  = 0U;
 static uint8               s_return_rotate_started = 0U; /* 直线返库后原地转回 0° 的子步骤 */
 
-/* ----- 自动发车 (首次贴边位/关间 (1,5) → 上位机触发点 (1,4)) -------
- * 首次上电从贴边位出发，关间仍从 (1,5) 出发；到达 (1,4) 后停车，
+/* ----- 自动发车 (首次贴边位/关间 (1,5) → 上位机触发点 (2,5)) -------
+ * 首次上电从贴边位出发，关间仍从 (1,5) 出发；到达 (2,5) 后停车，
  * 等待上位机刷新本关地图。
  * 与硬编码模式一致，目标发出后持续等待底盘报告到达，不做业务层超时重发。
  * --------------------------------------------------------------- */
@@ -336,7 +336,7 @@ static uint8 completion_invalid_or_empty_map_received(uint32 baseline_frame_id)
     return 1U;
 }
 
-/* 到达 (1,4) 后只接纳连续五张完全一致的合法新图。每张图都重新检查
+/* 到达 (2,5) 后只接纳连续五张完全一致的合法新图。每张图都重新检查
  * 箱子/目标数量，任意非法帧或布局变化都会重新从第一张开始计数。 */
 static uint8 launch_map_stability_tick(uint32 baseline_frame_id)
 {
@@ -1227,7 +1227,7 @@ static uint8 rolling_background_idle_step(void)
 
 static void prepare_launch_departure(void)
 {
-    /* OpenART 负责连续帧稳定过滤；主控将在到达 (1,4) 并停车后建立
+    /* OpenART 负责连续帧稳定过滤；主控将在到达 (2,5) 并停车后建立
      * 接收栅栏，行驶途中落地的地图不能参与本关解算。 */
     s_launch_arrival_frame_id = 0U;
     s_map_accepted = 0U;
@@ -1318,7 +1318,7 @@ static void stage_wait_start_handler(void)
 {
     /* 仅保留左侧发车区。phase 0 依靠里程计返回 (1,5)；phase 1 在首次上电时等待滤波稳定，
      * 关间返航后不重复等待。
-     * 地图在发车和到达 (1,4) 后的等待阶段始终解冻。
+     * 地图在发车和到达 (2,5) 后的等待阶段始终解冻。
      */
     map_snapshot_release();
 
@@ -1400,7 +1400,7 @@ static void stage_launch_exit_handler(void)
         return;
     }
 
-    /* 赛规以上位机网格 (1,4) 为刷新触发点，因此以该航点到达为发车成功，
+    /* 上位机网格 (2,5) 为刷新触发点，因此以该航点到达为发车成功，
      * 不再用车体外接圆完全离开旧发车区几何作为硬门槛。 */
     if (chassis_nav_arrived()) {
         chassis_ctrl_stop();
@@ -1415,7 +1415,7 @@ static void stage_launch_exit_handler(void)
 
 static void stage_wait_map_refresh_handler(void)
 {
-    /* 到达 (1,4) 并停车后，在主控侧重新确认五张完整地图完全一致。
+    /* 到达 (2,5) 并停车后，在主控侧重新确认五张完整地图完全一致。
      * 这样冻结条件不依赖 OpenART 是否实现了地图投票。 */
     map_snapshot_release();
     if (launch_map_stability_tick(s_launch_arrival_frame_id) == 0U) {
@@ -1805,7 +1805,7 @@ static void stage_level_judge_handler(void)
 {
     /* 各关均在复核新图已无箱子/目标，或完整推箱后的新结果不是合法地图时到达此处。
      * 所有关卡均保持 0° 返回 (1,5)；
-     * 前两关随后再驶到 (1,4) 触发新图，第三关返航后收车。 */
+     * 前两关随后再驶到 (2,5) 触发新图，第三关返航后收车。 */
     chassis_ctrl_stop();
     mark_current_level_finished();
 
@@ -1933,7 +1933,7 @@ static uint8 recognize_stage_needs_class_link(void)
 static uint8 current_stage_needs_map_link(void)
 {
     /* 五帧地图一旦接纳即由主控冻结。识别巡航、规划和执行都只依赖该本地
-     * 快照；若继续把 RECOGNIZE 绑定到地图心跳，车离开 (1,4) 后地图端静默
+     * 快照；若继续把 RECOGNIZE 绑定到地图心跳，车离开 (2,5) 后地图端静默
      * 1s 就会停车并错误地重新等待五帧地图。 */
     return (uint8)((current_stage == STAGE_WAIT_MAP_REFRESH) ||
                    (current_stage == STAGE_WAIT_RECOVERY_MAP));
@@ -1941,7 +1941,7 @@ static uint8 current_stage_needs_map_link(void)
 
 static void enter_link_pause(LinkPauseReason_e reason)
 {
-    /* 返回 (1,5)、驶向 (1,4)、失败返航和最终驻停均不依赖地图内容。
+    /* 返回 (1,5)、驶向 (2,5)、失败返航和最终驻停均不依赖地图内容。
      * 这些阶段只记录链路状态，不切 PAUSE，避免地图尚未刷新反而阻止发车。 */
     if ((current_stage == STAGE_WAIT_START) ||
         (current_stage == STAGE_LAUNCH_EXIT) ||
@@ -2006,7 +2006,7 @@ static void recover_from_link_pause(void)
         }
         if (s_stage_resume == STAGE_LAUNCH_EXIT)
         {
-            /* 重新下发 (1,4) 目标；到站后再建立本轮收图栅栏。 */
+            /* 重新下发 (2,5) 目标；到站后再建立本轮收图栅栏。 */
             s_launch_drive_issued = 0U;
             map_snapshot_release();
             current_stage = STAGE_LAUNCH_EXIT;
