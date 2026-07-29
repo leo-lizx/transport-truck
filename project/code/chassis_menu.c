@@ -27,7 +27,7 @@
 #define CHASSIS_MENU_FLASH_SECTOR      (127U)
 #define CHASSIS_MENU_FLASH_PAGE        (FLASH_PAGE_7)
 #define CHASSIS_MENU_FLASH_MAGIC       (0x4D4E5455U)
-#define CHASSIS_MENU_FLASH_VERSION     (6U)  /* 新增 Y 方向速度上限，chassis_tune_params_t 布局变化 */
+#define CHASSIS_MENU_FLASH_VERSION     (7U)  /* 失效旧调参，确保采用 2026-07-29 提速默认值 */
 
 typedef struct
 {

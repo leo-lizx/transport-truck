@@ -158,6 +158,9 @@
 /** 即位锁需车体稳定: |rate| < 此值 */
 #define CHASSIS_YAW_INPOS_SETTLE_DPS        (10.0f)
 
+/** Point-navigation arrival uses a stricter yaw-rate limit than the in-position lock. */
+#define CHASSIS_YAW_ARRIVAL_SETTLE_DPS      (2.0f)
+
 /* ---- 小角度原地旋转静摩擦前馈 ----
  * 通用四轮 breakaway 前馈负责平移和大角度起步；以下参数只在
  * vx/vy 近零且航向误差不超过 MAX_ERR 时替换它，原有线性 yaw 前馈仍叠加。
@@ -233,11 +236,11 @@
  *  P0-调参 2026-05-08: 2.50→3.50，加快远场逼近
  *  P0-修复 2026-05-11 (拐点停留+走斜线): 10.50→4.50
  *  (KP=10.5 时 linear_dist=accel/KP²≈0.027m → 冲过头) */
-/* P0-修复 2026-07-17: 4.50→5.50, 加快逼近和D项阻尼, 远距不冲近距快停 */
-#define CHASSIS_POS_KP                      (6.0f)
+/* 2026-07-29 提速: 6.00→6.60，近端位置曲线提高约 10%。 */
+#define CHASSIS_POS_KP                      (6.60f)
 
 /** Y 方向位置环 Kp — Y 轴机械特性独立，允许与 X 分别调节。 */
-#define CHASSIS_POS_Y_KP                    (4.00f)
+#define CHASSIS_POS_Y_KP                    (4.0f)
 
 /** Runtime safety limit for position-loop Kp; must cover the compile-time default. */
 #define CHASSIS_TUNE_POS_KP_LIMIT           (10.0f)
@@ -251,11 +254,28 @@
 
 /** X 方向线速度最大加速度 (m/s²)；保留旧宏名兼容现有调参接口。
  *  P0-调参 2026-05-08: 3.00→5.00，加快爬坡/刹车
- *  P0-修复 2026-06-07: 0.60→3.00，ramp 能跟上 brake_cap */
-#define CHASSIS_CMD_ACCEL_LIMIT_MPS2        (5.0f)
+ *  2026-07-29 提速: 5.00→5.80，中距离斜坡提高约 16%。 */
+#define CHASSIS_CMD_ACCEL_LIMIT_MPS2        (6.80f)
 
 /** Y 方向线速度最大加速度 (m/s²)；独立于 X，按 Y 方向实车响应调节。 */
-#define CHASSIS_CMD_ACCEL_LIMIT_Y_MPS2      (6.0f)
+#define CHASSIS_CMD_ACCEL_LIMIT_Y_MPS2      (8.90f)
+
+/** 在线调参时 X/Y 线加速度的安全上限 (m/s²)。 */
+#define CHASSIS_TUNE_MAX_LINEAR_ACCEL_X_MPS2 (7.0f)
+#define CHASSIS_TUNE_MAX_LINEAR_ACCEL_Y_MPS2 (9.0f)
+
+/* 20cm 短程起步使用更高加速度；仅在实测停车距离仍有余量时启用。 */
+#define CHASSIS_SHORT_MOVE_DIST_M                  (0.25f)
+#define CHASSIS_CMD_SHORT_ACCEL_LIMIT_MPS2         (10.0f)
+#define CHASSIS_CMD_SHORT_ACCEL_LIMIT_Y_MPS2       (12.0f)
+
+/* 主动制动减速度独立于加速度，通过轮速目标快速回落驱动 PID 制动。 */
+#define CHASSIS_CMD_BRAKE_DECEL_LIMIT_MPS2         (12.0f)
+#define CHASSIS_CMD_BRAKE_DECEL_LIMIT_Y_MPS2       (13.0f)
+
+/* 动态停车距离补偿：覆盖一次轮速低通约 37ms 与 20ms 控制/执行延迟。 */
+#define CHASSIS_DYNAMIC_BRAKE_LATENCY_S             (0.060f)
+#define CHASSIS_DYNAMIC_BRAKE_MARGIN_M              (0.015f)
 
 /* ---- 位置环自动推导比例常量 (用户一般无需修改) ----
  *   kd_eff = pos_kp * KD_RATIO        (主轴速度阻尼)
@@ -294,7 +314,8 @@
  *  如需应对长距离 sqrt_controller 路径的静摩擦卡死，可保留 0.20~0.25。 */
 /* P0-修复 2026-07-17: 0.15→0.06, 刹车区末段最低速减半, 配合 KD 翻倍平滑停入 EPSILON. */
 /* 0.06→0.10: 略高以克服静摩擦, 配合 KD=1.65 刹得住不过冲 */
-/* 降到 0.02: 仅克服静摩擦的最低推力, 不强制推车冲过 EPSILON */
+/* 制动段速度上限的下限：仅防止包络上限过早塌到零；
+ * 它不是强制目标速度，位置环给出的更低速度仍会原样保留。 */
 #define CHASSIS_POS_BRAKE_FLOOR_MPS         (0.200f)
 
 /* ============================================================
@@ -412,11 +433,12 @@
 
 /* ---- 速度限幅 ---- */
 
-/** 地图坐标系 X 方向最大线速度 (m/s)；保留原宏名兼容现有调用方。 */
-#define CHASSIS_MAX_LINEAR_SPEED_MPS        (2.00f)
+/** 地图坐标系 X 方向最大线速度 (m/s)；保留原宏名兼容现有调用方。
+ *  2026-07-29 提速: 1.60→1.90，远距离上限提高约 19%。 */
+#define CHASSIS_MAX_LINEAR_SPEED_MPS        (1.90f)
 
 /** 地图坐标系 Y 方向最大线速度 (m/s) */
-#define CHASSIS_MAX_LINEAR_SPEED_Y_MPS      (1.70f)
+#define CHASSIS_MAX_LINEAR_SPEED_Y_MPS      (1.55f)
 
 /** 正常控制路径的单轮速度兑底上限 (m/s) — 等比例缩放保方向 */
 #define CHASSIS_WHEEL_SPEED_CAP_MPS         (4.0f)
@@ -455,8 +477,9 @@
 
 /* ---- 静摩擦前馈 (Breakaway FF) — 每轮独立可配 ----
  *   实现 (apply_speed): 每轮独立查 g_chassis_tune_params
- *     if |target| > target_eps[i] && |fb| < fb_static_eps[i]:
- *         pwm += sign(target) * pwm_floor[i]
+ *     仅在真实静止起步，或目标与反馈同向且目标幅值不低于反馈时启用；
+ *     同向减速/尚未停稳的换向会立即撤掉前馈，避免抵消主动制动。
+ *     前馈幅值随 |fb| / fb_static_eps[i] 线性衰减。
  *   调参口诀:
  *     起步迟/不动 → 加大 FLOOR
  *     起步猛冲    → 减小 FLOOR

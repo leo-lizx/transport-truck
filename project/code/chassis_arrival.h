@@ -25,8 +25,8 @@ static inline uint8_t chassis_yaw_arrival_realtime_ok(
 }
 
 /* 到点驻留决策保持为纯函数式小状态机，便于在无硬件环境验证。
- * 进入位置窗口后立即冻结平移；速度或航向尚未稳定时不累计，但也不重新加速。
- * 只有实时位置离开窗口才释放冻结并清零驻留计数。 */
+ * 位置入窗但速度仍高时继续由运动曲线主动制动，避免硬停后滑出窗口再启动；
+ * 位置和速度都满足后冻结平移，航向稳定期间不累计驻留。 */
 static inline chassis_arrival_decision_t chassis_arrival_dwell_update(
     uint16_t *dwell_count,
     uint8_t position_ok,
@@ -36,13 +36,13 @@ static inline chassis_arrival_decision_t chassis_arrival_dwell_update(
 {
     chassis_arrival_decision_t decision = {0U, 0U};
 
-    if (position_ok == 0U) {
+    if ((position_ok == 0U) || (velocity_ok == 0U)) {
         *dwell_count = 0U;
         return decision;
     }
 
     decision.hold_translation = 1U;
-    if ((velocity_ok == 0U) || (yaw_ok == 0U)) {
+    if (yaw_ok == 0U) {
         *dwell_count = 0U;
         return decision;
     }
