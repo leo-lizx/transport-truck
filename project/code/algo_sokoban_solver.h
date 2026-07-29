@@ -243,6 +243,27 @@ SokoSearchStatus_e Sokoban_Stage2_Search_Step(uint8 max_work_units,
                                               SokoFullSolution_t *result);
 
 /**
+ * @brief 启动单箱方向终态搜索，不修改输入地图。
+ *
+ * 同轴直推可行时先让车辆到箱后并直接推到 target_pos；箱子已经位于
+ * target_pos 时只规划车辆到箱后。其他情况仅在箱子到达 target_pos 且
+ * 最后一推等于 required_goal_direction 时成功。其他箱子、墙和炸弹保持
+ * 输入地图中的真实障碍语义，目标格保持可通行。
+ * map 在搜索结束或取消前必须保持有效且内容不变。
+ */
+uint8 Sokoban_Directional_Push_Search_Begin(
+    const uint8 map[MAP_ROWS][MAP_COLS],
+    Point_t player_pos,
+    Point_t box_pos,
+    Point_t target_pos,
+    SokoAction_e required_goal_direction);
+
+/** 每拍最多推进 max_work_units 个方向单箱搜索工作单元。 */
+SokoSearchStatus_e Sokoban_Directional_Push_Search_Step(
+    uint8 max_work_units,
+    SokoFullSolution_t *result);
+
+/**
  * @brief  第二阶段求解 — 指定箱→目标映射（分类模式）
  *
  * @param  map                当前地图

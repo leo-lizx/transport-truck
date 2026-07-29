@@ -25,6 +25,10 @@ Point_t g_player_pos = {(int8)APP_GAME_LAUNCH_HOME_X, (int8)APP_GAME_LAUNCH_HOME
  * 推完箱子后返回发车点；死局自动返航/重置暂时关闭，异常时停车等待。 */
 #define APP_GAME_TOTAL_LEVELS          (3U)
 
+/* 第二关连续共线目标的盲扫特判。两个目标偶然共线很常见，至少三个且
+ * 初始位置连续才进入；所有箱子共用开局快照规划，中间不重读地图。 */
+#define APP_GAME_LINE_SWEEP_MIN_TARGETS (3U)
+
 /* ==================================================================
  * 【P0-2】视觉链路超时回退参数
  *   LINK_LOSS_MS  : 触发"掉线"判定的静默时长门槛
@@ -158,6 +162,23 @@ static uint8                 s_bomb_mapping_rescan_active = 0U;
 static uint32                s_completion_map_len_err_baseline = 0U;
 static uint8                 s_partial_plan_map[MAP_ROWS][MAP_COLS];
 static uint8                 s_partial_plan_mapping[SOKOBAN_MAX_BOXES];
+/* 第二关共线目标一次性盲扫：保持开局快照冻结，在预测占用状态上依次
+ * 规划所有箱子；方向终态直接约束最后一推，不向地图添加虚拟墙。 */
+static uint8                 s_line_sweep_plan_active = 0U;
+static uint8                 s_line_sweep_execute_active = 0U;
+static uint8                 s_line_sweep_horizontal = 0U;
+static int8                  s_line_sweep_fixed_coord = 0;
+static int8                  s_line_sweep_min_axis = 0;
+static int8                  s_line_sweep_max_axis = 0;
+static uint8                 s_line_sweep_initial_box_count = 0U;
+static uint8                 s_line_sweep_planned_count = 0U;
+static uint8                 s_line_sweep_execute_index = 0U;
+static uint16                s_line_sweep_attempted_mask = 0U;
+static Point_t               s_line_sweep_candidate_box;
+static Point_t               s_line_sweep_candidate_staging;
+static uint8                 s_line_sweep_candidate_direction = SOKO_ACT_NONE;
+static uint8                 s_line_sweep_sweep_length = 0U;
+static uint32                s_line_sweep_rejected_generation = 0U;
 static ExecMode_e            g_exec_mode = EXEC_NONE;
 static PlanMode_e            s_plan_mode = PLAN_MODE_PUSH;
 static uint8                 s_bomb_strategy = 0U;
@@ -470,6 +491,13 @@ static void reset_exec_context(void)
     s_roll_bg_expected_boxes = 0U;
     s_roll_queue_count = 0U;
     s_roll_queue_next = 0U;
+    s_line_sweep_plan_active = 0U;
+    s_line_sweep_execute_active = 0U;
+    s_line_sweep_planned_count = 0U;
+    s_line_sweep_execute_index = 0U;
+    s_line_sweep_attempted_mask = 0U;
+    s_line_sweep_candidate_direction = SOKO_ACT_NONE;
+    s_line_sweep_sweep_length = 0U;
 
     g_bomb_waypoints.count = 0;
     g_bomb_wp_idx = 0;
@@ -653,6 +681,330 @@ static uint8 get_map_target_count(void)
     return count;
 }
 
+static uint8 line_sweep_inner_cell(Point_t point)
+{
+    return (uint8)(point.x >= (int8)CHASSIS_GRID_INNER_MIN_X &&
+                   point.x <= (int8)CHASSIS_GRID_INNER_MAX_X &&
+                   point.y >= (int8)CHASSIS_GRID_INNER_MIN_Y &&
+                   point.y <= (int8)CHASSIS_GRID_INNER_MAX_Y);
+}
+
+static Point_t line_sweep_axis_point(int8 axis,
+                                     int8 perpendicular_delta)
+{
+    Point_t point;
+    if (s_line_sweep_horizontal != 0U) {
+        point.x = axis;
+        point.y = (int8)(s_line_sweep_fixed_coord + perpendicular_delta);
+    } else {
+        point.x = (int8)(s_line_sweep_fixed_coord + perpendicular_delta);
+        point.y = axis;
+    }
+    return point;
+}
+
+static void reset_line_sweep_context(void)
+{
+    s_line_sweep_plan_active = 0U;
+    s_line_sweep_execute_active = 0U;
+    s_line_sweep_horizontal = 0U;
+    s_line_sweep_fixed_coord = 0;
+    s_line_sweep_min_axis = 0;
+    s_line_sweep_max_axis = 0;
+    s_line_sweep_initial_box_count = 0U;
+    s_line_sweep_planned_count = 0U;
+    s_line_sweep_execute_index = 0U;
+    s_line_sweep_attempted_mask = 0U;
+    s_line_sweep_candidate_staging.x = -1;
+    s_line_sweep_candidate_staging.y = -1;
+    s_line_sweep_candidate_direction = SOKO_ACT_NONE;
+    s_line_sweep_sweep_length = 0U;
+}
+
+/* 初始特判只接纳至少三个连续共行/共列目标，避免普通地图中两个目标
+ * 偶然共线时错误跳过图案识别。 */
+static uint8 detect_initial_line_sweep_targets(
+    const uint8 map[MAP_ROWS][MAP_COLS],
+    uint8 *horizontal_out,
+    int8 *fixed_coord_out,
+    int8 *min_axis_out,
+    int8 *max_axis_out)
+{
+    uint8 target_count = 0U;
+    uint8 same_row = 1U;
+    uint8 same_col = 1U;
+    int8 first_x = -1;
+    int8 first_y = -1;
+    int8 min_x = (int8)MAP_COLS;
+    int8 max_x = -1;
+    int8 min_y = (int8)MAP_ROWS;
+    int8 max_y = -1;
+    int8 r;
+    int8 c;
+
+    if (horizontal_out == NULL || fixed_coord_out == NULL ||
+        min_axis_out == NULL || max_axis_out == NULL) return 0U;
+    for (r = (int8)CHASSIS_GRID_INNER_MIN_Y;
+         r <= (int8)CHASSIS_GRID_INNER_MAX_Y; ++r) {
+        for (c = (int8)CHASSIS_GRID_INNER_MIN_X;
+             c <= (int8)CHASSIS_GRID_INNER_MAX_X; ++c) {
+            if (map[r][c] != MAP_TARGET) continue;
+            if (target_count == 0U) {
+                first_x = c;
+                first_y = r;
+            } else {
+                if (r != first_y) same_row = 0U;
+                if (c != first_x) same_col = 0U;
+            }
+            if (c < min_x) min_x = c;
+            if (c > max_x) max_x = c;
+            if (r < min_y) min_y = r;
+            if (r > max_y) max_y = r;
+            target_count++;
+        }
+    }
+
+    if (target_count < APP_GAME_LINE_SWEEP_MIN_TARGETS) return 0U;
+    if (same_row != 0U &&
+        (uint8)(max_x - min_x + 1) == target_count) {
+        *horizontal_out = 1U;
+        *fixed_coord_out = first_y;
+        *min_axis_out = min_x;
+        *max_axis_out = max_x;
+        return 1U;
+    }
+    if (same_col != 0U &&
+        (uint8)(max_y - min_y + 1) == target_count) {
+        *horizontal_out = 0U;
+        *fixed_coord_out = first_x;
+        *min_axis_out = min_y;
+        *max_axis_out = max_y;
+        return 1U;
+    }
+    return 0U;
+}
+
+/* 预测地图保留开局目标线，已命中的箱子仅在内部被删除。
+ * 箱子只会变少，障碍因此单调减少，已完成的子规划无需回溯。 */
+static uint8 line_sweep_work_map_matches(
+    const uint8 map[MAP_ROWS][MAP_COLS])
+{
+    uint8 box_count = 0U;
+    uint8 target_count = 0U;
+    int8 r;
+    int8 c;
+
+    for (r = (int8)CHASSIS_GRID_INNER_MIN_Y;
+         r <= (int8)CHASSIS_GRID_INNER_MAX_Y; ++r) {
+        for (c = (int8)CHASSIS_GRID_INNER_MIN_X;
+             c <= (int8)CHASSIS_GRID_INNER_MAX_X; ++c) {
+            if (map[r][c] == MAP_BOX) {
+                box_count++;
+            } else if (map[r][c] == MAP_TARGET) {
+                if ((s_line_sweep_horizontal != 0U &&
+                     r != s_line_sweep_fixed_coord) ||
+                    (s_line_sweep_horizontal == 0U &&
+                     c != s_line_sweep_fixed_coord)) {
+                    return 0U;
+                }
+                target_count++;
+            }
+        }
+    }
+    return (uint8)(box_count != 0U &&
+                   box_count + s_line_sweep_planned_count ==
+                       s_line_sweep_initial_box_count &&
+                   target_count == s_line_sweep_initial_box_count);
+}
+
+static uint16 line_sweep_candidate_cost(Point_t player,
+                                        Point_t box,
+                                        Point_t staging)
+{
+    int16 dx1 = (int16)player.x - (int16)box.x;
+    int16 dy1 = (int16)player.y - (int16)box.y;
+    int16 dx2 = (int16)box.x - (int16)staging.x;
+    int16 dy2 = (int16)box.y - (int16)staging.y;
+    if (dx1 < 0) dx1 = (int16)-dx1;
+    if (dy1 < 0) dy1 = (int16)-dy1;
+    if (dx2 < 0) dx2 = (int16)-dx2;
+    if (dy2 < 0) dy2 = (int16)-dy2;
+    return (uint16)(dx1 + dy1 + dx2 + dy2);
+}
+
+/* 每拍只选一个未尝试的 box/direction，按玩家→箱子→入口的曼哈顿
+ * 代价贪心排序。原地图语义保持不变，最后一推方向由求解终态约束。
+ * 返回 1=可开始搜索，2=本候选静态不可行，0=已穷尽。 */
+static uint8 build_line_sweep_plan_problem(void)
+{
+    Point_t boxes[SOKOBAN_MAX_BOXES];
+    Point_t active_box;
+    Point_t staging;
+    uint8 box_count = 0U;
+    uint8 target_count = 0U;
+    uint8 candidate_box_idx = 0U;
+    uint8 candidate_id = 0U;
+    uint8 found = 0U;
+    uint16 best_cost = 0xFFFFU;
+    int8 direction;
+    int8 near_axis;
+    int8 r;
+    int8 c;
+
+    if (s_line_sweep_plan_active == 0U ||
+        line_sweep_work_map_matches(s_roll_after_active_map) == 0U ||
+        line_sweep_inner_cell(s_roll_after_active_player) == 0U) {
+        return 0U;
+    }
+
+    for (r = (int8)CHASSIS_GRID_INNER_MIN_Y;
+         r <= (int8)CHASSIS_GRID_INNER_MAX_Y; ++r) {
+        for (c = (int8)CHASSIS_GRID_INNER_MIN_X;
+             c <= (int8)CHASSIS_GRID_INNER_MAX_X; ++c) {
+            if (s_roll_after_active_map[r][c] == MAP_BOX) {
+                if (box_count >= (uint8)SOKOBAN_MAX_BOXES) return 0U;
+                boxes[box_count].x = c;
+                boxes[box_count].y = r;
+                box_count++;
+            } else if (s_roll_after_active_map[r][c] == MAP_TARGET) {
+                if (target_count >= (uint8)SOKOBAN_MAX_BOXES) return 0U;
+                target_count++;
+            }
+        }
+    }
+    if (box_count == 0U || target_count != s_line_sweep_initial_box_count) {
+        return 0U;
+    }
+
+    for (uint8 i = 0U; i < box_count; ++i) {
+        for (uint8 direction_slot = 0U; direction_slot < 2U;
+             ++direction_slot) {
+            Point_t candidate_staging;
+            uint8 id = (uint8)(i * 2U + direction_slot);
+            int8 candidate_sign = (direction_slot == 0U) ? 1 : -1;
+            int8 candidate_near = (candidate_sign > 0)
+                                ? s_line_sweep_min_axis
+                                : s_line_sweep_max_axis;
+            uint16 cost;
+            if ((s_line_sweep_attempted_mask & (uint16)(1U << id)) != 0U) {
+                continue;
+            }
+            candidate_staging = line_sweep_axis_point(
+                (int8)(candidate_near - candidate_sign), 0);
+            cost = line_sweep_candidate_cost(s_roll_after_active_player,
+                                             boxes[i], candidate_staging);
+            if (found == 0U || cost < best_cost ||
+                (cost == best_cost && id < candidate_id)) {
+                found = 1U;
+                best_cost = cost;
+                candidate_id = id;
+                candidate_box_idx = i;
+            }
+        }
+    }
+    if (found == 0U) return 0U;
+    s_line_sweep_attempted_mask |= (uint16)(1U << candidate_id);
+
+    direction = ((candidate_id & 1U) == 0U) ? 1 : -1;
+    near_axis = (direction > 0) ? s_line_sweep_min_axis
+                                : s_line_sweep_max_axis;
+    active_box = boxes[candidate_box_idx];
+
+    /* 已位于目标段内部的箱子无法在不拉箱的前提下先退到某一端。 */
+    if (((s_line_sweep_horizontal != 0U &&
+          active_box.y == s_line_sweep_fixed_coord) ||
+         (s_line_sweep_horizontal == 0U &&
+          active_box.x == s_line_sweep_fixed_coord))) {
+        int8 box_axis = (s_line_sweep_horizontal != 0U)
+                      ? active_box.x : active_box.y;
+        if (box_axis >= s_line_sweep_min_axis &&
+            box_axis <= s_line_sweep_max_axis) return 2U;
+    }
+
+    staging = line_sweep_axis_point((int8)(near_axis - direction), 0);
+    s_line_sweep_candidate_direction = (s_line_sweep_horizontal != 0U)
+                                     ? ((direction > 0) ? SOKO_ACT_RIGHT
+                                                        : SOKO_ACT_LEFT)
+                                     : ((direction > 0) ? SOKO_ACT_DOWN
+                                                        : SOKO_ACT_UP);
+    if (line_sweep_inner_cell(staging) == 0U ||
+        ((staging.x != active_box.x || staging.y != active_box.y) &&
+         s_roll_after_active_map[staging.y][staging.x] != MAP_EMPTY)) {
+        return 2U;
+    }
+    s_line_sweep_candidate_box = active_box;
+    s_line_sweep_candidate_staging = staging;
+    s_line_sweep_sweep_length = (uint8)(s_line_sweep_max_axis -
+                                        s_line_sweep_min_axis + 1);
+    return 1U;
+}
+
+static void fallback_line_sweep_to_recognition(void)
+{
+    reset_exec_context();
+    clear_box_target_mapping();
+    reset_line_sweep_context();
+    s_line_sweep_rejected_generation = s_display_frozen_map_generation;
+    map_cache_invalidate();
+    App_Recognize_Reset();
+    map_snapshot_freeze();
+    goto_stage(STAGE_RECOGNIZE_MAP);
+}
+
+static uint8 start_line_sweep_plan(uint8 horizontal,
+                                   int8 fixed_coord,
+                                   int8 min_axis,
+                                   int8 max_axis)
+{
+    uint8 box_count;
+
+    box_count = get_map_box_count();
+    if (box_count == 0U || box_count > (uint8)SOKOBAN_MAX_BOXES ||
+        box_count != get_map_target_count()) return 0U;
+    clear_box_target_mapping();
+    reset_exec_context();
+    s_line_sweep_plan_active = 1U;
+    s_line_sweep_horizontal = horizontal;
+    s_line_sweep_fixed_coord = fixed_coord;
+    s_line_sweep_min_axis = min_axis;
+    s_line_sweep_max_axis = max_axis;
+    s_line_sweep_initial_box_count = box_count;
+    copy_map(s_roll_after_active_map, g_game_map);
+    s_roll_after_active_player = g_player_pos;
+    map_snapshot_freeze();
+    goto_stage(STAGE_PLAN_PATH);
+    return 1U;
+}
+
+/* 返回 1 表示本拍已切入盲扫规划；返回 0 时继续原识别状态机。 */
+static uint8 try_start_stage2_line_sweep(void)
+{
+    uint8 horizontal;
+    int8 fixed_coord;
+    int8 min_axis;
+    int8 max_axis;
+
+    if (current_level_number() != 2U) return 0U;
+    if (s_line_sweep_rejected_generation ==
+        s_display_frozen_map_generation) {
+        return 0U;
+    }
+    if (detect_initial_line_sweep_targets(g_game_map,
+                                          &horizontal,
+                                          &fixed_coord,
+                                          &min_axis,
+                                          &max_axis) == 0U) {
+        return 0U;
+    }
+
+    if (start_line_sweep_plan(horizontal, fixed_coord,
+                              min_axis, max_axis) != 0U) return 1U;
+
+    reset_line_sweep_context();
+    s_line_sweep_rejected_generation = s_display_frozen_map_generation;
+    return 0U;
+}
+
 static uint8 map_has_bomb(void)
 {
     if (s_map_has_bomb_valid != 0U) return s_map_has_bomb_cached;
@@ -766,6 +1118,120 @@ static uint8 exec_waypoints_common(const SokoWaypointPath_t *wp, uint16 *wp_idx)
 static uint8 rolling_seq_is_push(const SokoActionSeq_t *seq, uint16 index)
 {
     return (uint8)((seq->push_bitmap[index >> 3] >> (index & 7U)) & 1U);
+}
+
+static uint8 line_sweep_seq_append_push(SokoActionSeq_t *seq,
+                                        uint8 direction)
+{
+    uint16 index;
+    if (seq == NULL || direction > (uint8)SOKO_ACT_RIGHT ||
+        seq->count >= (uint16)SOKOBAN_MAX_ACTIONS) {
+        return 0U;
+    }
+    index = seq->count;
+    seq->actions[index] = (SokoAction_e)direction;
+    seq->push_bitmap[index >> 3] |= (uint8)(1U << (index & 7U));
+    seq->count++;
+    return 1U;
+}
+
+/* 单箱子搜索只负责把箱子送到目标线外的 staging。这里在空闲时间
+ * 追加直线扫过整段目标的推送，转成航点并更新下一箱的预测起点。 */
+static uint8 commit_line_sweep_subplan(void)
+{
+    static const int8 dr[4] = {-1, 1, 0, 0};
+    static const int8 dc[4] = {0, 0, -1, 1};
+    SokoActionSeq_t *seq;
+    Point_t predicted_player;
+    Point_t staging_player;
+    uint8 last_push_found = 0U;
+    uint8 queue_index = s_line_sweep_planned_count;
+
+    if (s_line_sweep_plan_active == 0U ||
+        g_soko_solution.is_solved == 0U ||
+        g_soko_solution.total_boxes != 1U ||
+        queue_index >= s_line_sweep_initial_box_count ||
+        s_line_sweep_candidate_direction > (uint8)SOKO_ACT_RIGHT ||
+        s_line_sweep_sweep_length == 0U) {
+        return 0U;
+    }
+    seq = &g_soko_solution.sub_solutions[0];
+    staging_player.x = (int8)(s_line_sweep_candidate_staging.x -
+        dc[s_line_sweep_candidate_direction]);
+    staging_player.y = (int8)(s_line_sweep_candidate_staging.y -
+        dr[s_line_sweep_candidate_direction]);
+    if (g_soko_solution.player_end_pos[0].x != staging_player.x ||
+        g_soko_solution.player_end_pos[0].y != staging_player.y) {
+        return 0U;
+    }
+    if (s_line_sweep_candidate_box.x != s_line_sweep_candidate_staging.x ||
+        s_line_sweep_candidate_box.y != s_line_sweep_candidate_staging.y) {
+        for (uint16 i = seq->count; i > 0U; --i) {
+            uint16 action_index = (uint16)(i - 1U);
+            if (rolling_seq_is_push(seq, action_index) != 0U) {
+                if ((uint8)seq->actions[action_index] !=
+                    s_line_sweep_candidate_direction) {
+                    return 0U;
+                }
+                last_push_found = 1U;
+                break;
+            }
+        }
+        if (last_push_found == 0U) return 0U;
+    }
+
+    for (uint8 i = 0U; i < s_line_sweep_sweep_length; ++i) {
+        if (line_sweep_seq_append_push(
+                seq, s_line_sweep_candidate_direction) == 0U) {
+            return 0U;
+        }
+    }
+    if (Sokoban_Seq_To_Waypoints(
+            seq, s_roll_after_active_player,
+            &s_roll_queue_waypoints[queue_index]) == 0U) {
+        return 0U;
+    }
+
+    predicted_player = g_soko_solution.player_end_pos[0];
+    predicted_player.x = (int8)(predicted_player.x +
+        dc[s_line_sweep_candidate_direction] * s_line_sweep_sweep_length);
+    predicted_player.y = (int8)(predicted_player.y +
+        dr[s_line_sweep_candidate_direction] * s_line_sweep_sweep_length);
+    if (line_sweep_inner_cell(predicted_player) == 0U ||
+        s_roll_after_active_map[s_line_sweep_candidate_box.y]
+                               [s_line_sweep_candidate_box.x] != MAP_BOX) {
+        return 0U;
+    }
+
+    /* 命中的箱/目标类别在扫线中途会消失；预测模型只删除该箱的
+     * 开局位置，并保留整条目标为后续箱子的可通行扫描走廊。 */
+    s_roll_after_active_map[s_line_sweep_candidate_box.y]
+                           [s_line_sweep_candidate_box.x] = MAP_EMPTY;
+    s_roll_after_active_player = predicted_player;
+    s_roll_queue_after_player[queue_index] = predicted_player;
+    s_line_sweep_planned_count++;
+    s_line_sweep_attempted_mask = 0U;
+    g_soko_solution.is_solved = 0U;
+    g_soko_solution.total_boxes = 0U;
+
+    if (s_line_sweep_planned_count < s_line_sweep_initial_box_count) {
+        return 1U;
+    }
+
+    s_line_sweep_plan_active = 0U;
+    s_line_sweep_execute_active = 1U;
+    s_line_sweep_execute_index = 0U;
+    s_roll_queue_count = s_line_sweep_planned_count;
+    s_roll_queue_next = 0U;
+    g_soko_waypoints = s_roll_queue_waypoints[0];
+    g_soko_wp_idx = 0U;
+    g_soko_sub_idx = 0U;
+    g_exec_mode = EXEC_PUSH_BOX;
+    is_navigating = 0U;
+    s_solve_succeeded = 1U;
+    map_snapshot_release();
+    goto_stage(STAGE_EXECUTE_ACTION);
+    return 1U;
 }
 
 /* 在预测地图上回放一个“单箱到目标”子解。箱子到达该段目标后与目标点
@@ -952,6 +1418,19 @@ static uint8 exec_push_box_solution(void)
      * 不能直接向上层报告整关完成，否则比赛模式会在第一箱后提前结算。 */
     if (g_soko_wp_idx < g_soko_waypoints.count &&
         exec_waypoints_common(&g_soko_waypoints, &g_soko_wp_idx) == 0U) {
+        return 0U;
+    }
+
+    if (s_line_sweep_execute_active != 0U) {
+        s_line_sweep_execute_index++;
+        if (s_line_sweep_execute_index >= s_line_sweep_planned_count) {
+            s_line_sweep_execute_active = 0U;
+            return 1U;
+        }
+        g_soko_waypoints =
+            s_roll_queue_waypoints[s_line_sweep_execute_index];
+        g_soko_wp_idx = 0U;
+        is_navigating = 0U;
         return 0U;
     }
 
@@ -1302,6 +1781,8 @@ void Game_Logic_Init(void)
     s_completion_verify_active = 0U;
     s_bomb_mapping_rescan_active = 0U;
     s_completion_map_len_err_baseline = 0U;
+    reset_line_sweep_context();
+    s_line_sweep_rejected_generation = 0U;
     reset_exec_context();
     /* 首次上电已由 main 设置为贴边发车位，因此跳过返航子阶段；
      * 关间 reset_exec_context() 会恢复 phase 0，仍先返回 (1,5)。 */
@@ -1513,11 +1994,17 @@ static void stage_recognize_handler(void)
     /* ============================================================
      * 识别 tour 子状态机驱动 (app_recognize.c):
      *   - Stage1 无数字配对要求（有无炸弹均同）→ DONE_NO_NEED 直接放行
+     *   - Stage2 连续共行/共列目标 → 依开局快照一次性规划全部箱子，
+     *               不读取图案；箱间不重读，若全量规划失败才回退常规识别
      *   - Stage2/3: BOX/TARGET 混合规划最短观察 Tour；当前物体确认后才切换,
      *               全部实地确认后写入最大可行 box→target 映射。类别不配平时
      *               先执行已匹配子集，再从当前空地重读图继续识别剩余项
      *   - 视觉暂时无结果时循环当前物体观察位；路线不可恢复才停车等待人工处理
      * ============================================================ */
+    if (try_start_stage2_line_sweep() != 0U) {
+        return;
+    }
+
     AppRecognizeStatus_e r = App_Recognize_Tick(g_game_map, g_player_pos,
                                                 map_has_bomb(),
                                                 current_level_number(),
@@ -1664,6 +2151,21 @@ static void stage_plan_handler(void)
         {
             begin_ok = Sokoban_Stage1_Search_Begin(g_game_map, g_player_pos, home);
         }
+        else if (s_line_sweep_plan_active != 0U)
+        {
+            uint8 build_status = build_line_sweep_plan_problem();
+            if (build_status == 0U) {
+                fallback_line_sweep_to_recognition();
+                return;
+            }
+            if (build_status == 2U) return;
+            begin_ok = Sokoban_Directional_Push_Search_Begin(
+                s_roll_after_active_map,
+                s_roll_after_active_player,
+                s_line_sweep_candidate_box,
+                s_line_sweep_candidate_staging,
+                (SokoAction_e)s_line_sweep_candidate_direction);
+        }
         else if (s_partial_batch_active != 0U)
         {
             if (build_partial_plan_problem() == 0U) {
@@ -1680,11 +2182,13 @@ static void stage_plan_handler(void)
                 g_game_map, g_player_pos, g_box_to_target, box_count, home);
         }
         g_soko_exec_init = 1U;
-        /* Begin 已复制地图与固定映射；后续搜索不依赖视觉快照持续冻结。 */
-        map_snapshot_release();
+        /* 普通规划 Begin 已完成私有拷贝。盲扫需一直保持开局快照，
+         * 直到所有箱子的航点均规划完成才解冻。 */
+        if (s_line_sweep_plan_active == 0U) map_snapshot_release();
         if (begin_ok == 0U)
         {
             g_soko_exec_init = 0U;
+            if (s_line_sweep_plan_active != 0U) return;
             if (s_partial_batch_active != 0U &&
                 current_level_number() == 2U) {
                 prepare_map_rescan_wait(1U);
@@ -1708,9 +2212,14 @@ static void stage_push_search_idle_step(void)
         return;
     }
 
-    search_status = (current_level_number() == 1U)
-                  ? Sokoban_Stage1_Search_Step(1U, &g_soko_solution)
-                  : Sokoban_Stage2_Search_Step(1U, &g_soko_solution);
+    if (s_line_sweep_plan_active != 0U) {
+        search_status = Sokoban_Directional_Push_Search_Step(
+            1U, &g_soko_solution);
+    } else {
+        search_status = (current_level_number() == 1U)
+                      ? Sokoban_Stage1_Search_Step(1U, &g_soko_solution)
+                      : Sokoban_Stage2_Search_Step(1U, &g_soko_solution);
+    }
 
     if (current_level_number() == 1U &&
         Sokoban_Search_Has_Incumbent() != 0U) {
@@ -1728,6 +2237,12 @@ static void stage_push_search_idle_step(void)
     if (search_status == SOKO_SEARCH_RUNNING) { return; }
     Sokoban_Stage1_Search_Cancel();
     g_soko_exec_init = 0U;
+    if (s_line_sweep_plan_active != 0U) {
+        if (search_status == SOKO_SEARCH_SOLVED) {
+            (void)commit_line_sweep_subplan();
+        }
+        return;
+    }
     if (search_status == SOKO_SEARCH_SOLVED && activate_push_box_solution()) {
         goto_stage(STAGE_EXECUTE_ACTION);
         return;
@@ -1807,6 +2322,8 @@ static void stage_level_judge_handler(void)
      * 所有关卡均保持 0° 返回 (1,5)；
      * 前两关随后再驶到 (2,5) 触发新图，第三关返航后收车。 */
     chassis_ctrl_stop();
+    reset_line_sweep_context();
+    s_line_sweep_rejected_generation = 0U;
     mark_current_level_finished();
 
     reset_exec_context();

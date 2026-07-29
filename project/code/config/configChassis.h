@@ -216,7 +216,7 @@
 /** 到位驻留确认次数 (20ms/次): 连续 N 次同时满足位置+速度+角度条件才判到达。
  *  单拍 odom 噪声/瞬态过冲可能让 dist 瞬间掉进 EPSILON, 不加驻留会误触到达。
  *  8 次 = 160ms；低速零目标停轮门控负责消除 PID 残留输出。 */
-#define CHASSIS_ARRIVAL_DWELL_COUNT         (7U)
+#define CHASSIS_ARRIVAL_DWELL_COUNT         (2U)
 
 /** 到位后 Schmitt 滞后释放阈值 (米): 1cm 进入、5cm 退出，避免噪声重启位置环。 */
 #define CHASSIS_POS_HOLD_EXIT_M             (0.05f)
@@ -237,7 +237,7 @@
 #define CHASSIS_POS_KP                      (6.0f)
 
 /** Y 方向位置环 Kp — Y 轴机械特性独立，允许与 X 分别调节。 */
-#define CHASSIS_POS_Y_KP                    (4.20f)
+#define CHASSIS_POS_Y_KP                    (4.00f)
 
 /** Runtime safety limit for position-loop Kp; must cover the compile-time default. */
 #define CHASSIS_TUNE_POS_KP_LIMIT           (10.0f)
@@ -413,10 +413,10 @@
 /* ---- 速度限幅 ---- */
 
 /** 地图坐标系 X 方向最大线速度 (m/s)；保留原宏名兼容现有调用方。 */
-#define CHASSIS_MAX_LINEAR_SPEED_MPS        (1.60f)
+#define CHASSIS_MAX_LINEAR_SPEED_MPS        (2.00f)
 
 /** 地图坐标系 Y 方向最大线速度 (m/s) */
-#define CHASSIS_MAX_LINEAR_SPEED_Y_MPS      (1.30f)
+#define CHASSIS_MAX_LINEAR_SPEED_Y_MPS      (1.70f)
 
 /** 正常控制路径的单轮速度兑底上限 (m/s) — 等比例缩放保方向 */
 #define CHASSIS_WHEEL_SPEED_CAP_MPS         (4.0f)

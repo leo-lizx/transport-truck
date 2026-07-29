@@ -5,8 +5,8 @@ sokoban_car_sim.py — 推箱子"整车流程"验证器 (车载屏幕 UI 版)
 **严格按照固件 app_game_logic.c 的整车状态机流程**模拟运动:
 
     STAGE_WAIT_START  → 发车流程 (回 (5,1) → 上移至 (4,1))
-    STAGE_RECOGNIZE_MAP → 识别地图 (第 2/3 关: 先逐个去箱子/目标面前观察)
-    STAGE_PLAN_PATH   → 规划 (第1关贪心 / 第2关按数字配对 / 第3关含炸弹)
+    STAGE_RECOGNIZE_MAP → 识别地图 (第 2 关共线目标跳过观察, 其余逐个实地识别)
+    STAGE_PLAN_PATH   → 规划 (第1关时间优化 / 第2关配对或单快照盲扫 / 第3关含炸弹)
     STAGE_EXECUTE_ACTION → 执行 (推箱; 第3关先推炸弹炸墙再推箱)
     STAGE_LEVEL_JUDGE → 关卡判定
     STAGE_DONE        → 完成
@@ -36,9 +36,10 @@ from sokoban_validator import (
     is_inner,
     find_observe_point_for_box,
     plan_scout_phase_v2,
+    detect_stage2_line_targets,
+    solve_stage2_line_sweep,
     solve_full,
     solve_level,
-    solve_stage2,
     build_return_path,
     check_deadlock,
     apply_bomb_explosion,
@@ -372,11 +373,11 @@ def _gen_open_map(level: int, box_count: int, wall_density: float,
         if level == 1:
             ok = solve_level(1, m, exit_c) is not None
         else:
-            scout = plan_scout_phase_v2(
-                m, exit_c, box_classes=bc, target_classes=tc)
-            mapping = scout.get('box_to_target_idx')
-            ok = bool(scout.get('all_visited') and mapping and
-                      solve_stage2(m, scout['player_after_scout'], mapping))
+            ok = solve_level(
+                2, m, exit_c,
+                box_classes=bc,
+                target_classes=tc,
+            ) is not None
         if not ok:
             continue
 
@@ -555,6 +556,8 @@ class CarSim:
         self.frames: List[dict] = []
         self.log: List[str] = []
         self.mapping: Optional[list] = None
+        self.line_sweep_plan: Optional[dict] = None
+        self.line_sweep_mode = False
         self.recog_summary = ''
 
     # ---- 工具 ----
@@ -568,7 +571,8 @@ class CarSim:
 
     def _win(self) -> bool:
         if not self.boxes:
-            return False
+            return self.line_sweep_mode and not extract_elements(
+                self.base, TARGET)
         # 通关前提: 箱子两两不重叠, 且全部落在目标格
         if len(set(self.boxes)) != len(self.boxes):
             return False
@@ -600,6 +604,7 @@ class CarSim:
             'explosion': explosion,
             'win':       self._win(),
             'mapping':   list(self.mapping) if self.mapping else None,
+            'line_sweep': self.line_sweep_mode,
             'recog':     self.recog_summary,
             'box_classes': list(self.box_class),
             'target_classes': list(self.target_class),
@@ -675,6 +680,33 @@ class CarSim:
             return
 
         fm = self.full_map()
+        if self.level == 2:
+            line_info = detect_stage2_line_targets(fm)
+            if line_info is not None:
+                line_plan = solve_stage2_line_sweep(
+                    fm, self.player, line_info,
+                    box_classes=self.box_class,
+                    target_classes=self.target_class,
+                    home_pos=self.start,
+                )
+                if line_plan is not None:
+                    self.line_sweep_plan = line_plan
+                    self.line_sweep_mode = True
+                    self.mapping = None
+                    self.recog_summary = (
+                        '共线目标盲扫: 跳过图案识别, '
+                        '使用开局地图全量规划')
+                    self._snap(
+                        'RECOGNIZE',
+                        '检测到连续共线目标, 跳过数字分类')
+                    self.log.append(
+                        '[RECOGNIZE] LINE_SWEEP_BYPASS: '
+                        '开局地图读取 1 次, 不进行观察 Tour')
+                    return
+                self.log.append(
+                    '[RECOGNIZE] 共线目标全量规划失败, '
+                    '执行前回退常规数字识别')
+
         scout = plan_scout_phase_v2(fm, self.player,
                                     box_classes=self.box_classes,
                                     target_classes=self.target_classes)
@@ -718,24 +750,37 @@ class CarSim:
     def plan_and_execute(self):
         self._snap('PLAN', '规划推箱/炸弹路径 (推宏 A* + 时间成本搜索)')
         fm = self.full_map()
-        if self.level >= 2 and self.mapping is None:
-            self._snap('DEADLOCK', '分类映射不完整，禁止降级为任意配对')
-            self.log.append('[DEADLOCK_RESET] 分类映射失败')
-            return False
-        res = solve_full(fm, self.player, self.mapping, home_pos=self.start)
-        if res is None or not res['is_solved']:
-            self._snap('DEADLOCK', '无解 → 回发车区静止 3s 复位')
-            self.log.append('[DEADLOCK_RESET] 规划失败')
-            return False
+        if self.line_sweep_plan is not None:
+            self._snap(
+                'PLAN',
+                '开局快照已生成全部盲扫路径, 准备一批连续执行')
+            self.log.append(
+                f"[PLAN] LINE_SWEEP: {len(self.line_sweep_plan['sub_solutions'])} "
+                '只箱子, 1 次读图 / 1 个执行批次')
+            for sub in self.line_sweep_plan['sub_solutions']:
+                if not self._exec_line_sweep(sub):
+                    self._snap('DEADLOCK', '盲扫动画状态与预计路径不一致')
+                    self.log.append('[DEADLOCK_RESET] 盲扫执行校验失败')
+                    return False
+        else:
+            if self.level >= 2 and self.mapping is None:
+                self._snap('DEADLOCK', '分类映射不完整，禁止降级为任意配对')
+                self.log.append('[DEADLOCK_RESET] 分类映射失败')
+                return False
+            res = solve_full(fm, self.player, self.mapping, home_pos=self.start)
+            if res is None or not res['is_solved']:
+                self._snap('DEADLOCK', '无解 → 回发车区静止 3s 复位')
+                self.log.append('[DEADLOCK_RESET] 规划失败')
+                return False
 
-        for ph in res['phases']:
-            if ph['kind'] == 'push':
-                self._exec_push(ph)
-            else:
-                self._exec_bomb(ph)
-            # 每炸完一颗炸弹, 固件会回 PLAN 重新规划 → 我们已用 solve_full 一次展开
-            if ph['kind'] == 'bomb':
-                self._snap('PLAN', '爆破完成, 重新规划剩余推箱')
+            for ph in res['phases']:
+                if ph['kind'] == 'push':
+                    self._exec_push(ph)
+                else:
+                    self._exec_bomb(ph)
+                # 每炸完一颗炸弹, 固件会回 PLAN 重新规划 → 我们已用 solve_full 一次展开
+                if ph['kind'] == 'bomb':
+                    self._snap('PLAN', '爆破完成, 重新规划剩余推箱')
 
         return_plan = build_return_path(self.full_map(), self.player, self.start)
         if return_plan is None:
@@ -746,6 +791,51 @@ class CarSim:
         self.player = self.start
         self._snap('WAIT_START', '返库终点关键 Snap + 航向校准')
         self.log.append(f"[WAIT_START] 直线返库 → {self._xy(self.start)}")
+        return True
+
+    def _exec_line_sweep(self, sub: dict) -> bool:
+        """按已经全量规划的子路径播放一只箱子。
+
+        箱子到达同号目标时与目标同时消失；剩余的直线推送指令继续
+        作为车辆前进动画，所以最终车位与固件预测一致。
+        """
+        box_idx = self._find_movable(self.boxes, sub['box_start'])
+        matched_target = sub['matched_target']
+        if box_idx < 0 or len(sub['actions']) != len(sub['push_flags']):
+            return False
+        if self.box_class[box_idx] != self.target_class_by_pos.get(
+                matched_target):
+            return False
+
+        info = f"盲扫箱子 {self._xy(sub['box_start'])}"
+        self._snap('EXECUTE', info)
+        removed = False
+        for action, is_push in zip(sub['actions'], sub['push_flags']):
+            active_idx = box_idx if is_push and not removed else -1
+            self._step(action, 'EXECUTE', info,
+                       mv_kind='box', mv_idx=active_idx)
+            if (not removed and is_push and
+                    self.boxes[box_idx] == matched_target):
+                target_positions = extract_elements(self.base, TARGET)
+                if matched_target not in target_positions:
+                    return False
+                target_idx = target_positions.index(matched_target)
+                self.boxes.pop(box_idx)
+                self.box_class.pop(box_idx)
+                self.base[matched_target[0]][matched_target[1]] = EMPTY
+                self.target_class.pop(target_idx)
+                self.target_class_by_pos.pop(matched_target, None)
+                removed = True
+                self._snap(
+                    'EXECUTE',
+                    f"命中同号目标 {self._xy(matched_target)}, 箱子/目标消失",
+                    event='LINE_SWEEP_MATCH')
+
+        if not removed or self.player != sub['player_end']:
+            return False
+        self.log.append(
+            f"[EXECUTE] LINE_SWEEP {self._xy(sub['box_start'])} 完成, "
+            f"遍历 {len(sub['sweep_targets'])} 个开局目标")
         return True
 
     def _exec_push(self, ph: dict):
@@ -846,8 +936,12 @@ def run_selftest() -> int:
         if level >= 2:
             need_face = len(extract_elements(info['map'], BOX)) + len(extract_elements(info['map'], TARGET))
             face_count = sum(1 for fr in frames if fr.get('event') == 'FACE')
-            if face_count != need_face:
-                print(f"Level {level}: FACE frames mismatch {face_count}/{need_face}")
+            expected_face = 0 if (level == 2 and
+                                  any(fr.get('line_sweep') for fr in frames)) \
+                else need_face
+            if face_count != expected_face:
+                print(f"Level {level}: FACE frames mismatch "
+                      f"{face_count}/{expected_face}")
                 ok = False
         print(f"Level {level}: stage={last['stage']} steps={last['steps']} "
               f"frames={len(frames)} win={ok}")
@@ -855,6 +949,37 @@ def run_selftest() -> int:
             print('   ', line)
         if not ok:
             rc = 1
+
+    line_map = _make_empty_map()
+    for col in range(7, 11):
+        line_map[5][col] = TARGET
+    for row in (2, 4, 6, 8):
+        line_map[row][2] = BOX
+    line_info = {
+        'map': line_map,
+        'start': expected_start,
+        'exit': expected_exit,
+        'zone': ZONE_LEFT,
+        'box_classes': [1, 2, 3, 4],
+        'target_classes': [4, 2, 1, 3],
+        'level': 2,
+    }
+    line_frames, line_log = build_timeline(line_info)
+    line_last = line_frames[-1]
+    line_matches = sum(
+        1 for frame in line_frames
+        if frame.get('event') == 'LINE_SWEEP_MATCH')
+    line_faces = sum(
+        1 for frame in line_frames if frame.get('event') == 'FACE')
+    line_ok = (line_last['win'] and line_matches == 4 and line_faces == 0
+               and not line_last['boxes']
+               and not extract_elements(line_last['base'], TARGET))
+    print(f"Level 2 line sweep: matches={line_matches} "
+          f"faces={line_faces} win={line_ok}")
+    for line in line_log:
+        print('   ', line)
+    if not line_ok:
+        rc = 1
     print('SELFTEST', 'PASS' if rc == 0 else 'FAIL')
     return rc
 
@@ -863,7 +988,8 @@ def run_selftest() -> int:
 # 图形界面 (复刻车载 IPS200 屏幕风格)
 # ============================================================
 
-def launch_gui():
+def launch_gui(initial_info: Optional[dict] = None,
+               autoplay: bool = False):
     import tkinter as tk
     from tkinter import messagebox
 
@@ -1281,7 +1407,11 @@ def launch_gui():
 
     # 初始演示
     refresh_map_choices()
-    _load_info(gen_level_map(1, 2, 0.08, 20260608, ZONE_LEFT))
+    if initial_info is None:
+        initial_info = gen_level_map(1, 2, 0.08, 20260608, ZONE_LEFT)
+    _load_info(initial_info)
+    if autoplay:
+        root.after(500, do_play)
 
     root.mainloop()
 
@@ -1535,6 +1665,16 @@ def _open_custom_editor(root, on_load, default_level=1,
 def main():
     if '--selftest' in sys.argv:
         sys.exit(run_selftest())
+    if '--last-saved' in sys.argv:
+        saved_maps = _load_custom_maps()
+        if not saved_maps:
+            raise SystemExit('没有可用的已保存地图')
+        record = saved_maps[-1]
+        info = _info_from_map_text(
+            record['text'], record['level'],
+            record.get('box_classes'), record.get('target_classes'))
+        launch_gui(info, autoplay='--autoplay' in sys.argv)
+        return
     launch_gui()
 
 

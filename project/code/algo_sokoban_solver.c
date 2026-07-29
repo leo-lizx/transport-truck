@@ -44,6 +44,8 @@ static const int8 s_dc[4] = {  0,  0, -1,  1 };
 /* 与正式执行层一致的规划标尺（毫秒量级，不用于精确物理仿真）。 */
 #define SOKO_COST_MOVE_MS       (100UL)
 #define SOKO_COST_WAYPOINT_MS   (400UL)
+/* 方向终态盲扫优先减少箱子推动次数，再比较实际行车时间。 */
+#define SOKO_DIRECTIONAL_PUSH_PRIORITY_MS (1000000UL)
 #if CHASSIS_VISION_SNAP_ON_ARRIVE_ENABLE
 #define SOKO_COST_SNAP_MS       (200UL)
 #else
@@ -65,6 +67,7 @@ static uint16 sb_macro_heap[SB_MACRO_STATE_COUNT];
 static uint16 sb_macro_heap_pos[SB_MACRO_STATE_COUNT];
 static uint16 sb_macro_heap_size;
 static Point_t sb_macro_heap_target;
+static uint32 sb_macro_push_cost_bias;
 static uint8  sb_macro_base_map[MAP_ROWS][MAP_COLS];
 static uint8  sb_macro_walk_map[MAP_ROWS][MAP_COLS];
 static NavPath_t sb_macro_walk_path;
@@ -567,7 +570,7 @@ static uint32 sb_macro_heap_key(uint16 state)
     Point_t box = sb_macro_box(state);
     uint32 heuristic = (uint32)(abs(box.x - sb_macro_heap_target.x) +
                                 abs(box.y - sb_macro_heap_target.y)) *
-                       SOKO_COST_MOVE_MS;
+                       (SOKO_COST_MOVE_MS + sb_macro_push_cost_bias);
     return sb_macro_cost[state] + heuristic;
 }
 
@@ -715,7 +718,7 @@ static uint8 sb_macro_make_edge(const uint8 sub_map[MAP_ROWS][MAP_COLS],
     if (edge_cost) {
         uint8 last_direction = walk_end_direction;
         uint32 cost = (uint32)walk_cost_units * SOKO_COST_MOVE_MS;
-        cost += SOKO_COST_MOVE_MS;
+        cost += SOKO_COST_MOVE_MS + sb_macro_push_cost_bias;
         if (last_direction >= 4U || last_direction != push_dir) {
             cost += SOKO_COST_WAYPOINT_MS;
         }
@@ -742,6 +745,7 @@ typedef struct {
     Point_t player_start;
     Point_t box_start;
     Point_t target;
+    SokoAction_e required_goal_direction;
     Point_t reconstruct_player;
     Point_t reconstruct_box;
     SokoAction_e reconstruct_direction;
@@ -752,14 +756,18 @@ typedef struct {
 
 static SbSearchContext_t s_sb_search;
 
-static uint8 sb_search_begin(const uint8 sub_map[MAP_ROWS][MAP_COLS],
-                             Point_t player, Point_t box, Point_t target,
-                             SokoActionSeq_t *solution)
+static uint8 sb_search_begin_directional(
+    const uint8 sub_map[MAP_ROWS][MAP_COLS],
+    Point_t player, Point_t box, Point_t target,
+    SokoAction_e required_goal_direction,
+    SokoActionSeq_t *solution)
 {
     memset(&s_sb_search, 0, sizeof(s_sb_search));
     if (!solution || !map_is_inner_cell(player.y, player.x) ||
         !map_is_inner_cell(box.y, box.x) ||
-        !map_is_inner_cell(target.y, target.x)) {
+        !map_is_inner_cell(target.y, target.x) ||
+        (required_goal_direction != SOKO_ACT_NONE &&
+         required_goal_direction > SOKO_ACT_RIGHT)) {
         s_sb_search.status = SB_SEARCH_FAILED;
         return 0U;
     }
@@ -769,8 +777,10 @@ static uint8 sb_search_begin(const uint8 sub_map[MAP_ROWS][MAP_COLS],
     s_sb_search.player_start = player;
     s_sb_search.box_start = box;
     s_sb_search.target = target;
+    s_sb_search.required_goal_direction = required_goal_direction;
     s_sb_search.solution = solution;
-    if (box.y == target.y && box.x == target.x) {
+    if (box.y == target.y && box.x == target.x &&
+        required_goal_direction == SOKO_ACT_NONE) {
         s_sb_search.status = SB_SEARCH_SOLVED;
         return 1U;
     }
@@ -785,6 +795,9 @@ static uint8 sb_search_begin(const uint8 sub_map[MAP_ROWS][MAP_COLS],
     memset(sb_macro_closed, 0, sizeof(sb_macro_closed));
     sb_macro_heap_size = 0U;
     sb_macro_heap_target = target;
+    sb_macro_push_cost_bias =
+        (required_goal_direction == SOKO_ACT_NONE)
+      ? 0UL : SOKO_DIRECTIONAL_PUSH_PRIORITY_MS;
 
     if (!sb_macro_prepare_walk(sb_macro_base_map, player, box,
                                (uint8)SOKO_ACT_NONE)) {
@@ -811,6 +824,14 @@ static uint8 sb_search_begin(const uint8 sub_map[MAP_ROWS][MAP_COLS],
     return (uint8)(s_sb_search.status != SB_SEARCH_FAILED);
 }
 
+static uint8 sb_search_begin(const uint8 sub_map[MAP_ROWS][MAP_COLS],
+                             Point_t player, Point_t box, Point_t target,
+                             SokoActionSeq_t *solution)
+{
+    return sb_search_begin_directional(sub_map, player, box, target,
+                                       SOKO_ACT_NONE, solution);
+}
+
 /** 每个 work unit 最多执行一次宏状态扩展或一次推宏动作重建。 */
 static SbSearchStatus_e sb_search_step(uint8 max_work_units)
 {
@@ -835,7 +856,10 @@ static SbSearchStatus_e sb_search_step(uint8 max_work_units)
             current_player.x = (int8)(current_box.x - s_dc[previous_dir]);
 
             if (current_box.x == s_sb_search.target.x &&
-                current_box.y == s_sb_search.target.y) {
+                current_box.y == s_sb_search.target.y &&
+                (s_sb_search.required_goal_direction == SOKO_ACT_NONE ||
+                 previous_dir ==
+                     (uint8)s_sb_search.required_goal_direction)) {
                 uint16 state = current;
                 s_sb_search.macro_count = 0U;
                 while (state != SB_MACRO_PREV_NONE) {
@@ -1387,6 +1411,20 @@ typedef struct {
 
 static SokoOptContext_t s_soko_opt;
 
+typedef struct {
+    SokoSearchStatus_e status;
+    const uint8 (*map)[MAP_COLS];
+    Point_t player;
+    Point_t box;
+    Point_t target;
+    SokoAction_e required_goal_direction;
+    uint8 direct_checked;
+    uint8 search_started;
+    SokoFullSolution_t *out;
+} SokoDirectionalPushContext_t;
+
+static SokoDirectionalPushContext_t s_directional_push;
+
 static uint8 soko_mapping_is_valid(const uint8 mapping[], uint8 box_n, uint8 target_n)
 {
     uint8 used = 0U;
@@ -1817,6 +1855,177 @@ SokoSearchStatus_e Sokoban_Stage2_Search_Step(uint8 max_work_units,
     return Sokoban_Stage1_Search_Step(max_work_units, result);
 }
 
+static uint8 soko_directional_try_direct(
+    const uint8 map[MAP_ROWS][MAP_COLS],
+    Point_t player,
+    Point_t box,
+    Point_t target,
+    SokoAction_e direction,
+    SokoFullSolution_t *result)
+{
+    Point_t stand;
+    Point_t previous;
+    int16 delta_x = (int16)target.x - (int16)box.x;
+    int16 delta_y = (int16)target.y - (int16)box.y;
+    uint8 push_count;
+
+    if (!result) return 0U;
+    if (direction == SOKO_ACT_UP && delta_x == 0 && delta_y <= 0) {
+        push_count = (uint8)(-delta_y);
+    } else if (direction == SOKO_ACT_DOWN &&
+               delta_x == 0 && delta_y >= 0) {
+        push_count = (uint8)delta_y;
+    } else if (direction == SOKO_ACT_LEFT &&
+               delta_y == 0 && delta_x <= 0) {
+        push_count = (uint8)(-delta_x);
+    } else if (direction == SOKO_ACT_RIGHT &&
+               delta_y == 0 && delta_x >= 0) {
+        push_count = (uint8)delta_x;
+    } else {
+        return 0U;
+    }
+
+    for (uint8 step = 1U; step <= push_count; ++step) {
+        int8 y = (int8)(box.y + s_dr[direction] * step);
+        int8 x = (int8)(box.x + s_dc[direction] * step);
+        if (!sb_is_free(map, y, x)) return 0U;
+    }
+    stand.x = (int8)(box.x - s_dc[direction]);
+    stand.y = (int8)(box.y - s_dr[direction]);
+    if (!Algo_Nav_Time_Path(map, player, stand, SOKO_ACT_NONE,
+                            &sb_macro_walk_path, NULL, NULL)) {
+        return 0U;
+    }
+
+    result->sub_solutions[0].count = 0U;
+    memset(result->sub_solutions[0].push_bitmap, 0,
+           sizeof(result->sub_solutions[0].push_bitmap));
+    previous = player;
+    for (uint16 i = 0U; i < sb_macro_walk_path.step_count; ++i) {
+        uint8 action;
+        if (!soko_action_from_points(previous, sb_macro_walk_path.path[i],
+                                     &action) ||
+            !soko_seq_append(&result->sub_solutions[0], action, 0U)) {
+            return 0U;
+        }
+        previous = sb_macro_walk_path.path[i];
+    }
+    for (uint8 step = 0U; step < push_count; ++step) {
+        if (!soko_seq_append(&result->sub_solutions[0],
+                             (uint8)direction, 1U)) {
+            return 0U;
+        }
+    }
+
+    result->total_boxes = 1U;
+    result->is_solved = 1U;
+    result->player_end_pos[0].x = (int8)(target.x - s_dc[direction]);
+    result->player_end_pos[0].y = (int8)(target.y - s_dr[direction]);
+    return 1U;
+}
+
+uint8 Sokoban_Directional_Push_Search_Begin(
+    const uint8 map[MAP_ROWS][MAP_COLS],
+    Point_t player_pos,
+    Point_t box_pos,
+    Point_t target_pos,
+    SokoAction_e required_goal_direction)
+{
+    memset(&s_directional_push, 0, sizeof(s_directional_push));
+    if (!map || !map_is_inner_cell(player_pos.y, player_pos.x) ||
+        !map_is_inner_cell(box_pos.y, box_pos.x) ||
+        !map_is_inner_cell(target_pos.y, target_pos.x) ||
+        required_goal_direction > SOKO_ACT_RIGHT ||
+        map[box_pos.y][box_pos.x] != MAP_BOX ||
+        ((box_pos.x != target_pos.x || box_pos.y != target_pos.y) &&
+         !sb_is_free(map, target_pos.y, target_pos.x))) {
+        s_directional_push.status = SOKO_SEARCH_FAILED;
+        return 0U;
+    }
+
+    s_directional_push.status = SOKO_SEARCH_RUNNING;
+    s_directional_push.map = map;
+    s_directional_push.player = player_pos;
+    s_directional_push.box = box_pos;
+    s_directional_push.target = target_pos;
+    s_directional_push.required_goal_direction = required_goal_direction;
+    return 1U;
+}
+
+SokoSearchStatus_e Sokoban_Directional_Push_Search_Step(
+    uint8 max_work_units,
+    SokoFullSolution_t *result)
+{
+    SbSearchStatus_e search_status;
+    uint8 work_left = (max_work_units == 0U) ? 1U : max_work_units;
+
+    if (s_directional_push.status != SOKO_SEARCH_RUNNING) {
+        return s_directional_push.status;
+    }
+    if (!result) {
+        s_directional_push.status = SOKO_SEARCH_FAILED;
+        return s_directional_push.status;
+    }
+    if (!s_directional_push.out) {
+        memset(result, 0, sizeof(*result));
+        s_directional_push.out = result;
+    } else if (s_directional_push.out != result) {
+        s_directional_push.status = SOKO_SEARCH_FAILED;
+        return s_directional_push.status;
+    }
+
+    if (s_directional_push.direct_checked == 0U) {
+        s_directional_push.direct_checked = 1U;
+        if (soko_directional_try_direct(
+                s_directional_push.map,
+                s_directional_push.player,
+                s_directional_push.box,
+                s_directional_push.target,
+                s_directional_push.required_goal_direction,
+                result)) {
+            s_directional_push.status = SOKO_SEARCH_SOLVED;
+            return s_directional_push.status;
+        }
+        --work_left;
+        if (work_left == 0U) return SOKO_SEARCH_RUNNING;
+    }
+
+    if (s_directional_push.search_started == 0U) {
+        if (!sb_search_begin_directional(
+                s_directional_push.map,
+                s_directional_push.player,
+                s_directional_push.box,
+                s_directional_push.target,
+                s_directional_push.required_goal_direction,
+                &result->sub_solutions[0])) {
+            s_directional_push.status = SOKO_SEARCH_FAILED;
+            return s_directional_push.status;
+        }
+        s_directional_push.search_started = 1U;
+        --work_left;
+        if (work_left == 0U) return SOKO_SEARCH_RUNNING;
+    }
+
+    search_status = sb_search_step(work_left);
+    if (search_status == SB_SEARCH_EXPAND ||
+        search_status == SB_SEARCH_RECONSTRUCT) {
+        return SOKO_SEARCH_RUNNING;
+    }
+    if (search_status != SB_SEARCH_SOLVED) {
+        s_directional_push.status = SOKO_SEARCH_FAILED;
+        return s_directional_push.status;
+    }
+
+    result->total_boxes = 1U;
+    result->is_solved = 1U;
+    result->player_end_pos[0] = simulate_actions(
+        &result->sub_solutions[0],
+        s_directional_push.player,
+        s_directional_push.box);
+    s_directional_push.status = SOKO_SEARCH_SOLVED;
+    return s_directional_push.status;
+}
+
 uint8 Sokoban_Search_Has_Incumbent(void)
 {
     return (uint8)((s_soko_opt.best_valid != 0U) &&
@@ -1830,6 +2039,8 @@ void Sokoban_Stage1_Search_Cancel(void)
     s_soko_opt.pair_active = 0U;
     s_sb_search.status = SB_SEARCH_IDLE;
     s_soko_opt.out = 0;
+    s_directional_push.status = SOKO_SEARCH_IDLE;
+    s_directional_push.out = 0;
 }
 
 uint8 Sokoban_Solve_Stage1(const uint8 map[MAP_ROWS][MAP_COLS],

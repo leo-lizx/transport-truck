@@ -45,6 +45,7 @@ BOMB   = 4
 
 MAX_BOXES = 8
 UNMATCHED_TARGET = 0xFF
+LINE_SWEEP_MIN_TARGETS = 3
 
 # 单次推箱最大步数（镜像 C 端 algo_sokoban_solver.h::SOKOBAN_MAX_ACTIONS）
 SOKOBAN_MAX_ACTIONS = 500
@@ -924,6 +925,7 @@ def plan_scout_phase_v2(the_map: list, player_start: tuple,
 
 SOKO_COST_MOVE_MS = 100
 SOKO_COST_WAYPOINT_MS = 400
+DIRECTIONAL_PUSH_PRIORITY_MS = 1_000_000
 # Firmware configChassis.h currently disables arrival Snap; keep the mirror's
 # objective identical instead of charging a non-existent 200ms operation.
 SOKO_COST_SNAP_MS = 0
@@ -972,20 +974,71 @@ def _macro_edge(sub_map: list, player: tuple, box: tuple,
         cost += SOKO_COST_SNAP_MS
     return next_box, walk_path, cost
 
+
+def _direct_aligned_push_actions(sub_map: list, player: tuple,
+                                 box: tuple, target: tuple,
+                                 push_direction: int) -> Optional[list]:
+    """同轴且走廊无真实障碍时，先走到箱后，再直推到方向终点。"""
+    delta_row = target[0] - box[0]
+    delta_col = target[1] - box[1]
+    if push_direction == 0 and delta_col == 0 and delta_row <= 0:
+        push_count = -delta_row
+    elif push_direction == 1 and delta_col == 0 and delta_row >= 0:
+        push_count = delta_row
+    elif push_direction == 2 and delta_row == 0 and delta_col <= 0:
+        push_count = -delta_col
+    elif push_direction == 3 and delta_row == 0 and delta_col >= 0:
+        push_count = delta_col
+    else:
+        return None
+
+    for step in range(1, push_count + 1):
+        cell = (box[0] + DR[push_direction] * step,
+                box[1] + DC[push_direction] * step)
+        if not is_free(sub_map, *cell):
+            return None
+
+    stand = (box[0] - DR[push_direction],
+             box[1] - DC[push_direction])
+    route = nav_time_path(sub_map, player, stand, None)
+    if route is None:
+        return None
+    actions = []
+    for src, dst in zip(route[0], route[0][1:]):
+        action = _action_from_points(src, dst)
+        if action is None:
+            return None
+        actions.append(action)
+    return actions + [push_direction] * push_count
+
 def sokoban_bfs_single(sub_map: list, player: tuple, box: tuple,
-                       target: tuple) -> Optional[list]:
+                       target: tuple,
+                       required_goal_direction: Optional[int] = None
+                       ) -> Optional[list]:
     """
     单箱推宏 A*。状态=(box_r, box_c, last_push_dir)，普通行走由导航 BFS 连接。
+    required_goal_direction 非空时，终点还要求末次推动方向一致，并优先减少
+    箱子推动次数，再比较实际行车时间。
     返回动作序列 [0..3]，无解返回 None。
     对应 C 代码 sokoban_bfs_single()。
     """
     if not (is_inner(*player) and is_inner(*box) and is_inner(*target)):
         return None
-    if box == target:
+    if required_goal_direction is not None and \
+       required_goal_direction not in range(4):
+        return None
+    if required_goal_direction is not None:
+        direct = _direct_aligned_push_actions(
+            sub_map, player, box, target, required_goal_direction)
+        if direct is not None:
+            return direct
+    if box == target and required_goal_direction is None:
         return []
 
     work_map = [row[:] for row in sub_map]
     work_map[box[0]][box[1]] = EMPTY
+    push_priority = (DIRECTIONAL_PUSH_PRIORITY_MS
+                     if required_goal_direction is not None else 0)
 
     best_cost: Dict[tuple, int] = {}
     parent: Dict[tuple, Optional[tuple]] = {}
@@ -1001,12 +1054,15 @@ def sokoban_bfs_single(sub_map: list, player: tuple, box: tuple,
             continue
         next_box, _, edge_cost = edge
         state = (next_box[0], next_box[1], d)
-        if edge_cost < best_cost.get(state, 10 ** 18):
-            best_cost[state] = edge_cost
+        state_cost = edge_cost + push_priority
+        if state_cost < best_cost.get(state, 10 ** 18):
+            best_cost[state] = state_cost
             parent[state] = None
             heuristic = (abs(next_box[0] - target[0])
-                         + abs(next_box[1] - target[1])) * SOKO_COST_MOVE_MS
-            heapq.heappush(queue, (edge_cost + heuristic, edge_cost, state))
+                         + abs(next_box[1] - target[1])) * \
+                        (SOKO_COST_MOVE_MS + push_priority)
+            heapq.heappush(queue, (state_cost + heuristic,
+                                   state_cost, state))
 
     closed = set()
     goal_state = None
@@ -1018,7 +1074,9 @@ def sokoban_bfs_single(sub_map: list, player: tuple, box: tuple,
         br, bc, previous_dir = state
         cur_box = (br, bc)
         cur_player = (br - DR[previous_dir], bc - DC[previous_dir])
-        if cur_box == target:
+        if cur_box == target and \
+           (required_goal_direction is None or
+            previous_dir == required_goal_direction):
             goal_state = state
             break
 
@@ -1033,13 +1091,14 @@ def sokoban_bfs_single(sub_map: list, player: tuple, box: tuple,
                 continue
             next_box, _, edge_cost = edge
             next_state = (next_box[0], next_box[1], d)
-            next_cost = cost + edge_cost
+            next_cost = cost + edge_cost + push_priority
             if next_state in closed or next_cost >= best_cost.get(next_state, 10 ** 18):
                 continue
             best_cost[next_state] = next_cost
             parent[next_state] = state
             heuristic = (abs(next_box[0] - target[0])
-                         + abs(next_box[1] - target[1])) * SOKO_COST_MOVE_MS
+                         + abs(next_box[1] - target[1])) * \
+                        (SOKO_COST_MOVE_MS + push_priority)
             heapq.heappush(queue, (next_cost + heuristic, next_cost, next_state))
 
     if goal_state is None:
@@ -1584,6 +1643,242 @@ def solve_stage2(the_map: list, player_pos: tuple,
         the_map, player_pos,
         player_pos if home_pos is None else home_pos,
         box_to_target_idx)
+
+
+def detect_stage2_line_targets(the_map: list) -> Optional[dict]:
+    """检测第二关初始盲扫布局：至少三个目标连续共行或共列。"""
+    targets = extract_elements(the_map, TARGET)
+    if len(targets) < LINE_SWEEP_MIN_TARGETS:
+        return None
+
+    same_row = all(pos[0] == targets[0][0] for pos in targets)
+    same_col = all(pos[1] == targets[0][1] for pos in targets)
+    if same_row:
+        coordinates = sorted(pos[1] for pos in targets)
+        if coordinates[-1] - coordinates[0] + 1 == len(coordinates):
+            return {'horizontal': True, 'fixed': targets[0][0]}
+    if same_col:
+        coordinates = sorted(pos[0] for pos in targets)
+        if coordinates[-1] - coordinates[0] + 1 == len(coordinates):
+            return {'horizontal': False, 'fixed': targets[0][1]}
+    return None
+
+
+def _line_sweep_targets_match(the_map: list, line_info: dict) -> bool:
+    targets = extract_elements(the_map, TARGET)
+    boxes = extract_elements(the_map, BOX)
+    if not targets or not boxes or len(boxes) > len(targets):
+        return False
+    if line_info['horizontal']:
+        return all(pos[0] == line_info['fixed'] for pos in targets)
+    return all(pos[1] == line_info['fixed'] for pos in targets)
+
+
+def build_stage2_line_sweep_problem(the_map: list,
+                                    player_pos: tuple,
+                                    line_info: dict,
+                                    box_idx: int,
+                                    positive_direction: bool) -> Optional[dict]:
+    """构造只读单箱 staging 子问题，不向地图添加任何虚拟障碍。"""
+    boxes = extract_elements(the_map, BOX)
+    targets = extract_elements(the_map, TARGET)
+    if box_idx < 0 or box_idx >= len(boxes) or \
+       not _line_sweep_targets_match(the_map, line_info):
+        return None
+
+    horizontal = bool(line_info['horizontal'])
+    axis_values = sorted(pos[1] if horizontal else pos[0] for pos in targets)
+    direction = 1 if positive_direction else -1
+    near_axis = axis_values[0] if direction > 0 else axis_values[-1]
+    fixed = line_info['fixed']
+    active_box = boxes[box_idx]
+
+    def axis_point(axis: int, perpendicular_delta: int = 0) -> tuple:
+        if horizontal:
+            return fixed + perpendicular_delta, axis
+        return axis, fixed + perpendicular_delta
+
+    staging = axis_point(near_axis - direction)
+    sweep_action = (3 if direction > 0 else 2) if horizontal else \
+                   (1 if direction > 0 else 0)
+    already_staged = staging == active_box
+    if not is_inner(*staging):
+        return None
+    if not already_staged and the_map[staging[0]][staging[1]] != EMPTY:
+        return None
+
+    return {
+        'map': the_map,
+        'box_idx': box_idx,
+        'box_pos': active_box,
+        'targets': targets,
+        'direction': direction,
+        'sweep_action': sweep_action,
+        'staging': staging,
+        'already_staged': already_staged,
+        'sweep_length': axis_values[-1] - axis_values[0] + 1,
+    }
+
+
+def _planned_box_trace(actions: list, push_flags: list,
+                       player_pos: tuple, box_pos: tuple) -> list:
+    player = player_pos
+    box = box_pos
+    trace = []
+    for action, is_push in zip(actions, push_flags):
+        player = (player[0] + DR[action], player[1] + DC[action])
+        if is_push:
+            box = (box[0] + DR[action], box[1] + DC[action])
+            trace.append(box)
+    return trace
+
+
+def solve_stage2_line_sweep(the_map: list,
+                            player_pos: tuple,
+                            line_info: dict,
+                            box_classes: Optional[list] = None,
+                            target_classes: Optional[list] = None,
+                            home_pos: tuple = (5, 1)) -> Optional[dict]:
+    """只读取开局地图，在预测地图上一次性规划全部箱子的盲扫航线。"""
+    original_boxes = extract_elements(the_map, BOX)
+    original_targets = extract_elements(the_map, TARGET)
+    if len(original_boxes) != len(original_targets) or not original_boxes:
+        return None
+
+    remaining_box_classes = list(box_classes) if box_classes is not None else \
+        list(range(1, len(original_boxes) + 1))
+    remaining_target_classes = list(target_classes) if target_classes is not None else \
+        list(range(1, len(original_targets) + 1))
+    if len(remaining_box_classes) != len(original_boxes) or \
+       len(remaining_target_classes) != len(original_targets):
+        return None
+
+    work = [row[:] for row in the_map]
+    cur_player = player_pos
+    sub_solutions = []
+    available_target_indices = list(range(len(original_targets)))
+
+    while extract_elements(work, BOX):
+        boxes = extract_elements(work, BOX)
+        targets = extract_elements(work, TARGET)
+        if not _line_sweep_targets_match(work, line_info):
+            return None
+
+        candidates = []
+        horizontal = bool(line_info['horizontal'])
+        axis_values = sorted(
+            pos[1] if horizontal else pos[0] for pos in targets)
+        fixed = line_info['fixed']
+        for box_idx, box in enumerate(boxes):
+            for direction_slot, positive_direction in enumerate((True, False)):
+                direction = 1 if positive_direction else -1
+                near_axis = axis_values[0] if direction > 0 else axis_values[-1]
+                staging = (fixed, near_axis - direction) if horizontal else \
+                          (near_axis - direction, fixed)
+                cost = sum(abs(a - b) for a, b in zip(cur_player, box)) + \
+                       sum(abs(a - b) for a, b in zip(box, staging))
+                candidates.append((cost, box_idx * 2 + direction_slot,
+                                   box_idx, positive_direction))
+
+        chosen = None
+        for _, _, box_idx, positive_direction in sorted(candidates):
+            problem = build_stage2_line_sweep_problem(
+                work, cur_player, line_info, box_idx, positive_direction)
+            if problem is None:
+                continue
+            actions_to_staging = sokoban_bfs_single(
+                problem['map'], cur_player, problem['box_pos'],
+                problem['staging'], problem['sweep_action'])
+            if actions_to_staging is None:
+                continue
+            push_flags = _push_flags(
+                actions_to_staging, cur_player, problem['box_pos'])
+            if not problem['already_staged']:
+                push_indices = [
+                    idx for idx, is_push in enumerate(push_flags) if is_push]
+                if not push_indices or actions_to_staging[push_indices[-1]] != \
+                   problem['sweep_action']:
+                    continue
+            player_at_staging = (
+                problem['staging'][0] - DR[problem['sweep_action']],
+                problem['staging'][1] - DC[problem['sweep_action']],
+            )
+            actions = list(actions_to_staging) + \
+                [problem['sweep_action']] * problem['sweep_length']
+            push_flags = list(push_flags) + [True] * problem['sweep_length']
+            trace = _planned_box_trace(
+                actions, push_flags, cur_player, problem['box_pos'])
+            if not set(targets).issubset(set(trace)):
+                continue
+            sub = {
+                'actions': actions_to_staging,
+                'push_flags': push_flags[:-problem['sweep_length']],
+                'player_end': player_at_staging,
+            }
+            chosen = (box_idx, problem, sub, actions, push_flags, trace)
+            break
+        if chosen is None:
+            return None
+
+        box_idx, problem, sub, actions, push_flags, trace = chosen
+        box_class = remaining_box_classes[box_idx]
+        matching_indices = [
+            idx for idx in available_target_indices
+            if remaining_target_classes[idx] == box_class
+        ]
+        if box_class <= 0 or not matching_indices:
+            return None
+        trace_order = {pos: idx for idx, pos in enumerate(trace)}
+        matching_target_idx = min(
+            matching_indices,
+            key=lambda idx: trace_order.get(original_targets[idx],
+                                            len(trace) + idx),
+        )
+        matching_target = original_targets[matching_target_idx]
+        if matching_target not in trace_order:
+            return None
+
+        completed = dict(sub)
+        predicted_player = (
+            sub['player_end'][0] +
+                DR[problem['sweep_action']] * problem['sweep_length'],
+            sub['player_end'][1] +
+                DC[problem['sweep_action']] * problem['sweep_length'],
+        )
+        completed.update({
+            'phase': 'line_sweep',
+            'box_idx': box_idx,
+            'box_start': problem['box_pos'],
+            'target_idx': matching_target_idx,
+            'actions': actions,
+            'push_flags': push_flags,
+            'player_end': predicted_player,
+            'sweep_targets': list(original_targets),
+            'sweep_direction': problem['direction'],
+            'matched_target': matching_target,
+            'direct_staging': problem['already_staged'],
+            'planned_from_initial_snapshot': True,
+        })
+        sub_solutions.append(completed)
+
+        # 已命中箱子只从预测地图删除；开局目标线始终保留为可通行走廊。
+        # 删除障碍不会破坏已经找到的前缀解，因此不需要箱序回溯。
+        box_start = boxes[box_idx]
+        work[box_start[0]][box_start[1]] = EMPTY
+        cur_player = predicted_player
+        del remaining_box_classes[box_idx]
+        available_target_indices.remove(matching_target_idx)
+
+    return {
+        'sub_solutions': sub_solutions,
+        'boxes': original_boxes,
+        'targets': original_targets,
+        'total_steps': sum(len(sub['actions']) for sub in sub_solutions),
+        'line_sweep': True,
+        'player_end': cur_player,
+        'planning_map_reads': 1,
+        'execution_batches': 1,
+    }
 
 
 def is_blocker(the_map: list, r: int, c: int) -> bool:
@@ -2150,8 +2445,30 @@ def solve_level(stage: int, the_map: list, player_pos: tuple,
     scout = None
     work_player = player_pos
     scout_mapping: Optional[list] = None
+    line_sweep_result = None
 
-    if stage >= 2 and require_scout and boxes:
+    if stage == 2 and require_scout and boxes and box_to_target is None:
+        line_info = detect_stage2_line_targets(the_map)
+        if line_info is not None:
+            line_sweep_result = solve_stage2_line_sweep(
+                the_map, player_pos, line_info,
+                box_classes=box_classes,
+                target_classes=target_classes,
+                home_pos=(5, 1))
+            if line_sweep_result is not None:
+                scout = {
+                    'scout_actions': [],
+                    'visits': [],
+                    'all_visited': True,
+                    'line_sweep_bypass': True,
+                    'box_to_target_idx': [],
+                    'planning_map_reads':
+                        line_sweep_result['planning_map_reads'],
+                    'execution_batches':
+                        line_sweep_result['execution_batches'],
+                }
+
+    if stage >= 2 and require_scout and boxes and line_sweep_result is None:
         # Stage3 默认不强求侦查全部 box+target (横墙隔断时 target 暂不可达,
         # 真实赛规是炸墙后再识别 target). 仅在用户显式传 box_classes/target_classes
         # 时, Stage3 也启用 v2 (假设地图本身允许全部可达).
@@ -2183,10 +2500,13 @@ def solve_level(stage: int, the_map: list, player_pos: tuple,
     if stage == 1:
         push_result = solve_stage1(the_map, work_player, home_pos=(5, 1))
     elif stage == 2:
-        # 优先用侦查得到的映射; 外部显式传入则覆盖
-        if box_to_target is None:
-            box_to_target = scout_mapping or default_box_mapping(boxes, targets)
-        push_result = solve_stage2(the_map, work_player, box_to_target)
+        if line_sweep_result is not None:
+            push_result = line_sweep_result
+        else:
+            # 优先用侦查得到的映射; 外部显式传入则覆盖
+            if box_to_target is None:
+                box_to_target = scout_mapping or default_box_mapping(boxes, targets)
+            push_result = solve_stage2(the_map, work_player, box_to_target)
     elif stage == 3:
         raw3 = solve_stage3(the_map, work_player,
                              box_to_target_idx=(box_to_target or scout_mapping))

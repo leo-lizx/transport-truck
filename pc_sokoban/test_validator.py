@@ -412,6 +412,126 @@ sub11_near = sv.build_sub_map(
 assert sv.sokoban_bfs_single(sub11_near, (5, 2), boxes11[0], targets11[0]) is not None
 print("Box passes through the unused target; both corridor targets are solvable.")
 
+# Test 11b/11c: 第二关目标连续共行/共列时，不识别图案；只用开局地图
+# 一次性规划所有箱子，然后连续扫过整条目标线，中间不重读地图。
+print("\n=== Test 11b: Stage2 horizontal target-line sweep bypass ===")
+m11b = sv._make_empty_map()
+for c11b in range(7, 11):
+    m11b[5][c11b] = sv.TARGET
+for r11b in (2, 4, 6, 8):
+    m11b[r11b][2] = sv.BOX
+line11b = sv.detect_stage2_line_targets(m11b)
+assert line11b == {'horizontal': True, 'fixed': 5}
+sol11b = sv.solve_level(
+    2, m11b, (5, 2),
+    box_classes=[1, 2, 3, 4],
+    target_classes=[4, 2, 1, 3],
+)
+assert sol11b is not None
+assert sol11b['scout']['line_sweep_bypass']
+assert sol11b['scout']['planning_map_reads'] == 1
+assert sol11b['scout']['execution_batches'] == 1
+sweeps11b = sol11b['sub_solutions']
+assert [sub['phase'] for sub in sweeps11b] == ['line_sweep'] * 4
+assert [len(sub['sweep_targets']) for sub in sweeps11b] == [4] * 4
+assert all(sub['planned_from_initial_snapshot'] for sub in sweeps11b)
+assert {sub['matched_target'] for sub in sweeps11b} == {
+    (5, 7), (5, 8), (5, 9), (5, 10)}
+for idx11b, sub11b in enumerate(sweeps11b):
+    trace11b = sv._planned_box_trace(
+        sub11b['actions'], sub11b['push_flags'],
+        (5, 2) if idx11b == 0 else sweeps11b[idx11b - 1]['player_end'],
+        sub11b['box_start'])
+    assert set(sub11b['sweep_targets']).issubset(set(trace11b))
+print("四只箱子共用一张开局地图完成规划，一批连续执行且每箱均扫过 4 个目标。")
+
+print("\n=== Test 11c: vertical line detection and conservative trigger ===")
+m11c = sv._make_empty_map()
+for r11c in range(3, 7):
+    m11c[r11c][8] = sv.TARGET
+for c11c in (3, 5, 7, 11):
+    m11c[9][c11c] = sv.BOX
+line11c = sv.detect_stage2_line_targets(m11c)
+assert line11c == {'horizontal': False, 'fixed': 8}
+sol11c = sv.solve_stage2_line_sweep(
+    m11c, (9, 8), line11c,
+    box_classes=[1, 2, 3, 4],
+    target_classes=[3, 1, 4, 2],
+)
+assert sol11c is not None and len(sol11c['sub_solutions']) == 4
+assert sol11c['planning_map_reads'] == 1
+assert sol11c['execution_batches'] == 1
+assert all(len(sub['sweep_targets']) == 4
+           for sub in sol11c['sub_solutions'])
+m11c_gap = sv._make_empty_map()
+for c11c in (5, 6, 8, 9):
+    m11c_gap[5][c11c] = sv.TARGET
+assert sv.detect_stage2_line_targets(m11c_gap) is None
+print("竖排同样进入盲扫；带间隔的偶然共线布局仍保留原识别流程。")
+
+print("\n=== Test 11d: one-shot line-sweep planning fallback ===")
+m11d = [row[:] for row in m11b]
+m11d[5][6] = sv.WALL
+m11d[5][11] = sv.WALL
+line11d = sv.detect_stage2_line_targets(m11d)
+assert line11d is not None
+assert sv.solve_stage2_line_sweep(
+    m11d, (5, 2), line11d,
+    box_classes=[1, 2, 3, 4],
+    target_classes=[4, 2, 1, 3],
+) is None
+sol11d = sv.solve_level(
+    2, m11d, (5, 2),
+    box_classes=[1, 2, 3, 4],
+    target_classes=[4, 2, 1, 3],
+)
+assert sol11d is not None
+assert not sol11d['scout'].get('line_sweep_bypass', False)
+print("两端入口都不可用时，全量盲扫不执行任何前缀，整体回退到常规识别。")
+
+print("\n=== Test 11e: directional staging keeps the map unchanged ===")
+m11e = sv._make_empty_map()
+for c11e in range(7, 11):
+    m11e[5][c11e] = sv.TARGET
+m11e[4][2] = sv.BOX
+m11e[5][6] = sv.WALL
+original11e = [row[:] for row in m11e]
+problem11e = sv.build_stage2_line_sweep_problem(
+    m11e, (5, 2), sv.detect_stage2_line_targets(m11e),
+    0, positive_direction=False)
+assert problem11e is not None
+assert m11e == original11e and problem11e['map'] == original11e
+assert problem11e['map'] is m11e
+actions11e = sv.sokoban_bfs_single(
+    problem11e['map'], (5, 2), problem11e['box_pos'],
+    problem11e['staging'], problem11e['sweep_action'])
+assert actions11e is not None
+flags11e = sv._push_flags(actions11e, (5, 2), problem11e['box_pos'])
+trace11e = sv._planned_box_trace(
+    actions11e, flags11e, (5, 2), problem11e['box_pos'])
+assert [action for action, pushed in zip(actions11e, flags11e)
+        if pushed][-1] == sv.DIR_LETTER.index('L')
+assert all(row in (4, 5) for row, _ in trace11e)
+print("方向终态替代入口虚拟墙；真实地图逐格不变且箱子不再反向绕行。")
+
+print("\n=== Test 11f: staged/aligned boxes enter the sweep directly ===")
+m11f = sv._make_empty_map()
+for r11f in range(5, 9):
+    m11f[r11f][7] = sv.TARGET
+for box11f in ((3, 9), (4, 4), (4, 7), (7, 5)):
+    m11f[box11f[0]][box11f[1]] = sv.BOX
+sol11f = sv.solve_stage2_line_sweep(
+    m11f, (5, 2), sv.detect_stage2_line_targets(m11f),
+    box_classes=[1, 2, 2, 2],
+    target_classes=[1, 2, 2, 2])
+assert sol11f is not None
+assert sol11f['sub_solutions'][0]['box_start'] == (4, 7)
+assert sol11f['sub_solutions'][0]['direct_staging']
+assert not any(sol11f['sub_solutions'][0]['push_flags'][:-4])
+assert {sub11f['matched_target'] for sub11f in sol11f['sub_solutions']} == {
+    (5, 7), (6, 7), (7, 7), (8, 7)}
+print("入口已有箱子时车辆只走到箱后；同轴箱子沿目标列直接推入并完成重复号码盲扫。")
+
 # Test 12: current six-box first-level regression. The objective includes the
 # direct return to the formal garage and must beat the old feasible greedy plan.
 print("\n=== Test 12: Stage1 six-box continuous-time regression ===")
