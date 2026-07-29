@@ -252,6 +252,8 @@ static float s_pos_i_hold  = 0.0f;
 static float s_yaw_i       = 0.0f;
 /* 到位驻留计数器: 连续 N 拍满足到位条件 → 判到达, 防止单拍噪声误触 */
 static uint16 s_arrival_dwell_cnt = 0U;
+/* 驱动路径进入动态制动后保持到路径结束，避免低速后停车距离缩短又重启短程加速。 */
+static uint8 s_drive_braking_latched = 0U;
 /* 逐轴到位: X/Y 各自判断 |err|≤EPSILON, 两轴都到位→整体 arrived */
 static volatile uint8 s_axis_x_arrived = 0U;
 static volatile uint8 s_axis_y_arrived = 0U;
@@ -504,6 +506,7 @@ static void force_stop(void)
     s_yaw_i      = 0.0f;
     s_v_along_lpf = 0.0f;
     s_v_cross_lpf = 0.0f;
+    s_drive_braking_latched = 0U;
     s_point_nav_mode = CHASSIS_POINT_NAV_AXIS_BY_AXIS;
     s_direct_state = DIRECT_INACTIVE;
 
@@ -1051,6 +1054,7 @@ static void enter_mode(ctrl_mode_t m)
                      * 车大幅过冲后剧烈反向 → Y 保持轴被甩出震荡. */
     s_axis_x_arrived    = 0U;   /* 复位逐轴到达标志 */
     s_axis_y_arrived    = 0U;
+    s_drive_braking_latched = 0U;
     /* P0-修复 2026-07-17: 保持轴锚点初始化为当前位置。
      * 旧代码从未设过锚点, 残留上一目标的旧值 → Y 保持环拉偏 → 短距平移抖动. */
     s_axis_hold_x_m     = s_pose.x_m;
@@ -1368,6 +1372,7 @@ void chassis_ctrl_task_20ms(void)
 
                 if (arrival_decision.arrived != 0U) {
                     s_arrived = 1U;
+                    s_drive_braking_latched = 0U;
                     g_chassis_arrival_count++;
                     if (s_point_nav_mode == CHASSIS_POINT_NAV_DIRECT_LINE) {
                         s_direct_state = DIRECT_HOLD;
@@ -1418,6 +1423,7 @@ void chassis_ctrl_task_20ms(void)
             s_arrival_dwell_cnt = 0U;  /* 驻留计数器清零: 重新驱动需重新确认 */
             s_ramp.vx_body_mps = 0.0f;  /* 清 ramp, 防旧残值污染新驱动方向 */
             s_ramp.vy_body_mps = 0.0f;
+            s_drive_braking_latched = 0U;
             s_axis_hold_x_m = s_pose.x_m;  /* 更新保持轴锚点到当前位置 */
             s_axis_hold_y_m = s_pose.y_m;
             if (s_point_nav_mode == CHASSIS_POINT_NAV_DIRECT_LINE) {
@@ -1525,7 +1531,11 @@ void chassis_ctrl_task_20ms(void)
                     CHASSIS_SHORT_MOVE_DIST_M,
                     CHASSIS_DYNAMIC_BRAKE_LATENCY_S,
                     CHASSIS_DYNAMIC_BRAKE_MARGIN_M,
-                    CHASSIS_POS_BRAKE_FLOOR_MPS);
+                    CHASSIS_POS_BRAKE_FLOOR_MPS,
+                    s_drive_braking_latched);
+                if (along_profile.braking != 0U) {
+                    s_drive_braking_latched = 1U;
+                }
                 linear_accel_limit_mps2 = along_profile.accel_limit_mps2;
                 linear_decel_limit_mps2 = brake_decel_along;
 
@@ -1653,6 +1663,7 @@ void chassis_ctrl_task_20ms(void)
                     if (fabsf(dx) <= CHASSIS_TARGET_REACHED_EPSILON_M
                         && fabsf(s_v_along_lpf) < 0.10f) {  /* 速度<10cm/s 才判到达, 防冲过头 */
                         s_axis_x_arrived = 1U;
+                        s_drive_braking_latched = 0U;
                         s_axis_hold_x_m  = s_tgt_x_m;  /* 锚到目标 X */
                         s_pos_i          = 0.0f;
                         s_pos_i_hold     = 0.0f;
@@ -1675,7 +1686,11 @@ void chassis_ctrl_task_20ms(void)
                                 CHASSIS_SHORT_MOVE_DIST_M,
                                 CHASSIS_DYNAMIC_BRAKE_LATENCY_S,
                                 CHASSIS_DYNAMIC_BRAKE_MARGIN_M,
-                                CHASSIS_POS_BRAKE_FLOOR_MPS);
+                                CHASSIS_POS_BRAKE_FLOOR_MPS,
+                                s_drive_braking_latched);
+                        if (x_profile.braking != 0U) {
+                            s_drive_braking_latched = 1U;
+                        }
                         linear_accel_limit_mps2 = x_profile.accel_limit_mps2;
                         linear_decel_limit_mps2 = CHASSIS_CMD_BRAKE_DECEL_LIMIT_MPS2;
                         vxg = driving_axis_velocity_cmd(dx, s_v_along_lpf,
@@ -1715,6 +1730,7 @@ void chassis_ctrl_task_20ms(void)
                     if (fabsf(dy) <= CHASSIS_TARGET_REACHED_EPSILON_M
                         && fabsf(s_v_cross_lpf) < 0.10f) {  /* 速度<10cm/s 才判到达 */
                         s_axis_y_arrived = 1U;
+                        s_drive_braking_latched = 0U;
                         s_axis_hold_y_m  = s_tgt_y_m;
                         s_pos_i          = 0.0f;
                         s_pos_i_hold     = 0.0f;
@@ -1727,6 +1743,7 @@ void chassis_ctrl_task_20ms(void)
                         if ((fabsf(dx) > CHASSIS_TARGET_REACHED_EPSILON_M * 2.0f)
                             && (fabsf(dx) > fabsf(dy) * 1.5f)) {
                             s_axis_x_arrived = 0U;
+                            s_drive_braking_latched = 0U;
                             s_pos_i          = 0.0f;
                             s_pos_i_hold     = 0.0f;
                             vxg = 0.0f;
@@ -1746,7 +1763,11 @@ void chassis_ctrl_task_20ms(void)
                                     CHASSIS_SHORT_MOVE_DIST_M,
                                     CHASSIS_DYNAMIC_BRAKE_LATENCY_S,
                                     CHASSIS_DYNAMIC_BRAKE_MARGIN_M,
-                                    CHASSIS_POS_BRAKE_FLOOR_MPS);
+                                    CHASSIS_POS_BRAKE_FLOOR_MPS,
+                                    s_drive_braking_latched);
+                            if (y_profile.braking != 0U) {
+                                s_drive_braking_latched = 1U;
+                            }
                             linear_accel_limit_mps2 = y_profile.accel_limit_mps2;
                             linear_decel_limit_mps2 = CHASSIS_CMD_BRAKE_DECEL_LIMIT_Y_MPS2;
                             vyg = driving_axis_velocity_cmd(dy, s_v_cross_lpf,

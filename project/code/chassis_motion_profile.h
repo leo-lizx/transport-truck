@@ -26,7 +26,8 @@ static inline chassis_motion_profile_t chassis_motion_profile_calculate(
     float short_move_dist_m,
     float latency_s,
     float margin_m,
-    float brake_floor_mps)
+    float brake_floor_mps,
+    uint8_t braking_latched)
 {
     chassis_motion_profile_t profile;
     float abs_error_m = (axis_error_m >= 0.0f) ? axis_error_m : -axis_error_m;
@@ -61,7 +62,8 @@ static inline chassis_motion_profile_t chassis_motion_profile_calculate(
                         + toward_speed_mps * latency_s
                         + margin_m;
 
-        if (remaining_m <= stop_distance_m + 1e-6f) {
+        if ((braking_latched != 0U) ||
+            (remaining_m <= stop_distance_m + 1e-6f)) {
             float usable_distance_m = remaining_m - margin_m;
             float allowed_speed_mps = 0.0f;
 
