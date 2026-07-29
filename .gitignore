@@ -85,6 +85,8 @@ __pycache__/
 /project/code/tests/test_chassis_tune_config.py
 /project/code/tests/test_chassis_velocity_handoff.c
 /project/code/tests/test_chassis_mpc_feature_guards.py
+/project/code/tests/test_chassis_speed_profile.py
+/project/code/tests/test_chassis_motion_profile.c
 
 # PC-only configuration source regression; not part of IAR firmware/full-course execution
 /project/code/tests/test_chassis_config_source.py
