@@ -36,7 +36,6 @@
 #include "zf_common_headfile.h"
 #include "clock_config.h"
 #include "chassis_ctrl.h"
-#include "chassis_pid.h"
 #include "chassis_menu.h"
 #include "app_game_logic.h"
 #include "app_link.h"   /* P0-1: 视觉-主控帧协议 */
@@ -63,7 +62,7 @@
  *  ────────────────────────────────────────────────────────────────
  *   0   MAIN_RUN_MODE_GAME                  ✅    OpenART 串口    正式比赛: 摄像头识图→解算→推箱→回库
  *   1   MAIN_RUN_MODE_YAW_HOLD              ❌    无               航向保持调试: 车不动, IMU 锁死目标角度调 wz 环
- *   2   MAIN_RUN_MODE_SINGLE_WHEEL          单轮   无               单轮 PID 调试: 只让一个轮子转, 调速度环 Kp/Ki/Kd
+ *   2   MAIN_RUN_MODE_SINGLE_WHEEL          单轮   无               单轮开环测试: 只给方向和固定 80% PWM
  *   3   MAIN_RUN_MODE_POINT_NAV             ✅    无               定点导航: 按预设 9 个航点依次跑四角→回起点
  *   4   MAIN_RUN_MODE_SOKO_SELFTEST         ❌    摄像头 UART4     推箱求解自测: 接收摄像头地图帧→屏幕彩色方块显示
  *   5   MAIN_RUN_MODE_SOLVE_VERIFY          ❌    摄像头 UART4     解算验证: 收图→解算→虚拟走比赛流程, 车不动仅验算法
@@ -76,7 +75,7 @@
  *=========================================================================*/
 #define MAIN_RUN_MODE_GAME            (0)   /* 正式比赛: 完整视觉+推箱+底盘闭环 */
 #define MAIN_RUN_MODE_YAW_HOLD        (1)   /* 航向保持: 车不动, IMU 锁角度调 yaw PID */
-#define MAIN_RUN_MODE_SINGLE_WHEEL    (2)   /* 单轮调试: 一个轮子转, 调速度环参数 */
+#define MAIN_RUN_MODE_SINGLE_WHEEL    (2)   /* 单轮开环: 一个轮子按指定方向输出 80% PWM */
 #define MAIN_RUN_MODE_POINT_NAV       (3)   /* 定点导航: 预设航点四角遍历, 测里程计精度 */
 #define MAIN_RUN_MODE_SOKO_SELFTEST   (4)   /* 推箱自测: 收摄像头地图→屏幕色块, 车不动 */
 #define MAIN_RUN_MODE_SOLVE_VERIFY    (5)   /* 解算验证: 收图→解算→虚拟跑流程显示, 车不动 */
@@ -1863,19 +1862,15 @@ static void main_mode5_render_100ms(void)
 #define MAIN_POS_NAV_TARGET_Y_M       MAIN_POS_GRID_TO_M_Y(MAIN_POS_NAV_TARGET_Y_GRID)
 
 /* ========================================================================== */
-/*  ⬇⬇⬇ 以下是单轮 PID 调试专用代码, 仅在 MAIN_RUN_MODE_SINGLE_WHEEL 生效 ⬇⬇⬇  */
-/*  ⬇⬇⬇ 姿态闭环调试阶段这里全部被 #if 屏蔽, 不会被编译, 不要删 ⬇⬇⬇          */
+/*  ⬇⬇⬇ 以下是单轮开环测试配置, 仅在 MAIN_RUN_MODE_SINGLE_WHEEL 生效 ⬇⬇⬇  */
 /* ========================================================================== */
 #if (MAIN_RUN_MODE == MAIN_RUN_MODE_SINGLE_WHEEL)
-#define MAIN_PID_DEBUG_WHEEL_INDEX    (CHASSIS_WHEEL_LF)  /* 0=LF, 1=RF, 2=LB, 3=RB */
-#define MAIN_PID_DEBUG_TARGET_MPS     (0.10f)             /* target wheel speed, m/s */
-#define MAIN_PID_DEBUG_FORCE_PID      (1)                 /* 1=use KP/KI/KD below */
-#define MAIN_PID_DEBUG_KP             (200.0f)
-#define MAIN_PID_DEBUG_KI             (50.0f)
-#define MAIN_PID_DEBUG_KD             (10.0f)
+#define MAIN_SINGLE_WHEEL_INDEX       (CHASSIS_WHEEL_RF)  /* 0=LF, 1=RF, 2=LB, 3=RB */
+#define MAIN_SINGLE_WHEEL_DIRECTION   (+1.0f)             /* +1=车轮前进, -1=车轮后退 */
+#define MAIN_SINGLE_WHEEL_PWM_PERCENT (80.0f)
 #endif /* MAIN_RUN_MODE_SINGLE_WHEEL */
 /* ========================================================================== */
-/*  ⬆⬆⬆ 单轮 PID 调试专用代码结束 ⬆⬆⬆                                            */
+/*  ⬆⬆⬆ 单轮开环测试配置结束 ⬆⬆⬆                                            */
 /* ========================================================================== */
 
 /* 菜单渲染分频 (主循环 5ms tick * N), N=20 => 100ms 刷一次 */
@@ -2162,30 +2157,6 @@ static void main_openart2_test_render_100ms(void)
 }
 #endif
 
-/* ========================================================================== */
-/*  ⬇⬇⬇ 单轮 PID 调试辅助函数, 仅 SINGLE_WHEEL 模式下编译 ⬇⬇⬇              */
-/* ========================================================================== */
-#if (MAIN_RUN_MODE == MAIN_RUN_MODE_SINGLE_WHEEL) && (1 == MAIN_PID_DEBUG_FORCE_PID)
-/*
- * 把 main 内 KP/KI/KD 写进 chassis_tune_params, 仅覆盖被调试的那一个轮子,
- * 其余轮子的 PID 维持编译期初始化值不动. 在 chassis_ctrl_init 之后调用.
- */
-static void main_apply_debug_wheel_pid(void)
-{
-    chassis_tune_params_t tune_params;
-    uint8 idx = (uint8)MAIN_PID_DEBUG_WHEEL_INDEX;
-
-    chassis_ctrl_get_tune_params(&tune_params);
-    tune_params.wheel_pid_kp[idx] = MAIN_PID_DEBUG_KP;
-    tune_params.wheel_pid_ki[idx] = MAIN_PID_DEBUG_KI;
-    tune_params.wheel_pid_kd[idx] = MAIN_PID_DEBUG_KD;
-    chassis_ctrl_set_tune_params(&tune_params);
-}
-#endif
-/* ========================================================================== */
-/*  ⬆⬆⬆ 单轮 PID 调试辅助函数结束 ⬆⬆⬆                                          */
-/* ========================================================================== */
-
 int main(void)
 {
 #if (CHASSIS_MENU_ENABLE != 0)
@@ -2269,20 +2240,12 @@ int main(void)
 #endif
 
 #if (MAIN_RUN_MODE == MAIN_RUN_MODE_SINGLE_WHEEL)
-    /* ⬇⬇⬇ 单轮 PID 调试启动逻辑, 姿态调试阶段这里被 #if 屏蔽 ⬇⬇⬇ */
-    /* 单轮 PID 调试模式: 仅一个轮子参与闭环, 其余轮子目标恒 0;
-     * 闭环执行体在 PIT_CH1 / chassis_ctrl_task_20ms 内. */
-  #if (1 == MAIN_PID_DEBUG_FORCE_PID)
-    main_apply_debug_wheel_pid();
-  #endif
-    chassis_ctrl_start_single_wheel_pid_debug((uint8)MAIN_PID_DEBUG_WHEEL_INDEX,
-                                              MAIN_PID_DEBUG_TARGET_MPS);
-    printf("SW_BOOT wheel=%d target=%.3f kp=%.1f ki=%.1f kd=%.1f\n",
-           (int)MAIN_PID_DEBUG_WHEEL_INDEX,
-           MAIN_PID_DEBUG_TARGET_MPS,
-           MAIN_PID_DEBUG_KP,
-           MAIN_PID_DEBUG_KI,
-           MAIN_PID_DEBUG_KD);
+    /* 单轮开环测试: PWM 一次性锁存, 编码器/IMU 反馈不参与电机输出。 */
+    chassis_ctrl_start_single_wheel_open_loop(
+        (uint8)MAIN_SINGLE_WHEEL_INDEX,
+        MAIN_SINGLE_WHEEL_DIRECTION
+            * CHASSIS_MOTOR_PWM_MAX
+            * MAIN_SINGLE_WHEEL_PWM_PERCENT / 100.0f);
 #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_YAW_HOLD)
     /* ✅ 姿态闭环调试走这里: 只设一次目标角, 后续 PIT_CH1 20ms 中断中持续闭环. */
     chassis_ctrl_hold_yaw(MAIN_POS_NAV_HOLD_YAW_DEG);
@@ -2374,9 +2337,7 @@ int main(void)
 #endif
 
     #if (MAIN_RUN_MODE == MAIN_RUN_MODE_SINGLE_WHEEL)
-        /* ⬇⬇⬇ 单轮 PID 打印, 姿态调试阶段这里被 #if 屏蔽 ⬇⬇⬇ */
-        /* 单轮 PID 调试: 100ms 打印目标速度/实际速度两列, 上位机绘曲线 */
-        chassis_pid_debug_task_5ms();
+        /* 开环 PWM 由硬件保持, 主循环不再运行任何单轮闭环或调参任务。 */
     #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_YAW_HOLD)
         /* ✅ 姿态闭环调试打印走这里: 50ms 打印 12 通道, 用于画角度曲线 */
         chassis_ctrl_attitude_debug_task_5ms();

@@ -175,28 +175,16 @@ void chassis_ctrl_hold_yaw(float target_yaw_deg);
 void chassis_ctrl_rotate_to_deg(float target_yaw_deg);
 
 /**
- * @brief  启动单轮 PID 调试模式
- *         仅指定轮子参与速度闭环，其余轮子目标速度固定为 0。
- * @param  wheel_index      调试轮子索引（0:LF 1:RF 2:LB 3:RB）
- * @param  target_speed_mps 该轮目标速度（m/s）
+ * @brief  启动单轮开环输出，编码器/IMU 反馈不参与电机输出。
+ * @param  wheel_index 调试轮子索引（0:LF 1:RF 2:LB 3:RB）
+ * @param  pwm_signed  前进符号域的有符号 PWM；正值前进，负值后退
  */
-void chassis_ctrl_start_single_wheel_pid_debug(uint8 wheel_index,
-                                               float target_speed_mps);
-
-/**
- * @brief  更新单轮 PID 调试目标速度（m/s）
- * @param  target_speed_mps 新目标速度（m/s）
- */
-void chassis_ctrl_set_single_wheel_pid_debug_target(float target_speed_mps);
-
-/**
- * @brief  退出单轮 PID 调试模式并停车
- */
-void chassis_ctrl_stop_single_wheel_pid_debug(void);
+void chassis_ctrl_start_single_wheel_open_loop(uint8 wheel_index,
+                                               float pwm_signed);
 
 /**
  * @brief  读取 4 路轮速反馈快照 (LPF 后, 单位 m/s).
- *         用于诊断接线: 调单轮 PID 时一并打印 4 路反馈, 手转任一物理轮观察哪个 index 在动,
+ *         用于诊断接线: 单轮测试时读取 4 路反馈, 手转任一物理轮观察哪个 index 在动,
  *         即可反推出该物理轮接的是哪个软件 wheel index, 进而修正 chassis_config.h 的 ENC 引脚定义.
  * @param  out_wheel_fb_mps 4 元素输出数组 (LF/RF/LB/RB), 必须非空.
  */
