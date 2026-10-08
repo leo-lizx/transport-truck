@@ -22,7 +22,7 @@
  *
  * 不在本任务范围 (留给 P0-2 / P1):
  *   - 链路超时回退状态机 (本文件只更新时间戳与心跳计数, 不做回退)
- *   - g_game_map 的 seq-lock 并发保护 (P0-3)
+ *   - 地图快照采用 seq-lock 并发保护
  *********************************************************************************************************************/
 #ifndef APP_LINK_H_
 #define APP_LINK_H_
@@ -44,6 +44,13 @@ extern "C" {
 #define APP_LINK_MAP_WITH_POS_LEN   (194U)          /* 192B 地图 + 2B 车辆坐标            */
 #define APP_LINK_MAP_ROWS           (12U)           /* P0-3: 地图行数 (与 MAP_ROWS 同义)  */
 #define APP_LINK_MAP_COLS           (16U)           /* P0-3: 地图列数 (与 MAP_COLS 同义)  */
+
+/* 保留既有地图载荷编码，供串口地图快照和底盘软限位使用。 */
+#define APP_LINK_CELL_EMPTY         (0U)
+#define APP_LINK_CELL_WALL          (1U)
+#define APP_LINK_CELL_TARGET        (2U)
+#define APP_LINK_CELL_BOX           (3U)
+#define APP_LINK_CELL_BOMB          (4U)
 
 /*-- 帧类型枚举 ---------------------------------------------------------------------------------------------------*/
 typedef enum
@@ -194,7 +201,7 @@ void app_link_send_recog_request(uint8 obj_kind, uint8 request_id);
  *   1. 写者位于视觉 UART ISR (commit_map_frame), 读者可在主循环 / PIT 中断中调用, 均无阻塞
  *   2. 内部最多重试 8 次; 超限则放弃本次拷贝并自增 g_link_map_snapshot_retry_giveup,
  *      调用方应保留上次快照 (本函数不会写脏数据, 但可能保留部分上次内容)
- *   3. 上电至首帧到达前, 拷贝结果为全 0 (= MAP_EMPTY), 业务层应配合 Game_Link_Is_Alive 使用
+ *   3. 上电至首帧到达前, 拷贝结果为全 0，调用者应检查地图帧时间戳
  *-----------------------------------------------------------------------------------------------------------------*/
 void app_link_get_map_snapshot(uint8 dst[APP_LINK_MAP_ROWS][APP_LINK_MAP_COLS]);
 
@@ -239,7 +246,7 @@ typedef struct
 
 /*-------------------------------------------------------------------------------------------------------------------
  * 函数: app_link_get_box_class_snapshot
- * 功能: seq-lock 拷贝最近一帧 BOX_CLASS 解析结果, 供 app_recognize 连续确认采样
+ * 功能: seq-lock 拷贝最近一帧 BOX_CLASS 解析结果
  * 参数: out —— 输出, 可为 NULL (直接忽略)
  * 备注: 业务层应配合 frame_id 变化和 stamp_ms 抗陈旧来判定 "新一帧已到"
  *-----------------------------------------------------------------------------------------------------------------*/

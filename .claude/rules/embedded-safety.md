@@ -40,6 +40,6 @@
 ## 内存约束
 
 - SRAM 预算 ≤ 512KB (DTCM + OCRAM)
-- BFS 静态数组 ~35KB，新增 BSS 数组上限 10KB
+- 新增 BSS 数组上限 10KB
 - 大数组优先放 DTCM（零等待），其次 OCRAM
 - 禁止递归（栈溢出风险），栈使用通过 IAR Stack Usage 分析确认

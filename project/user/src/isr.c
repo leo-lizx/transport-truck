@@ -36,7 +36,6 @@
 #include "zf_common_headfile.h"
 #include "zf_common_debug.h"
 #include "isr.h"
-#include "chassis_menu.h"
 #include "app_link.h"   /* P0-1: 视觉?主控帧协议解析层 */
 
 /* P0-5: 主循环 5ms 节拍唤醒钩子, 实现位于 user/src/main.c */
@@ -67,14 +66,6 @@ void PIT_IRQHandler(void)
         chassis_ctrl_task_20ms();  // 20ms: 编码器 + 里程计 + PID + 导航
     }
     
-#if (CHASSIS_MENU_ENABLE != 0)
-    if(pit_flag_get(PIT_CH2))
-    {
-        pit_flag_clear(PIT_CH2);
-
-        chassis_menu_task_10ms();
-    }
-#endif
     
     if(pit_flag_get(PIT_CH3))
     {

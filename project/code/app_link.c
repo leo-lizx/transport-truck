@@ -13,12 +13,11 @@
  *   3. 字节超时: 50 ms 内未收到下一字节 → 状态机复位 (防止半截帧污染下一帧)
  *   4. OpenART1/UART4 只接收 MAP/HEARTBEAT; OpenART2/UART1 只接收 BOX_CLASS/HEARTBEAT
  *   5. MAP 帧: 兼容 LEN=192 纯地图与 LEN=194 地图+车辆坐标; 地图字符非法则丢弃
- *   6. 写 g_game_map 用 const 字符 → 枚举的查表映射, 与 app_game_logic.h 中 MAP_* 枚举对齐
+ *   6. 地图字符按 app_link.h 中的载荷编码写入通信层地图快照
  *   7. 不调用任何阻塞 API, 不分配堆内存
  *********************************************************************************************************************/
 
 #include "app_link.h"
-#include "app_game_logic.h"
 #include "zf_common_typedef.h"
 #include "zf_common_headfile.h"     /* P0-3: 间接引入 core_cm7.h, 提供 __DMB() 内存屏障  */
 
@@ -407,7 +406,7 @@ static inline void stats_accept_heartbeat(app_link_port_e port, uint8 seq)
 }
 
 /*===================================================================================================================
- * MAP 帧落地: ASCII 字符 → MAP_* 枚举 → g_game_map
+ * MAP 帧落地: ASCII 字符 → 单元格编码 → 通信层地图快照
  *=================================================================================================================*/
 
 /*-------------------------------------------------------------------------------------------------------------------
@@ -416,17 +415,16 @@ static inline void stats_accept_heartbeat(app_link_port_e port, uint8 seq)
  *-----------------------------------------------------------------------------------------------------------------*/
 static uint8 ascii_to_map_cell(uint8 ch)
 {
-    /* 注: 与 algo_sokoban_solver.h 中 MAP_EMPTY/WALL/TARGET/BOX/BOMB 枚举对齐;
-     *     '@' (角色) 在视觉端表示当前虚拟车位置, 主控不据此更新 g_game_map
+    /* '@' (角色) 在视觉端表示当前虚拟车位置, 主控不据此更新底盘位姿
      *     而是依赖里程计自身位姿; 这里把 '@' 当作 EMPTY 处理 (不写入车位).      */
     switch (ch)
     {
-        case '-': return (uint8)MAP_EMPTY;
-        case '#': return (uint8)MAP_WALL;
-        case '.': return (uint8)MAP_TARGET;
-        case '$': return (uint8)MAP_BOX;
-        case '*': return (uint8)MAP_BOMB;
-        case '@': return (uint8)MAP_EMPTY;
+        case '-': return (uint8)APP_LINK_CELL_EMPTY;
+        case '#': return (uint8)APP_LINK_CELL_WALL;
+        case '.': return (uint8)APP_LINK_CELL_TARGET;
+        case '$': return (uint8)APP_LINK_CELL_BOX;
+        case '*': return (uint8)APP_LINK_CELL_BOMB;
+        case '@': return (uint8)APP_LINK_CELL_EMPTY;
         default : return 0xFFU;        /* 非法字符 (含 '?' 越界标记) */
     }
 }
@@ -436,8 +434,7 @@ static uint8 ascii_to_map_cell(uint8 ch)
  * 功能: 把 192 字节 ASCII 载荷写入权威地图副本 s_map_authoritative (CRC 已通过)
  * 返回: 1 成功, 0 因载荷含非法字符而拒绝
  * 备注: 整张地图先写入栈上临时缓冲, 全部合法后再以 seq-lock 提交; 写期间允许被高优先级 ISR 抢占,
- *       读者会自动重试. 不再写 g_game_map (现已降级为主循环私有快照, 由
- *       Game_Logic_Task_Run() 入口 app_link_get_map_snapshot() 刷新).
+ *       读者会自动重试，通过 app_link_get_map_snapshot() 获取一致快照。
  *-----------------------------------------------------------------------------------------------------------------*/
 static uint8 commit_map_frame(const uint8 *payload)
 {
@@ -733,7 +730,7 @@ void app_link_init(void)
 
     /* P0-3: seq-lock 计数与权威副本归零 */
     g_link_map_snapshot_retry_giveup = 0U;
-    /* s_map_seq 保持累计 (即便 init 重入也不破坏奇偶语义); 副本归零保证读到 MAP_EMPTY */
+    /* s_map_seq 保持累计 (即便 init 重入也不破坏奇偶语义); 副本归零保证读到空地编码 */
     {
         uint32 r;
         uint32 c;
@@ -743,7 +740,7 @@ void app_link_init(void)
         {
             for (c = 0U; c < (uint32)APP_LINK_MAP_COLS; ++c)
             {
-                s_map_authoritative[r][c] = (uint8)MAP_EMPTY;
+                s_map_authoritative[r][c] = (uint8)APP_LINK_CELL_EMPTY;
             }
         }
         __DMB();

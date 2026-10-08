@@ -1,4 +1,6 @@
-# CLAUDE.md — 推箱子视觉小车项目
+# CLAUDE.md — 运输车主控工程
+
+> 两个入口文件共享项目约束。
 
 ## 强制规则
 
@@ -19,28 +21,28 @@
 
 - [ ] 已阅读 `代码编写与变更规范.md` 第 11 节（AI 强制指令）
 - [ ] 已评估对 BSS 内存预算和 5ms tick 实时约束的影响
-- [ ] 已确认是否需要同步更新 PC 镜像 `pc_sokoban/sokoban_validator.py`
+- [ ] 已确定与此次变更相符的验证方式
 
 ## 项目结构
 
 ```
-visual-group/
+transport-truck/
 ├── project/code/           # 固件 C 代码 (RT1064)
-│   ├── algo_sokoban_solver.c/h  # 推箱子求解器 (导航+推箱+炸弹+后处理)
-│   ├── app_game_logic.c/h       # 游戏主状态机
-│   ├── app_recognize.c/h        # 地图识别 Tour 子状态机
-│   ├── app_recognize_clear.c/h  # 清障导航
+│   ├── config/                  # 硬件契约层 (pinMap + configChassis)
 │   └── app_link.c/h             # 通信链路
-├── pc_sokoban/             # PC 端 Python 镜像/验证器
-│   ├── sokoban_validator.py     # 核心算法镜像
-│   └── test_validator.py        # 回归测试
 └── project/iar/            # IAR 工程文件
 ```
 
 ## 关键约束
 
 - **MCU**: NXP RT1064 (Cortex-M7)
-- **SRAM 预算**: ~512KB (DTCM + OCRAM)，BFS static 数组约 35KB，禁止新增 >10KB 的 BSS 数组
-- **实时约束**: `Game_Logic_Task_Run` 单次执行 < 800μs（5ms tick 留余量）
-- **不可重入**: `algo_sokoban_solver` 内部函数共享 static buffer，禁止 ISR/嵌套调用
-- **C/Python 同步**: 算法修改必须在两端同步
+- **SRAM 预算**: ~512KB (DTCM + OCRAM)，禁止新增 >10KB 的 BSS 数组
+- **实时约束**: 保留 5ms 姿态采样和 20ms 底盘闭环节拍，中断中禁止阻塞操作
+- **算法验证**: 本仓库已移除 PC 推箱子镜像，修改算法时须选择与变更相符的验证方式
+
+## 相关文档
+
+- [PROJECT.md](PROJECT.md) — 编译/烧录/调试/硬件契约层入口
+- [代码编写与变更规范.md](代码编写与变更规范.md) — 强制编码规范
+- [README.md](README.md) — 完整目录结构与模块说明
+- [.hecateflow/project.json](.hecateflow/project.json) — HecateFlow 项目清单

@@ -1132,40 +1132,10 @@
     <group>
         <name>code</name>
         <file>
-            <name>$PROJ_DIR$\..\..\code\algo_sokoban_solver.c</name>
-        </file>
-        <file>
-            <name>$PROJ_DIR$\..\..\code\algo_sokoban_solver.h</name>
-        </file>
-        <file>
-            <name>$PROJ_DIR$\..\..\code\app_game_logic.c</name>
-        </file>
-        <file>
-            <name>$PROJ_DIR$\..\..\code\app_game_logic.h</name>
-        </file>
-        <file>
             <name>$PROJ_DIR$\..\..\code\app_link.c</name>
         </file>
         <file>
             <name>$PROJ_DIR$\..\..\code\app_link.h</name>
-        </file>
-        <file>
-            <name>$PROJ_DIR$\..\..\code\app_recognize.c</name>
-        </file>
-        <file>
-            <name>$PROJ_DIR$\..\..\code\app_recognize.h</name>
-        </file>
-        <file>
-            <name>$PROJ_DIR$\..\..\code\app_recognize_clear.c</name>
-        </file>
-        <file>
-            <name>$PROJ_DIR$\..\..\code\app_recognize_clear.h</name>
-        </file>
-        <file>
-            <name>$PROJ_DIR$\..\..\code\app_vision_fusion.c</name>
-        </file>
-        <file>
-            <name>$PROJ_DIR$\..\..\code\app_vision_fusion.h</name>
         </file>
         <file>
             <name>$PROJ_DIR$\..\..\code\chassis_config.h</name>
@@ -1205,12 +1175,6 @@
         </file>
         <file>
             <name>$PROJ_DIR$\..\..\code\chassis_mpc.h</name>
-        </file>
-        <file>
-            <name>$PROJ_DIR$\..\..\code\chassis_menu.c</name>
-        </file>
-        <file>
-            <name>$PROJ_DIR$\..\..\code\chassis_menu.h</name>
         </file>
         <file>
             <name>$PROJ_DIR$\..\..\code\chassis_motor.c</name>

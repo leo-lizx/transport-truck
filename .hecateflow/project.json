@@ -2,7 +2,7 @@
   "$schema": "hecateflow/manifest-v1",
   "version": 1,
   "workspace": {
-    "name": "visual-group",
+    "name": "transport-truck",
     "mcuFamily": "NXP RT1064DVL6A",
     "arch": "Cortex-M7",
     "toolchain": "IAR EWARM 9.2",
@@ -10,14 +10,8 @@
     "encoding": "utf-8-no-bom",
     "indent": "4-spaces",
     "scenario": {
-      "domain": "第21届智能车竞赛 AI视觉组 推箱子",
-      "constraints": [
-        "物理场地有效区域约 3.2 m × 2.4 m",
-        "车模及全部附属物地面投影 ≤ 35 cm × 35 cm",
-        "全程自主完成，禁止人工干预",
-        "推箱子规划必须检测死角与不可恢复状态",
-        "多关卡连续闯关，关卡间须返回发车区",
-      ],
+      "domain": "工程系统设计运输车（任务逻辑待构建）",
+      "constraints": [],
       "safetyRules": [],
       "forbidden": []
     },
@@ -42,7 +36,7 @@
   "targets": [
     {
       "id": "rt1064-main",
-      "description": "RT1064 主控固件 — 推箱子游戏逻辑 + 底盘运动控制 + 视觉链路",
+      "description": "RT1064 主控基础 — 底盘运动控制 + 保留的串口链路",
       "buildTarget": "nor_sdram_zf_dtcm",
       "layout": {
         "style": "feature-subdirs",
@@ -56,7 +50,7 @@
       "ownedPeripherals": [
         {"device": "LPUART4",      "owner": "rt1064-main", "io": true,  "gate": "whitelist-#if", "planNote": "OpenART1 地图帧 C16/C17, 115200bps CRC8"},
         {"device": "LPUART1",      "owner": "rt1064-main", "io": true,  "gate": "whitelist-#if", "planNote": "OpenART2 分类数据 B12/B13, 115200bps CRC8"},
-        {"device": "SPI3",         "owner": "rt1064-main", "io": false, "gate": "none",           "planNote": "IPS200 调试菜单屏 SCK=B0 MOSI=B1 RST=B2 DC=C19 CS=B3 BL=C18"},
+        {"device": "SPI3",         "owner": "rt1064-main", "io": false, "gate": "none",           "planNote": "IPS200 硬件接口（旧菜单已移除） SCK=B0 MOSI=B1 RST=B2 DC=C19 CS=B3 BL=C18"},
         {"device": "SPI4",         "owner": "rt1064-main", "io": false, "gate": "none",           "planNote": "IMU660RB 航向传感器 SCK=C23 MOSI=C22 MISO=C21 CS=C20"},
         {"device": "QTIMER1",      "owner": "rt1064-main", "io": false, "gate": "none",           "planNote": "编码器 LB(ENC1)+RB(ENC2)"},
         {"device": "QTIMER2",      "owner": "rt1064-main", "io": false, "gate": "none",           "planNote": "编码器 LF(ENC4)+RF(ENC3)"},
@@ -64,15 +58,8 @@
         {"device": "GPIO_C10_C7_D2_C9", "owner": "rt1064-main", "io": false, "gate": "none",     "planNote": "四路电机方向控制 (推挽输出)"},
         {"device": "GPIO_C15_C14_C13_C12", "owner": "rt1064-main", "io": false, "gate": "none",  "planNote": "按键 K1-K4 (key_scanner 轮询)"}
       ],
-      "hazardFiles": [
-        {"file": "project/code/app_recognize.c",       "semantic": "地图识别 Tour 子状态机"},
-        {"file": "project/code/app_recognize_clear.c",  "semantic": "清障导航"},
-        {"file": "project/code/app_vision_fusion.c",    "semantic": "视觉位姿融合 (Snap+一致性监控)"}
-      ],
-      "companionFiles": [
-        {"file": "main copy.py",                        "runtime": "OpenART1", "role": "16×12 地图识别与车辆定位，194字节二进制协议帧发给主控"},
-        {"file": "visual_inspection/visual_inspect.py",  "runtime": "OpenART2", "role": "图片分类模型推理，CRC8 校验协议帧"}
-      ],
+      "hazardFiles": [],
+      "companionFiles": [],
       "docPath": "PROJECT.md"
     }
   ],
