@@ -35,7 +35,7 @@ Project → Rebuild All  (或 Ctrl+F7 单文件编译)
 ```
 
 - 备选工具链: MDK/Keil (`project/mdk/rt1064.uvprojx`)
-- 本轮模式 1／2／3／4 已通过 IAR 编译链接；MDK 仅登记新增吸盘文件，原有底盘源文件登记缺失尚未修复，未验证完整构建。
+- 本轮模式 1／2／3／4 已通过 IAR 编译链接；2026-10-19 补齐 MDK `code` 组底盘源文件登记，MDK 5.43 完整构建通过（0 error，2 条 SDK 浮点告警）。
 - C 标准: C11, 编译选项 `--c99`
 - 编码: UTF-8 no BOM, 4 空格缩进
 
