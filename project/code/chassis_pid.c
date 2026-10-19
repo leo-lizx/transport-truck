@@ -11,7 +11,7 @@
 #include <stdio.h>
 
 #if (DEBUG_UART_ENABLE == 0)
-#define printf(...) (0)
+#define printf(...) ((void)0)
 #endif
 
 /* ---------------------- 单轮 PID 调试缓存 ---------------------- */
