@@ -85,4 +85,5 @@ Project → Rebuild All  (或 Ctrl+F7 单文件编译)
 | [docs/PINOUT.md](docs/PINOUT.md) | V3.0 主板接口标注、底盘占用、候选接口与复用／供电限制 |
 | [吸盘模式 4 接线与测试](docs/吸盘模式4接线与测试.md) | 泵阀控制端、供电边界、无负载检查与短按吸放测试 |
 | [代码编写与变更规范.md](代码编写与变更规范.md) | 编码规范、审查清单、AI 助手强制指令 |
+| [docs/Git提交流程.md](docs/Git提交流程.md) | 提交粒度、消息格式、验证清单与不入库资料 |
 | [.hecateflow/project.json](.hecateflow/project.json) | HecateFlow 项目清单 (外设/约束/构建系统) |

@@ -22,6 +22,14 @@
 - [ ] 已阅读 `代码编写与变更规范.md` 第 11 节（AI 强制指令）
 - [ ] 已评估对 BSS 内存预算和 5ms tick 实时约束的影响
 - [ ] 已确定与此次变更相符的验证方式
+- [ ] 已确认本次提交范围只包含本次改动
+
+### 每次改动都要留 Git 记录
+
+- 修改前先 `git status --short` 记录基线；只暂存本次改动的文件，禁止 `git add -A` / `git add .`。
+- 提交消息格式 `{模块} {动作/说明}`，正文写明为什么改、怎么验证、哪些没验证。
+- 提交前完成与改动相符的编译/测试；默认只提交、不推送。
+- 完整流程见 [docs/Git提交流程.md](docs/Git提交流程.md)。
 
 ## 项目结构
 
@@ -44,5 +52,6 @@ transport-truck/
 
 - [PROJECT.md](PROJECT.md) — 编译/烧录/调试/硬件契约层入口
 - [代码编写与变更规范.md](代码编写与变更规范.md) — 强制编码规范
+- [docs/Git提交流程.md](docs/Git提交流程.md) — 提交粒度、消息格式与验证清单
 - [README.md](README.md) — 完整目录结构与模块说明
 - [.hecateflow/project.json](.hecateflow/project.json) — HecateFlow 项目清单

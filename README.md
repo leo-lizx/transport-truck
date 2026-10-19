@@ -33,10 +33,10 @@ transport-truck/
 ## 编译与文档
 
 - IAR 工作空间：`project/iar/rt1064.eww`，配置 `nor_sdram_zf_dtcm`。
-- MDK 工程：`project/mdk/rt1064.uvprojx`。
-- MDK 本次仅同步新增吸盘文件登记，未验证完整构建；原有底盘源文件登记缺失另行处理。
+- MDK 工程：`project/mdk/rt1064.uvprojx`；2026-10-19 已补齐底盘源文件登记，完整构建通过（0 error，仅 SDK 浮点告警）。
 - [PROJECT.md](PROJECT.md)：硬件、编译和调试入口。
 - [代码编写与变更规范.md](代码编写与变更规范.md)：编码与变更规范。
+- [docs/Git提交流程.md](docs/Git提交流程.md)：提交粒度、消息格式与提交前验证清单。
 - [docs/PINOUT.md](docs/PINOUT.md)：V3.0 主板可用接口、底盘占用、复用限制及彩色标注图。
 - [吸盘模式 4 接线与测试](docs/吸盘模式4接线与测试.md)：电子开关接线、供电边界和首次测试步骤。
 - [底盘运动控制角度环与位置环评审及最优方案.md](底盘运动控制角度环与位置环评审及最优方案.md)：保留的底盘控制评审记录。
