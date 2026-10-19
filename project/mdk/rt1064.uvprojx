@@ -408,6 +408,33 @@
         </Group>
         <Group>
           <GroupName>code</GroupName>
+          <Files>
+            <File>
+              <FileName>app_suction_test.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\code\app_suction_test.c</FilePath>
+            </File>
+            <File>
+              <FileName>app_suction_test.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\code\app_suction_test.h</FilePath>
+            </File>
+            <File>
+              <FileName>drv_suction.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\code\drv_suction.c</FilePath>
+            </File>
+            <File>
+              <FileName>drv_suction.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\code\drv_suction.h</FilePath>
+            </File>
+            <File>
+              <FileName>configSuction.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\code\config\configSuction.h</FilePath>
+            </File>
+          </Files>
         </Group>
         <Group>
           <GroupName>doc</GroupName>

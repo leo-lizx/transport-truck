@@ -100,6 +100,11 @@
 #define KEY_K3_PIN              C13
 #define KEY_K4_PIN              C12
 
+/* 吸盘台架测试：两路同属 PWM1_SM3，统一配置；不改底盘 PWM2。 */
+#define SUCTION_TEST_BUTTON_PIN  KEY_K1_PIN
+#define SUCTION_PUMP_PWM_CHANNEL PWM1_MODULE3_CHA_D0  /* P17.1，泵开关白线 */
+#define SUCTION_VALVE_PWM_CHANNEL PWM1_MODULE3_CHB_D1 /* P18.1，阀开关白线 */
+
 /* BEEP 引脚 — 待补充 (如使用) */
 /* #define BEEP_PIN               XX */
 

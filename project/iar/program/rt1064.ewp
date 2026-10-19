@@ -1132,6 +1132,21 @@
     <group>
         <name>code</name>
         <file>
+            <name>$PROJ_DIR$\..\..\code\app_suction_test.c</name>
+        </file>
+        <file>
+            <name>$PROJ_DIR$\..\..\code\app_suction_test.h</name>
+        </file>
+        <file>
+            <name>$PROJ_DIR$\..\..\code\drv_suction.c</name>
+        </file>
+        <file>
+            <name>$PROJ_DIR$\..\..\code\drv_suction.h</name>
+        </file>
+        <file>
+            <name>$PROJ_DIR$\..\..\code\config\configSuction.h</name>
+        </file>
+        <file>
             <name>$PROJ_DIR$\..\..\code\app_link.c</name>
         </file>
         <file>
