@@ -41,6 +41,7 @@ project/iar/program/*/Obj/
 project/iar/program/*/.ninja_deps
 project/iar/program/*/.ninja_log
 project/iar/program/*/.rt1064_build_cache
+project/iar/program/*/build_ide.ninja
 
 # Office 临时锁文件
 project/~$*.xlsx
