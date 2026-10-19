@@ -36,7 +36,7 @@
   "targets": [
     {
       "id": "rt1064-main",
-      "description": "RT1064 主控基础 — 底盘运动控制 + 保留的串口链路",
+      "description": "RT1064 主控基础 — 底盘运动控制 + 保留的串口链路 + 模式4吸盘独立测试",
       "buildTarget": "nor_sdram_zf_dtcm",
       "layout": {
         "style": "feature-subdirs",
@@ -44,7 +44,7 @@
       },
       "headers": {
         "pinMap": "project/code/config/pinMap.h",
-        "configHeaders": ["project/code/config/configChassis.h"],
+        "configHeaders": ["project/code/config/configChassis.h", "project/code/config/configSuction.h"],
         "polaritySource": "project/code/config/configChassis.h §极性段"
       },
       "ownedPeripherals": [
@@ -55,8 +55,9 @@
         {"device": "QTIMER1",      "owner": "rt1064-main", "io": false, "gate": "none",           "planNote": "编码器 LB(ENC1)+RB(ENC2)"},
         {"device": "QTIMER2",      "owner": "rt1064-main", "io": false, "gate": "none",           "planNote": "编码器 LF(ENC4)+RF(ENC3)"},
         {"device": "PWM2",         "owner": "rt1064-main", "io": false, "gate": "none",           "planNote": "四路电机 PWM 载波 17kHz"},
+        {"device": "PWM1_SM3",     "owner": "rt1064-main", "io": false, "gate": "whitelist-#if", "planNote": "仅模式4吸盘测试：D0/P17.1泵、D1/P18.1阀；A/B统一初始化，名义50Hz，OFF约544us/ON约2400us，实物兼容待测；不占用PWM2"},
         {"device": "GPIO_C10_C7_D2_C9", "owner": "rt1064-main", "io": false, "gate": "none",     "planNote": "四路电机方向控制 (推挽输出)"},
-        {"device": "GPIO_C15_C14_C13_C12", "owner": "rt1064-main", "io": false, "gate": "none",  "planNote": "按键 K1-K4 (key_scanner 轮询)"}
+        {"device": "GPIO_C15_C14_C13_C12", "owner": "rt1064-main", "io": false, "gate": "whitelist-#if", "planNote": "仅模式4初始化C15板载K1：低有效，按住吸附、松手泄压2秒后关阀；C14/C13/C12尚未初始化，不启用旧key_scanner"}
       ],
       "hazardFiles": [],
       "companionFiles": [],
