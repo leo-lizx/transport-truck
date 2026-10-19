@@ -63,6 +63,15 @@
 关联：docs/Git提交流程.md
 ```
 
+### 2.4 检索与追溯
+
+```bash
+git log --oneline --grep '^吸盘测试'            # 按模块前缀
+git log --oneline --grep '关联：Q-07'           # 按任务编号
+git log --oneline --follow -- docs/PINOUT.md    # 按文件追踪
+git show <哈希>                                  # 查看单次改动与验证记录
+```
+
 ## 3. 提交前验证
 
 | 检查 | 命令 | 通过标准 |
