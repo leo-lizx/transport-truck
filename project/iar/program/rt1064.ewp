@@ -1147,6 +1147,21 @@
             <name>$PROJ_DIR$\..\..\code\config\configSuction.h</name>
         </file>
         <file>
+            <name>$PROJ_DIR$\..\..\code\drv_servo.c</name>
+        </file>
+        <file>
+            <name>$PROJ_DIR$\..\..\code\drv_servo.h</name>
+        </file>
+        <file>
+            <name>$PROJ_DIR$\..\..\code\app_servo_test.c</name>
+        </file>
+        <file>
+            <name>$PROJ_DIR$\..\..\code\app_servo_test.h</name>
+        </file>
+        <file>
+            <name>$PROJ_DIR$\..\..\code\config\configServo.h</name>
+        </file>
+        <file>
             <name>$PROJ_DIR$\..\..\code\app_link.c</name>
         </file>
         <file>

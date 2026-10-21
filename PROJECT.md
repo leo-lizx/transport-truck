@@ -17,6 +17,7 @@
 | 显示屏 | IPS200（驱动保留，旧菜单已移除） (SPI3, SCK=B0 MOSI=B1 RST=B2 DC=C19 CS=B3 BL=C18) |
 | 按键 | K1~K4 (C15~C12)；模式 4 使用 C15，按下低有效 |
 | 吸盘独立测试 | 模式 4：D0／P17.1 控泵，D1／P18.1 控阀，PWM1 子模块 3 A／B；[接线与测试](docs/吸盘模式4接线与测试.md) |
+| 舵机独立测试 | 模式 5：BDS300 经 P16／C30（PWM4 子模块 2 A），300 Hz、官方公式 0.5–2.5 ms 对应 0–180°、75–105° 往返；参数见 [configServo.h](project/code/config/configServo.h) |
 | 预留串口 | LPUART4 (C16/C17) + LPUART1 (B12/B13)，保留 app_link 的既有协议 |
 | 调试串口 | 115200bps 8N1, VOFA+ FireWater 协议 |
 
@@ -64,7 +65,8 @@ Project → Rebuild All  (或 Ctrl+F7 单文件编译)
 | 文件 | 作用 |
 |------|------|
 | [project/user/src/main.c](project/user/src/main.c) | 系统初始化、主循环调度、5ms tick 节拍 |
-| [project/code/app_suction_test.c](project/code/app_suction_test.c) | 默认模式 4：C15 按住吸附、松手泄压 2 秒后关阀；底盘 STOP |
+| [project/code/app_suction_test.c](project/code/app_suction_test.c) | 模式 4：C15 按住吸附、松手泄压 2 秒后关阀；底盘 STOP |
+| [project/code/app_servo_test.c](project/code/app_servo_test.c) | 模式 5：BDS300 在 75–105° 之间往返；底盘 STOP |
 | [project/user/src/isr.c](project/user/src/isr.c) | PIT/UART 中断入口 |
 | [project/code/chassis_ctrl.c](project/code/chassis_ctrl.c) | 底盘顶层控制 (IMU→里程计→导航→运动学→PID→电机) |
 | [project/code/app_link.c](project/code/app_link.c) | 视觉串口帧协议解析 (CRC8/状态机/Seq-Lock) |

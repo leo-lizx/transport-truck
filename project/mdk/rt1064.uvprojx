@@ -529,6 +529,31 @@
               <FileType>5</FileType>
               <FilePath>..\code\config\configSuction.h</FilePath>
             </File>
+            <File>
+              <FileName>drv_servo.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\code\drv_servo.c</FilePath>
+            </File>
+            <File>
+              <FileName>drv_servo.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\code\drv_servo.h</FilePath>
+            </File>
+            <File>
+              <FileName>app_servo_test.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\code\app_servo_test.c</FilePath>
+            </File>
+            <File>
+              <FileName>app_servo_test.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\code\app_servo_test.h</FilePath>
+            </File>
+            <File>
+              <FileName>configServo.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\code\config\configServo.h</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>

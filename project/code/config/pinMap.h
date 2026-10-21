@@ -105,6 +105,12 @@
 #define SUCTION_PUMP_PWM_CHANNEL PWM1_MODULE3_CHA_D0  /* P17.1，泵开关白线 */
 #define SUCTION_VALVE_PWM_CHANNEL PWM1_MODULE3_CHB_D1 /* P18.1，阀开关白线 */
 
+/* BDS300 旋转舵机台架测试：舵机接口 1，PWM4 子模块 2 A。
+ * 2026-10-20 对照结论：模式 7（C30、300Hz、官方公式）实测可转，
+ * 说明 C30/PWM4 与 300Hz 均正常；此前模式 5 在 C30 不转按“未跑到该构建/
+ * 接线未切换”处理，不再作为引脚故障。模式 5 与模式 4 编译期二选一。 */
+#define SERVO_TEST_PWM_CHANNEL   PWM4_MODULE2_CHA_C30 /* P16，C30 信号脚 */
+
 /* BEEP 引脚 — 待补充 (如使用) */
 /* #define BEEP_PIN               XX */
 
