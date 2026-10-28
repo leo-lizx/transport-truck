@@ -1159,6 +1159,12 @@
             <name>$PROJ_DIR$\..\..\code\app_servo_test.h</name>
         </file>
         <file>
+            <name>$PROJ_DIR$\..\..\code\app_servo_sequence.c</name>
+        </file>
+        <file>
+            <name>$PROJ_DIR$\..\..\code\app_servo_sequence.h</name>
+        </file>
+        <file>
             <name>$PROJ_DIR$\..\..\code\config\configServo.h</name>
         </file>
         <file>

@@ -550,6 +550,16 @@
               <FilePath>..\code\app_servo_test.h</FilePath>
             </File>
             <File>
+              <FileName>app_servo_sequence.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\code\app_servo_sequence.c</FilePath>
+            </File>
+            <File>
+              <FileName>app_servo_sequence.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\code\app_servo_sequence.h</FilePath>
+            </File>
+            <File>
               <FileName>configServo.h</FileName>
               <FileType>5</FileType>
               <FilePath>..\code\config\configServo.h</FilePath>

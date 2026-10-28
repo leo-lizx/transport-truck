@@ -10,7 +10,7 @@ static uint8_t s_have_last_ms;
 
 void app_servo_test_init(void)
 {
-    servo_init();
+    servo_init(SERVO_TEST_START_DEG);
     s_angle = SERVO_TEST_START_DEG;
     s_direction = 1;
     s_last_step_ms = 0U;

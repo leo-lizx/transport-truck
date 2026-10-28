@@ -39,6 +39,7 @@
 #include "chassis_pid.h"
 #include "app_suction_test.h"
 #include "app_servo_test.h"
+#include "app_servo_sequence.h"
 #include <stdio.h>
 #include "fsl_rtwdog.h"  /* 2s 硬件看门狗 */
 
@@ -47,15 +48,17 @@
 #define printf(...) ((void)0)
 #endif
 
-/* 编译期运行模式，保留原编号。当前默认进入舵机台架测试。 */
+/* 编译期运行模式，保留原编号。当前默认进入舵机按键序列测试。 */
 #define MAIN_RUN_MODE_YAW_HOLD        (1)   /* 航向保持调试 */
 #define MAIN_RUN_MODE_SINGLE_WHEEL    (2)   /* 单轮 PID 调试 */
 #define MAIN_RUN_MODE_POINT_NAV       (3)   /* 预设航点导航 */
 #define MAIN_RUN_MODE_SUCTION_TEST    (4)   /* C15 按住吸附，松手泄压 */
-#define MAIN_RUN_MODE_SERVO_TEST      (5)   /* BDS300 舵机 75–105° 往返测试 */
+#define MAIN_RUN_MODE_SERVO_TEST      (5)   /* FS5323M 舵机 75–105° 往返测试 */
+#define MAIN_RUN_MODE_SERVO_SEQUENCE  (6)   /* 上电自动：90→0→180→90，每步 1.5s */
 
-/* 修改此行切换模式：YAW_HOLD / SINGLE_WHEEL / POINT_NAV / SUCTION_TEST / SERVO_TEST。 */
-#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_SERVO_TEST)
+/* 修改此行切换模式：YAW_HOLD / SINGLE_WHEEL / POINT_NAV / SUCTION_TEST /
+ * SERVO_TEST / SERVO_SEQUENCE。 */
+#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_SERVO_SEQUENCE)
 
 static volatile uint32 s_main_tick_pending = 0U;   /* PIT_CH0 累加, 主循环消费 */
 static volatile uint32 s_main_tick_overrun = 0U;   /* 一次消费 >1 的累计差值 */
@@ -143,6 +146,8 @@ int main(void)
 #if (MAIN_RUN_MODE == MAIN_RUN_MODE_SERVO_TEST)
     /* 舵机先停在起始角，再进行底盘 IMU 标定。 */
     app_servo_test_init();
+#elif (MAIN_RUN_MODE == MAIN_RUN_MODE_SERVO_SEQUENCE)
+    app_servo_sequence_init();
 #endif
 
     /* 初始化前保持车体静止，供 IMU 零偏标定使用。 */
@@ -172,6 +177,8 @@ int main(void)
 #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_SUCTION_TEST)
     chassis_ctrl_stop();
 #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_SERVO_TEST)
+    chassis_ctrl_stop();
+#elif (MAIN_RUN_MODE == MAIN_RUN_MODE_SERVO_SEQUENCE)
     chassis_ctrl_stop();
 #endif
 
@@ -206,6 +213,8 @@ int main(void)
         app_suction_test_task(s_main_tick_total * 5U);
     #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_SERVO_TEST)
         app_servo_test_task(s_main_tick_total * 5U);
+    #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_SERVO_SEQUENCE)
+        app_servo_sequence_task(s_main_tick_total * 5U);
     #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_POINT_NAV)
 
         /* 路径航点遍历状态机:

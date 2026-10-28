@@ -1,7 +1,8 @@
 /*
- * BDS300 旋转舵机 PWM 输出：P16 / C30，PWM4 子模块 2 A。
- * 脉宽映射采用官方例程公式：0.5ms→0°、1.5ms→90°、2.5ms→180°。
- * 当前台架只扫 75–105°，首次仍须空载、小范围。
+ * FeETech FS5323M 数字舵机 PWM 输出：P16 / C30，PWM4 子模块 2 A。
+ * 脉宽采用官方例程公式：0.5ms→0°、1.5ms→90°、2.5ms→180°，
+ * 与舵机 500–2500µs 的额定量程一致。
+ * 模式 5 扫动 75–105°；模式 6 使用 0–180°，首次必须空载确认端点。
  */
 #include "drv_servo.h"
 
@@ -39,8 +40,8 @@ void servo_set_angle(float deg)
     pwm_set_duty(SERVO_TEST_PWM_CHANNEL, (uint32)servo_duty_from_angle(deg));
 }
 
-void servo_init(void)
+void servo_init(float home_deg)
 {
     pwm_init(SERVO_TEST_PWM_CHANNEL, SERVO_PWM_FREQ_HZ, 0U);
-    servo_set_angle(SERVO_TEST_START_DEG);
+    servo_set_angle(home_deg);
 }

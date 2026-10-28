@@ -3,7 +3,7 @@
 
 #include <stdint.h>
 
-/* 初始化舵机 PWM 并停在起始角。 */
+/* 模式 5：初始化舵机 PWM 并停在起始角，之后在 MIN/MAX 之间往返扫动。 */
 void app_servo_test_init(void);
 
 /* 主循环每 5ms 调用，now_ms 为累计节拍时间，允许 uint32_t 回绕。

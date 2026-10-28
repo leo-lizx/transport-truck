@@ -13,10 +13,10 @@ static unsigned s_failures;
 static unsigned s_cases;
 static const char *s_case_name;
 
-void servo_init(void)
+void servo_init(float home_deg)
 {
     ++s_init_calls;
-    s_last_angle = SERVO_TEST_START_DEG;
+    s_last_angle = home_deg;
 }
 
 void servo_set_angle(float deg)
