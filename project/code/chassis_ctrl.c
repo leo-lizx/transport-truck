@@ -1340,7 +1340,7 @@ void chassis_ctrl_task_20ms(void)
                 yaw_ok = chassis_yaw_arrival_realtime_ok(
                     yerr_arrival,
                     chassis_imu_get_yaw_rate_dps(),
-                    CHASSIS_YAW_INPOS_ENTER_DEG,
+                    CHASSIS_YAW_ARRIVAL_TOL_DEG,
                     CHASSIS_YAW_ARRIVAL_SETTLE_DPS);
                 if (yaw_ok != 0U) {
                     s_yaw_in_position = 1U;

@@ -161,6 +161,10 @@
 /** Point-navigation arrival uses a stricter yaw-rate limit than the in-position lock. */
 #define CHASSIS_YAW_ARRIVAL_SETTLE_DPS      (2.0f)
 
+/** 定点导航到位时的航向容差 (度): 比原地锁的 0.6° 宽，
+ *  避免 IMU 零偏/齿隙让航向条件长期不满足而卡住到位判定。 */
+#define CHASSIS_YAW_ARRIVAL_TOL_DEG         (1.5f)
+
 /* ---- 小角度原地旋转静摩擦前馈 ----
  * 通用四轮 breakaway 前馈负责平移和大角度起步；以下参数只在
  * vx/vy 近零且航向误差不超过 MAX_ERR 时替换它，原有线性 yaw 前馈仍叠加。
@@ -213,8 +217,11 @@
 
 /* ---- 导航：到位/保持/制动 ---- */
 
-/** 到达目标点判定阈值 (米): 纯位置窗口；速度、航向和驻留在下游独立确认。 */
-#define CHASSIS_TARGET_REACHED_EPSILON_M    (0.010f)
+/** 到达目标点判定阈值 (米): 纯位置窗口；速度、航向和驻留在下游独立确认。
+ *  必须大于制动包络的停车距离：BRAKE_FLOOR 0.20 m/s 时
+ *  v*latency + v²/(2a) + margin ≈ 2.9 cm，窗口过小会停在窗外反复修正，
+ *  表现为“到位判断很久/一直不到达”。 */
+#define CHASSIS_TARGET_REACHED_EPSILON_M    (0.030f)
 
 /** 到位驻留确认次数 (20ms/次): 连续 N 次同时满足位置+速度+角度条件才判到达。
  *  单拍 odom 噪声/瞬态过冲可能让 dist 瞬间掉进 EPSILON, 不加驻留会误触到达。

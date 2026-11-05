@@ -55,10 +55,12 @@
 #define MAIN_RUN_MODE_SUCTION_TEST    (4)   /* C15 按住吸附，松手泄压 */
 #define MAIN_RUN_MODE_SERVO_TEST      (5)   /* FS5323M 舵机 75–105° 往返测试 */
 #define MAIN_RUN_MODE_SERVO_SEQUENCE  (6)   /* 上电自动：90→0→180→90，每步 1.5s */
+#define MAIN_RUN_MODE_STORAGE_NAV     (7)   /* 右下角存放区航点导航，停顿 1s */
+#define MAIN_RUN_MODE_STORAGE_NAV_FAST (8)  /* 同模式 7，停顿 0.3s */
 
 /* 修改此行切换模式：YAW_HOLD / SINGLE_WHEEL / POINT_NAV / SUCTION_TEST /
- * SERVO_TEST / SERVO_SEQUENCE。 */
-#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_SERVO_SEQUENCE)
+ * SERVO_TEST / SERVO_SEQUENCE / STORAGE_NAV / STORAGE_NAV_FAST。 */
+#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_STORAGE_NAV_FAST)
 
 static volatile uint32 s_main_tick_pending = 0U;   /* PIT_CH0 累加, 主循环消费 */
 static volatile uint32 s_main_tick_overrun = 0U;   /* 一次消费 >1 的累计差值 */
@@ -104,9 +106,23 @@ static uint32 wait_for_tick(void)
 #define MAIN_POINT_NAV_WARMUP_TICKS   (200U)   /* 200 × 5ms = 1s */
 #endif
 
+#if (MAIN_RUN_MODE == MAIN_RUN_MODE_STORAGE_NAV) || \
+    (MAIN_RUN_MODE == MAIN_RUN_MODE_STORAGE_NAV_FAST)
+#define MAIN_STORAGE_NAV_WARMUP_TICKS (200U)   /* 200 × 5ms = 1s */
+#define MAIN_STORAGE_NAV_DWELL_TICKS  (200U)   /* 模式 7：到位后停留 1s */
+#define MAIN_STORAGE_NAV_FAST_DWELL_TICKS (60U) /* 模式 8：停留 0.3s */
+
+/* 单段超时保护：正常 0.5m 段几秒内应到位；若 6s 后已在目标 6cm 内
+ * 仍未判到达（低速蠕行/航向条件卡住），强制进入 1s 停顿；
+ * 12s 仍未接近则停车，避免状态机永久挂起。 */
+#define MAIN_STORAGE_NAV_LEG_TIMEOUT_TICKS (1200U)
+#define MAIN_STORAGE_NAV_LEG_ABORT_TICKS   (2400U)
+#define MAIN_STORAGE_NAV_NEAR_M            (0.060f)
+#endif
+
 #if (MAIN_RUN_MODE == MAIN_RUN_MODE_SINGLE_WHEEL)
-#define MAIN_PID_DEBUG_WHEEL_INDEX    (CHASSIS_WHEEL_LF)  /* 0=LF, 1=RF, 2=LB, 3=RB */
-#define MAIN_PID_DEBUG_TARGET_MPS     (0.10f)             /* target wheel speed, m/s */
+#define MAIN_PID_DEBUG_WHEEL_INDEX    (CHASSIS_WHEEL_RB)  /* 0=LF左前, 1=RF右前, 2=LB左后, 3=RB右后 */
+#define MAIN_PID_DEBUG_TARGET_MPS     (0.10f)             /* 10 cm/s，仅用于转向核对 */
 #define MAIN_PID_DEBUG_FORCE_PID      (1)                 /* 1=use KP/KI/KD below */
 #define MAIN_PID_DEBUG_KP             (200.0f)
 #define MAIN_PID_DEBUG_KI             (50.0f)
@@ -152,9 +168,15 @@ int main(void)
 
     /* 初始化前保持车体静止，供 IMU 零偏标定使用。 */
     chassis_ctrl_init();
+#if (MAIN_RUN_MODE == MAIN_RUN_MODE_STORAGE_NAV) || \
+    (MAIN_RUN_MODE == MAIN_RUN_MODE_STORAGE_NAV_FAST)
+    /* 存放区导航：车放在 (0,0)，车头朝 +y（yaw=0）。 */
+    chassis_ctrl_set_pose(0.0f, 0.0f, 0.0f);
+#else
     chassis_ctrl_set_pose(MAIN_POS_GRID_TO_M_X(MAIN_POS_NAV_START_X_GRID),
                           MAIN_POS_GRID_TO_M_Y(MAIN_POS_NAV_START_Y_GRID),
                           0.0f);
+#endif
 
 #if (MAIN_RUN_MODE == MAIN_RUN_MODE_SINGLE_WHEEL)
     /* 单轮闭环由 PIT_CH1 的 20ms 底盘任务执行。 */
@@ -180,6 +202,10 @@ int main(void)
     chassis_ctrl_stop();
 #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_SERVO_SEQUENCE)
     chassis_ctrl_stop();
+#elif (MAIN_RUN_MODE == MAIN_RUN_MODE_STORAGE_NAV) || \
+      (MAIN_RUN_MODE == MAIN_RUN_MODE_STORAGE_NAV_FAST)
+    /* 暖机期间保持车头 +y，航点由主循环状态机依次下发。 */
+    chassis_ctrl_hold_yaw(0.0f);
 #endif
 
     /* CH0: 5ms 姿态采样与主循环节拍；CH1: 20ms 底盘闭环。 */
@@ -215,6 +241,92 @@ int main(void)
         app_servo_test_task(s_main_tick_total * 5U);
     #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_SERVO_SEQUENCE)
         app_servo_sequence_task(s_main_tick_total * 5U);
+    #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_STORAGE_NAV) || \
+          (MAIN_RUN_MODE == MAIN_RUN_MODE_STORAGE_NAV_FAST)
+        /*
+         * 右下角存放区航点状态机：
+         *   暖机 1s → 依次沿直线斜向前往各点（车头保持 +y，不转向）
+         *   → 每点到位后停顿（模式 7：1s，模式 8：0.3s）→ 最后一点停完停车。
+         * 坐标单位为米，顺序沿地图上的蛇形路径。
+         */
+        {
+            typedef struct { float x_m; float y_m; } s_storage_wp_t;
+
+            /* 地图原值 x：-0.200、+0.200、-0.200、+0.200、0。
+             * 实车内部 +x 实际向左，这里直接写下发值（地图 x 取反）：
+             *   +x = 左，-x = 右。 */
+            static const s_storage_wp_t s_wps[] = {
+                {  0.200f, 0.475f },
+                { -0.200f, 0.975f },
+                {  0.200f, 1.475f },
+                { -0.200f, 1.975f },
+                {  0.000f, 2.275f },
+            };
+            static const uint8 s_wp_count =
+                (uint8)(sizeof(s_wps) / sizeof(s_wps[0]));
+
+            static uint8  s_wp_idx        = 0U;
+            static uint16 s_warmup_ticks  = 0U;
+            static uint8  s_started       = 0U;
+            static uint8  s_dwelling      = 0U;
+            static uint16 s_dwell_ticks   = 0U;
+            static uint16 s_leg_ticks     = 0U;
+            static uint8  s_done          = 0U;
+
+            /* 模式 8 与模式 7 只差到位停顿时间。 */
+            const uint16 dwell_target_ticks =
+#if (MAIN_RUN_MODE == MAIN_RUN_MODE_STORAGE_NAV)
+                MAIN_STORAGE_NAV_DWELL_TICKS;
+#else
+                MAIN_STORAGE_NAV_FAST_DWELL_TICKS;
+#endif
+
+            if (!s_started) {
+                if (++s_warmup_ticks >= MAIN_STORAGE_NAV_WARMUP_TICKS) {
+                    s_started = 1U;
+                    s_leg_ticks = 0U;
+                    chassis_ctrl_move_to_m_direct(s_wps[0].x_m, s_wps[0].y_m);
+                }
+            } else if (!s_done) {
+                if (s_dwelling) {
+                    if (++s_dwell_ticks >= dwell_target_ticks) {
+                        s_dwelling = 0U;
+                        ++s_wp_idx;
+                        if (s_wp_idx < s_wp_count) {
+                            s_leg_ticks = 0U;
+                            chassis_ctrl_move_to_m_direct(s_wps[s_wp_idx].x_m,
+                                                          s_wps[s_wp_idx].y_m);
+                        } else {
+                            s_done = 1U;
+                            chassis_ctrl_stop();
+                        }
+                    }
+                } else {
+                    uint8 force_arrive = 0U;
+
+                    ++s_leg_ticks;
+                    if (s_leg_ticks >= MAIN_STORAGE_NAV_LEG_TIMEOUT_TICKS) {
+                        chassis_pose_t pose = chassis_ctrl_get_pose();
+                        float dx = pose.x_m - s_wps[s_wp_idx].x_m;
+                        float dy = pose.y_m - s_wps[s_wp_idx].y_m;
+
+                        if ((dx * dx + dy * dy) <=
+                            (MAIN_STORAGE_NAV_NEAR_M * MAIN_STORAGE_NAV_NEAR_M)) {
+                            force_arrive = 1U;
+                        } else if (s_leg_ticks >= MAIN_STORAGE_NAV_LEG_ABORT_TICKS) {
+                            s_done = 1U;
+                            chassis_ctrl_stop();
+                        }
+                    }
+
+                    if ((s_done == 0U) &&
+                        ((force_arrive != 0U) || (chassis_ctrl_is_arrived() != 0U))) {
+                        s_dwelling    = 1U;
+                        s_dwell_ticks = 0U;
+                    }
+                }
+            }
+        }
     #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_POINT_NAV)
 
         /* 路径航点遍历状态机:
