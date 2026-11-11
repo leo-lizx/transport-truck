@@ -1,7 +1,7 @@
-/*********************************************************************************************************************
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    /*********************************************************************************************************************
 * RT1064DVL6A Opensourec Library 即（RT1064DVL6A 开源库）是一个基于官方 SDK 接口的第三方开源库
 * Copyright (c) 2022 SEEKFREE 逐飞科技
-*
+*                    
 * 本文件是 RT1064DVL6A 开源库的一部分
 *
 * RT1064DVL6A 开源库 是免费软件
@@ -40,6 +40,7 @@
 #include "app_suction_test.h"
 #include "app_servo_test.h"
 #include "app_servo_sequence.h"
+#include "app_stepper_test.h"
 #include <stdio.h>
 #include "fsl_rtwdog.h"  /* 2s 硬件看门狗 */
 
@@ -57,10 +58,11 @@
 #define MAIN_RUN_MODE_SERVO_SEQUENCE  (6)   /* 上电自动：90→0→180→90，每步 1.5s */
 #define MAIN_RUN_MODE_STORAGE_NAV     (7)   /* 右下角存放区航点导航，停顿 1s */
 #define MAIN_RUN_MODE_STORAGE_NAV_FAST (8)  /* 同模式 7，停顿 0.3s */
+#define MAIN_RUN_MODE_STEPPER_TEST    (9)   /* 升降步进：回原点 + K1/K2 点动 */
 
 /* 修改此行切换模式：YAW_HOLD / SINGLE_WHEEL / POINT_NAV / SUCTION_TEST /
- * SERVO_TEST / SERVO_SEQUENCE / STORAGE_NAV / STORAGE_NAV_FAST。 */
-#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_STORAGE_NAV_FAST)
+ * SERVO_TEST / SERVO_SEQUENCE / STORAGE_NAV / STORAGE_NAV_FAST / STEPPER_TEST。 */
+#define MAIN_RUN_MODE                 (MAIN_RUN_MODE_STEPPER_TEST)
 
 static volatile uint32 s_main_tick_pending = 0U;   /* PIT_CH0 累加, 主循环消费 */
 static volatile uint32 s_main_tick_overrun = 0U;   /* 一次消费 >1 的累计差值 */
@@ -164,11 +166,21 @@ int main(void)
     app_servo_test_init();
 #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_SERVO_SEQUENCE)
     app_servo_sequence_init();
+#elif (MAIN_RUN_MODE == MAIN_RUN_MODE_STEPPER_TEST)
+    /* 只配置引脚与 GPT1，不发脉冲；回原点在主循环 1s 后开始。 */
+    app_stepper_test_init();
 #endif
 
+#if (MAIN_RUN_MODE == MAIN_RUN_MODE_STEPPER_TEST)
+    /* 模式 9 只测步进：不初始化底盘、IMU、编码器和电机 PWM，
+     * 避免未接 IMU 的台架主板卡在初始化里。 */
+#else
     /* 初始化前保持车体静止，供 IMU 零偏标定使用。 */
     chassis_ctrl_init();
-#if (MAIN_RUN_MODE == MAIN_RUN_MODE_STORAGE_NAV) || \
+#endif
+#if (MAIN_RUN_MODE == MAIN_RUN_MODE_STEPPER_TEST)
+    /* 不设置底盘位姿。 */
+#elif (MAIN_RUN_MODE == MAIN_RUN_MODE_STORAGE_NAV) || \
     (MAIN_RUN_MODE == MAIN_RUN_MODE_STORAGE_NAV_FAST)
     /* 存放区导航：车放在 (0,0)，车头朝 +y（yaw=0）。 */
     chassis_ctrl_set_pose(0.0f, 0.0f, 0.0f);
@@ -208,9 +220,15 @@ int main(void)
     chassis_ctrl_hold_yaw(0.0f);
 #endif
 
+#if (MAIN_RUN_MODE == MAIN_RUN_MODE_STEPPER_TEST)
+    /* 模式 9 不启动 CH0/CH1（其中断会调用底盘任务），
+     * 改用 CH2 只产生 5ms 主循环节拍。 */
+    pit_ms_init(PIT_CH2, 5);
+#else
     /* CH0: 5ms 姿态采样与主循环节拍；CH1: 20ms 底盘闭环。 */
     pit_ms_init(PIT_CH0, 5);
     pit_ms_init(PIT_CH1, 20);
+#endif
 
     /* 保留原看门狗参数：主循环停止刷新约 2s 后复位。 */
     {
@@ -241,6 +259,8 @@ int main(void)
         app_servo_test_task(s_main_tick_total * 5U);
     #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_SERVO_SEQUENCE)
         app_servo_sequence_task(s_main_tick_total * 5U);
+    #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_STEPPER_TEST)
+        app_stepper_test_task(s_main_tick_total * 5U);
     #elif (MAIN_RUN_MODE == MAIN_RUN_MODE_STORAGE_NAV) || \
           (MAIN_RUN_MODE == MAIN_RUN_MODE_STORAGE_NAV_FAST)
         /*

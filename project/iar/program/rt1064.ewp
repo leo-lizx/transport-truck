@@ -1168,6 +1168,24 @@
             <name>$PROJ_DIR$\..\..\code\config\configServo.h</name>
         </file>
         <file>
+            <name>$PROJ_DIR$\..\..\code\drv_stepper.c</name>
+        </file>
+        <file>
+            <name>$PROJ_DIR$\..\..\code\drv_stepper.h</name>
+        </file>
+        <file>
+            <name>$PROJ_DIR$\..\..\code\stepper_profile.h</name>
+        </file>
+        <file>
+            <name>$PROJ_DIR$\..\..\code\app_stepper_test.c</name>
+        </file>
+        <file>
+            <name>$PROJ_DIR$\..\..\code\app_stepper_test.h</name>
+        </file>
+        <file>
+            <name>$PROJ_DIR$\..\..\code\config\configStepper.h</name>
+        </file>
+        <file>
             <name>$PROJ_DIR$\..\..\code\app_link.c</name>
         </file>
         <file>

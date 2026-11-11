@@ -18,7 +18,8 @@
 | 按键 | K1~K4 (C15~C12)；模式 4 使用 C15，按下低有效 |
 | 吸盘独立测试 | 模式 4：D0／P17.1 控泵，D1／P18.1 控阀，PWM1 子模块 3 A／B；[接线与测试](docs/吸盘模式4接线与测试.md) |
 | 舵机独立测试 | 模式 5：FeETech FS5323M 经 P16／C30（PWM4 子模块 2 A），300 Hz、官方公式 0.5–2.5 ms（与 500–2500 µs 量程一致）、75–105° 往返；参数见 [configServo.h](project/code/config/configServo.h) |
-| 舵机上电序列测试 | 默认模式 6：上电自动执行一个周期 90° → 0° → 180° → 90°，每次转动后停顿 1.5 s，结束停在 90° 不再动作；无需按键；底盘 STOP。0–180° 对应 0.5–2.5 ms，在 FS5323M 额定量程内，但首次仍须卸载机构空载确认机械限位；指令角度不代表实测角度 |
+| 升降步进测试 | 默认模式 9：RMN28 驱动器 + FSK30 丝杆（导程 12 mm，1/8 细分）；D12 脉冲、D13 方向、D4 限位（按下导通），GPT1 中断产生脉冲；上电回原点后 K1/K2 点动 10 mm、K3 回原点、K4 急停；见 [接线与测试](docs/升降步进模式9接线与测试.md) |
+| 舵机上电序列测试 | 模式 6：上电自动执行一个周期 90° → 0° → 180° → 90°，每次转动后停顿 1.5 s，结束停在 90° 不再动作；无需按键；底盘 STOP。0–180° 对应 0.5–2.5 ms，在 FS5323M 额定量程内，但首次仍须卸载机构空载确认机械限位；指令角度不代表实测角度 |
 | 预留串口 | LPUART4 (C16/C17) + LPUART1 (B12/B13)，保留 app_link 的既有协议 |
 | 调试串口 | 115200bps 8N1, VOFA+ FireWater 协议 |
 
@@ -69,7 +70,8 @@ Project → Rebuild All  (或 Ctrl+F7 单文件编译)
 | [project/code/app_suction_test.c](project/code/app_suction_test.c) | 模式 4：C15 按住吸附、松手泄压 2 秒后关阀；底盘 STOP |
 | [project/code/app_servo_test.c](project/code/app_servo_test.c) | 模式 5：75–105° 自动扫动；底盘 STOP |
 | [project/code/app_servo_sequence.c](project/code/app_servo_sequence.c) | 模式 6：上电自动执行 90→0→180→90 单周期，每步 1.5s；底盘 STOP |
-| [project/user/src/isr.c](project/user/src/isr.c) | PIT/UART 中断入口 |
+| [project/code/app_stepper_test.c](project/code/app_stepper_test.c) | 模式 9：升降步进回原点与按键点动；底盘 STOP |
+| [project/user/src/isr.c](project/user/src/isr.c) | PIT/UART/GPT1 中断入口 |
 | [project/code/chassis_ctrl.c](project/code/chassis_ctrl.c) | 底盘顶层控制 (IMU→里程计→导航→运动学→PID→电机) |
 | [project/code/app_link.c](project/code/app_link.c) | 视觉串口帧协议解析 (CRC8/状态机/Seq-Lock) |
 

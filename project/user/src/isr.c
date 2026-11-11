@@ -37,6 +37,7 @@
 #include "zf_common_debug.h"
 #include "isr.h"
 #include "app_link.h"   /* P0-1: 视觉?主控帧协议解析层 */
+#include "drv_stepper.h"
 
 /* P0-5: 主循环 5ms 节拍唤醒钩子, 实现位于 user/src/main.c */
 extern void main_loop_on_pit_tick(void);
@@ -46,6 +47,13 @@ void CSI_IRQHandler(void)
 {
     CSI_DriverIRQHandler();     // 调用SDK自带的中断函数 这个函数最后会调用我们设置的回调函数
     __DSB();                    // 数据同步隔离
+}
+
+/* GPT1：升降步进脉冲（仅模式 9 使能该中断）。GPT2 由 system_delay 使用。 */
+void GPT1_IRQHandler(void)
+{
+    stepper_isr();
+    __DSB();
 }
 
 void PIT_IRQHandler(void)
@@ -64,6 +72,14 @@ void PIT_IRQHandler(void)
         pit_flag_clear(PIT_CH1);
 
         chassis_ctrl_task_20ms();  // 20ms: 编码器 + 里程计 + PID + 导航
+    }
+
+    /* CH2：仅模式 9 初始化，只唤醒主循环，不运行底盘任务。 */
+    if(pit_flag_get(PIT_CH2))
+    {
+        pit_flag_clear(PIT_CH2);
+
+        main_loop_on_pit_tick();
     }
     
     

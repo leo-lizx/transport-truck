@@ -564,6 +564,36 @@
               <FileType>5</FileType>
               <FilePath>..\code\config\configServo.h</FilePath>
             </File>
+            <File>
+              <FileName>drv_stepper.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\code\drv_stepper.c</FilePath>
+            </File>
+            <File>
+              <FileName>drv_stepper.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\code\drv_stepper.h</FilePath>
+            </File>
+            <File>
+              <FileName>stepper_profile.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\code\stepper_profile.h</FilePath>
+            </File>
+            <File>
+              <FileName>app_stepper_test.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\code\app_stepper_test.c</FilePath>
+            </File>
+            <File>
+              <FileName>app_stepper_test.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\code\app_stepper_test.h</FilePath>
+            </File>
+            <File>
+              <FileName>configStepper.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\code\config\configStepper.h</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>

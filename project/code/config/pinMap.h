@@ -111,6 +111,15 @@
  * 接线未切换”处理，不再作为引脚故障。模式 5 与模式 4 编译期二选一。 */
 #define SERVO_TEST_PWM_CHANNEL   PWM4_MODULE2_CHA_C30 /* P16，C30 信号脚 */
 
+/* 升降步进台架测试（RMN28 驱动器 + FSK30 丝杆）：
+ *   脉冲 D12（P7 SCK）→ 驱动器 P+，P- 接 GND；
+ *   方向 D13（P7 CS） → 驱动器 D+，D- 接 GND；
+ *   限位 D4（P21.1）  ← 开关一端，另一端接 P21.3 GND；按下导通 = 低电平。
+ * 占用后 P7 SPI 无线模块不可同时使用。 */
+#define STEPPER_PULSE_PIN        D12
+#define STEPPER_DIR_PIN          D13
+#define STEPPER_HOME_SWITCH_PIN  D4
+
 /* BEEP 引脚 — 待补充 (如使用) */
 /* #define BEEP_PIN               XX */
 
