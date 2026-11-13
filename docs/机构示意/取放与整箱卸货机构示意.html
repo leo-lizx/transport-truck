@@ -1,0 +1,510 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>运输车：取放与整箱卸货机构示意</title>
+<style>
+  body { font-family: "Microsoft YaHei", "PingFang SC", sans-serif; margin: 0; background: #f4f6f8; color: #222; }
+  header { background: #1f3a5f; color: #fff; padding: 14px 24px; }
+  header h1 { margin: 0; font-size: 22px; }
+  header p { margin: 4px 0 0; font-size: 13px; opacity: .85; }
+  main { max-width: 1240px; margin: 0 auto; padding: 16px 20px 40px; }
+  section { background: #fff; border-radius: 8px; padding: 16px 20px; margin: 16px 0; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+  h2 { font-size: 18px; margin: 0 0 10px; color: #1f3a5f; border-left: 4px solid #2e7dd7; padding-left: 8px; }
+  h3 { font-size: 15px; margin: 14px 0 6px; }
+  .views { display: flex; gap: 12px; flex-wrap: wrap; }
+  .view { flex: 1 1 560px; border: 1px solid #dde3ea; border-radius: 6px; background: #fbfcfd; }
+  .view .cap { font-size: 13px; padding: 6px 10px; border-bottom: 1px solid #e5e9ee; color: #555; }
+  svg { display: block; width: 100%; height: auto; }
+  .ctrl { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 10px 0; }
+  button { border: 1px solid #2e7dd7; background: #fff; color: #2e7dd7; border-radius: 4px; padding: 5px 12px; cursor: pointer; font-size: 13px; }
+  button:hover { background: #eaf3fd; }
+  button.primary { background: #2e7dd7; color: #fff; }
+  #label { font-size: 15px; font-weight: bold; color: #b5462b; min-height: 22px; margin: 6px 0; }
+  #readout { font-family: Consolas, monospace; font-size: 13px; color: #333; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { border: 1px solid #d5dbe2; padding: 5px 8px; text-align: left; vertical-align: top; }
+  th { background: #eef3f8; }
+  .note { background: #fff7e6; border: 1px solid #f3d08a; border-radius: 6px; padding: 8px 12px; font-size: 13px; }
+  .ok { color: #1b7f3b; font-weight: bold; }
+  .warn { color: #b5462b; font-weight: bold; }
+  .legend span { display: inline-block; margin-right: 14px; font-size: 12px; }
+  .sw { display: inline-block; width: 12px; height: 12px; vertical-align: -2px; margin-right: 4px; border: 1px solid #555; }
+  .fig2 { display: flex; gap: 14px; flex-wrap: wrap; }
+  .fig2 > div { flex: 1 1 360px; }
+  p, li { font-size: 14px; line-height: 1.65; }
+</style>
+</head>
+<body>
+<header>
+  <h1>运输车：取放机构与“整箱卸货”示意</h1>
+  <p>尺寸为设计估算值（方块按 35 mm 估），用于理解原理和确定方向；机构定型前需按实物复核。打开即可离线播放动画。</p>
+</header>
+<main>
+
+<section>
+  <h2>1. 一句话原理</h2>
+  <p>
+    5 块方块逐个放进车上一个<b>竖直的方管货箱</b>，叠成一摞；到存放区后，吸盘不吸方块，而是吸住货箱侧面的一个
+    <b>“耳座”</b>，把整个货箱连同 5 块一起提起来、转到车外、放进 12×12 cm 区域。
+    这样 5 次精确放置变成 <b>1 次粗放置</b>：货箱底面只有约 46×46 mm，在 120×120 mm 区域里每边还能偏约
+    <span class="ok">±37 mm</span>，惯导误差（约 ±2 cm）就够，不需要视觉对准存放区。
+  </p>
+</section>
+
+<section>
+  <h2>2. 动画：完整取件 + 卸货流程</h2>
+  <div class="ctrl">
+    <button class="primary" id="btnPlay">▶ 播放</button>
+    <button id="btnPrev">⏮ 上一步</button>
+    <button id="btnNext">下一步 ⏭</button>
+    <button id="btnReset">重置</button>
+    <label style="font-size:13px">速度
+      <select id="speed"><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="2">2×</option><option value="4">4×</option></select>
+    </label>
+    <span id="stepNo" style="font-size:13px;color:#666"></span>
+  </div>
+  <div id="label"></div>
+  <div id="readout"></div>
+  <div class="views">
+    <div class="view"><div class="cap">俯视图（车头朝上；虚线圆 = 吸盘能到达的唯一圆弧，半径 R = 200 mm）</div><svg id="top" viewBox="0 0 600 520"></svg></div>
+    <div class="view"><div class="cap">后视图（从车尾向前看，左右与俯视图一致；只看高度关系）</div><svg id="side" viewBox="0 0 600 520"></svg></div>
+  </div>
+  <div class="legend" style="margin-top:8px">
+    <span><i class="sw" style="background:#9fb3c8"></i>车台/底盘</span>
+    <span><i class="sw" style="background:#6b7a8f"></i>FSK30 升降滑台</span>
+    <span><i class="sw" style="background:#2e7dd7"></i>舵机 + 旋转臂</span>
+    <span><i class="sw" style="background:#222"></i>吸盘头</span>
+    <span><i class="sw" style="background:#f5c26b"></i>货箱</span>
+    <span><i class="sw" style="background:#7e57c2"></i>耳座（被吸的地方）</span>
+    <span><i class="sw" style="background:#e5533d"></i>方块</span>
+    <span><i class="sw" style="background:#c8e6c9"></i>存放区 12×12 cm</span>
+  </div>
+</section>
+
+<section>
+  <h2>3. 为什么这样设计：逐条讲原理</h2>
+
+  <h3>3.1 固定臂长 → 所有工作点都必须在同一个圆上</h3>
+  <p>
+    吸盘装在固定长度 R 的臂端，舵机只能改变角度，所以吸盘在俯视图里<b>只能落在一个半径为 R 的圆上</b>。
+    因此左取件点、右取件点、货箱口、耳座、卸货点，全部要安排在这个圆上（动画俯视图里的彩色标记）。
+    车体移动 + 舵机转角配合，就能把吸盘送到任意需要的位置：
+    沿圆周方向的误差由舵机转角修正，沿半径方向的误差由车移动修正。
+  </p>
+  <p>
+    FS5323M 只有 0–180°，所以工作点都放在车的<b>右 → 前 → 左</b>半圈（10° 到 170°），
+    升降滑台放在车台后部中央，旋转臂永远扫不到它，不会相撞。
+  </p>
+
+  <h3>3.2 为什么吸“耳座”，不吸货箱中心</h3>
+  <p>
+    货箱顶部中间是开口（方块从这里放进去），没有平面可吸。只能在货箱侧面加一个专门给吸盘用的结构。
+    但这带来一个问题：耳座在货箱侧面，货箱和方块的重心在开口中心，两者水平错开约 43 mm。
+    只靠一个吸盘吸住时，重力会让货箱绕吸盘<b>歪下去</b>，吸盘边缘被撬开、漏气、掉落。
+  </p>
+  <div class="fig2">
+    <div>
+      <svg viewBox="0 0 420 330" id="figMoment"></svg>
+    </div>
+    <div>
+      <p><b>解决办法：承插式耳座。</b>耳座不是一块平板，而是一个带<b>导向孔</b>的方块：</p>
+      <ul>
+        <li>吸盘头外面套一个刚性导向环（直径 22 mm），吸盘（直径 20 mm）在导向环下面。</li>
+        <li>耳座上开一个直径 24 mm、深 25 mm 的孔，孔口有 36 mm 的倒角漏斗。</li>
+        <li>吸盘头插进孔里，吸盘吸住<b>孔底平面</b>，负责“往上提”。</li>
+        <li>货箱想歪的时候，孔壁顶住导向环，负责“不让歪”。</li>
+      </ul>
+      <p>
+        这样吸盘只承受竖直拉力（约 1 N，20 mm 吸盘按 30% 有效吸力约 5.6 N，余量约 5 倍），
+        歪斜力矩全部由孔壁和吸盘杆承担。吸盘头外面没有任何凸出物，<b>吸方块时完全不受影响</b>。
+      </p>
+      <p class="note">
+        说明：上一版文字里我写的是“耳板 + 2 根支撑钉”。这次按尺寸画图时发现，支撑钉在把方块放进 40 mm 仓口时会撞到仓壁或方块，
+        所以改成承插式耳座。原理一样（让歪斜力有地方被挡住），但不会和取放方块冲突。
+      </p>
+    </div>
+  </div>
+
+  <h3>3.3 方块“放”进去，不是“扔”进去</h3>
+  <p>
+    吸盘杆长 100 mm，臂只要停在货箱口上方，吸盘就能伸进仓里。第 1 块落差约 60 mm，第 2 块约 25 mm，
+    从第 3 块开始直接放到下面那块上面再泄压，没有落差。仓口做成 60→40 mm 的漏斗，方块偏一点也会被导正；
+    仓内 40×40 mm，比 35 mm 的方块大 5 mm，不会卡住。
+  </p>
+
+  <h3>3.4 高度规划（决定滑台行程和整机高度）</h3>
+  <table>
+    <tr><th>动作</th><th>吸盘高度</th><th>臂高度（= 吸盘 + 100）</th><th>原因</th></tr>
+    <tr><td>吸地面上的方块</td><td>30 mm</td><td>130 mm（最低）</td><td>方块顶面 35 mm，弹簧再压 5 mm</td></tr>
+    <tr><td>带方块越过货箱口</td><td>263 mm</td><td>365 mm（最高）</td><td>方块底面要高于货箱口 220 mm 再留 8 mm</td></tr>
+    <tr><td>吸货箱耳座（车上）</td><td>195 mm</td><td>290 mm</td><td>孔底在货箱口下 25 mm</td></tr>
+    <tr><td>带货箱转出车外</td><td>255 mm</td><td>350 mm</td><td>货箱底面 85 mm，高于车台 70 mm</td></tr>
+    <tr><td>货箱放到地上</td><td>165 mm</td><td>260 mm</td><td>货箱底面触地，弹簧再压 5 mm</td></tr>
+  </table>
+  <p>
+    臂的高度范围 130–365 mm，所以 <b>FSK30 的有效行程至少约 240 mm</b>，最高点约 375 mm，在 400 mm 限高内但余量不多。
+    <span class="warn">需要实测 FSK30 的有效行程</span>：如果不够，就改用 3+2 双列货箱（高度降到约 120 mm，行程约 170 mm 够用；
+    隔墙正好在重心上方，吸盘直接吸隔墙顶面、没有歪斜问题；代价是长边余量只剩约 ±7 mm，卸货需要视觉对准）。
+  </p>
+
+  <h3>3.5 静态尺寸（收拢状态在 400×400 mm 内）</h3>
+  <p>
+    车台 300×300 mm。货箱放在车台<b>左前角</b>的定位槽支架上，最外缘离中心约 171 mm；
+    臂收拢时停在货箱上方，臂端在 141 mm 处。所以收拢状态整车约 342×342 mm。
+    取件和卸货时臂会伸出车外（臂端 200 mm 加方块半宽），这是工作中的瞬时状态；赛规的尺寸限制是否包含运动过程，需要向课程方确认。
+  </p>
+</section>
+
+<section>
+  <h2>4. 货箱结构</h2>
+  <div class="fig2">
+    <div><svg viewBox="0 0 420 380" id="figBin"></svg></div>
+    <div>
+      <table>
+        <tr><th>部位</th><th>建议尺寸</th><th>说明</th></tr>
+        <tr><td>仓体</td><td>外 46×46，内 40×40，高 190 mm</td><td>3D 打印，壁厚 3 mm；内壁打磨或贴光滑胶带</td></tr>
+        <tr><td>仓口漏斗</td><td>60→40 mm，高 12 mm</td><td>方块偏 ±10 mm 也能被导正</td></tr>
+        <tr><td>仓底</td><td>3 mm</td><td>可在底面贴防滑垫，放到地上不滑</td></tr>
+        <tr><td>耳座</td><td>40×40×30 mm，导向孔 Ø24 深 25，孔口倒角到 Ø36</td><td>粘在仓体侧面顶部，顶面与仓口平齐；孔底贴一片光滑亚克力，保证吸盘密封</td></tr>
+        <tr><td>质量</td><td>仓体约 45 g + 5 块泡沫</td><td>合计约 100 g（方块质量待实测）</td></tr>
+        <tr><td>车上定位槽</td><td>比货箱大 8 mm，深 15 mm，口部倒角</td><td>货箱竖直放入、竖直吸出；允许 ±4 mm 晃动，吸盘头插孔时会把货箱推正</td></tr>
+      </table>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>5. 车上需要的机构清单</h2>
+  <table>
+    <tr><th>#</th><th>机构</th><th>选型 / 关键尺寸</th><th>作用</th><th>当前状态</th></tr>
+    <tr><td>1</td><td>行进</td><td>四麦轮底盘 + IMU 惯导</td><td>走停顿点；取件前按视觉微调位置</td><td>已有，模式 7/8 已跑通路线</td></tr>
+    <tr><td>2</td><td>升降</td><td>FSK30 丝杆模组（导程 12 mm）+ 步进电机 + STEP/DIR 驱动器 + 底部限位开关；竖直装在车台后部中央</td><td>带动舵机、臂、吸盘整体上下；有效行程需 ≥ 约 240 mm</td><td>固件模式 9 已完成；等新驱动器</td></tr>
+    <tr><td>3</td><td>转动</td><td>FS5323M 舵机，装在滑台的滑块上；输出轴加一个法兰轴承承受侧向力</td><td>转动旋转臂，工作范围 10°–170°</td><td>模式 5/6 已测</td></tr>
+    <tr><td>4</td><td>旋转臂</td><td>碳纤维板或铝条，转轴到吸盘中心 R = 200 mm</td><td>把吸盘送到圆弧上的各个点</td><td>待制作</td></tr>
+    <tr><td>5</td><td>吸盘头</td><td>吸盘杆长 100 mm，穿过臂端导向衬套；5–8 mm 压缩弹簧；Ø22 刚性导向环；Ø20 吸盘</td><td>吸方块；插入耳座吸货箱；弹簧吸收高度误差</td><td>待制作</td></tr>
+    <tr><td>6</td><td>气路</td><td>370 真空泵 + 三通电磁阀 + 2 个电子开关（D0/D1）；建议加一个负压传感器</td><td>吸附、泄压；传感器用来判断“吸住了没有”“途中掉了没有”</td><td>模式 4 已有</td></tr>
+    <tr><td>7</td><td>货箱</td><td>见第 4 节</td><td>装 5 块；整体被搬进存放区</td><td>待打印</td></tr>
+    <tr><td>8</td><td>货箱定位槽</td><td>车台左前角的支架，槽底比车台低</td><td>行驶中固定货箱，保证吸盘每次都能对准耳座</td><td>待制作</td></tr>
+    <tr><td>9</td><td>摄像头</td><td>装在旋转臂上，镜头朝下，跟臂一起转</td><td>取件前测方块相对吸盘的偏差</td><td>方案已写，未联调</td></tr>
+  </table>
+</section>
+
+<section>
+  <h2>6. 需要先确认或实测的事</h2>
+  <ol>
+    <li><b>课程方</b>：方块装在货箱里、货箱整体放进存放区，算不算得分。如果不算，退回“从仓顶逐块吸出、码放到区域内”，硬件不用改。</li>
+    <li><b>FSK30 有效行程</b>：≥ 240 mm 用单列；不够就改 3+2 双列。</li>
+    <li><b>方块实物</b>：边长、质量、顶面是否平整（影响吸盘密封）。</li>
+    <li><b>台架试验</b>：先打印一个 40×40 方管 + 耳座，手动做 20 次放块、20 次吸起货箱，统计卡住、掉落次数，再定间隙。</li>
+  </ol>
+</section>
+
+</main>
+
+<script>
+/* ============ 几何参数（mm） ============ */
+const R = 200, ROD = 100, ZSAFE = 365, DECK = 70, BLK = 35;
+const BIN_W = 46, BIN_H = 190, BIN_FLOOR = 3, BIN_STORE_BOTTOM = 30;
+const SOCK_OFF = 43, SOCK_DEPTH = 25, SOCK_W = 40;
+const DEG = Math.PI / 180;
+const D = 2 * Math.asin(SOCK_OFF / 2 / R) / DEG;     // 货箱口与耳座在圆弧上的夹角
+const A_R = 10, A_L = 170;
+const A_OPEN = 135 - D / 2, A_SOCK = 135 + D / 2;    // 货箱放在左前角
+const A_UNLOAD = 10, PHI_UNLOAD = A_UNLOAD + D;
+const pol = (r, a) => [r * Math.cos(a * DEG), r * Math.sin(a * DEG)];
+const f1 = v => (Math.round(v * 10) / 10).toFixed(1);
+
+/* ============ 关键帧 ============ */
+const K = [];
+const S = { carry: null, placed: 0, ground: null, bin: 'store', zone: false };
+let lastPhi = 90, lastZ = ZSAFE;
+function k(phi, z, dur, label) {
+  K.push({ phi, z, dur, label, st: JSON.parse(JSON.stringify(S)) });
+  lastPhi = phi; lastZ = z;
+}
+k(90, ZSAFE, 900, '待机：臂朝车头，升降在安全高度');
+const sides = ['R', 'L', 'R', 'L', 'L'];
+for (let i = 0; i < 5; i++) {
+  const a = sides[i] === 'R' ? A_R : A_L, side = sides[i] === 'R' ? '右' : '左';
+  const nm = `第 ${i + 1} 块：`;
+  S.ground = { a };
+  k(lastPhi, ZSAFE, 900, nm + `车到停顿点 ${i + 1}，视觉校正车体，让方块中心落在吸盘圆弧上（${side}侧）` +
+    (i === 4 ? '；第 5 块先整车转向，复用左侧取件' : ''));
+  k(a, ZSAFE, 900, nm + `舵机转到${side}侧取件角 ${a}°`);
+  k(a, 130, 800, nm + '步进下降：吸盘压到方块顶面，弹簧压缩约 5 mm 吸收高度误差');
+  S.carry = 'block'; S.ground = null;
+  k(a, 130, 500, nm + '泵抽气，吸住方块');
+  k(a, ZSAFE, 800, nm + '提升到安全高度（方块底面高于货箱口）');
+  k(A_OPEN, ZSAFE, 1000, nm + '舵机转到货箱口上方');
+  const landBottom = BIN_STORE_BOTTOM + BIN_FLOOR + BLK * S.placed;
+  // 臂本身不能低于货箱口 + 8 mm；吸盘杆可以伸进仓里
+  const armLand = Math.max(landBottom + BLK + ROD, BIN_STORE_BOTTOM + BIN_H + 8);
+  const drop = (armLand - ROD - BLK) - landBottom;
+  k(A_OPEN, armLand, 800, nm + '下降：吸盘带着方块伸进仓口' + (drop > 1 ? `（臂已贴近仓口，方块离仓底/下一块还有 ${Math.round(drop)} mm）` : '，直接放到下面那块上'));
+  S.carry = null; S.placed++;
+  k(A_OPEN, armLand, 600, nm + '关泵泄压，方块放稳在仓内' + (drop > 1 ? `（落差约 ${Math.round(drop)} mm）` : '（无落差）'));
+  k(A_OPEN, ZSAFE, 700, nm + '提升，准备下一块');
+}
+S.zone = true;
+k(lastPhi, ZSAFE, 1500, '卸货：5 块已在仓内叠成一摞。车行驶到存放区旁，让存放区中心落在吸盘圆弧 10° 处（惯导误差 ±2 cm 即可）');
+k(A_SOCK, ZSAFE, 900, `卸货：舵机转到耳座角度（比货箱口多转 ${f1(D)}°）`);
+const seatStore = BIN_STORE_BOTTOM + BIN_H - SOCK_DEPTH;
+k(A_SOCK, seatStore + ROD - 5, 900, '卸货：下降，吸盘头插入耳座导向孔，压到孔底');
+S.carry = 'bin'; S.bin = 'carry';
+k(A_SOCK, seatStore + ROD - 5, 600, '卸货：抽气，吸盘吸住孔底平面；孔壁挡住货箱，不让它歪');
+k(A_SOCK, 350, 900, '卸货：提升 60 mm，货箱底面离开定位槽并高于车台');
+k(PHI_UNLOAD, 350, 1600, '卸货：舵机带着整个货箱转到车外');
+const armGround = BIN_H - SOCK_DEPTH + ROD - 5;
+k(PHI_UNLOAD, armGround, 1100, '卸货：下降到货箱底面触地，弹簧再压 5 mm 保证完全放稳');
+S.carry = null; S.bin = 'ground';
+k(PHI_UNLOAD, armGround, 900, '卸货：关泵泄压 2 s');
+k(PHI_UNLOAD, ZSAFE, 800, '卸货：吸盘从导向孔中竖直抽出');
+k(90, ZSAFE, 1100, '完成：货箱连同 5 块都在 12×12 cm 区域内，臂回到待机位');
+
+/* ============ 绘图工具 ============ */
+const svgTop = document.getElementById('top'), svgSide = document.getElementById('side');
+function rectRot(cx, cy, w, h, angDeg, attrs) {
+  return `<rect x="${-w / 2}" y="${-h / 2}" width="${w}" height="${h}" transform="translate(${cx},${cy}) rotate(${angDeg})" ${attrs}/>`;
+}
+function binPose(st, phi) {
+  if (st.bin === 'carry') return { c: pol(R, phi - D), s: pol(R, phi) };
+  if (st.bin === 'ground') return { c: pol(R, A_UNLOAD), s: pol(R, PHI_UNLOAD) };
+  return { c: pol(R, A_OPEN), s: pol(R, A_SOCK) };
+}
+
+/* ---- 俯视图 ---- */
+function drawTop(phi, z, st) {
+  const CX = 300, CY = 270;
+  let g = '';
+  if (st.zone) {
+    const [zx, zy] = pol(R, A_UNLOAD);
+    g += `<rect x="${zx - 60}" y="${zy - 60}" width="120" height="120" fill="#c8e6c9" stroke="#2e7d32" stroke-width="2"/>`;
+  }
+  // 车台、车轮
+  g += `<rect x="-150" y="-150" width="300" height="300" fill="#9fb3c8" stroke="#56677a" stroke-width="2" opacity="0.55"/>`;
+  for (const [wx, wy] of [[-105, 100], [105, 100], [-105, -100], [105, -100]])
+    g += `<rect x="${wx - 12}" y="${wy - 32}" width="24" height="64" fill="none" stroke="#56677a" stroke-dasharray="4 3"/>`;
+  // 车头箭头
+  g += `<path d="M -20 125 L 0 145 L 20 125" fill="none" stroke="#56677a" stroke-width="3"/>`;
+  // 工作圆弧
+  g += `<circle cx="0" cy="0" r="${R}" fill="none" stroke="#2e7dd7" stroke-dasharray="6 5" opacity="0.6"/>`;
+  // 舵机工作范围扇形
+  const [ax0, ay0] = pol(R + 12, 10), [ax1, ay1] = pol(R + 12, 170);
+  g += `<path d="M ${ax0} ${ay0} A ${R + 12} ${R + 12} 0 0 1 ${ax1} ${ay1}" fill="none" stroke="#2e7dd7" stroke-width="3" opacity="0.35"/>`;
+  // 升降滑台（车尾中央）
+  g += `<rect x="-22" y="-80" width="44" height="34" fill="#6b7a8f"/>`;
+  // 定位槽支架
+  {
+    const [cx, cy] = pol(R, A_OPEN), [sx, sy] = pol(R, A_SOCK);
+    const ang = Math.atan2(sy - cy, sx - cx) / DEG;
+    g += rectRot(cx, cy, BIN_W + 10, BIN_W + 10, ang, 'fill="none" stroke="#8d6e63" stroke-width="2" stroke-dasharray="3 2"');
+  }
+  // 地面方块
+  if (st.ground) {
+    const [bx, by] = pol(R, st.ground.a);
+    g += `<rect x="${bx - BLK / 2}" y="${by - BLK / 2}" width="${BLK}" height="${BLK}" fill="#e5533d" stroke="#8e2b1d"/>`;
+  }
+  // 货箱
+  {
+    const p = binPose(st, phi);
+    const ang = Math.atan2(p.s[1] - p.c[1], p.s[0] - p.c[0]) / DEG;
+    g += `<g transform="translate(${p.c[0]},${p.c[1]}) rotate(${ang})">`;
+    g += `<rect x="${-BIN_W / 2}" y="${-BIN_W / 2}" width="${BIN_W}" height="${BIN_W}" fill="#f5c26b" stroke="#a5761d" stroke-width="2"/>`;
+    g += `<rect x="-20" y="-20" width="40" height="40" fill="${st.placed ? '#e5533d' : '#fff3d6'}" stroke="#a5761d" opacity="${st.placed ? 0.85 : 1}"/>`;
+    g += `<rect x="${BIN_W / 2}" y="${-SOCK_W / 2}" width="${SOCK_W}" height="${SOCK_W}" fill="#7e57c2" stroke="#4527a0" opacity="0.9"/>`;
+    g += `<circle cx="${SOCK_OFF}" cy="0" r="12" fill="#ede7f6" stroke="#4527a0"/>`;
+    g += `</g>`;
+  }
+  // 旋转臂
+  const [tx, ty] = pol(R, phi);
+  g += `<line x1="0" y1="0" x2="${tx}" y2="${ty}" stroke="#2e7dd7" stroke-width="14" stroke-linecap="round" opacity="0.85"/>`;
+  g += `<circle cx="0" cy="0" r="16" fill="#1d4f8f"/>`;
+  if (st.carry === 'block') g += `<rect x="${tx - BLK / 2}" y="${ty - BLK / 2}" width="${BLK}" height="${BLK}" fill="#e5533d" stroke="#8e2b1d" opacity="0.9"/>`;
+  g += `<circle cx="${tx}" cy="${ty}" r="11" fill="#222" stroke="#fff" stroke-width="2"/>`;
+  // 摄像头（臂中段）
+  const [kx, ky] = pol(R * 0.62, phi);
+  g += `<rect x="${kx - 8}" y="${ky - 8}" width="16" height="16" fill="#455a64" transform="rotate(${phi} ${kx} ${ky})"/>`;
+
+  // 标签（不翻转）
+  let t = '';
+  const lab = (a, text, color, r = R + 36) => {
+    const [x, y] = pol(r, a);
+    t += `<text x="${CX + x}" y="${CY - y}" font-size="12" fill="${color}" text-anchor="middle">${text}</text>`;
+  };
+  lab(A_R, '右取件 10°', '#c62828', R + 48);
+  lab(A_L, '左取件 170°', '#c62828', R + 48);
+  lab(A_OPEN - 3, '货箱口', '#a5761d', R + 30);
+  lab(A_SOCK + 6, '耳座', '#4527a0', R + 32);
+  lab(90, '车头 90°', '#56677a', R + 50);
+  if (st.zone) lab(A_UNLOAD - 26, '存放区', '#2e7d32', R + 28);
+  t += `<text x="${CX}" y="${CY + 105}" font-size="12" fill="#37474f" text-anchor="middle">升降滑台（车尾）</text>`;
+  t += `<text x="${CX - 140}" y="${CY + 140}" font-size="12" fill="#56677a">车台 300×300</text>`;
+  t += `<text x="10" y="510" font-size="12" fill="#555">粗蓝弧 = 舵机实际使用的 10°–170°；滑台在车尾，臂永远扫不到</text>`;
+
+  svgTop.innerHTML = `<g transform="translate(${CX},${CY}) scale(1,-1)">${g}</g>${t}`;
+}
+
+/* ---- 后视图（只看高度） ---- */
+function drawSide(phi, z, st) {
+  const OX = 300, OY = 480;           // 原点：转轴正下方的地面
+  const X = x => OX + x, Y = zz => OY - zz;
+  let s = '';
+  // 高度刻度
+  for (const [zz, txt] of [[ZSAFE, '安全高度 365（臂）'], [DECK, '车台 70'], [400, '限高 400']]) {
+    s += `<line x1="20" y1="${Y(zz)}" x2="580" y2="${Y(zz)}" stroke="${zz === 400 ? '#c62828' : '#bbb'}" stroke-dasharray="4 4"/>`;
+    s += `<text x="22" y="${Y(zz) - 3}" font-size="11" fill="${zz === 400 ? '#c62828' : '#888'}">${txt}</text>`;
+  }
+  // 地面
+  s += `<line x1="0" y1="${Y(0)}" x2="600" y2="${Y(0)}" stroke="#444" stroke-width="2"/>`;
+  if (st.zone) {
+    const zx = R * Math.cos(A_UNLOAD * DEG);
+    s += `<rect x="${X(zx - 60)}" y="${Y(0)}" width="120" height="6" fill="#2e7d32"/>`;
+    s += `<text x="${X(zx)}" y="${Y(0) + 20}" font-size="11" fill="#2e7d32" text-anchor="middle">存放区 120</text>`;
+  }
+  // 底盘
+  s += `<rect x="${X(-150)}" y="${Y(DECK)}" width="300" height="${DECK - 30}" fill="#9fb3c8" stroke="#56677a"/>`;
+  for (const wx of [-105, 105]) s += `<circle cx="${X(wx)}" cy="${Y(31)}" r="31" fill="#56677a"/>`;
+  // 滑台
+  s += `<rect x="${X(-14)}" y="${Y(385)}" width="28" height="${385 - DECK}" fill="#6b7a8f"/>`;
+  s += `<text x="${X(18)}" y="${Y(200)}" font-size="11" fill="#6b7a8f">FSK30</text>`;
+  // 滑块 + 舵机
+  s += `<rect x="${X(-24)}" y="${Y(z - 8)}" width="48" height="36" fill="#455a64"/>`;
+  s += `<text x="${X(-60)}" y="${Y(z - 30)}" font-size="11" fill="#1d4f8f">舵机</text>`;
+  // 定位槽支架
+  {
+    const cx = R * Math.cos(A_OPEN * DEG);
+    s += `<rect x="${X(cx - 31)}" y="${Y(BIN_STORE_BOTTOM)}" width="62" height="12" fill="#8d6e63"/>`;
+    s += `<line x1="${X(cx + 31)}" y1="${Y(BIN_STORE_BOTTOM)}" x2="${X(-150)}" y2="${Y(DECK - 20)}" stroke="#8d6e63" stroke-width="4"/>`;
+  }
+  // 地面方块
+  if (st.ground) {
+    const bx = R * Math.cos(st.ground.a * DEG);
+    s += `<rect x="${X(bx - BLK / 2)}" y="${Y(BLK)}" width="${BLK}" height="${BLK}" fill="#e5533d" stroke="#8e2b1d"/>`;
+  }
+  // 货箱
+  const cupZ = z - ROD;
+  {
+    let bottom, cxAng, sxAng;
+    if (st.bin === 'carry') { bottom = cupZ - (BIN_H - SOCK_DEPTH); cxAng = phi - D; sxAng = phi; }
+    else if (st.bin === 'ground') { bottom = 0; cxAng = A_UNLOAD; sxAng = PHI_UNLOAD; }
+    else { bottom = BIN_STORE_BOTTOM; cxAng = A_OPEN; sxAng = A_SOCK; }
+    const bx = R * Math.cos(cxAng * DEG), sx = R * Math.cos(sxAng * DEG);
+    const top = bottom + BIN_H;
+    // 方块（先画，货箱半透明盖在上面）
+    for (let i = 0; i < st.placed; i++) {
+      const b = bottom + BIN_FLOOR + BLK * i;
+      s += `<rect x="${X(bx - BLK / 2)}" y="${Y(b + BLK)}" width="${BLK}" height="${BLK}" fill="#e5533d" stroke="#8e2b1d"/>`;
+    }
+    s += `<rect x="${X(bx - BIN_W / 2)}" y="${Y(top)}" width="${BIN_W}" height="${BIN_H}" fill="#f5c26b" fill-opacity="0.35" stroke="#a5761d" stroke-width="2"/>`;
+    s += `<path d="M ${X(bx - 30)} ${Y(top)} L ${X(bx - 20)} ${Y(top - 12)} M ${X(bx + 30)} ${Y(top)} L ${X(bx + 20)} ${Y(top - 12)}" stroke="#a5761d" stroke-width="2"/>`;
+    s += `<rect x="${X(sx - SOCK_W / 2)}" y="${Y(top)}" width="${SOCK_W}" height="30" fill="#7e57c2" fill-opacity="0.8" stroke="#4527a0"/>`;
+    s += `<rect x="${X(sx - 12)}" y="${Y(top)}" width="24" height="${SOCK_DEPTH}" fill="#ede7f6" stroke="#4527a0"/>`;
+  }
+  // 旋转臂（投影长度 = R·cosφ）
+  const tx = R * Math.cos(phi * DEG);
+  s += `<line x1="${X(0)}" y1="${Y(z)}" x2="${X(tx)}" y2="${Y(z)}" stroke="#2e7dd7" stroke-width="9" stroke-linecap="round"/>`;
+  // 吸盘杆 + 弹簧 + 导向环 + 吸盘
+  s += `<line x1="${X(tx)}" y1="${Y(z + 10)}" x2="${X(tx)}" y2="${Y(cupZ + 14)}" stroke="#222" stroke-width="5"/>`;
+  let zig = `M ${X(tx)} ${Y(z - 8)}`;
+  for (let i = 1; i <= 6; i++) zig += ` L ${X(tx + (i % 2 ? 7 : -7))} ${Y(z - 8 - i * 4)}`;
+  s += `<path d="${zig}" fill="none" stroke="#888" stroke-width="2"/>`;
+  s += `<rect x="${X(tx - 11)}" y="${Y(cupZ + 14)}" width="22" height="9" fill="#555"/>`;
+  s += `<path d="M ${X(tx - 6)} ${Y(cupZ + 5)} L ${X(tx - 10)} ${Y(cupZ)} L ${X(tx + 10)} ${Y(cupZ)} L ${X(tx + 6)} ${Y(cupZ + 5)} Z" fill="#222"/>`;
+  if (st.carry === 'block')
+    s += `<rect x="${X(tx - BLK / 2)}" y="${Y(cupZ)}" width="${BLK}" height="${BLK}" fill="#e5533d" stroke="#8e2b1d"/>`;
+  s += `<text x="560" y="20" font-size="11" fill="#888" text-anchor="end">← 车左侧　　　车右侧 →</text>`;
+  svgSide.innerHTML = s;
+}
+
+/* ============ 播放控制 ============ */
+let idx = 1, t0 = 0, playing = false, speed = 1, raf = 0;
+const ease = x => x < 0.5 ? 2 * x * x : 1 - Math.pow(-2 * x + 2, 2) / 2;
+function render(i, frac) {
+  const a = K[i - 1], b = K[i], e = ease(Math.min(1, Math.max(0, frac)));
+  const phi = a.phi + (b.phi - a.phi) * e, z = a.z + (b.z - a.z) * e;
+  drawTop(phi, z, b.st);
+  drawSide(phi, z, b.st);
+  document.getElementById('label').textContent = b.label;
+  document.getElementById('stepNo').textContent = `步骤 ${i} / ${K.length - 1}`;
+  document.getElementById('readout').textContent =
+    `舵机角 ${f1(phi)}°   臂高 ${Math.round(z)} mm   吸盘高 ${Math.round(z - ROD)} mm   步进位置(离最低点) ${Math.round(z - 130)} mm   仓内 ${b.st.placed}/5 块`;
+}
+function tick(ts) {
+  if (!playing) return;
+  const frac = (ts - t0) * speed / K[idx].dur;
+  if (frac >= 1) {
+    if (idx < K.length - 1) { idx++; t0 = ts; }
+    else { render(idx, 1); stop(); return; }
+  }
+  render(idx, Math.min(frac, 1));
+  raf = requestAnimationFrame(tick);
+}
+function play() { if (idx >= K.length - 1) idx = 1; playing = true; t0 = performance.now(); document.getElementById('btnPlay').textContent = '⏸ 暂停'; raf = requestAnimationFrame(tick); }
+function stop() { playing = false; cancelAnimationFrame(raf); document.getElementById('btnPlay').textContent = '▶ 播放'; }
+document.getElementById('btnPlay').onclick = () => playing ? stop() : play();
+document.getElementById('btnNext').onclick = () => { stop(); if (idx < K.length - 1) idx++; render(idx, 1); };
+document.getElementById('btnPrev').onclick = () => { stop(); if (idx > 1) idx--; render(idx, 1); };
+document.getElementById('btnReset').onclick = () => { stop(); idx = 1; render(1, 0); };
+document.getElementById('speed').onchange = e => { speed = parseFloat(e.target.value); };
+render(1, 0);
+
+/* ============ 静态图：歪斜力矩与承插耳座 ============ */
+document.getElementById('figMoment').innerHTML = `
+  <text x="10" y="18" font-size="13" font-weight="bold" fill="#c62828">只用吸盘吸平板：会歪</text>
+  <rect x="40" y="70" width="46" height="190" fill="#f5c26b" fill-opacity=".5" stroke="#a5761d" stroke-width="2" transform="rotate(-9 108 70)"/>
+  <rect x="86" y="66" width="40" height="8" fill="#7e57c2" transform="rotate(-9 108 70)"/>
+  <rect x="98" y="40" width="20" height="26" fill="#222"/>
+  <line x1="63" y1="160" x2="63" y2="215" stroke="#c62828" stroke-width="3" marker-end="url(#ar)"/>
+  <text x="20" y="232" font-size="12" fill="#c62828">重力 W（在开口中心）</text>
+  <text x="20" y="290" font-size="12" fill="#333">W 偏离吸盘 43 mm → 绕吸盘转</text>
+  <text x="20" y="306" font-size="12" fill="#333">→ 吸盘边缘被撬开、漏气</text>
+
+  <text x="230" y="18" font-size="13" font-weight="bold" fill="#1b7f3b">承插耳座：不会歪</text>
+  <rect x="250" y="80" width="46" height="190" fill="#f5c26b" fill-opacity=".5" stroke="#a5761d" stroke-width="2"/>
+  <rect x="296" y="80" width="56" height="34" fill="#7e57c2" fill-opacity=".85" stroke="#4527a0"/>
+  <path d="M 306 80 L 314 90 L 314 106 L 334 106 L 334 90 L 342 80" fill="#ede7f6" stroke="#4527a0"/>
+  <rect x="319" y="30" width="10" height="62" fill="#222"/>
+  <rect x="314" y="84" width="20" height="8" fill="#555"/>
+  <path d="M 316 92 L 314 106 L 334 106 L 332 92 Z" fill="#222"/>
+  <line x1="273" y1="170" x2="273" y2="225" stroke="#c62828" stroke-width="3" marker-end="url(#ar)"/>
+  <text x="240" y="242" font-size="12" fill="#c62828">重力 W</text>
+  <line x1="324" y1="60" x2="324" y2="34" stroke="#1b7f3b" stroke-width="3" marker-end="url(#ag)"/>
+  <text x="332" y="48" font-size="12" fill="#1b7f3b">吸盘只管提</text>
+  <line x1="352" y1="96" x2="336" y2="96" stroke="#1b7f3b" stroke-width="3" marker-end="url(#ag)"/>
+  <text x="356" y="100" font-size="12" fill="#1b7f3b">孔壁挡住歪斜</text>
+  <text x="240" y="290" font-size="12" fill="#333">导向环 Ø22 在孔 Ø24 里</text>
+  <text x="240" y="306" font-size="12" fill="#333">→ 歪斜力由孔壁和吸盘杆承担</text>
+  <defs>
+    <marker id="ar" markerWidth="8" markerHeight="8" refX="4" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#c62828"/></marker>
+    <marker id="ag" markerWidth="8" markerHeight="8" refX="4" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#1b7f3b"/></marker>
+  </defs>`;
+
+/* ============ 静态图：货箱结构 ============ */
+(function () {
+  let s = '<text x="10" y="18" font-size="13" font-weight="bold">侧视剖面（单位 mm）</text>';
+  const ox = 60, oy = 350, k = 1.5;          // 1 mm = 1.5 px
+  const X = x => ox + x * k, Y = z => oy - z * k * 0.82;
+  s += `<line x1="20" y1="${Y(0)}" x2="400" y2="${Y(0)}" stroke="#444" stroke-width="2"/>`;
+  s += `<rect x="${X(0)}" y="${Y(190)}" width="${46 * k}" height="${(Y(0) - Y(190))}" fill="#f5c26b" fill-opacity=".35" stroke="#a5761d" stroke-width="2"/>`;
+  s += `<rect x="${X(3)}" y="${Y(178)}" width="${40 * k}" height="${Y(3) - Y(178)}" fill="#fff8e7" stroke="#a5761d" stroke-dasharray="3 2"/>`;
+  for (let i = 0; i < 5; i++)
+    s += `<rect x="${X(5.5)}" y="${Y(3 + 35 * (i + 1))}" width="${35 * k}" height="${Y(0) - Y(35)}" fill="#e5533d" fill-opacity=".8" stroke="#8e2b1d"/>`;
+  s += `<path d="M ${X(-7)} ${Y(190)} L ${X(3)} ${Y(178)} M ${X(53)} ${Y(190)} L ${X(43)} ${Y(178)}" stroke="#a5761d" stroke-width="3"/>`;
+  s += `<rect x="${X(46)}" y="${Y(190)}" width="${40 * k}" height="${Y(160) - Y(190)}" fill="#7e57c2" fill-opacity=".85" stroke="#4527a0"/>`;
+  s += `<rect x="${X(54)}" y="${Y(190)}" width="${24 * k}" height="${Y(165) - Y(190)}" fill="#ede7f6" stroke="#4527a0"/>`;
+  s += `<text x="${X(92)}" y="${Y(180)}" font-size="12" fill="#4527a0">耳座 40×40×30</text>`;
+  s += `<text x="${X(92)}" y="${Y(168)}" font-size="12" fill="#4527a0">导向孔 Ø24 深 25</text>`;
+  s += `<text x="${X(92)}" y="${Y(156)}" font-size="12" fill="#4527a0">孔底贴亚克力（吸这里）</text>`;
+  s += `<text x="${X(-30)}" y="${Y(196)}" font-size="12" fill="#a5761d">漏斗 60→40</text>`;
+  s += `<text x="${X(92)}" y="${Y(100)}" font-size="12" fill="#333">仓内 40×40，外 46×46</text>`;
+  s += `<text x="${X(92)}" y="${Y(86)}" font-size="12" fill="#333">高 190，5 块叠放约 175</text>`;
+  s += `<text x="${X(92)}" y="${Y(60)}" font-size="12" fill="#333">耳座中心距开口中心 43 mm</text>`;
+  s += `<line x1="${X(23)}" y1="${Y(205)}" x2="${X(66)}" y2="${Y(205)}" stroke="#333" marker-start="url(#d1)" marker-end="url(#d1)"/>`;
+  s += `<text x="${X(36)}" y="${Y(209)}" font-size="11">43</text>`;
+  s += `<defs><marker id="d1" markerWidth="6" markerHeight="6" refX="3" refY="3" orient="auto"><circle cx="3" cy="3" r="2" fill="#333"/></marker></defs>`;
+  document.getElementById('figBin').innerHTML = s;
+})();
+</script>
+</body>
+</html>
