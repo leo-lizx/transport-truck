@@ -37,9 +37,9 @@
 /* 每按一次 K1/K2 点动的距离。 */
 #define STEPPER_JOG_MM                  (10.0f)
 
-/* D13 方向电平：首测确认。若回原点时滑台远离开关，立即按 K4 停止，
- * 把此值改为 0U（或互换 A+/A-）后重新编译。 */
-#define STEPPER_DIR_LEVEL_AWAY_FROM_HOME (1U)
+/* C16 方向电平：若回零方向相反，先断开驱动电源，
+ * 在 0U/1U 间切换；或断电互换一相接线，二者只选一种。 */
+#define STEPPER_DIR_LEVEL_AWAY_FROM_HOME (0U)
 
 /* 限位开关：按下导通到 GND，D4 上拉输入，低电平 = 触发。
  * 朝开关方向运动时，连续 N 个步进周期读到触发才停，滤掉单次毛刺。 */
